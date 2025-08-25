@@ -12,7 +12,8 @@ image_channels = 3
 
 # --- Dataset Generation ---
 # Create the root Zarr group
-root_group = zarr.open(zarr_path, mode='w') #, zarr_versio=2)
+# IMPORTANT! The diffusion policy repo uses zarr version 2
+root_group = zarr.open(zarr_path, mode='w', zarr_version=2)
 
 # Create the top-level 'meta' and 'data' groups
 data_group = root_group.create_group('data')
@@ -55,13 +56,13 @@ episode_ends = np.cumsum(all_episode_lengths).astype(np.int64)
 
 # --- Save the data to the Zarr file ---
 # Create datasets in the 'data' group
-data_group.create_dataset(
-    'keypoints',
-    shape=full_keypoints.shape,
-    dtype=full_keypoints.dtype,
-    data=full_keypoints,
-    overwrite=True
-)
+# data_group.create_dataset(
+#     'keypoints',
+#     shape=full_keypoints.shape,
+#     dtype=full_keypoints.dtype,
+#     data=full_keypoints,
+#     overwrite=True
+# )
 data_group.create_dataset(
     'img',
     shape=full_imgs.shape,
@@ -76,13 +77,13 @@ data_group.create_dataset(
     data=full_states,
     overwrite=True
 )
-data_group.create_dataset(
-    'n_contacts',
-    shape=full_n_contacts.shape,
-    dtype=full_n_contacts.dtype,
-    data=full_n_contacts,
-    overwrite=True
-)
+# data_group.create_dataset(
+#     'n_contacts',
+#     shape=full_n_contacts.shape,
+#     dtype=full_n_contacts.dtype,
+#     data=full_n_contacts,
+#     overwrite=True
+# )
 data_group.create_dataset(
     'action',
     shape=full_actions.shape,
@@ -110,10 +111,10 @@ print(f"Data-level groups/arrays: {list(read_group['data'].keys())}")
 print(f"Meta-level groups/arrays: {list(read_group['meta'].keys())}")
 
 # Check the shapes and content
-print(f"Full keypoints array shape: {read_group['data']['keypoints'].shape}")
+# print(f"Full keypoints array shape: {read_group['data']['keypoints'].shape}")
 print(f"Full image array shape: {read_group['data']['img'].shape}")
 print(f"Full state array shape: {read_group['data']['state'].shape}")
-print(f"Full n_contacts array shape: {read_group['data']['n_contacts'].shape}")
+# print(f"Full n_contacts array shape: {read_group['data']['n_contacts'].shape}")
 print(f"Full action array shape: {read_group['data']['action'].shape}")
 print(f"Episode ends array shape: {read_group['meta']['episode_ends'].shape}")
 print(f"Number of episodes: {read_group['meta']['episode_ends'].shape}")

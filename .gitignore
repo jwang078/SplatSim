@@ -31,3 +31,6 @@ MUJOCO_LOG.TXT
 
 # build
 **/build/*
+
+# Generated datasets (download these separately)
+data/datasets/*
