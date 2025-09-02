@@ -47,6 +47,7 @@ class Args:
     data_dir: str = "~/data/bc_data"
     bimanual: bool = False
     verbose: bool = False
+    no_joint_max_velocity: bool = False
 
 
 def main(args):
@@ -164,12 +165,12 @@ def main(args):
         elif args.agent == "policy":
             from splatsim.agents.policy_agent import DiffusionAgent
             agent = DiffusionAgent(port="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT3M9NVB-if00-port0")
-            startup_steps = 25
+            startup_steps = 2
             query_new_joints_per_startup_step = True
         elif args.agent == "policy6DOF":
             from splatsim.agents.policy_agent_6DOF import DiffusionAgent
             agent = DiffusionAgent(port="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT3M9NVB-if00-port0")
-            startup_steps = 25
+            startup_steps = 2
             query_new_joints_per_startup_step = True
         elif args.agent == "servoing":
             from splatsim.agents.servoing_agent import ServoingAgent
@@ -256,7 +257,7 @@ def main(args):
         joints
     ), f"agent output dim = {len(start_pos)}, but env dim = {len(joints)}"
 
-    max_delta = 0.05
+    max_delta = 0.05 if not args.no_joint_max_velocity else float("inf")
     command_joints = start_pos
     for _ in range(startup_steps):
         obs = env.get_obs()
@@ -351,8 +352,8 @@ def main(args):
             action = action[:-1]
         obs = env.step(action)
 
-        for img_obs_name in ["wrist_rgb", "base_rgb"]:
-            if img_obs_name not in obs or obs[img_obs_name] is None:
+        for img_obs_name in [img_obs_name for img_obs_name in obs.keys() if img_obs_name.endswith("_rgb")]:
+            if obs[img_obs_name] is None:
                 continue
             frame = obs[img_obs_name]
             frame = np.transpose(frame.detach().cpu().numpy(), (1, 2, 0))  # CxHxW -> HxWxC

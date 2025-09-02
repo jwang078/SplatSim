@@ -82,7 +82,7 @@ def launch_robot_server(args: Args):
 
         server = OrangeOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=OrangeOnPlatePybulletRobotServer.SERVE_MODES.GENERATE_DEMOS,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=[], robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_orange_interactive":
@@ -90,7 +90,7 @@ def launch_robot_server(args: Args):
 
         server = OrangeOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=OrangeOnPlatePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-            camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+            camera_names=camera_names, robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_apple":
@@ -98,7 +98,7 @@ def launch_robot_server(args: Args):
 
         server = AppleOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=AppleOnPlatePybulletRobotServer.SERVE_MODES.GENERATE_DEMOS,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=[], robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_apple_interactive":
@@ -106,7 +106,8 @@ def launch_robot_server(args: Args):
 
         server = AppleOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=AppleOnPlatePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=["base_rgb"], robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
+        #    camera_names=["base_rgb"], robot_name=args.robot_name, base_cam_is=[3, 100], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_apple_interactive-nosplat":
@@ -114,7 +115,7 @@ def launch_robot_server(args: Args):
 
         server = AppleOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=AppleOnPlatePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=[], robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_apple_search":
@@ -122,7 +123,7 @@ def launch_robot_server(args: Args):
 
         server = AppleSearchPybulletRobotServer(
            port=port, host=args.hostname, serve_mode=AppleSearchPybulletRobotServer.SERVE_MODES.GENERATE_DEMOS,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=[], robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_apple_search_interactive":
@@ -130,7 +131,7 @@ def launch_robot_server(args: Args):
 
         server = AppleSearchPybulletRobotServer(
            port=port, host=args.hostname, serve_mode=AppleSearchPybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=camera_names, robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_banana":
@@ -138,7 +139,7 @@ def launch_robot_server(args: Args):
 
         server = BananaOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=BananaOnPlatePybulletRobotServer.SERVE_MODES.GENERATE_DEMOS,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=[], robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_banana_interactive":
@@ -146,7 +147,7 @@ def launch_robot_server(args: Args):
 
         server = BananaOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=BananaOnPlatePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=camera_names, robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_splat":

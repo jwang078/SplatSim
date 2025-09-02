@@ -229,14 +229,14 @@ class PybulletRobotServerBase:
         use_link_centers: bool = True,
         robot_name: str = "robot_iphone",
         camera_names: List[str] = ["base_rgb"],
-        cam_i: int = 254,
+        base_cam_is: List[int] = [254],
         object_config_path: str = "./configs/object_configs/objects.yaml",
     ):
         self.serve_mode = serve_mode
         self.use_link_centers = use_link_centers
         self.robot_name = robot_name
         self.camera_names = camera_names
-        self.cam_i = cam_i
+        self.base_cam_is = base_cam_is
 
         # load labels.npy
         self.robot_labels = np.load(
@@ -448,7 +448,7 @@ class PybulletRobotServerBase:
         # trajectory path
         with open("configs/folder_configs.yaml", "r") as f:
             folder_config = yaml.safe_load(f)
-        self.path = folder_config["traj_folder"]
+        self.path = folder_config["traj_folder"] + "/"
         # get no of folders in the path
         self.trajectory_count = len(os.listdir(self.path))
 
@@ -509,7 +509,7 @@ class PybulletRobotServerBase:
                 load_iteration=-1,
                 shuffle=False,
                 resolution_scales=[self.cam_scale],
-                train_cam_indices=[self.cam_i],
+                train_cam_indices=self.base_cam_is,
                 test_cam_indices=[
                     0
                 ],  # Even tho we're not using this, make sure to load at max 1 camera for memory purposes
@@ -518,11 +518,13 @@ class PybulletRobotServerBase:
             bg_color = [1, 1, 1]
             self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-            self.base_camera = self.setup_camera_from_dataset(
-                cam_i=self.cam_i, use_train=True
-            )
+            self.base_cameras = []
+            for cam_is_index in range(len(self.base_cam_is)):
+                self.base_cameras.append(self.setup_camera_from_dataset(
+                    cam_is_index=cam_is_index, use_train=True
+                ))
         else:
-            self.base_camera = None
+            self.base_cameras = None
             self.scene = None
             self.pipeline = None
             self.background = None
@@ -857,9 +859,13 @@ class PybulletRobotServerBase:
             )
 
     def render_image(self, camera_name):
-        # TODO to save compute, you only need to create the splat once, then it can be rendered w/ different cameras
-        if camera_name == "base_rgb":
-            camera = self.base_camera
+        if camera_name.startswith("base") and camera_name.endswith("_rgb"):
+            if camera_name[len("base") : -len("_rgb")] == "":
+                cam_i = 0
+            else:
+                # Offset by 1 so that the second camera is base_rgb2 and is in index 1
+                cam_i = int(camera_name[len("base") : -len("_rgb")]) - 1
+            camera = self.base_cameras[cam_i]
         elif camera_name == "wrist_rgb":
             camera = self.get_wrist_camera()
             if camera is None:
@@ -874,13 +880,13 @@ class PybulletRobotServerBase:
         # save the image
         return rendering
 
-    def setup_camera_from_dataset(self, cam_i, use_train=True):
+    def setup_camera_from_dataset(self, cam_is_index, use_train=True):
         # Assume that self.cam_train_indices and self.cam_test_indices have already singled out
         # the camera of interest. Return the first camera in the list
         if use_train:
-            camera = self.scene.getTrainCameras(scale=self.cam_scale)[0]
+            camera = self.scene.getTrainCameras(scale=self.cam_scale)[cam_is_index]
         else:
-            camera = self.scene.getTestCameras(scale=self.cam_scale)[0]
+            camera = self.scene.getTestCameras(scale=self.cam_scale)[cam_is_index]
         return camera
 
     def get_current_ee_pose(self):
@@ -963,7 +969,13 @@ class PybulletRobotServerBase:
         if len(self.camera_names) > 0:
             self.prep_image_rendering(data=observations)
             for camera_name in self.camera_names:
-                observations[camera_name] = self.render_image(camera_name=camera_name)
+                if camera_name == "base_rgb":
+                    # Create new camera names for each of the base camera poses
+                    for i in range(len(self.base_cam_is)):
+                        base_camera_name = f"base{i + 1}_rgb" if i > 0 else "base_rgb"
+                        observations[base_camera_name] = self.render_image(camera_name=base_camera_name)
+                else:
+                    observations[camera_name] = self.render_image(camera_name=camera_name)
         for camera_name in ["base_rgb", "wrist_rgb"]:
             if camera_name not in observations:
                 observations[camera_name] = None

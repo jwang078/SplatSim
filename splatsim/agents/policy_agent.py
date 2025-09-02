@@ -135,12 +135,14 @@ class DiffusionAgent(Agent):
         # self.policy = 
         print('Loading policy')
 
-        ckpt_path = '/home/nomaan/Desktop/corl24/main/diffusion_policy/diffusion_policy/data/outputs/2024.07.16/00.55.58_train_diffusion_unet_image_real_image/checkpoints/epoch=0150-train_loss=0.009.ckpt'
-        # ckpt_path = '/home/nomaan/Desktop/corl24/main/diffusion_policy/diffusion_policy/data/outputs/2024.07.17/23.07.05_train_diffusion_unet_image_real_image/checkpoints/epoch=0250-train_loss=0.007.ckpt'
-        ckpt_path = '/home/nomaan/Desktop/corl24/main/diffusion_policy/diffusion_policy/data/outputs/2024.07.23/13.49.47_train_diffusion_unet_image_real_image/checkpoints/epoch=0150-train_loss=0.010.ckpt'
+        ckpt_path = "/home/jennyw2/code/diffusion_policy/data/outputs/2025.08.25/18.25.55_train_diffusion_unet_hybrid_splatsim_object_on_plate/checkpoints/epoch=0050-test_mean_score=0.000.ckpt"
 
-        ######################## Final Pusht Checkpoint ########################
-        ckpt_path = '/home/nomaan/Desktop/corl24/main/diffusion_policy/diffusion_policy/data/outputs/2024.07.30/02.38.06_train_diffusion_unet_image_real_image/checkpoints/epoch=0150-train_loss=0.011.ckpt'
+        # ckpt_path = '/home/nomaan/Desktop/corl24/main/diffusion_policy/diffusion_policy/data/outputs/2024.07.16/00.55.58_train_diffusion_unet_image_real_image/checkpoints/epoch=0150-train_loss=0.009.ckpt'
+        # # ckpt_path = '/home/nomaan/Desktop/corl24/main/diffusion_policy/diffusion_policy/data/outputs/2024.07.17/23.07.05_train_diffusion_unet_image_real_image/checkpoints/epoch=0250-train_loss=0.007.ckpt'
+        # ckpt_path = '/home/nomaan/Desktop/corl24/main/diffusion_policy/diffusion_policy/data/outputs/2024.07.23/13.49.47_train_diffusion_unet_image_real_image/checkpoints/epoch=0150-train_loss=0.010.ckpt'
+
+        # ######################## Final Pusht Checkpoint ########################
+        # ckpt_path = '/home/nomaan/Desktop/corl24/main/diffusion_policy/diffusion_policy/data/outputs/2024.07.30/02.38.06_train_diffusion_unet_image_real_image/checkpoints/epoch=0150-train_loss=0.011.ckpt'
         ########################################################################
         
         payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill)
@@ -166,7 +168,8 @@ class DiffusionAgent(Agent):
             self.policy.n_action_steps = self.policy.horizon - self.policy.n_obs_steps + 1
         
         p.connect(p.DIRECT)
-        self.dummy_robot = p.loadURDF("../gaussian-splatting/pybullet-playground/urdf/sisbot.urdf", useFixedBase=True)
+        # TODO make this use the configs
+        self.dummy_robot = p.loadURDF("/home/jennyw2/code/SplatSim/splatsim/robot_definitions/urdf/sisbot.urdf", useFixedBase=True)
         p.resetBasePositionAndOrientation(self.dummy_robot, [0, 0, -0.1], [0, 0, 0, 1])
         
         p.setGravity(0, 0, -9.81)
@@ -206,7 +209,9 @@ class DiffusionAgent(Agent):
         
 
         #resize the image to 480x640x3 to 240x320x3
-        image = cv2.resize(obs_dict['wrist_rgb'], (320, 240))
+        # TODO this is changed from wrist to base
+        image = cv2.resize(obs_dict['base_rgb'], (320, 240))
+        # image = cv2.resize(obs_dict['wrist_rgb'], (320, 240))
 
     
         plt.imsave('image.png', image)

@@ -160,6 +160,13 @@ class DiffusionAgent(Agent):
         ckpt_path = '/home/nomaan/Desktop/corl24/main/diffusion_policy/diffusion_policy/data/outputs/2024.09.11/10.07.03_train_diffusion_unet_image_real_image_assembly/checkpoints/epoch=0550-train_loss=0.001.ckpt'
 
 
+        # 96x96 image
+        ckpt_path = "/home/jennyw2/code/diffusion_policy/data/outputs/2025.08.25/18.25.55_train_diffusion_unet_hybrid_splatsim_object_on_plate/checkpoints/epoch=0100-test_mean_score=0.000.ckpt"
+        # 240x320 image <- this does not even run
+        # ckpt_path = "/home/jennyw2/data/diffusion_policy/checkpoints/epoch=0050-test_mean_score=0.000.ckpt"
+
+        self.DOF = 7
+
         payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill)
         cfg = payload['cfg']
         cls = hydra.utils.get_class(cfg._target_)
@@ -183,7 +190,8 @@ class DiffusionAgent(Agent):
             self.policy.n_action_steps = self.policy.horizon - self.policy.n_obs_steps + 1
         
         p.connect(p.DIRECT)
-        self.dummy_robot = p.loadURDF("../gaussian-splatting/pybullet-playground/urdf/sisbot.urdf", useFixedBase=True)
+        # TOOD put this in configs
+        self.dummy_robot = p.loadURDF("/home/jennyw2/code/SplatSim/splatsim/robot_definitions/urdf/sisbot.urdf", useFixedBase=True)
         p.resetBasePositionAndOrientation(self.dummy_robot, [0, 0, -0.1], [0, 0, 0, 1])
         
         p.setGravity(0, 0, -9.81)
@@ -193,7 +201,7 @@ class DiffusionAgent(Agent):
         initial_joint_state = [0, -1.57, 1.57, -1.57, -1.57, 0]
         self.initial_joint_state = initial_joint_state
         joint_signs = [1, 1, 1, 1, 1, 1]
-        for i in range(1, 7):
+        for i in range(1, self.DOF):
             p.resetJointState(self.dummy_robot, i, initial_joint_state[i-1]*joint_signs[i-1])
         # p.stepSimulation()    
 
@@ -219,7 +227,7 @@ class DiffusionAgent(Agent):
         '''
 
         #set joint positions to the pybullet robot
-        for i in range(1, 7):
+        for i in range(1, self.DOF):
                 p.resetJointState(self.dummy_robot, i, obs_dict['joint_positions'][i-1])
         #get end effector pose from the pybullet robot
         ee_pos, ee_quat = p.getLinkState(self.dummy_robot, 6)[0], p.getLinkState(self.dummy_robot, 6)[1]
@@ -229,36 +237,65 @@ class DiffusionAgent(Agent):
         
 
         #resize the image to 480x640x3 to 240x320x3
-        image = cv2.resize(obs_dict['wrist_rgb'], (320, 240))
+        # target size
+        def resize_and_center_crop(img, image_width, image_height):
+            target_w, target_h = image_width, image_height
+            h, w = img.shape[:2]
 
+            # compute scaling factor to fill target (like ImageOps.fit)
+            scale = max(target_w / w, target_h / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+
+            # resize with LANCZOS
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+            # for some reason, this interpolation gives values outside of the range [0, 1]
+            # TODO does this need to go to the dataset generation script, too?
+            # resized = (resized - np.min(resized)) / (np.max(resized) - np.min(resized))
+
+            # center crop
+            start_x = (new_w - target_w) // 2
+            start_y = (new_h - target_h) // 2
+            cropped = resized[start_y:start_y + target_h, start_x:start_x + target_w]
+
+            return cropped
+        # image = resize_and_center_crop(np.transpose(obs_dict['base_rgb'].detach().cpu().numpy()), 92, 92)
+        image = resize_and_center_crop(np.transpose(obs_dict['base_rgb'].detach().cpu().numpy().transpose(0, 2, 1)), 92, 92)
+
+        # image = cv2.resize(np.transpose(obs_dict['base_rgb'].detach().cpu().numpy(), (1, 2, 0)), (320, 240))
+        # image = cv2.resize(obs_dict['wrist_rgb'], (320, 240))
+
+        # TODO generalize this code to any history length (not just 2)
     
-        plt.imsave('image.png', image)
+        # plt.imsave('image.png', image)
         #make image sharper
+        # TODO what is this additional noise o-o
         image = image.transpose(2, 0, 1)
         image = np.expand_dims(image, axis=0)
         image = np.expand_dims(image, axis=0)
         image = torch.from_numpy(image).float()/255.0
-        image = image + 0.1*torch.randn_like(image)
-        # exit()
+        # Apparently this was really important. tho this also has to be added to the training data
+        # image = image + 0.1*torch.randn_like(image)
 
-        image_2 = cv2.resize(obs_dict['base_rgb'], (320, 240))
+        image_2 = image
+        # image_2 = cv2.resize(obs_dict['base_rgb'], (320, 240))
         
-        plt.imsave('image_2.png', image_2)
-        image_2 = image_2.transpose(2, 0, 1)
-        image_2 = np.expand_dims(image_2, axis=0)
-        image_2 = np.expand_dims(image_2, axis=0)
-        image_2 = torch.from_numpy(image_2).float()/255.0
-        image_2 = image_2 + 0.1*torch.randn_like(image_2)
+        # plt.imsave('image_2.png', image_2)
+        # image_2 = image_2.transpose(2, 0, 1)
+        # image_2 = np.expand_dims(image_2, axis=0)
+        # image_2 = np.expand_dims(image_2, axis=0)
+        # image_2 = torch.from_numpy(image_2).float()/255.0
+        # image_2 = image_2 + 0.1*torch.randn_like(image_2)
 
         if self.last_image_obs is None:
             self.last_image_obs = image
             self.last_image_obs_1 = image_2
-            self.last_state_obs = obs_dict['state'][:].reshape(1, 1, 7)
+            self.last_state_obs = obs_dict['state'][:].reshape(1, 1, self.DOF)
             self.last_state_obs = torch.from_numpy(self.last_state_obs).float()
 
 
 
-        cur_state_obs = obs_dict['state'][:].reshape(1, 1, 7)
+        cur_state_obs = obs_dict['state'][:].reshape(1, 1, self.DOF)
         cur_state_obs = torch.from_numpy(cur_state_obs).float()
 
 
@@ -268,27 +305,37 @@ class DiffusionAgent(Agent):
             
         
             
-        
+        # If new action sequence needs to be predicted, predict it.
+        # Otherwise, return the next action in the preplaned sequence
         if self.cur_index == -1 or self.cur_joint_list is None:
         # if True:  
             print('new step')
-            
-
             obs_dict_1 = {
-                'camera_1' :  image_out,
-                'camera_2' :  image_out_1,
-                'robot_eef_pose': state_out
+                'image':  image_out,
+                'agent_pos': state_out
             }
+
+            # obs_dict_1 = {
+            #     'camera_1' :  image_out,
+            #     'camera_2' :  image_out_1,
+            #     'robot_eef_pose': state_out
+            # }
             result = self.policy.predict_action(obs_dict_1)
             
             # result = {
             #     'action': action,
             #     'action_pred': action_pred
             # }
+            
+            # Return the first action in the sequence and store the rest for later
             self.cur_index = 0
             self.cur_joint_list = []
+            # Shape of result['action']: (batch=1, horizon=15, action_dim=7)
+            # This gets rid of the batch dimension
             self.cur_joint_list_1 = result['action'][0].detach().cpu().numpy()
             #reverse the order of the joints
+            # Takes the first 3 timesteps of the predicted plan
+            # Not sure what -12 is from
             for i in range(0, len(self.cur_joint_list_1)-12):
             # for i in range(4):
                 for k in range(1):
@@ -299,7 +346,11 @@ class DiffusionAgent(Agent):
                     
             
 
-        if self.cur_index == len(self.cur_joint_list) - 2:
+        # If self.cur_index == 1 (because cur_joint_list takes the first 3 steps)
+        # So does this mean it happens every other step?
+        if True:
+        # This was the original
+        # if self.cur_index == len(self.cur_joint_list) - 2:
             self.last_image_obs = copy.deepcopy(image)
             self.last_image_obs_1 = copy.deepcopy(image_2)
             self.last_state_obs = copy.deepcopy(cur_state_obs)
@@ -310,42 +361,56 @@ class DiffusionAgent(Agent):
         # if action_pred[2] < 0.235:
         #     action_pred[2] = 0.235
 
-        ee_pose = [action_pred[0], action_pred[1], action_pred[2]] 
-        ee_quat = p.getQuaternionFromEuler( action_pred[3:6])
-        print('ee_pose:', ee_pose, 'ee_quat:', ee_quat)
+        pred_mode = "ee_pose"
+        if pred_mode == "ee_pose":
+            # The diffusion policy was predicting xyzrpy for rotation and translation of the end effector
+            # Not joint angles
+            ee_pose = [action_pred[0], action_pred[1], action_pred[2]] 
+            ee_quat = p.getQuaternionFromEuler( action_pred[3:6])
+            print('ee_pose:', ee_pose, 'ee_quat:', ee_quat)
 
-        # ee_pose = [action_pred[0]*0.5 + obs_dict['state'][0]*0.5, action_pred[1]*0.5 + obs_dict['state'][1]*0.5, 0.095]
+            # ee_pose = [action_pred[0]*0.5 + obs_dict['state'][0]*0.5, action_pred[1]*0.5 + obs_dict['state'][1]*0.5, 0.095]
 
-        dummy_joint_pos = p.calculateInverseKinematics(self.dummy_robot, 6, ee_pose , ee_quat,
-            residualThreshold=0.00001, maxNumIterations=100000, 
-            # lowerLimits=[self.initial_joint_state[k] - np.pi/2 for k in range(6)],
-            lowerLimits=[obs_dict['joint_positions'][k] - np.pi for k in range(6)],
-            # upperLimits=[self.initial_joint_state[k] + np.pi/2 for k in range(6)],
-            upperLimits=[obs_dict['joint_positions'][k] + np.pi for k in range(6)],
-            jointRanges=[12.566, 12.566, 6.282, 12.566, 12.566, 12.566],
-            restPoses=[0* np.pi, -0.5* np.pi, 0.5* np.pi, -0.5* np.pi, -0.5* np.pi, 0]
-            )
-        
-        # check the error between the end effector pose and the calculated pose
-        for i in range(1, 7):
-            p.resetJointState(self.dummy_robot, i, dummy_joint_pos[i-1])
-        new_ee_pos, new_ee_quat = p.getLinkState(self.dummy_robot, 6)[0], p.getLinkState(self.dummy_robot, 6)[1]
-        new_ee_euler = p.getEulerFromQuaternion(new_ee_quat)
-        new_ee_pos = np.array(new_ee_pos)
-        # print('ee_pos:', new_ee_pos, 'ee_quat:', new_ee_quat, 'ee_euler:', new_ee_euler)
-        # print('target_ee_pos:', ee_pose, 'target_ee_quat:', ee_quat, 'target_ee_euler:', action_pred[3:6])
-
-        # print('error in ee pos:', np.linalg.norm(np.array(new_ee_pos) - np.array(ee_pose)))
-        # print('error in ee euler:', np.linalg.norm(np.array(new_ee_euler) - np.array(action_pred[3:6])))
+            # Convert end effector pose to joint angles using inverse kinematics
+            dummy_joint_pos = p.calculateInverseKinematics(self.dummy_robot, 6, ee_pose , ee_quat,
+                residualThreshold=0.00001, maxNumIterations=100000, 
+                # lowerLimits=[self.initial_joint_state[k] - np.pi/2 for k in range(6)],
+                lowerLimits=[obs_dict['joint_positions'][k] - np.pi for k in range(6)],
+                # upperLimits=[self.initial_joint_state[k] + np.pi/2 for k in range(6)],
+                upperLimits=[obs_dict['joint_positions'][k] + np.pi for k in range(6)],
+                jointRanges=[12.566, 12.566, 6.282, 12.566, 12.566, 12.566],
+                restPoses=[0* np.pi, -0.5* np.pi, 0.5* np.pi, -0.5* np.pi, -0.5* np.pi, 0]
+                )
             
-        # calculate difference between current and target joint angles
-        joint_diff = np.array(dummy_joint_pos)[:6] - np.array(obs_dict['joint_positions'])[:6]
-        self.cur_total_steps += 1
-        # if self.cur_total_steps > 400:
-        #     self.policy.reset()
-        if np.linalg.norm(joint_diff) < 0.01 :
+            # check the error between the end effector pose and the calculated pose
+            for i in range(1, self.DOF):
+                p.resetJointState(self.dummy_robot, i, dummy_joint_pos[i-1])
+            new_ee_pos, new_ee_quat = p.getLinkState(self.dummy_robot, 6)[0], p.getLinkState(self.dummy_robot, 6)[1]
+            new_ee_euler = p.getEulerFromQuaternion(new_ee_quat)
+            new_ee_pos = np.array(new_ee_pos)
+            # print('ee_pos:', new_ee_pos, 'ee_quat:', new_ee_quat, 'ee_euler:', new_ee_euler)
+            # print('target_ee_pos:', ee_pose, 'target_ee_quat:', ee_quat, 'target_ee_euler:', action_pred[3:6])
+
+            # print('error in ee pos:', np.linalg.norm(np.array(new_ee_pos) - np.array(ee_pose)))
+            # print('error in ee euler:', np.linalg.norm(np.array(new_ee_euler) - np.array(action_pred[3:6])))
+                
+            # calculate difference between current and target joint angles
+            joint_diff = np.array(dummy_joint_pos)[:6] - np.array(obs_dict['joint_positions'])[:6]
+            self.cur_total_steps += 1
+            # Maybe this is: if the IK fails 400 times in a row, reset the diffusion model
+            # if self.cur_total_steps > 400:
+            #     self.policy.reset()
+            if np.linalg.norm(joint_diff) < 0.01 :
+                self.cur_index += 1
+                self.cur_total_steps = 0
+        elif pred_mode == "joint_angles":
+            print("action pred:", action_pred)
+            dummy_joint_pos = action_pred
             self.cur_index += 1
             self.cur_total_steps = 0
+        else:
+            raise ValueError('pred_mode must be either ee_pose or joint_angles')
+
         if self.cur_index == len(self.cur_joint_list):
         # if True:
             self.cur_index = -1
@@ -353,6 +418,7 @@ class DiffusionAgent(Agent):
 
         joints = np.array(dummy_joint_pos)[:6]
         # joints = np.array([1.5681470689206045, -1.068216007103522, 2.1378836578411438, -2.6390424613000025, -1.5699116232851198, -0.0018527878551533776])
+        # Append gripper action
         joints = np.append(joints, action_pred[-1])
 
         return joints   
