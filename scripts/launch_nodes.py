@@ -106,8 +106,8 @@ def launch_robot_server(args: Args):
 
         server = AppleOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=AppleOnPlatePybulletRobotServer.SERVE_MODES.INTERACTIVE,
+        #    camera_names=["base_rgb"], robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
            camera_names=["base_rgb"], robot_name=args.robot_name, base_cam_is=[3], use_gripper=use_gripper
-        #    camera_names=["base_rgb"], robot_name=args.robot_name, base_cam_is=[3, 100], use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_apple_interactive-nosplat":

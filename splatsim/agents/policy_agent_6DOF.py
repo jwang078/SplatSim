@@ -164,6 +164,8 @@ class DiffusionAgent(Agent):
         ckpt_path = "/home/jennyw2/code/diffusion_policy/data/outputs/2025.08.25/18.25.55_train_diffusion_unet_hybrid_splatsim_object_on_plate/checkpoints/epoch=0100-test_mean_score=0.000.ckpt"
         # 240x320 image <- this does not even run
         # ckpt_path = "/home/jennyw2/data/diffusion_policy/checkpoints/epoch=0050-test_mean_score=0.000.ckpt"
+        # splatsim_apple_on_plate_diffusion_policy_cnn_72x96_twocams_nonoise
+        ckpt_path = "/home/jennyw2/code/diffusion_policy/data/outputs/2025.08.29/20.44.46_train_diffusion_unet_hybrid_splatsim_object_on_plate/checkpoints/latest.ckpt"
 
         self.DOF = 7
 
@@ -260,7 +262,6 @@ class DiffusionAgent(Agent):
 
             return cropped
         # image = resize_and_center_crop(np.transpose(obs_dict['base_rgb'].detach().cpu().numpy()), 92, 92)
-        image = resize_and_center_crop(np.transpose(obs_dict['base_rgb'].detach().cpu().numpy().transpose(0, 2, 1)), 92, 92)
 
         # image = cv2.resize(np.transpose(obs_dict['base_rgb'].detach().cpu().numpy(), (1, 2, 0)), (320, 240))
         # image = cv2.resize(obs_dict['wrist_rgb'], (320, 240))
@@ -270,6 +271,7 @@ class DiffusionAgent(Agent):
         # plt.imsave('image.png', image)
         #make image sharper
         # TODO what is this additional noise o-o
+        image = resize_and_center_crop(np.transpose(obs_dict['base_rgb'].detach().cpu().numpy().transpose(0, 2, 1)), 92, 92)
         image = image.transpose(2, 0, 1)
         image = np.expand_dims(image, axis=0)
         image = np.expand_dims(image, axis=0)
@@ -277,7 +279,11 @@ class DiffusionAgent(Agent):
         # Apparently this was really important. tho this also has to be added to the training data
         # image = image + 0.1*torch.randn_like(image)
 
-        image_2 = image
+        image_2 = resize_and_center_crop(np.transpose(obs_dict['base2_rgb'].detach().cpu().numpy().transpose(0, 2, 1)), 92, 92)
+        image_2 = image_2.transpose(2, 0, 1)
+        image_2 = np.expand_dims(image_2, axis=0)
+        image_2 = np.expand_dims(image_2, axis=0)
+        image_2 = torch.from_numpy(image_2).float()/255.0
         # image_2 = cv2.resize(obs_dict['base_rgb'], (320, 240))
         
         # plt.imsave('image_2.png', image_2)
@@ -311,7 +317,8 @@ class DiffusionAgent(Agent):
         # if True:  
             print('new step')
             obs_dict_1 = {
-                'image':  image_out,
+                'base_rgb':  image_out,
+                "base2_rgb":  image_out_1,
                 'agent_pos': state_out
             }
 
