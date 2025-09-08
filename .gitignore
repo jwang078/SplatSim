@@ -31,3 +31,5 @@ MUJOCO_LOG.TXT
 
 # build
 **/build/*
+data/datasets/*
+output/*
