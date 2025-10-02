@@ -24,6 +24,31 @@ robot_iphone:
   source_path: /home/jennyw2/data/test_data/robot_iphone
   model_path: /home/jennyw2/data/output/robot_iphone
   use_gripper: true
+robot_iphone_w_engine:
+  transformation:
+    matrix:
+    - [-0.031934, 0.086246, -0.316679, 0.747205]
+    - [0.327034, -0.018588, -0.03804, -0.169514]
+    - [-0.027799, -0.317742, -0.083732, 0.447195]
+    - [0, 0, 0, 1]
+  aabb:
+    bounding_box:
+    - [-0.0734, -0.11, -0.0033]
+    - [0.5296, 0.2044, 0.5747]
+    urdf_bbox_adjustment:
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+  urdf_path:
+  - ./splatsim/robot_definitions/urdf/sisbot.urdf
+  base_position:
+  - [0.0, 0.0, -0.1]
+  joint_states:
+  - [0, 0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
+    0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
+  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_2_images_500_highres_20match_540height/sfm_disk_disk+lightglue/undistorted
+  model_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height
+  use_gripper: true
 sim_franka:
   transformation:
     matrix:
