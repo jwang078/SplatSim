@@ -207,6 +207,24 @@ def main(args):
             agent = ReplayTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=True)
             startup_steps = 2
             query_new_joints_per_startup_step = False
+        elif args.agent == "replay_zarr_trajectory":
+            from splatsim.agents.replay_zarr_trajectory_agent import ReplayZarrTrajectoryAgent
+            with open("configs/folder_configs.yaml", "r") as file:
+                folder_config = yaml.safe_load(file)
+            traj_folder = "./output/test_obstacles.zarr" # temporary hardcoding
+            # traj_folder = "./output/test_obstacles.zarr" # temporary hardcoding
+            agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
+            startup_steps = 2
+            query_new_joints_per_startup_step = False
+        elif args.agent == "replay_zarr_trajectory_and_save":
+            from splatsim.agents.replay_zarr_trajectory_agent import ReplayZarrTrajectoryAgent
+            with open("configs/folder_configs.yaml", "r") as file:
+                folder_config = yaml.safe_load(file)
+            traj_folder = "./output/test_obstacles.zarr" # temporary hardcoding
+            # traj_folder = "./output/test_obstacles.zarr" # temporary hardcoding
+            agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=True)
+            startup_steps = 2
+            query_new_joints_per_startup_step = False
         else:
             raise ValueError("Invalid agent name")
         

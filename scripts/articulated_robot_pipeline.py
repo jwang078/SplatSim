@@ -141,8 +141,6 @@ def main(args):
         link_pcds.append(pcd)
         link_labels.append(link_index)
 
-
-
     #now prepare the data for knn
     segmented_points = []
     segmented_labels = []

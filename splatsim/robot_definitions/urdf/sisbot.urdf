@@ -530,7 +530,7 @@
     <axis xyz="0 0 1"/>
   </joint>
 
-  <link name="dummy_center_indicator_link">
+  <!-- <link name="dummy_center_indicator_link"> -->
     <!-- <visual>
       <geometry>
         <box size="0.025 0.08 0.002"/>
@@ -545,7 +545,7 @@
         <color rgba="0.4 0.4 0.4 1"/>
       </material>
     </visual> -->
-    <inertial>
+    <!-- <inertial>
       <mass value="0.1" />
       <inertia ixx = "0" ixy = "0" ixz = "0"
                iyx = "0" iyy = "0" iyz = "0"
@@ -556,7 +556,7 @@
     <parent link="robotiq_arg2f_base_link"/>
     <child link="dummy_center_indicator_link"/>
     <origin xyz="0 0 0.15"/>
-  </joint>
+  </joint> -->
 
  <gazebo reference="robotiq_arg2f_base_link">
     <selfCollide>true</selfCollide>
@@ -580,6 +580,23 @@
     <child link="robotiq_arg2f_base_link"/>
     <origin rpy="0.0 1.5708 1.5708" xyz="0.0 0.09435 0.0"/>
   </joint>
+
+  <!-- <link name="gripper_center_link">
+  <visual>
+    <geometry>
+      <sphere radius="0.01"/>
+    </geometry>
+    <material name="yellow">
+      <color rgba="0 1 0 1"/>
+    </material>
+  </visual>
+</link> -->
+
+<!-- <joint name="gripper_center_fixed_joint" type="fixed">
+  <parent link="robotiq_arg2f_base_link"/>
+  <child link="gripper_center_link"/>
+  <origin xyz="0 0 0.2" rpy="0 0 0"/>
+</joint> -->
 
 </robot>
 

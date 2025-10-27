@@ -117,6 +117,14 @@ def launch_robot_server(args: Args):
            camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
         )
 
+    elif args.robot == "sim_ur_pybullet_small_engine_interactive":
+        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEnginePybulletRobotServer
+
+        server = UprightRobotSmallEnginePybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=UprightRobotSmallEnginePybulletRobotServer.SERVE_MODES.INTERACTIVE,
+           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+        )
+
     elif args.robot == "sim_ur_pybullet_apple_search":
         from splatsim.robots.sim_robot_pybullet_apple_search import AppleSearchPybulletRobotServer
 

@@ -5,6 +5,7 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 import zmq
+import random
 
 assert mujoco.viewer is mujoco.viewer
 import pybullet as p
@@ -221,6 +222,46 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
             return []
 
         return all_paths
+    
+    def randomize_plate_and_drop_pose(self):
+        # randomize plate and drop location
+        # [0.3, -0.5, 0.07]
+        while True:
+            x = random.uniform(0.2, 0.8)
+            y = random.uniform(-0.4, 0.4)
+            z = 0.0
+
+            # get obj[0] position
+            (
+                object_pos,
+                object_quat,
+            ) = self.pybullet_client.getBasePositionAndOrientation(
+                self.urdf_object_list[0]
+            )
+
+            # check the distance between the object and the drop location
+            if np.linalg.norm(np.array(object_pos)[:2] - np.array([x, y])) > 0.2:
+                break
+
+        euler_z = 0
+        quat = self.pybullet_client.getQuaternionFromEuler([0, 0, euler_z])
+
+        self.pybullet_client.resetBasePositionAndOrientation(
+            self.urdf_object_list[-1], [x, y, z], quat
+        )
+
+        self.drop_ee_pos = [x, y, 0.3]
+
+        # calculate the drop ee joint
+        self.drop_ee_joint = self.pybullet_client.calculateInverseKinematics(
+            self.dummy_robot,
+            6,
+            self.drop_ee_pos,
+            self.drop_ee_quat,
+            maxNumIterations=100000,
+        )
+
+
 
     def serve_loop(self) -> None:
         # To be called in the parent's serve()

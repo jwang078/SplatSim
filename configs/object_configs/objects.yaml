@@ -78,6 +78,31 @@ mug:
     - [-0.06174099954962731, -0.048921999961137774, -0.04394899818301201]
     - [0.06177900123596192, 0.05085599932074547, 0.043957998484373095]
   ply_path: /home/jennyw2/data/output/mug/point_cloud/iteration_7000/point_cloud.ply
+small_engine:
+  transformation:
+    matrix:
+    - [0.03328, -0.077565, 0.307622, -0.428054]
+    - [-0.317168, -0.015161, 0.03049, 0.71483]
+    - [0.007206, -0.309045, -0.078703, 0.371978]
+    - [0.0, 0.0, 0.0, 1.0]
+  aabb:
+    bounding_box:
+    - [-0.179, -0.0767, 0.0014]
+    - [0.1631, 0.2996, 0.3388]
+    urdf_bbox_adjustment:
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+  ply_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height/point_cloud/iteration_30000/point_cloud.ply
+  urdf_path:
+  - /home/jennyw2/data/small_engine_on_table_2/small_engine_with_prismatic_cap2/urdf/small_engine_with_prismatic_cap2.urdf
+  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_2_images_500_highres_20match_540height/sfm_disk_disk+lightglue/undistorted
+  model_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height
+  joint_states:
+  - [0]
+  base_position:
+  - [0.0, 0.0, 0.345]
+  use_fixed_base: true
 plastic_apple:
   transformation:
     matrix:
@@ -90,6 +115,7 @@ plastic_apple:
     - [-0.040464000284671786, -0.04481899875402451, -0.003991999986581507]
     - [0.042181999862194064, 0.03782700139284134, 0.07506100225448609]
   ply_path: /home/jennyw2/data/output/plastic_apple/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: false
 plastic_banana:
   transformation:
     matrix:
@@ -102,6 +128,7 @@ plastic_banana:
     - [-0.10480799663066864, -0.05512200060486794, -0.021652999773621562]
     - [0.09845499831438065, 0.026052999749779704, 0.021651999533176425]
   ply_path: /home/jennyw2/data/output/plastic_banana/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: false
 plastic_strawberry:
   transformation:
     matrix:
@@ -114,6 +141,7 @@ plastic_strawberry:
     - [-0.026838000372052195, -0.010228999864310029, -0.0035789999850094345]
     - [0.024836999803781512, 0.04144700008630753, 0.048820999890565875]
   ply_path: /home/jennyw2/data/output/plastic_strawberry/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: false
 plastic_orange:
   transformation:
     matrix:
@@ -126,6 +154,7 @@ plastic_orange:
     - [-0.042241001009941104, -0.05334599825739861, -0.003751000014133754]
     - [0.029288999244570735, 0.02029799993336201, 0.06777800011634827]
   ply_path: /home/jennyw2/data/output/plastic_orange/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: false
 plate:
   transformation:
     matrix:
@@ -138,6 +167,7 @@ plate:
     - [-0.14549199628829956, -0.13433099675178528, -0.006904999932274225]
     - [0.12161000210046768, 0.13436300444602967, 0.027752000346779826]
   ply_path: /home/jennyw2/data/output/plate/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: true
 pepper_plant:
   transformation:
     matrix:
@@ -150,6 +180,7 @@ pepper_plant:
     - [-0.10084044325351715, -0.07163486766815186, -0.04365334051847458]
     - [0.1079582064151764, 0.11075531828403473, 0.18289256978034973]
   ply_path: /home/jennyw2/data/output/pepper_plant/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: false
 orange_bin:
   transformation:
     matrix:
@@ -162,6 +193,7 @@ orange_bin:
     - [-0.15628000485897064, -0.19878200578689575, -0.10199599850177765]
     - [0.15677600491046906, 0.19878200578689575, 0.10260500150918961]
   ply_path: /home/jennyw2/data/output/orange_bin/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: false
 redblock:
   transformation:
     matrix:
@@ -174,6 +206,7 @@ redblock:
     - [-0.13175, -0.128575, -0.11905]
     - [0.13175, 0.128575, 0.11905]
   ply_path: /home/jennyw2/data/output/redblock/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: false
 greenblock:
   transformation:
     matrix:
@@ -186,6 +219,7 @@ greenblock:
     - [-0.13175, -0.128575, -0.11905]
     - [0.13175, 0.128575, 0.11905]
   ply_path: /home/jennyw2/data/output/greenblock/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: false
 T_object:
   transformation:
     matrix:
@@ -198,3 +232,4 @@ T_object:
     - [-0.10481339830160141, -0.17983333158493042, -0.0066666600499302175]
     - [0.10481339830160141, 0.029833329349756244, 0.04666666078567505]
   ply_path: /home/jennyw2/data/output/T_object/point_cloud/iteration_7000/point_cloud.ply
+  use_fixed_base: false

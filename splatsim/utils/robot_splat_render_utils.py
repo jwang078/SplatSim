@@ -137,6 +137,7 @@ def transform_object(pc, object_config, pos, quat, robot_transformation, object_
     rotation_obj_matrix = rot_rotation_matrix @ rotation_obj_matrix 
     rotation_obj = o3.matrix_to_quaternion(rotation_obj_matrix) 
     
+    # TODO for memory, can precompute aabb bounding box segmentation and only save the relevant points
     aabb = object_config['aabb']['bounding_box']
     #segment according to axis aligned bounding box
     segmented_indices = ((xyz_obj[:, 0] > aabb[0][0]) & (xyz_obj[:, 0] < aabb[1][0]) & (xyz_obj[:, 1] > aabb[0][1] ) & (xyz_obj[:, 1] < aabb[1][1]) & (xyz_obj[:, 2] > aabb[0][2] ) & (xyz_obj[:, 2] < aabb[1][2]))
@@ -152,7 +153,7 @@ def transform_object(pc, object_config, pos, quat, robot_transformation, object_
     scales_obj = scales_obj[segmented_indices]
     features_dc_obj = features_dc_obj[segmented_indices]
     features_rest_obj = features_rest_obj[segmented_indices]
-    features_rest_obj= transform_shs(features_rest_obj, rot_rotation_matrix)
+    features_rest_obj = transform_shs(features_rest_obj, rot_rotation_matrix)
     
     return xyz_obj, rotation_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
 

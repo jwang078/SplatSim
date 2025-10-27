@@ -147,6 +147,8 @@ class GripperPathSegment(PathSegment):
 class PybulletRobotServerBase:
     MAX_TRAJECTORY_COUNT = 500
 
+    TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
+
     # Enum for serve modes
     class SERVE_MODES(enum.Enum):
         GENERATE_DEMOS = "generate_demos"
@@ -306,8 +308,6 @@ class PybulletRobotServerBase:
         # model_lib = md.model_lib()
         # objectid = self.pybullet_client.loadURDF(model_lib['potato_chip_1'], [0.5, 0.15, 0])
 
-        x = random.uniform(0.2, 0.7)
-        y = random.uniform(-0.4, 0.4)
         # random euler angles for the orientation of the object
         # euler_z = random.uniform(-np.pi, np.pi)
         # random quaternion for the orientation of the object
@@ -337,46 +337,41 @@ class PybulletRobotServerBase:
             )
             self.populate_transformations_cache(object_name, transformation)
 
-        self.randomize_object_positions = [True, False]
-        self.randomize_object_rotations = [False, True]
+        # TODO fix hardcoding
         self.rotation_values = [[0, 0], [-np.pi / 6, np.pi / 6]]
-        self.use_fixed_base = [False, True]
-        global_scaling_list = [1, 1]
         self.urdf_object_list = []
         self.urdf_object_mass_list = []
         for object_name in range(len(self.object_name_list)):
+            my_object_config = self.object_config.get(self.object_name_list[object_name], {})
+            if len(my_object_config) == 0:
+                print("WARNING: No object config found for ", self.object_name_list[object_name])
+            use_fixed_base = my_object_config.get("use_fixed_base", False)
+            global_scaling = my_object_config.get("global_scaling", 1)
             if self.object_name_list[object_name] in models_lib.model_name_list:
-                object_loaded = self.pybullet_client.loadURDF(
-                    models_lib[self.object_name_list[object_name]],
-                    [x, y, 0.0],
-                    quat,
-                    globalScaling=global_scaling_list[object_name],
-                    useFixedBase=self.use_fixed_base[object_name],
-                )
-                self.urdf_object_list.append(object_loaded)
+                object_path = models_lib[self.object_name_list[object_name]]
             else:
-                object_path = (
-                    "/home/nomaan/Desktop/corl24/virtual_objects/"
-                    + self.object_name_list[object_name]
-                    + "/object.urdf"
-                )
-                object_loaded = self.pybullet_client.loadURDF(
-                    object_path,
-                    [x, y, 0.0],
-                    quat,
-                    globalScaling=1,
-                    useFixedBase=self.use_fixed_base[object_name],
-                )
-                self.urdf_object_list.append(object_loaded)
+                object_path = my_object_config["urdf_path"][0]
+
+            object_loaded = self.pybullet_client.loadURDF(
+                object_path,
+                [0, 0, 0],
+                quat,
+                globalScaling=global_scaling,
+                useFixedBase=use_fixed_base,
+            )
+            self.urdf_object_list.append(object_loaded)
             mass = self.pybullet_client.getDynamicsInfo(object_loaded, -1)[0]
             self.urdf_object_mass_list.append(mass)
+        self.randomize_object_pose()
 
         # reset the box position
-        self.pybullet_client.resetBasePositionAndOrientation(
-            self.urdf_object_list[-1],
-            [0.3, -0.5, 0.07],
-            p.getQuaternionFromEuler([0, 0, np.pi / 2]),
-        )
+        if "plate" in self.object_name_list:
+            plate_id = self.urdf_object_list[self.object_name_list.index("plate")]
+            self.pybullet_client.resetBasePositionAndOrientation(
+                plate_id,
+                [0.3, -0.5, 0.02],
+                p.getQuaternionFromEuler([0, 0, np.pi / 2]),
+            )
 
         # set the drop location for the apple and banana
         self.drop_ee_pos = [0.3, -0.5, 0.3]
@@ -786,21 +781,6 @@ class PybulletRobotServerBase:
         )
 
         # Transform each object splat to be in the right pose
-        cur_object_position_list = []
-        cur_object_rotation_list = []
-
-        for object_name in self.splat_object_name_list:
-            cur_object_position_list.append(
-                torch.tensor(data[object_name + "_position"], device="cuda").float()
-            )
-            cur_object_rotation_list.append(
-                torch.roll(
-                    torch.tensor(
-                        data[object_name + "_orientation"], device="cuda"
-                    ).float(),
-                    1,
-                )
-            )
         xyz_obj_list = []
         rot_obj_list = []
         opacity_obj_list = []
@@ -809,6 +789,17 @@ class PybulletRobotServerBase:
         features_rest_obj_list = []
         for i in range(len(self.urdf_object_list)):
             object_name = self.splat_object_name_list[i]
+            cur_object_position = torch.tensor(data[object_name + "_position"], device="cuda").float()
+            base_position = self.object_config[object_name].get("base_position", [[0, 0, 0]])[0]
+            if object_name == "small_engine":
+                print("cur obj position", cur_object_position)
+            cur_object_position = cur_object_position - torch.tensor(base_position, device="cuda").float()
+            cur_object_rotation = torch.roll(
+                torch.tensor(
+                    data[object_name + "_orientation"], device="cuda"
+                ).float(),
+                1,
+            )
             (
                 xyz_obj,
                 rot_obj,
@@ -819,8 +810,8 @@ class PybulletRobotServerBase:
             ) = transform_object(
                 self.object_gaussians[i],
                 object_config=self.object_config[object_name],
-                pos=cur_object_position_list[i],
-                quat=cur_object_rotation_list[i],
+                pos=cur_object_position,
+                quat=cur_object_rotation,
                 robot_transformation=robot_transformation,
                 object_name=object_name,
                 robot_name=self.robot_name,
@@ -862,7 +853,6 @@ class PybulletRobotServerBase:
             )
 
     def render_image(self, camera_name):
-        # TODO to save compute, you only need to create the splat once, then it can be rendered w/ different cameras
         if camera_name == "base_rgb":
             camera = self.base_camera
         elif camera_name == "wrist_rgb":
@@ -980,10 +970,33 @@ class PybulletRobotServerBase:
         while collison_between_objects:
             collison_between_objects = False
             for object_id in range(len(self.urdf_object_list)):
-                if self.randomize_object_positions[object_id]:
+                my_object_env_config = [conf for conf in self.ENV_CONFIG["objects"] if conf["object_name"] == self.object_name_list[object_id]][0]
+                my_object_config = self.object_config.get(self.object_name_list[object_id], {})
+                if my_object_env_config.get("table_pos", None) is not None:
+                    table_pos = my_object_env_config["table_pos"]
+                    table_quat = my_object_env_config.get("table_quat", [0, 0, 0, 1])
+                    base_position = my_object_config.get("base_position", [[0, 0, 0]])[0]
+                    pos = [
+                        table_pos[0] + base_position[0],
+                        table_pos[1] + base_position[1],
+                        0.0 + base_position[2],
+                    ]
+                    self.pybullet_client.resetBasePositionAndOrientation(
+                        self.urdf_object_list[object_id],
+                        pos,
+                        table_quat,
+                    )
+                elif my_object_env_config.get("randomize_pose", True):
                     # randomly reset the object position and orientation
-                    x = random.uniform(0.2, 0.6)
-                    y = random.uniform(-0.5, 0.5)
+                    # TODO remove hardcoding
+                    x = random.uniform(self.TABLE_LIMITS[0][0], self.TABLE_LIMITS[0][1])
+                    y = random.uniform(self.TABLE_LIMITS[1][0], self.TABLE_LIMITS[1][1])
+                    base_position = my_object_config.get("base_position", [[0, 0, 0]])[0]
+                    pos = [
+                        x + base_position[0],
+                        y + base_position[1],
+                        0.0 + base_position[2],
+                    ]
                     # random euler angles for the orientation of the object
                     euler_z = random.uniform(
                         self.rotation_values[object_id][0],
@@ -992,14 +1005,17 @@ class PybulletRobotServerBase:
                     # random quaternion for the orientation of the object
                     # get object name from the object id
                     object_name = self.object_name_list[object_id]
-                    grasp_config = random.choice(self.grasp_configs[object_name])
+                    if len(self.grasp_configs[object_name]) > 0:
+                        grasp_config = random.choice(self.grasp_configs[object_name])
+                    else:
+                        grasp_config = {"grasp_pose": [], "object_rot": [0, 0, 0]}
                     self.grasp_poses[object_id] = grasp_config["grasp_pose"]
                     object_rot = grasp_config["object_rot"]
                     quat = self.pybullet_client.getQuaternionFromEuler(
                         [object_rot[0], object_rot[1], euler_z]
                     )
                     self.pybullet_client.resetBasePositionAndOrientation(
-                        self.urdf_object_list[object_id], [x, y, 0], quat
+                        self.urdf_object_list[object_id], pos, quat
                     )
 
             for object_id in range(len(self.urdf_object_list)):
@@ -1012,44 +1028,6 @@ class PybulletRobotServerBase:
                         if collison_between_objects_1:
                             collison_between_objects = True
                             break
-
-    def randomize_plate_and_drop_pose(self):
-        # randomize plate and drop location
-        # [0.3, -0.5, 0.07]
-        while True:
-            x = random.uniform(0.2, 0.8)
-            y = random.uniform(-0.4, 0.4)
-            z = 0.0
-
-            # get obj[0] position
-            (
-                object_pos,
-                object_quat,
-            ) = self.pybullet_client.getBasePositionAndOrientation(
-                self.urdf_object_list[0]
-            )
-
-            euler_z = 0
-            quat = self.pybullet_client.getQuaternionFromEuler([0, 0, euler_z])
-
-            self.pybullet_client.resetBasePositionAndOrientation(
-                self.urdf_object_list[-1], [x, y, z], quat
-            )
-
-            self.drop_ee_pos = [x, y, 0.3]
-
-            # calculate the drop ee joint
-            self.drop_ee_joint = self.pybullet_client.calculateInverseKinematics(
-                self.dummy_robot,
-                6,
-                self.drop_ee_pos,
-                self.drop_ee_quat,
-                maxNumIterations=100000,
-            )
-
-            # check the distance between the object and the drop location
-            if np.linalg.norm(np.array(object_pos)[:2] - np.array([x, y])) > 0.2:
-                break
 
     def randomize_ee_pose(self):
         # generating random initial joint state using random end effector position and orientation
@@ -1079,8 +1057,8 @@ class PybulletRobotServerBase:
         if random.uniform(0, 1) > 0.2:
             random_ee_pos = np.array(
                 [
-                    random.uniform(0.2, 0.5),
-                    random.uniform(-0.6, 0.6),
+                    random.uniform(self.TABLE_LIMITS[0][0], self.TABLE_LIMITS[0][1] + 0.1),
+                    random.uniform(self.TABLE_LIMITS[1][0] - 0.1, self.TABLE_LIMITS[1][1] + 0.1),
                     random.uniform(0.25, 0.65),
                 ]
             )
@@ -1092,15 +1070,14 @@ class PybulletRobotServerBase:
             ) = self.pybullet_client.getBasePositionAndOrientation(
                 self.urdf_object_list[0]
             )
-            random_x = random.uniform(-0.1, 0.1)
-            random_y = random.uniform(-0.1, 0.1)
-            random_x = 0.05 * random_x / np.abs(random_x) + random_x
-            random_y = 0.05 * random_y / np.abs(random_y) + random_y
+            random_x = random.uniform(-0.105, 0.105)
+            random_y = random.uniform(-0.105, 0.105)
+            random_z = random.uniform(0.25, 0.3)
             random_ee_pos = np.array(
                 [
                     object_pos[0] + random_x,
                     object_pos[1] + random_y,
-                    object_pos[2] + random.uniform(0.25, 0.3),
+                    object_pos[2] + random_z,
                 ]
             )
         # random_ee_pos = np.array([random.uniform(0.2, 0.5), random.uniform(-0.6, 0.6), random.uniform(0.2, 0.65)])
