@@ -278,15 +278,13 @@ class PybulletRobotServerBase:
             object_name="robot", splat_object_name=self.robot_name
         )
         # The background uses the robot's full splat, but crops out the robot
-        # TODO this is debug
-        # self.splatsim_background: SplatSimObject = self.create_object(
-        #     object_name="background",
-        #     splat_object_name=self.robot_name,
-        #     keep_within_aabb=False,
-        #     load_urdf=False,
-        # )
-        # self.splatsim_background.is_articulated = False
-        self.splatsim_background = self.splatsim_robot
+        self.splatsim_background: SplatSimObject = self.create_object(
+            object_name="background",
+            splat_object_name=self.robot_name,
+            keep_within_aabb=False,
+            load_urdf=False,
+        )
+        self.splatsim_background.is_articulated = False
 
         self.skip_recording_first = 0
 
@@ -466,10 +464,7 @@ class PybulletRobotServerBase:
                     eval=False,
                 )
             )
-            self.cam_scale = (
-                10
-                # 2  # A scale of 2 produces a smaller image than a scale of 1
-            )
+            self.cam_scale = 2
             temp_gaussian_model = GaussianModel(3)
             self.scene = Scene(
                 dataset,
@@ -618,9 +613,10 @@ class PybulletRobotServerBase:
         # Find object config
         if splat_object_name is not None:
             object_config = self.object_config.get(splat_object_name, {})
-        if len(object_config) == 0 and object_config.get("object_type", None) == "cuboid":
+        if object_config.get("object_type", None) == "cuboid":
             # Use the redblock object's gaussian splat b/c it's a nice rectangular prism
-            object_config = self.object_config["redblock"]
+            # object_config has higher priority than the redblock config if there are overlapping attributes
+            object_config = {**self.object_config["redblock"], **object_config}
         elif len(object_config) == 0:
             print("WARNING: No object config found for ", splat_object_name)
 
@@ -764,10 +760,6 @@ class PybulletRobotServerBase:
         use_gravity: bool = True,
     ) -> None:
         """Set the pose of an object in the simulation."""
-        if splatsim_obj.sim_id is None:
-            raise ValueError(
-                "Cannot set pose of object not represented in pybullet (ex: has urdf)"
-            )
         if object_name not in [
             splatsim_obj.splat_name for splatsim_obj in self.splatsim_objects
         ]:
@@ -778,6 +770,12 @@ class PybulletRobotServerBase:
             object_name
         )
         splatsim_obj = self.splatsim_objects[object_i]
+
+        if splatsim_obj.sim_id is None:
+            raise ValueError(
+                "Cannot set pose of object not represented in pybullet (ex: has urdf)"
+            )
+    
         self.pybullet_client.resetBasePositionAndOrientation(
             splatsim_obj.sim_id, position, orientation
         )
@@ -977,6 +975,8 @@ class PybulletRobotServerBase:
                     segmented_list=segmented_list,
                     transformations_list=transformations_list,
                 )
+                # scales_obj = scales_obj * 1000
+                # opacity_obj = opacity_obj / 1000
                 # scales_obj = splatsim_obj.gaussians._scaling
             else:
                 if splatsim_obj.sim_id is not None:
@@ -1060,10 +1060,11 @@ class PybulletRobotServerBase:
                 return None
         else:
             raise ValueError(f"Unknown camera name {camera_name}")
-
+        
         rendering = render(camera, self.scene_gaussian, self.pipeline, self.background)[
             "render"
         ].cpu()
+        # If you index "depth" instead of "render", you get the depth image
 
         # save the image
         return rendering

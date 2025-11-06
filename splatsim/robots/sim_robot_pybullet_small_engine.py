@@ -62,28 +62,22 @@ class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer)
 
     ENV_CONFIG = {
         "objects": [
-            # {
-            #     "object_name": "small_engine",
-            #     "splat_object_name": "small_engine",
-            #     "grasp_config": [],
-            #     "randomize_pose": False,
-            #     "table_pos": [0.3, 0.55],
-            #     "table_quat": [0, 0, 1, 0],
-            #     "rotation_range_z": [0, 0],
-            # },
-            # {
-            #     "object_name": "small_engine",
-            #     "splat_object_name": "small_engine",
-            #     "grasp_config": [],
-            #     "randomize_pose": True,
-            # },
-            # {
-            #     "object_name": "plastic_apple",
-            #     "splat_object_name": "plastic_apple",
-            #     "grasp_config": [],
-            #     "randomize_pose": True,
-            #     "rotation_range_z": [0, 0],
-            # },
+            {
+                "object_name": "small_engine",
+                "splat_object_name": "small_engine",
+                "grasp_config": [],
+                "randomize_pose": False,
+                "table_pos": [0.3, 0.55],
+                "table_quat": [0, 0, 1, 0],
+                "rotation_range_z": [0, 0],
+            },
+            {
+                "object_name": "plastic_apple",
+                "splat_object_name": "plastic_apple",
+                "grasp_config": [],
+                "randomize_pose": True,
+                "rotation_range_z": [0, 0],
+            },
             # {
             #     "object_name": "redblock",
             #     "splat_object_name": "redblock",

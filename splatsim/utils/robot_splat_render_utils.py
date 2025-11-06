@@ -88,14 +88,13 @@ def crop_splat(splatsim_obj, splatsim_robot, keep_within_aabb=True):
     # Combine splats of robot and of objects
     with torch.no_grad():
         # gaussians.active_sh_degree = 0
-        splatsim_obj.gaussians._xyz = pc.get_xyz[segmented_indices]
-        splatsim_obj.gaussians._rotation = pc.get_rotation[segmented_indices]
-        splatsim_obj.gaussians._opacity = pc.get_opacity_raw[segmented_indices]
+        splatsim_obj.gaussians._xyz = pc._xyz[segmented_indices]
+        splatsim_obj.gaussians._rotation = pc._rotation[segmented_indices]
+        splatsim_obj.gaussians._opacity = pc._opacity[segmented_indices]
         splatsim_obj.gaussians._features_rest = pc._features_rest[segmented_indices]
         splatsim_obj.gaussians._features_dc = pc._features_dc[segmented_indices]
-        splatsim_obj.gaussians._scaling = pc.get_scaling[segmented_indices]
+        splatsim_obj.gaussians._scaling = pc._scaling[segmented_indices]
     
-
 def transform_means(splatsim_obj, splatsim_robot, xyz, segmented_list, transformations_list):
     # xyz is in global frame. pc is in splat frame
     pc = splatsim_obj.gaussians
@@ -121,7 +120,7 @@ def transform_means(splatsim_obj, splatsim_robot, xyz, segmented_list, transform
     inv_rotation_matrix = inv_transformation_matrix[:3, :3] 
     inv_translation = inv_transformation_matrix[:3, 3]
 
-    scales_obj = pc.get_scaling
+    scales_obj = pc.get_scaling # pc.get_scaling is exp(pc._scaling)
     # if splatsim_obj is splatsim_robot, the scale_obj and inv_scale_robot cancel out
     scales_obj = scales_obj * scale_obj * inv_scale_robot
     scales_obj = torch.log(scales_obj)
