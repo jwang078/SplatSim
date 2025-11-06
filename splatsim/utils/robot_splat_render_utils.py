@@ -6,7 +6,22 @@ import einops
 import numpy as np
 import pybullet as p
 
+from typing import Any, Dict, Optional, List
+from dataclasses import dataclass, field
+
 from splatsim.utils.utils_fk import *
+
+@dataclass
+class SplatSimObject:
+    name: str
+    splat_name: str
+    sim_id: int = None
+    is_articulated: bool = False # For example, the robot has is_articulated=True
+    mass: float = 0.0 # Default to static object
+    gaussians: Any = None 
+    grasp_configs: List[dict] = field(default_factory=list)
+    object_config: dict[Any] = None # The format in configs/object_configs/objects.yaml
+    transformations_cache: dict[Any] = None
 
 def get_curr_link_states(robot_uid, use_link_centers=True):
     link_states = []
@@ -49,21 +64,68 @@ def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=Tru
 
     return transformations_list
 
-def transform_means(robot_uid, pc, xyz, segmented_list, transformations_list, robot_transformation, robot_name, transformations_cache=None):
-    # xyz is in global frame. pc is in splat frame
+def crop_splat(splatsim_obj, splatsim_robot, keep_within_aabb=True):
+    pc = splatsim_obj.gaussians
+    aabb = splatsim_obj.object_config['aabb']['bounding_box']
 
-    if transformations_cache is None:
-        Trans = torch.tensor(robot_transformation).to(device=xyz.device).float()
-        scale_robot = torch.pow(torch.linalg.det(Trans[:3, :3]), 1/3)
-        inv_transformation_matrix = torch.inverse(Trans)
+    if splatsim_obj.transformations_cache is None:
+        Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=pc.get_xyz.device).float() # shape (4, 4)
     else:
-        Trans = transformations_cache[robot_name]["transformation"]
-        scale_robot = transformations_cache[robot_name]["transformation_scale"]
-        inv_transformation_matrix = transformations_cache[robot_name]["inv_transformation"]
-    rotation_matrix = Trans[:3, :3] / scale_robot
+        Trans_canonical = splatsim_obj.transformations_cache["transformation"]
+    rotation_matrix_c = Trans_canonical[:3, :3]
+    translation_c = Trans_canonical[:3, 3]
+
+    xyz_obj = copy.deepcopy(pc._xyz)
+
+    #transform the object to the canonical frame
+    xyz_obj = torch.matmul(rotation_matrix_c, xyz_obj.T).T + translation_c
+
+    #segment according to axis aligned bounding box
+    segmented_indices = ((xyz_obj[:, 0] > aabb[0][0]) & (xyz_obj[:, 0] < aabb[1][0]) & (xyz_obj[:, 1] > aabb[0][1] ) & (xyz_obj[:, 1] < aabb[1][1]) & (xyz_obj[:, 2] > aabb[0][2] ) & (xyz_obj[:, 2] < aabb[1][2]))
+    if not keep_within_aabb:
+        segmented_indices = ~segmented_indices
+
+    # Combine splats of robot and of objects
+    with torch.no_grad():
+        # gaussians.active_sh_degree = 0
+        splatsim_obj.gaussians._xyz = pc.get_xyz[segmented_indices]
+        splatsim_obj.gaussians._rotation = pc.get_rotation[segmented_indices]
+        splatsim_obj.gaussians._opacity = pc.get_opacity_raw[segmented_indices]
+        splatsim_obj.gaussians._features_rest = pc._features_rest[segmented_indices]
+        splatsim_obj.gaussians._features_dc = pc._features_dc[segmented_indices]
+        splatsim_obj.gaussians._scaling = pc.get_scaling[segmented_indices]
+    
+
+def transform_means(splatsim_obj, splatsim_robot, xyz, segmented_list, transformations_list):
+    # xyz is in global frame. pc is in splat frame
+    pc = splatsim_obj.gaussians
+    robot_uid = splatsim_robot.sim_id
+
+    if splatsim_robot.transformations_cache is None:
+        Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=pc.get_xyz.device).float() # shape (4, 4)
+        scale_obj = torch.pow(torch.linalg.det(Trans_canonical[:3, :3]), 1/3)
+    
+        Trans_robot = torch.tensor(splatsim_robot.object_config['transformation']['matrix']).to(device=xyz.get_xyz.device).float()
+        scale_robot = torch.pow(torch.linalg.det(Trans_robot[:3, :3]), 1/3)
+        inv_transformation_matrix = torch.inverse(Trans_robot)
+        inv_scale_robot = torch.pow(torch.linalg.det(inv_transformation_matrix[:3, :3]), 1/3)
+    else:
+        Trans_canonical = splatsim_obj.transformations_cache["transformation"]
+        scale_obj = splatsim_obj.transformations_cache["transformation_scale"]
+    
+        Trans_robot = splatsim_robot.transformations_cache["transformation"]
+        scale_robot = splatsim_robot.transformations_cache["transformation_scale"]
+        inv_transformation_matrix = splatsim_robot.transformations_cache["inv_transformation"]
+        inv_scale_robot = splatsim_robot.transformations_cache["inv_transformation_scale"]
+    rotation_matrix = Trans_robot[:3, :3] / scale_robot
     inv_rotation_matrix = inv_transformation_matrix[:3, :3] 
     inv_translation = inv_transformation_matrix[:3, 3]
-    
+
+    scales_obj = pc.get_scaling
+    # if splatsim_obj is splatsim_robot, the scale_obj and inv_scale_robot cancel out
+    scales_obj = scales_obj * scale_obj * inv_scale_robot
+    scales_obj = torch.log(scales_obj)
+
     rot = pc.get_rotation
     opacity = pc.get_opacity_raw
     with torch.no_grad():
@@ -95,24 +157,26 @@ def transform_means(robot_uid, pc, xyz, segmented_list, transformations_list, ro
     #transform_back to splat frame
     xyz = torch.matmul(inv_rotation_matrix, xyz.T).T + inv_translation
 
-    return xyz, rot, opacity, shs_featrest, shs_dc
+    return xyz, rot, opacity, scales_obj, shs_featrest, shs_dc
 
 
-def transform_object(pc, object_config, pos, quat, robot_transformation, object_name, robot_name, transformations_cache=None):
-    if transformations_cache is None:
-        Trans_canonical = torch.from_numpy(np.array(object_config['transformation']['matrix'])).to(device=pc.get_xyz.device).float() # shape (4, 4)
+def transform_object(splatsim_obj, splatsim_robot, pos, quat):
+    pc = splatsim_obj.gaussians
+
+    if splatsim_obj.transformations_cache is None:
+        Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=pc.get_xyz.device).float() # shape (4, 4)
         scale_obj = torch.pow(torch.linalg.det(Trans_canonical[:3, :3]), 1/3)
         
-        Trans_robot = torch.tensor(robot_transformation).to(device=pc.get_xyz.device).float()
+        Trans_robot = torch.tensor(splatsim_robot.object_config['transformation']['matrix']).to(device=pc.get_xyz.device).float()
         inv_transformation_r = torch.inverse(Trans_robot)
         inv_scale = torch.pow(torch.linalg.det(inv_transformation_r[:3, :3]), 1/3)
     else:
-        Trans_canonical = transformations_cache[object_name]["transformation"]
-        scale_obj = transformations_cache[object_name]["transformation_scale"]
+        Trans_canonical = splatsim_obj.transformations_cache["transformation"]
+        scale_obj = splatsim_obj.transformations_cache["transformation_scale"]
 
-        Trans_robot = transformations_cache[robot_name]["transformation"]
-        inv_transformation_r = transformations_cache[robot_name]["inv_transformation"]
-        inv_scale = transformations_cache[robot_name]["inv_transformation_scale"]
+        Trans_robot = splatsim_robot.transformations_cache["transformation"]
+        inv_transformation_r = splatsim_robot.transformations_cache["inv_transformation"]
+        inv_scale = splatsim_robot.transformations_cache["inv_transformation_scale"]
     rotation_matrix_c = Trans_canonical[:3, :3]
     translation_c = Trans_canonical[:3, 3]
     inv_rotation_matrix_r = inv_transformation_r[:3, :3]
@@ -137,29 +201,20 @@ def transform_object(pc, object_config, pos, quat, robot_transformation, object_
     rotation_obj_matrix = rot_rotation_matrix @ rotation_obj_matrix 
     rotation_obj = o3.matrix_to_quaternion(rotation_obj_matrix) 
     
-    # TODO for memory, can precompute aabb bounding box segmentation and only save the relevant points
-    aabb = object_config['aabb']['bounding_box']
-    #segment according to axis aligned bounding box
-    segmented_indices = ((xyz_obj[:, 0] > aabb[0][0]) & (xyz_obj[:, 0] < aabb[1][0]) & (xyz_obj[:, 1] > aabb[0][1] ) & (xyz_obj[:, 1] < aabb[1][1]) & (xyz_obj[:, 2] > aabb[0][2] ) & (xyz_obj[:, 2] < aabb[1][2]))
-    
+    # Assume that the aabb bounding box in the object_config has already been applied to the splat points
+    # We will apply the transformations to all points in this gaussian splat
+
     #offset the object by the position and rotation
     xyz_obj = torch.matmul(o3.quaternion_to_matrix(quat), xyz_obj.T).T + pos
-    
+    # transform the object out of the canonical frame
     xyz_obj = torch.matmul(inv_rotation_matrix_r, xyz_obj.T).T + inv_translation_r
 
-    xyz_obj = xyz_obj[segmented_indices]
-    rotation_obj = rotation_obj[segmented_indices]
-    opacity_obj = opacity_obj[segmented_indices]
-    scales_obj = scales_obj[segmented_indices]
-    features_dc_obj = features_dc_obj[segmented_indices]
-    features_rest_obj = features_rest_obj[segmented_indices]
     features_rest_obj = transform_shs(features_rest_obj, rot_rotation_matrix)
     
     return xyz_obj, rotation_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
 
 
 def transform_shs(shs_feat, rotation_matrix):
-
     ## rotate shs
     P = torch.tensor([[0, 0, 1], [1, 0, 0], [0, 1, 0]], device=rotation_matrix.device).float() # switch axes: yzx -> xyz
     permuted_rotation_matrix = torch.linalg.inv(P) @ rotation_matrix @ P
@@ -206,14 +261,18 @@ def transform_shs(shs_feat, rotation_matrix):
     return shs_feat
 
 
-def get_segmented_indices(robot_uid, pc, robot_transformation, aabb, robot_name, robot_labels=None, transformations_cache=None):
+def get_segmented_indices(splatsim_obj, splatsim_robot, robot_labels=None):
+    robot_uid = splatsim_robot.sim_id
+    pc = splatsim_obj.gaussians
+    aabb = splatsim_obj.object_config["aabb"]["bounding_box"]
+
     # Defining a cube in Gaussian space to segment out the robot
     means3D = pc.get_xyz # 3D means shape (N, 3)
 
-    if transformations_cache is None:
-        Trans = torch.tensor(robot_transformation).to(device=means3D.device).float() # shape (4, 4)
+    if splatsim_robot.transformations_cache is None:
+        Trans = torch.tensor(splatsim_robot.object_config['transformation']['matrix']).to(device=means3D.device).float() # shape (4, 4)
     else:
-        Trans = transformations_cache[robot_name]["transformation"]
+        Trans = splatsim_robot.transformations_cache["transformation"]
     R = Trans[:3, :3]
     translation = Trans[:3, 3]
     
@@ -226,9 +285,10 @@ def get_segmented_indices(robot_uid, pc, robot_transformation, aabb, robot_name,
     if robot_labels is None:
         # For best speed, load labels outside of this function so that it's not loaded every loop
         #load labels.npy
-        robot_labels = np.load('./data/labels_path/'+robot_name+'_labels.npy')
+        robot_labels = np.load('./data/labels_path/'+splatsim_robot.splat_name+'_labels.npy')
         robot_labels = torch.from_numpy(robot_labels).to(device=means3D.device).long()
 
+    # TODO can't this just be a list of xyz points, not the mask and the original points?
     condition = (xyz[:, 0] > aabb[0][0]) & (xyz[:, 0] < aabb[1][0]) & (xyz[:, 1] > aabb[0][1]) & (xyz[:, 1] < aabb[1][1]) & (xyz[:, 2] > aabb[0][2]) & (xyz[:, 2] < aabb[1][2])
     condition = torch.where(condition)[0]
     for i in range(p.getNumJoints(robot_uid)):

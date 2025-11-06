@@ -63,7 +63,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
 
         # get the joint positions using the inverse kinematics
         joint_positions = self.pybullet_client.calculateInverseKinematics(
-            self.dummy_robot,
+            self.splatsim_robot.sim_id,
             6,
             ee_pos,
             ee_quat,
@@ -73,10 +73,10 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
         joint_positions = list(joint_positions)
 
         # compute the path from the current joint positions to the target joint positions
-        ik_joints = get_movable_joints(self.dummy_robot)
+        ik_joints = get_movable_joints(self.splatsim_robot.sim_id)
         ik_joint_positions = []
         path = plan_joint_motion(
-            self.dummy_robot,
+            self.splatsim_robot.sim_id,
             ik_joints,
             joint_positions,
             obstacles=[
@@ -93,7 +93,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
         # reset the joint positions to the initial joint positions
         # Note: Doesn't reset gripper open/close state
         for i in range(1, self.num_dofs()):
-            self.pybullet_client.resetJointState(self.dummy_robot, i, path[0][i - 1])
+            self.pybullet_client.resetJointState(self.splatsim_robot.sim_id, i, path[0][i - 1])
 
         all_paths.append(
             TrajectoryPathSegment(
@@ -120,15 +120,15 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
         # Note: doesn't affect gripper open/close state
         for i in range(1, self.num_dofs()):
             self.pybullet_client.resetJointState(
-                self.dummy_robot, i, pre_grasp2grasp_path[0][i - 1]
+                self.splatsim_robot.sim_id, i, pre_grasp2grasp_path[0][i - 1]
             )
 
         # now plan the path from pre_grasp to intermediate position
-        ee_pos = self.pybullet_client.getLinkState(self.dummy_robot, 6)[0]
+        ee_pos = self.pybullet_client.getLinkState(self.splatsim_robot.sim_id, 6)[0]
         intermediate_ee_pos = [ee_pos[0], ee_pos[1], 0.4]
         intermediate_ee_quat = self.initial_ee_quat
         intermediate_joint_positions = self.pybullet_client.calculateInverseKinematics(
-            self.dummy_robot,
+            self.splatsim_robot.sim_id,
             6,
             intermediate_ee_pos,
             intermediate_ee_quat,
@@ -138,7 +138,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
 
         # compute the path from the current joint positions to the target joint positions
         path = plan_joint_motion(
-            self.dummy_robot,
+            self.splatsim_robot.sim_id,
             ik_joints,
             intermediate_joint_positions,
             obstacles=[self.plane, self.urdf_object_list[-1]],
@@ -150,7 +150,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
         # reset the joint positions to the initial joint positions
         # Note: doesn't affect gripper open/close state
         for i in range(1, self.num_dofs()):
-            self.pybullet_client.resetJointState(self.dummy_robot, i, path[-1][i - 1])
+            self.pybullet_client.resetJointState(self.splatsim_robot.sim_id, i, path[-1][i - 1])
 
         all_paths.append(
             TrajectoryPathSegment(
@@ -161,7 +161,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
 
         # now plan the path from intermediate to drop location
         path = plan_joint_motion(
-            self.dummy_robot,
+            self.splatsim_robot.sim_id,
             ik_joints,
             self.drop_ee_joint,
             obstacles=[self.plane, self.urdf_object_list[-1]],
@@ -173,7 +173,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
         # reset the joint positions to the initial joint positions
         # Note: doesn't affect gripper open/close state
         for i in range(1, self.num_dofs()):
-            self.pybullet_client.resetJointState(self.dummy_robot, i, path[-1][i - 1])
+            self.pybullet_client.resetJointState(self.splatsim_robot.sim_id, i, path[-1][i - 1])
 
         all_paths.append(
             TrajectoryPathSegment(
@@ -192,7 +192,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
         if self.skip_recording_first:
             for i in range(1, self.num_dofs()):
                 self.pybullet_client.resetJointState(
-                    self.dummy_robot, i, initial_joint_positions[i - 1]
+                    self.splatsim_robot.sim_id, i, initial_joint_positions[i - 1]
                 )
 
         # create a path from the drop location to the initial joint positions
@@ -254,7 +254,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
 
         # calculate the drop ee joint
         self.drop_ee_joint = self.pybullet_client.calculateInverseKinematics(
-            self.dummy_robot,
+            self.splatsim_robot.sim_id,
             6,
             self.drop_ee_pos,
             self.drop_ee_quat,
@@ -279,7 +279,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
                 self.open_gripper()
                 for k in range(1, self.num_dofs()):
                     self.pybullet_client.resetJointState(
-                        self.dummy_robot,
+                        self.splatsim_robot.sim_id,
                         k,
                         self.initial_joint_state[k - 1] * self.joint_signs[k - 1],
                     )
@@ -311,11 +311,13 @@ class AppleOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
                 "object_name": "plastic_apple",
                 "splat_object_name": "plastic_apple",
                 "grasp_config": [PybulletRobotServerBase.GRASP_CONFIGS["apple"]],
+                "rotation_range_z": [0, 0],
             },
             {
                 "object_name": "plate",
                 "splat_object_name": "plate",
                 "grasp_config": [],
+                "rotation_range_z": [-np.pi / 6, np.pi / 6],
             },
         ]
     }
@@ -333,11 +335,13 @@ class BananaOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
                     PybulletRobotServerBase.GRASP_CONFIGS["banana1"],
                     PybulletRobotServerBase.GRASP_CONFIGS["banana2"],
                 ],
+                "rotation_range_z": [0, 0],
             },
             {
                 "object_name": "plate",
                 "splat_object_name": "plate",
                 "grasp_config": [],
+                "rotation_range_z": [-np.pi / 6, np.pi / 6],
             },
         ]
     }
@@ -352,11 +356,13 @@ class OrangeOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
                 "object_name": "plastic_orange",
                 "splat_object_name": "plastic_orange",
                 "grasp_config": [PybulletRobotServerBase.GRASP_CONFIGS["orange"]],
+                "rotation_range_z": [0, 0],
             },
             {
                 "object_name": "plate",
                 "splat_object_name": "plate",
                 "grasp_config": [],
+                "rotation_range_z": [-np.pi / 6, np.pi / 6],
             },
         ]
     }

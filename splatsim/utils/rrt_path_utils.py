@@ -201,7 +201,7 @@ def set_robot_joint_positions(robot_id, joint_indices, q):
         p.resetJointState(robot_id, idx, qi)
     p.stepSimulation()
 
-def state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01, link_indices_to_check=None):
+def state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01, link_indices_to_check=None, verbose=True):
     """
     Returns True if any robot link is closer than distance_threshold to any obstacle.
     Uses pybullet.getClosestPoints.
@@ -218,7 +218,8 @@ def state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_thresh
         for obs in obstacle_ids:
             pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=distance_threshold, linkIndexA=link_i, linkIndexB=-1)
             if len(pts) > 0: # TODO I'm not sure why there's always 1 point in collision. setting the 1 to 0 made this always true
-                print(f"Collision detected between link {link_i} and obstacle {obs} with points {len(pts)}")
+                if verbose:
+                    print(f"Collision detected between link {link_i} and obstacle {obs} with points {len(pts)}")
                 return True
     return False
 
@@ -242,209 +243,6 @@ def min_distance_to_obstacles(robot_id, joint_indices, q, obstacle_ids, link_ind
                         return min_d
     return min_d
 
-###########################
-# RRT-Connect in Jointspace
-###########################
-
-class RRTConnectCustom:
-    def __init__(self, robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits,
-                 step_size=0.1, max_iters=20000, collision_distance=0.01, link_indices_to_check=None):
-        self.robot_id = robot_id
-        self.jidx = joint_indices
-        self.obstacle_ids = obstacle_ids
-        self.ll = np.array(lower_limits)
-        self.ul = np.array(upper_limits)
-        self.step_size = step_size
-        self.max_iters = max_iters
-        self.collision_distance = collision_distance
-        self.link_indices_to_check = link_indices_to_check
-
-    def sample(self):
-        return np.random.uniform(self.ll, self.ul)
-
-    def nearest(self, tree_nodes, q):
-        # tree_nodes: list of ndarrays
-        dists = [np.linalg.norm(q - n) for n in tree_nodes]
-        return int(np.argmin(dists))
-
-    def steer(self, q_src, q_tgt):
-        v = q_tgt - q_src
-        dist = np.linalg.norm(v)
-        if dist <= self.step_size:
-            return q_tgt.copy()
-        else:
-            return q_src + v / dist * self.step_size
-
-    def collision_free_segment(self, q_from, q_to, n_steps=10):
-        # linear interpolation in joint space; check collisions
-        for alpha in np.linspace(0.0, 1.0, n_steps):
-            q = (1 - alpha) * q_from + alpha * q_to
-            if state_in_collision(self.robot_id, self.jidx, q, self.obstacle_ids,
-                                  distance_threshold=self.collision_distance,
-                                  link_indices_to_check=self.link_indices_to_check):
-                return False
-        return True
-
-    def try_connect(self, tree_nodes, tree_parents, q_target):
-        """
-        Try to extend tree towards q_target (one step each time) until cannot extend or reached.
-        Returns: (new_node_index, reached_flag)
-        """
-        idx_near = self.nearest(tree_nodes, q_target)
-        q_near = tree_nodes[idx_near]
-        q_new = self.steer(q_near, q_target)
-        if not self.collision_free_segment(q_near, q_new):
-            return None, False
-        tree_nodes.append(q_new)
-        tree_parents.append(idx_near)
-        reached = np.allclose(q_new, q_target, atol=1e-6) or np.linalg.norm(q_new - q_target) < 1e-6
-        return len(tree_nodes) - 1, reached
-
-    def plan(self, q_start, q_goal, timeout=10.0):
-        t0 = time.time()
-        if state_in_collision(self.robot_id, self.jidx, q_start, self.obstacle_ids,
-                              distance_threshold=self.collision_distance,
-                              link_indices_to_check=self.link_indices_to_check):
-            raise RuntimeError("Start in collision")
-        if state_in_collision(self.robot_id, self.jidx, q_goal, self.obstacle_ids,
-                              distance_threshold=self.collision_distance,
-                              link_indices_to_check=self.link_indices_to_check):
-            raise RuntimeError("Goal in collision")
-
-        tree_a_nodes = [np.array(q_start)]
-        tree_a_parents = [-1]
-        tree_b_nodes = [np.array(q_goal)]
-        tree_b_parents = [-1]
-
-        for it in range(self.max_iters):
-            if time.time() - t0 > timeout:
-                break
-
-            q_rand = self.sample()
-            # extend tree A towards q_rand
-            idx_new_a, _ = self.try_connect(tree_a_nodes, tree_a_parents, q_rand)
-            if idx_new_a is not None:
-                # try connect tree B to this new node
-                idx_new_b, reached = self.try_connect(tree_b_nodes, tree_b_parents, tree_a_nodes[idx_new_a])
-                if idx_new_b is not None and reached:
-                    # found connection: reconstruct path
-                    path_a = self.reconstruct_path(tree_a_nodes, tree_a_parents, idx_new_a)
-                    path_b = self.reconstruct_path(tree_b_nodes, tree_b_parents, idx_new_b)
-                    path_b.reverse()
-                    path = path_a + path_b
-                    return path
-            # swap roles
-            tree_a_nodes, tree_b_nodes = tree_b_nodes, tree_a_nodes
-            tree_a_parents, tree_b_parents = tree_b_parents, tree_a_parents
-
-        raise RuntimeError("RRT-Connect failed (timeout/iterations)")
-
-    def reconstruct_path(self, nodes, parents, idx):
-        path = []
-        while idx != -1:
-            path.append(nodes[idx])
-            idx = parents[idx]
-        path.reverse()
-        return path
-
-###########################
-# Shortcut Smoothing
-###########################
-
-def get_shortcut_smoothed_path(path, robot_id, joint_indices, obstacle_ids, collision_distance=0.01, iterations=200):
-    """
-    path: list of joint vectors (ndarray)
-    For iterations, pick random i<j and if straight interpolation between them is collision free, remove intermediates.
-    """
-    if len(path) <= 2:
-        return path
-    for it in range(iterations):
-        n = len(path)
-        i = random.randint(0, n - 2)
-        j = random.randint(i + 1, n - 1)
-        if j == i + 1:
-            continue
-        if np.allclose(path[i], path[j]):
-            # identical
-            path = path[:i+1] + path[j:]
-            continue
-        # check segment
-        rrt = RRTConnectCustom(robot_id, joint_indices, obstacle_ids, np.zeros(len(joint_indices))-math.pi, np.zeros(len(joint_indices))+math.pi,
-                         step_size=0.1, max_iters=1)
-        if rrt.collision_free_segment(path[i], path[j], n_steps=max(6, j - i)):
-            # keep endpoints only
-            path = path[:i+1] + path[j:]
-    return path
-
-###########################
-# CHOMP-like Smoother (simple)
-###########################
-
-def chomp_smooth(path, robot_id, joint_indices, obstacle_ids,
-                 iterations=200, alpha=0.1, smoothing_weight=100.0, obs_weight=1.0,
-                 obstacle_distance_gain=10.0, min_clearance=0.1):
-    """
-    path: list of joint vectors (ndarray)
-    Minimizes smoothness (second derivative) + obstacle cost using finite difference gradients.
-    This is a simple and direct implementation — tune iterations/weights for performance.
-    """
-    path = [np.array(q).astype(float) for q in path]
-    N = len(path)
-    if N < 3:
-        return path
-
-    # fix endpoints
-    q0 = path[0].copy()
-    qf = path[-1].copy()
-
-    for it in range(iterations):
-        grads = [np.zeros_like(path[0]) for _ in range(N)]
-        # Smoothness gradient: second finite difference (discrete Laplacian)
-        for i in range(1, N-1):
-            grads[i] += smoothing_weight * (2 * path[i] - path[i-1] - path[i+1])
-
-        # Obstacle gradient: finite differences per waypoint
-        for i in range(1, N-1):  # don't move endpoints
-            q = path[i]
-            d = min_distance_to_obstacles(robot_id, joint_indices, q, obstacle_ids, max_dist=2.0)
-            # soft cost: only when closer than a margin
-            margin = min_clearance
-            if d < margin:
-                # cost = obs_weight * exp(-k*(d))  (we'll use simple hinge gradient)
-                # approximate gradient by finite diffs on each joint
-                eps = 1e-4
-                grad = np.zeros_like(q)
-                base_cost = math.exp(-obstacle_distance_gain * (d - margin))
-                for j in range(len(q)):
-                    q_pert = q.copy()
-                    q_pert[j] += eps
-                    d2 = min_distance_to_obstacles(robot_id, joint_indices, q_pert, obstacle_ids, max_dist=2.0)
-                    # numeric derivative of cost w.r.t joint j
-                    cost_pert = math.exp(-obstacle_distance_gain * (d2 - margin))
-                    grad[j] = (cost_pert - base_cost) / eps
-                grads[i] += obs_weight * grad
-
-        # gradient descent update (project endpoints fixed)
-        for i in range(1, N-1):
-            path[i] = path[i] - alpha * grads[i]
-
-        # re-lock endpoints
-        path[0] = q0
-        path[-1] = qf
-
-        # optional early exit if collisions resolved and smooth
-        if it % 10 == 0:
-            # check collisions
-            collision_found = False
-            for q in path:
-                if state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.0):
-                    collision_found = True
-                    break
-            if not collision_found:
-                # continue refining but this is a good sign
-                pass
-
-    return path
 
 ###########################
 # Utilities: Time parametrization / spline
@@ -482,82 +280,6 @@ def joints_to_trajectory(path, total_time=5.0, use_cubic_spline=True):
                 qs.append(q)
             return ts, np.array(qs)
         return sample_traj
-
-def chomp_with_jacobian(path, robot_id, joint_indices, obstacle_ids,
-                       iterations=200, alpha=0.05,
-                       smoothing_weight=100.0, safe_distance=0.06,
-                       margin=0.2, obstacle_gain=3.0, link_indices_to_check=None,
-                       joint_lower=None, joint_upper=None):
-    """
-    path: list of numpy joint vectors (len M)
-    Returns refined path (list of numpy joint vectors).
-    - Uses analytic collision gradients computed from PyBullet jacobians.
-    - smoothing_weight: weight on Laplacian smoothness (2*q_i - q_{i-1} - q_{i+1})
-    - safe_distance: threshold for activating collision cost
-    - margin: getClosestPoints query distance (only pairs within margin are considered)
-    - obstacle_gain: scales collision gradient magnitude
-    - joint_lower / joint_upper: arrays to clamp joint values after update
-    """
-    path = [np.array(q, dtype=float) for q in path]
-    M = len(path)
-    DOF = len(path[0])
-    if joint_lower is None or joint_upper is None:
-        # If not provided, use wide bounds
-        joint_lower = np.ones(DOF) * -math.pi
-        joint_upper = np.ones(DOF) * math.pi
-
-    q0 = path[0].copy()
-    qf = path[-1].copy()
-
-    for it in range(iterations):
-        grads = [np.zeros(DOF, dtype=float) for _ in range(M)]
-
-        # Smoothness gradient (discrete second derivative)
-        for i in range(1, M-1):
-            grads[i] += smoothing_weight * (2 * path[i] - path[i-1] - path[i+1])
-
-        # Collision gradients from jacobian
-        for i in range(1, M-1):  # don't move endpoints
-            q = path[i]
-            # compute analytic collision gradient at this q
-            cg = compute_collision_gradients_at_q(robot_id, joint_indices, q,
-                                                  obstacle_ids, margin=margin,
-                                                  link_indices_to_check=link_indices_to_check,
-                                                  safe_distance=safe_distance,
-                                                  obstacle_gain=obstacle_gain)
-            import pdb; pdb.set_trace()
-            grads[i] += cg
-
-        # Gradient descent step
-        for i in range(1, M-1):
-            path[i] = path[i] - alpha * grads[i]
-            # clamp joint limits
-            path[i] = np.minimum(np.maximum(path[i], joint_lower), joint_upper)
-
-        # re-lock endpoints
-        path[0] = q0
-        path[-1] = qf
-
-        # optional quick diagnostics
-        if it % 10 == 0:
-            # check if any waypoint collides (distance < 0)
-            coll_any = False
-            for q in path:
-                # use direct getClosestPoints with distance=0
-                for link_idx in (link_indices_to_check if link_indices_to_check is not None else range(p.getNumJoints(robot_id))):
-                    for obs in obstacle_ids:
-                        pts = p.getClosestPoints(robot_id, obs, distance=0.0, linkIndexA=link_idx, linkIndexB=-1)
-                        if pts:
-                            coll_any = True
-                            break
-                    if coll_any:
-                        break
-                if coll_any:
-                    break
-            # print progress
-            print(f"[chomp] iter {it}/{iterations}, collision_present={coll_any}")
-
-    return path
 
 def setup_env(args, robot_base_position):
     if args.gui:
@@ -691,103 +413,56 @@ def is_in_collision_pybullet(robot_id, joint_indices, q, obstacle_ids):
         return False # No collision
     return collision_fn(q)
 
-def get_rrt_plan(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, q_start, q_goal, step_size=0.1, max_iters=20000, collision_distance=0.01, custom=False):
-    if custom:
-        rrt = RRTConnectCustom(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, step_size=step_size, max_iters=max_iters, collision_distance=collision_distance)
-        print("Planning RRT-Connect...")
-        try:
-            path = rrt.plan(q_start, q_goal, timeout=30.0)
-        except RuntimeError as e:
-            print("RRT-Connect planning failed:", e)
-            return None
-    else:
-        # Use pybullet planning
+def get_rrt_plan(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, q_start, q_goal, step_size=0.1, max_iters=20000, collision_distance=0.01, verbose=True):
+    # Use pybullet planning
 
+    if verbose:
         print("Planning with pybullet planning...")
-        # move robot to q_start
-        set_robot_joint_positions(robot_id, joint_indices, q_start)
-        movable_joints = get_movable_joints(robot_id)
+    # move robot to q_start
+    set_robot_joint_positions(robot_id, joint_indices, q_start)
+    movable_joints = get_movable_joints(robot_id)
 
-        path = plan_joint_motion(
-            robot_id,
+    path = plan_joint_motion(
+        robot_id,
 
-            # movable_joints[1:6],
-            joint_indices,
+        # movable_joints[1:6],
+        joint_indices,
 
-            q_goal,
-            # start_conf=q_start,
-            obstacles=obstacle_ids,
-            self_collisions=True, #False,
-            # algorithm='rrt_connect',  # or 'birrt' / 'rrt'
-            # custom_limits=None,
-        )
-        if path is None:
-            print("PyBullet RRT-Connect planning failed.")
-            return None
-        path = np.array(path)
+        q_goal,
+        # start_conf=q_start,
+        obstacles=obstacle_ids,
+        self_collisions=True, #False,
+        # algorithm='rrt_connect',  # or 'birrt' / 'rrt'
+        # custom_limits=None,
+    )
+    if path is None:
+        if verbose:
+            print("PyBullet planning failed.")
+        return None
+    path = np.array(path)
+
     # Sometimes, the plan is from end to start
     if ((np.array(path[0]) - np.array(q_start))**2).sum() > ((np.array(path[0]) - np.array(q_goal))**2).sum():
         path.reverse()
-    print("RRT raw path length:", len(path))
+    if verbose:
+        print("RRT raw path length:", len(path))
     return path
 
-def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, time_per_traj, robot_update_rate, rrt_vis_fps=5, use_gui=False, use_chomp=False):
+def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, time_per_traj, robot_update_rate, rrt_vis_fps=5, use_gui=False, verbose=True):
     N_SAMPLES = int(robot_update_rate * time_per_traj)
     # Set joints to q_start
     set_robot_joint_positions(robot_id, joint_indices, q_start)
 
     # RRT-Connect planner
-    rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, ll, ul, q_start, q_goal, step_size=0.1, max_iters=40000, collision_distance=0.01)
+    rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, ll, ul, q_start, q_goal, step_size=0.1, max_iters=40000, collision_distance=0.01, verbose=verbose)
     # rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, ll, ul, q_start, q_goal, step_size=0.2, max_iters=20000, collision_distance=0.01)
     if rrt_path is None:
         return None
 
-    # Shortcut smoothing
-    print("DISABLED Shortcut smoothing...")
-    # shortcut_rrt_path = get_shortcut_smoothed_path(rrt_path, robot_id, joint_indices, obstacle_ids, iterations=300)
-    shortcut_rrt_path = rrt_path
-    print("Smoothed path length:", len(shortcut_rrt_path))
-
-    if use_chomp:
-        """
-        # CHOMP refinement (optional, slower)
-        # print("Refining with CHOMP-like optimizer...")
-        # path = chomp_smooth(path, robot_id, joint_indices, obstacle_ids,
-        #                     iterations=200, alpha=0.05, smoothing_weight=50.0,
-        #                     obs_weight=10.0, obstacle_distance_gain=30.0, min_clearance=0.06)
-        # print("Refined path length:", len(path))
-        # chomp_len = len(path)
-
-        # # Play back the path in GUI
-        # if args.gui:
-        #     input("Press Enter to show CHOMP-refined path...")
-        #     for q in path:
-        #         set_robot_joint_positions(robot_id, joint_indices, q)
-        #         p.stepSimulation()
-        #         time.sleep(1.0 / fps_in_playback * rrt_len / chomp_len)
-        """
-
-        chomp_path = chomp_with_jacobian(
-            shortcut_rrt_path,
-            robot_id,
-            joint_indices,
-            obstacle_ids,
-            iterations=150,
-            alpha=0.03,
-            smoothing_weight=80.0,
-            safe_distance=0.06,
-            margin=0.12,
-            obstacle_gain=4.0,
-            link_indices_to_check=list(range(1, 7)),
-            joint_lower=ll,
-            joint_upper=ul
-        )
-    else:
-        chomp_path = shortcut_rrt_path
-
     # Convert to time-parametrized trajectory
-    sampler = joints_to_trajectory(chomp_path, total_time=time_per_traj, use_cubic_spline=True)
-    ts, time_parametrized_path = sampler(n_samples=N_SAMPLES)
+    num_samples = max(N_SAMPLES, len(rrt_path))
+    sampler = joints_to_trajectory(rrt_path, total_time=time_per_traj, use_cubic_spline=True)
+    ts, time_parametrized_path = sampler(n_samples=num_samples)
 
     # Visualize in GUI if requested
     if use_gui:
@@ -796,9 +471,6 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, tim
         # show_joint_config_in_gui(robot_id, joint_indices, q_goal)
         # input("Showing goal pose. Press Enter to continue...")
         # playback_path_in_gui(rrt_path, robot_id, joint_indices, path_name="RRT", fps=rrt_vis_fps, playback_speed=1.0)
-        # playback_path_in_gui(shortcut_rrt_path, robot_id, joint_indices, path_name="Shortcut-Smoothed RRT", fps=rrt_vis_fps, playback_speed=len(shortcut_rrt_path)/ len(rrt_path))
-        # if use_chomp:
-        #     playback_path_in_gui(chomp_path, robot_id, joint_indices, path_name="CHOMP-Jacobian Smoothed", fps=rrt_vis_fps, playback_speed=len(chomp_path)/ len(shortcut_rrt_path))
         playback_path_in_gui(time_parametrized_path, robot_id, joint_indices, path_name="Time-Parametrized", fps=robot_update_rate, playback_speed=1.0)
     
     return time_parametrized_path

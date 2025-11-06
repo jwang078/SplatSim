@@ -33,7 +33,7 @@ from pybullet_planning import pairwise_collision, pairwise_collision_info, draw_
 # -0.2 for x because we don't want to put obstacles in the wall
 TABLE_SPACE = ((-0.2, 0.5), (-0.5, 0.5), (0.0, 0.8))  # x,y,z
 
-def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, max_tries=10000):
+def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, max_tries=10000, verbose=True):
     sample_fn = get_sample_fn(robot_id, joint_indices)
     for _ in range(max_tries):
 
@@ -53,7 +53,7 @@ def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_
         # trying out the pybullet planning version
         q = sample_fn()
 
-        if not state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01):
+        if not state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01, verbose=verbose):
             return q
     raise RuntimeError("Failed to find collision-free joint angles after many tries")
 
@@ -130,7 +130,11 @@ def get_link_index_by_name(robot_id: int, link_name: str) -> int:
 
 def add_random_obstacles(min_obstacles, max_obstacles, robot_id, robot_qs_to_avoid, base_ee_traj):
     new_obj_ids = []
+    new_obj_infos = []
     num_obstacles = np.random.randint(min_obstacles, max_obstacles + 1)
+    # Don't put obstacles too close to the start or end configurations
+    MIN_TIME_PROPORTION = 0.2
+    MAX_TIME_PROPORTION = 0.8
     for _ in range(num_obstacles):
         success = False
         while not success:
@@ -140,13 +144,14 @@ def add_random_obstacles(min_obstacles, max_obstacles, robot_id, robot_qs_to_avo
             #     [TABLE_SPACE[0][0], TABLE_SPACE[1][0], TABLE_SPACE[2][0]],
             #     [TABLE_SPACE[0][1], TABLE_SPACE[1][1], TABLE_SPACE[2][1]]
             # )
-            pos = base_ee_traj[len(base_ee_traj)//2]
+            time_proportion = np.random.uniform(MIN_TIME_PROPORTION, MAX_TIME_PROPORTION)
+            pos = base_ee_traj[int(len(base_ee_traj) * time_proportion)]
             orn = p.getQuaternionFromEuler([0, 0, np.random.uniform(0, np.pi)])
 
             # Random box size
-            lx = np.random.uniform(0.10, 0.30)
-            ly = np.random.uniform(0.10, 0.30)
-            lz = np.random.uniform(0.10, 0.30)
+            lx = np.random.uniform(0.02, 0.30)
+            ly = np.random.uniform(0.02, 0.30)
+            lz = np.random.uniform(0.02, 0.30)
 
             # Create collision and visual shapes
             body_id = create_box(lx, ly, lz, color=BLUE)
@@ -186,8 +191,14 @@ def add_random_obstacles(min_obstacles, max_obstacles, robot_id, robot_qs_to_avo
                 p.removeBody(body_id)  # remove and try again
 
         new_obj_ids.append(body_id)
+        new_obj_infos.append({
+            "type": "cuboid",
+            "pos": list(pos),
+            "orn": [0, 0, 0, 1],
+            "size": (lx, ly, lz),
+        })
 
-    return new_obj_ids
+    return new_obj_ids, new_obj_infos
 
 def get_end_effector_pos(
     robot_id: int, 
@@ -258,14 +269,6 @@ def main(args):
 
     N_SAMPLES = int(args.robot_update_rate * args.time_per_traj)
 
-    # TODO generate base trajectories within this script
-    # # load base trajectories
-    # load_traj_dir = os.path.join("output", args.experiment_name + ".zarr")
-    # assert os.path.exists(load_traj_dir), f"Trajectory directory {load_traj_dir} does not exist."
-    # load_root = zarr.open(load_traj_dir, mode="r")
-    # loaded_traj_ds = load_root["joint_trajectories"]
-    # print(f"Loaded {loaded_traj_ds.shape[0]} base trajectories from {load_traj_dir}.")
-
     if not args.no_save:
         os.makedirs("output", exist_ok=True)
         output_dir = os.path.join("output", args.experiment_name + ".zarr")
@@ -284,7 +287,6 @@ def main(args):
                 if m:
                     existing_ids.append(int(m.group(1)))
 
-
         # Start from next index
         num_prev_traj = (max(existing_ids) + 1) if existing_ids else 0
         print(f"Resuming at traj index {num_prev_traj}")
@@ -293,18 +295,15 @@ def main(args):
     ll, ul, obstacle_ids, robot_id, joint_indices = setup_env(args, robot_base_position)
 
     base_traj_i = 0
+    base_traj_pbar = tqdm(total=args.num_base_trajectories, desc="Base Trajectories")
     while base_traj_i < args.num_base_trajectories:
         saved_base_traj = False
-        print(f"Generating base trajectory {base_traj_i + 1}/{args.num_base_trajectories}...")
         q_start = get_random_joint_angles_without_collision(
-            robot_id, joint_indices, obstacle_ids, ll, ul
+            robot_id, joint_indices, obstacle_ids, ll, ul, verbose=args.verbose
         )
-        print("  Random collision-free start:", q_start)
-
         q_goal = get_random_joint_angles_without_collision(
-            robot_id, joint_indices, obstacle_ids, ll, ul
+            robot_id, joint_indices, obstacle_ids, ll, ul, verbose=args.verbose
         )
-        print("  Random collision-free goal:", q_goal)
 
         base_traj = get_path(
             q_start, q_goal,
@@ -314,13 +313,14 @@ def main(args):
             args.time_per_traj, args.robot_update_rate,
             rrt_vis_fps=args.rrt_vis_fps,
             use_gui=args.gui,
-            use_chomp=args.use_chomp
+            verbose=args.verbose
         )
 
         if base_traj is not None:
             base_traj = np.array(base_traj)  # (N_SAMPLES, dof)
         else:
-            print("  Failed to generate base trajectory, retrying...")
+            if args.verbose:
+                print("  Failed to generate base trajectory, retrying...")
             continue
 
         # This will accumulate all obstacle-specific modified trajectories for this base traj
@@ -333,13 +333,17 @@ def main(args):
         ])
 
         obstacle_i = 0
-        for obstacle_i_for_loop in tqdm(range(args.obstacles_per_base_trajectory), desc="Obstacle Configurations"):
+        obstacle_pbar = tqdm(total=args.obstacles_per_base_trajectory, desc="Obstacle Configurations")
+        num_obstacle_fails = 0
+        while obstacle_i < args.obstacles_per_base_trajectory and num_obstacle_fails < args.max_obstacle_fails_per_base_traj:
+            num_paths_for_this_obstacle = 0
             # This also checks for collisions with the robot
             robot_qs_to_avoid = [q_start, q_goal]
-            new_obj_ids = add_random_obstacles(args.min_obstacles, args.max_obstacles, robot_id, robot_qs_to_avoid, base_ee_traj)
-            num_fails = 0
-            path = None
-            for path_per_obstacle_i in tqdm(range(args.obstacles_per_base_trajectory), desc="Paths per Obstacle Configuration"):
+            new_obj_ids, new_obj_infos = add_random_obstacles(args.min_obstacles, args.max_obstacles, robot_id, robot_qs_to_avoid, base_ee_traj)
+            for path_per_obstacle_i in range(args.obstacles_per_base_trajectory):
+            # for path_per_obstacle_i in tqdm(range(args.obstacles_per_base_trajectory), desc="Paths per Obstacle Configuration"):
+                num_fails = 0
+                path = None
                 while path is None and num_fails < args.max_fails:
                     path = get_path(
                         q_start, q_goal,
@@ -349,25 +353,27 @@ def main(args):
                         args.time_per_traj, args.robot_update_rate,
                         rrt_vis_fps=args.rrt_vis_fps,
                         use_gui=args.gui,
-                        use_chomp=args.use_chomp
+                        verbose=args.verbose,
                     )
                     if path is None:
                         num_fails += 1
-                        print(f"    Retry {num_fails}/{args.max_fails}")
+                        if args.verbose:
+                            print(f"    Retry {num_fails}/{args.max_fails}")
 
                 if path is not None:
                     modified_trajs.append(path)
+                    num_paths_for_this_obstacle += 1
                 else:
-                    print(f"    Failed to find a path after {args.max_fails} attempts. Skipping this obstacle configuration.")
-                if num_fails >= args.max_fails:
+                    if args.verbose:
+                        print(f"    Failed to find a path after {args.max_fails} attempts. Skipping this obstacle configuration.")
+                if args.verbose and num_fails >= args.max_fails:
                     print("    Moving to next obstacle configuration due to repeated failures.")
-                path = None  # reset for next attempt
+
+            if num_paths_for_this_obstacle == 0:
+                num_obstacle_fails += 1
 
             obstacle_info = {
-                "num_obstacles": len(new_obj_ids),
-                "urdf_paths": [p.getBodyInfo(oid)[1].decode("utf-8") for oid in new_obj_ids],
-                # TODO add the cuboid sizes and positions
-                "timestamp": time.time(),
+                "obstacles": new_obj_infos,
             }
             if not args.no_save and len(modified_trajs) > 0 and len(modified_trajs) > 0:
                 # Save one Zarr subgroup per base trajectory
@@ -380,21 +386,23 @@ def main(args):
                     saved_base_traj = True
                     base_traj_i += 1
 
-
                 obstacle_grp = traj_grp.create_group(f"obstacle_config_{obstacle_i:02d}")
                 obstacle_grp.attrs["metadata"] = json.dumps(obstacle_info)
 
                 # Save modified trajectory as concatenated array
                 all_modified_trajs = np.stack(modified_trajs, axis=0)  # (num_modified, N_SAMPLES, dof)
                 obstacle_grp.create_dataset("modified_q", data=all_modified_trajs, dtype="f4", chunks=(1, N_SAMPLES, args.dof))
-                print(f"  Saved {traj_name} with {len(modified_trajs)} modified trajectories")
+                if args.verbose:
+                    print(f"  Saved {traj_name} with {len(modified_trajs)} modified trajectories")
                 obstacle_i += 1
-            else:
-                print(f"  No modified trajectories found for obstacle configuration {obstacle_i} of base trajectory {base_traj_i}.")
+                obstacle_pbar.update(1)
 
             # Remove the newly added obstacles before the next iteration
             for oid in new_obj_ids:
                 p.removeBody(oid)
+        obstacle_pbar.close()
+        base_traj_pbar.update(1)
+    base_traj_pbar.close()
 
     p.disconnect()
 
@@ -447,11 +455,6 @@ if __name__ == "__main__":
         help="If set, do not save trajectories to disk",
     )
     parser.add_argument(
-        "--use_chomp",
-        action="store_true",
-        help="If set, use CHOMP-like smoothing after RRT and shortcutting. Note: this implementation doesn't work",
-    )
-    parser.add_argument(
         "--min_obstacles", type=int, default=1, help="Minimum number of obstacles in the scene"
     )
     parser.add_argument(
@@ -464,10 +467,16 @@ if __name__ == "__main__":
         "--obstacles_per_base_trajectory", type=int, default=3, help="Number of different obstacle configurations to try per base trajectory"
     )
     parser.add_argument(
+        "--max_obstacle_fails_per_base_traj", type=int, default=20, help="Number of different obstacle configurations to try per base trajectory before doing another trajectory (assuming all failed)"
+    )
+    parser.add_argument(
         "--paths_per_obstacle", type=int, default=2, help="Number of different paths to to get per obstacle configuration per base trajectory"
     )
     parser.add_argument(
         "--num_base_trajectories", type=int, default=10_000, help="Number of base trajectories to generate"
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true"
     )
     args = parser.parse_args()
     main(args)

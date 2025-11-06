@@ -12,6 +12,7 @@ import zarr
 import re
 import json
 
+
 class ReplayZarrTrajectoryAgent(Agent): 
     def __init__(self, traj_folder: str, env: RobotEnv, save_images: bool = False, step_size=5):
         # TODO later put the step size to 1 when using a better machine
@@ -31,7 +32,7 @@ class ReplayZarrTrajectoryAgent(Agent):
         if save_images:
             os.makedirs(self.image_folder, exist_ok=True)
         self.save_images = save_images
-        self.traj_index = 0
+        self.traj_index = 1 #0 # for testing purposes, start with one with an obstacle
         self.t = 0
 
         assert traj_folder.endswith('.zarr'), "Currently only .zarr trajectory folder is supported."
@@ -77,10 +78,33 @@ class ReplayZarrTrajectoryAgent(Agent):
                         })
 
             path_names = [traj["name"] for traj in self.trajectories]
+        self.loaded_obstacle_names = []
 
     def load_next_recorded_trajectory(self):
         self.traj_index += 1
         self.t = 0
+
+        # Load new static obstacles
+        for obstacle_name in self.loaded_obstacle_names:
+            self.env._robot.delete_object(obstacle_name)
+        self.loaded_obstacle_names = []
+    
+        obstacle_config_json = self.trajectories[self.traj_index]["metadata"]
+        path_name = self.trajectories[self.traj_index]["name"]
+        for i, obstacle in enumerate(obstacle_config_json['obstacles']):
+            if obstacle['type'] == "cuboid":
+                # has pos, orn, and size attributes
+                obstacle_config = {
+                    "object_type": obstacle['type'],
+                    "position": obstacle["pos"],
+                    "orientation": obstacle["orn"],
+                    "size": obstacle["size"],
+                }
+                obstacle_name = f"{path_name}_cuboid{i}"
+                self.env._robot.create_object(obstacle_name, obstacle_config, use_gravity=False)
+                self.loaded_obstacle_names.append(obstacle_name)
+            else:
+                raise ValueError(f"Unknown obstacle type {obstacle['type']}")
 
     def next_trajectory_step(self):
         if self.traj_index >= len(self.trajectories):
@@ -100,7 +124,7 @@ class ReplayZarrTrajectoryAgent(Agent):
         # Add the world joint to the recorded joint state
         # cur_joint = [0] + cur_joint 
         cur_joint = np.array(cur_joint)
-        self.t += 1 * 5
+        self.t += 1 * 3
 
         # TODO Other objects not supported at the moment
         # object_list = [object_position_key[:-len("_position")] for object_position_key in data.keys() if object_position_key.endswith("_position")]

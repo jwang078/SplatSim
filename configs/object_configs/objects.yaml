@@ -24,6 +24,8 @@ robot_iphone:
   source_path: /home/jennyw2/data/test_data/robot_iphone
   model_path: /home/jennyw2/data/output/robot_iphone
   use_gripper: true
+  is_articulated: true
+  use_fixed_base: true
 robot_iphone_w_engine:
   transformation:
     matrix:
@@ -49,6 +51,8 @@ robot_iphone_w_engine:
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_2_images_500_highres_20match_540height/sfm_disk_disk+lightglue/undistorted
   model_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height
   use_gripper: true
+  is_articulated: true
+  use_fixed_base: true
 sim_franka:
   transformation:
     matrix:
@@ -78,6 +82,8 @@ mug:
     - [-0.06174099954962731, -0.048921999961137774, -0.04394899818301201]
     - [0.06177900123596192, 0.05085599932074547, 0.043957998484373095]
   ply_path: /home/jennyw2/data/output/mug/point_cloud/iteration_7000/point_cloud.ply
+  is_articulated: true
+  use_fixed_base: true
 small_engine:
   transformation:
     matrix:
