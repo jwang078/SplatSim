@@ -53,6 +53,33 @@ robot_iphone_w_engine:
   use_gripper: true
   is_articulated: true
   use_fixed_base: true
+bwa_open_space:
+  transformation:
+    matrix:
+    - [-0.043560, 0.089240, -0.233418, 0.367886]
+    - [0.248989, 0.035668, -0.032829, -0.119694]
+    - [0.021272, -0.234754, -0.093720, 0.319593]
+    - [0.000000, 0.000000, 0.000000, 1.000000]
+  aabb:
+    bounding_box:
+    - [-0.0734, -0.11, -0.0033]
+    - [0.5296, 0.2044, 0.5747]
+    urdf_bbox_adjustment:
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+  urdf_path:
+  - ./splatsim/robot_definitions/urdf/sisbot.urdf
+  base_position:
+  - [0.0, 0.0, -0.1]
+  joint_states:
+  - [0, 0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
+    0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
+  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/2025-10-24_new_bedford_engine_visit_GX010016_notwideangle_better_images_500_20match_540height/sfm_disk_disk+lightglue/undistorted
+  model_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/2025-10-24_new_bedford_engine_visit_GX010016_notwideangle_better_images_500_20match_540height
+  use_gripper: true
+  is_articulated: false
+  use_fixed_base: true
 sim_franka:
   transformation:
     matrix:

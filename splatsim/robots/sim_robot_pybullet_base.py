@@ -47,6 +47,7 @@ from splatsim.utils.robot_splat_render_utils import (
     transform_object,
     get_curr_link_states,
     crop_splat,
+    transform_splat,
     SplatSimObject,
 )
 from gaussian_splatting.gaussian_renderer import GaussianModel
@@ -277,10 +278,16 @@ class PybulletRobotServerBase:
         self.splatsim_robot: SplatSimObject = self.create_object(
             object_name="robot", splat_object_name=self.robot_name
         )
+
+        # self.pybullet_client.resetBasePositionAndOrientation(
+        #     self.splatsim_robot.sim_id, [0, 0, 0.4], [-1, 0, 0, 0]
+        # )
+
+        self.background_splat_name = "bwa_open_space" # self.robot_name
         # The background uses the robot's full splat, but crops out the robot
         self.splatsim_background: SplatSimObject = self.create_object(
             object_name="background",
-            splat_object_name=self.robot_name,
+            splat_object_name=self.background_splat_name,
             keep_within_aabb=False,
             load_urdf=False,
         )
@@ -438,11 +445,11 @@ class PybulletRobotServerBase:
         self.scene_gaussian = GaussianModel(3)
 
         if "base_rgb" in self.camera_names:
-            source_path = self.splatsim_robot.object_config["source_path"]
+            source_path = self.splatsim_background.object_config["source_path"]
             if not os.path.exists(source_path):
                 raise FileNotFoundError(f"Source path not found: {source_path}")
 
-            model_path = self.splatsim_robot.object_config["model_path"]
+            model_path = self.splatsim_background.object_config["model_path"]
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Model path not found: {model_path}")
 
@@ -464,7 +471,7 @@ class PybulletRobotServerBase:
                     eval=False,
                 )
             )
-            self.cam_scale = 2
+            self.cam_scale = 1 #2
             temp_gaussian_model = GaussianModel(3)
             self.scene = Scene(
                 dataset,
@@ -584,14 +591,24 @@ class PybulletRobotServerBase:
             del scene
         else:
             raise ValueError("Could not load gaussian splat")
+        
+        # Disable gradients on this gaussian splat b/c we're not optimizing
+        gaussians._xyz.requires_grad = False
+        gaussians._rotation.requires_grad = False
+        gaussians._opacity.requires_grad = False
+        gaussians._features_rest.requires_grad = False
+        gaussians._features_dc.requires_grad = False
+        gaussians._scaling.requires_grad = False
+            
         return gaussians
 
     def delete_object(self, object_name):
-        # TODO check if this is right
         index = [splatsim_obj.name for splatsim_obj in self.splatsim_objects].index(
             object_name
         )
         splatsim_obj = self.splatsim_objects.pop(index)
+
+        # Explicitly delete some values
         del splatsim_obj.gaussians
         if splatsim_obj.sim_id is not None:
             p.removeBody(splatsim_obj.sim_id)
@@ -661,10 +678,11 @@ class PybulletRobotServerBase:
                 object_type = object_config["object_type"]
                 if object_type == "cuboid":
                     # position, orientation, size
-                    if load_urdf:
-                        lx, ly, lz = object_config["size"]
-                        position = object_config["position"]
+                    # TODO orientation
+                    lx, ly, lz = object_config["size"]
+                    position = object_config["position"]
 
+                    if load_urdf:
                         # Apply global scaling
                         lx, ly, lz = (
                             lx * global_scaling,
@@ -689,6 +707,15 @@ class PybulletRobotServerBase:
                     else:
                         object_loaded = None
                         mass = 0
+
+                    # Customize the redblock splat rectanglular prism to have the right dimensions
+                    robot_scale = self.splatsim_robot.transformations_cache["transformation_scale"]
+                    for axis, actual_len in zip(range(3), [lx, ly, lz]):
+                        redblock_len = gaussians._xyz[:, axis].max() - gaussians._xyz[:, axis].min()
+                        ratio = actual_len / redblock_len / robot_scale
+                        gaussians._xyz[:, axis] = gaussians._xyz[:, axis] * ratio
+                        # Do the ratio in exponential space
+                        gaussians._scaling[:, axis] = torch.log(gaussians.get_scaling[:, axis] * ratio)
 
                     # TODO change this to a brownish color and also adjust the size of the block to the size of the cuboid
                 else:
@@ -975,9 +1002,36 @@ class PybulletRobotServerBase:
                     segmented_list=segmented_list,
                     transformations_list=transformations_list,
                 )
-                # scales_obj = scales_obj * 1000
-                # opacity_obj = opacity_obj / 1000
-                # scales_obj = splatsim_obj.gaussians._scaling
+
+                # # Now, apply the object's transformation within the simulation. Assume there is no scaling within pybullet
+                # # xyz_obj and rot_obj need to be changed
+                # (
+                #     object_pos,
+                #     object_quat,
+                # ) = self.pybullet_client.getBasePositionAndOrientation(
+                #     self.splatsim_objects[i].sim_id
+                # )
+
+                # # xyz_obj, rotation_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
+
+                # (
+                #     xyz_obj,
+                #     rot_obj,
+                #     opacity_obj,
+                #     scales_obj,
+                #     features_dc_obj,
+                #     features_rest_obj,
+                # ) = transform_splat(
+                #     xyz_obj,
+                #     rot_obj,
+                #     opacity_obj,
+                #     scales_obj,
+                #     features_dc_obj,
+                #     features_rest_obj,
+                #     torch.tensor(object_pos).to(xyz_obj.device),
+                #     torch.tensor(object_quat).to(xyz_obj.device)
+                # )
+
             else:
                 if splatsim_obj.sim_id is not None:
                     cur_object_position = torch.tensor(

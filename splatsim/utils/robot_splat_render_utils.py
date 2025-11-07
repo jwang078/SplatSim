@@ -158,6 +158,24 @@ def transform_means(splatsim_obj, splatsim_robot, xyz, segmented_list, transform
 
     return xyz, rot, opacity, scales_obj, shs_featrest, shs_dc
 
+def transform_splat(xyz_obj,
+                    rotation_obj,
+                    opacity_obj,
+                    scales_obj,
+                    features_dc_obj,
+                    features_rest_obj, pos, quat):
+
+    rot_rotation_matrix = o3.quaternion_to_matrix(quat)
+    rotation_obj_matrix = o3.quaternion_to_matrix(rotation_obj)
+    rotation_obj_matrix = rot_rotation_matrix @ rotation_obj_matrix 
+    rotation_obj = o3.matrix_to_quaternion(rotation_obj_matrix) 
+    
+    #offset the object by the position and rotation
+    xyz_obj = torch.matmul(o3.quaternion_to_matrix(quat), xyz_obj.T).T + pos
+    features_rest_obj = transform_shs(features_rest_obj, rot_rotation_matrix)
+    
+    return xyz_obj, rotation_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
+
 
 def transform_object(splatsim_obj, splatsim_robot, pos, quat):
     pc = splatsim_obj.gaussians

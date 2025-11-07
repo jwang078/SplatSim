@@ -122,7 +122,9 @@ def launch_robot_server(args: Args):
 
         server = UprightRobotSmallEnginePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=UprightRobotSmallEnginePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=camera_names, robot_name=args.robot_name, cam_i=5, use_gripper=use_gripper
+           # with the actual engine on table
+        #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_apple_search":
