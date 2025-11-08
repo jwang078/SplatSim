@@ -273,6 +273,8 @@ class PybulletRobotServerBase:
         with open(self.object_config_path, "r") as file:
             self.object_config = yaml.safe_load(file)
 
+        self.models_lib = md.model_lib()
+
         self.splatsim_objects: List[SplatSimObject] = []
         self.splatsim_robot = None # Need this initialization as a placeholder for self.create_object()
         self.splatsim_robot: SplatSimObject = self.create_object(
@@ -474,7 +476,7 @@ class PybulletRobotServerBase:
                     eval=False,
                 )
             )
-            self.cam_scale = 4 #1 #2
+            self.cam_scale = 1 #2
             temp_gaussian_model = GaussianModel(3)
             self.scene = Scene(
                 dataset,
@@ -624,7 +626,6 @@ class PybulletRobotServerBase:
         keep_within_aabb=True,
         load_urdf=True,
     ):
-        models_lib = md.model_lib()
         if len(object_config) == 0 and splat_object_name is None:
             splat_object_name = object_name  # TODO when is this wrong?
 
@@ -648,8 +649,8 @@ class PybulletRobotServerBase:
         self.load_gaussian_splat(gaussians, object_config)
 
         # Find possible URDF config
-        if object_name in models_lib.model_name_list:
-            urdf_path = models_lib[splat_object_name]
+        if object_name in self.models_lib.model_name_list:
+            urdf_path = self.models_lib[splat_object_name]
         elif "urdf_path" in object_config:
             urdf_path = object_config["urdf_path"][0]
             if not os.path.exists(urdf_path):
@@ -781,7 +782,7 @@ class PybulletRobotServerBase:
         )
 
         splatsim_obj.gaussians._xyz = xyz_obj
-        splatsim_obj.gaussians._rot = rot_obj
+        splatsim_obj.gaussians._rotation = rot_obj
         splatsim_obj.gaussians._opacity = opacity_obj
         splatsim_obj.gaussians._features_rest = features_rest_obj
         splatsim_obj.gaussians._features_dc = features_dc_obj
@@ -1200,76 +1201,152 @@ class PybulletRobotServerBase:
 
 
 
-        # 1. Define device and Trans_canonical (from your previous code)
+
+
+        # 1. Define device and Trans_canonical
         device = camera.world_view_transform.device
-        Trans_canonical_full = torch.from_numpy(np.array(self.splatsim_background.object_config['transformation']['matrix'])).to(device=device).float()
+        Trans_canonical_full = torch.from_numpy(
+            np.array(self.splatsim_background.object_config['transformation']['matrix'])
+        ).to(device=device).float()
 
-        # 2. Scale Normalization: Create T_pose (scale-normalized transformation)
-        scale = torch.pow(torch.linalg.det(Trans_canonical_full[:3, :3]), 1/3)
-        Trans_pose = Trans_canonical_full.clone()
-        Trans_pose[:3, :3] = Trans_pose[:3, :3] / scale
-        Trans_pose[:3, 3] = Trans_pose[:3, 3] / scale # CRITICAL: Scale the translation
+        # 2. Get the camera's pose in the SPLAT'S LOCAL FRAME
+        # V_original is the view matrix in the splat's local frame.
+        # M_CW_original is the Camera-to-World (C2W) matrix in the splat's local frame.
+        # We assume V_original's inverse is the C2W matrix.
+        V_original_inv = torch.linalg.inv(camera.world_view_transform.clone()).T
+        M_CW_original_local = V_original_inv
 
-        # 3. Calculate Original Camera-to-World Matrix (M_CW, original)
-        # V_original is typically the transpose of M_CW_original, but since V_original
-        # is not guaranteed to be a pure R|T matrix (it's V=P_inv @ P_full), we use the inverse.
-        V_original_inv = torch.linalg.inv(camera.world_view_transform.clone())
-        # The translation is in the 4th row, so ensure the inverse yields an R|T matrix.
-        # For a row-vector V: M_CW = V^T. Let's assume M_CW = V_inv for safety.
-        M_CW_original = V_original_inv
+        # 3. Calculate the new ABSOLUTE Camera-to-World matrix
+        # M_CW_world = T_world_from_local @ M_CW_local
+        # This matrix now has the full scale (s) embedded in it.
+        # background camera to background frame; background frame to world
+        # want: background camera to world
+        M_CW_new_world_scaled = torch.matmul(Trans_canonical_full, M_CW_original_local)
+        # M_CW_new_world_scaled = torch.matmul(M_CW_original_local, Trans_canonical_full)
 
-        # 4. Calculate New Camera-to-World Matrix (M_CW, new)
-        # M_CW_new = M_CW_original @ T_pose
-        M_CW_new = torch.matmul(M_CW_original, Trans_pose)
+        # 4. Decompose the new world pose (just like get_wrist_camera)
+        # We need to extract R_cw (scale-free), T_wc (scale-free), and scale (s)
+        
+        # Get the scaled rotation and translation components
+        R_cw_scaled = M_CW_new_world_scaled[:3, :3]
+        T_cw_scaled = M_CW_new_world_scaled[:3, 3]
 
-        # Extract and Normalize R_cw
-        R_cw = M_CW_new[:3, :3]
-        T_cw = M_CW_new[:3, 3] # This is the scale-normalized T_cw
-
-        # The R_cw matrix here is already the scale-normalized rotation from the M_CW_new calculation.
-        # You could re-normalize if needed, but M_CW_new should be scale-free in R.
-        # scale_recheck = torch.pow(torch.linalg.det(R_cw[:3, :3]), 1 / 3) # Should be close to 1.0
-
-        # Calculate T_wc (World-to-Camera Translation)
-        # T_wc is the translation component of the VIEW MATRIX (M_CW_new)^-1
-        Rt_wc = torch.linalg.inv(M_CW_new) # This is the new V_new
-        T_wc = Rt_wc[:3, 3]
-
-        # Convert to numpy for the Camera constructor
-        R_cw_np = R_cw.detach().cpu().numpy()
-        T_wc_np = T_wc.detach().cpu().numpy()
+        # Get the scalar scale
+        scale = torch.pow(torch.linalg.det(R_cw_scaled), 1/3)
         scale_np = scale.detach().cpu().numpy()
 
-        # 5. Initialize the New Camera
+        # Normalize the components to be scale-free
+        R_cw_normalized = R_cw_scaled / scale
+        T_cw_normalized = T_cw_scaled / scale
 
-        # Define placeholders for other parameters (assuming they are set elsewhere)
-        depth_params = None
+        # 5. Build the final SCALE-FREE C2W pose matrix
+        M_CW_new_world_pose = torch.eye(4, device=device, dtype=torch.float32)
+        M_CW_new_world_pose[:3, :3] = R_cw_normalized
+        M_CW_new_world_pose[:3, 3] = T_cw_normalized
 
-        # t doesnt have scale, but r has scale
+        # 6. Calculate T_wc (World-to-Camera Translation)
+        # This is the translation component of the final View Matrix (V_new)
+        V_new_world = torch.linalg.inv(M_CW_new_world_pose)
+        T_wc = V_new_world[:3, 3]
+
+        # Convert to numpy for the Camera constructor
+        R_cw_np = R_cw_normalized.detach().cpu().numpy()
+        T_wc_np = T_wc.detach().cpu().numpy()
+
+        # 7. Initialize the New Camera
+        # (Assuming other parameters are loaded as before)
         resolution = (camera.alpha_mask.shape[2], camera.alpha_mask.shape[1])
-        image = torch.zeros((3, resolution[1], resolution[0])).float() # Dummy image
+        image = torch.zeros((3, resolution[1], resolution[0])).float()
         depth_params = None
 
         new_camera = Camera(
             resolution,
             camera.colmap_id,
-            R_cw_np,           # R_cw (Camera-to-World Rotation)
-            T_wc_np,           # T_wc (World-to-Camera Translation)
+            R_cw_np,           # R_cw (scale-free C2W rotation)
+            T_wc_np,           # T_wc (scale-free W2C translation)
             camera.FoVx,
             camera.FoVy,
             depth_params,
-            # camera.depth_params,
-            to_pil_image(image), # to_pil_image utility needed here
+            to_pil_image(image),
             camera.invdepthmap,
             camera.image_name,
             camera.uid,
-            scale=scale_np,
+            scale=scale_np,    # The separate scale scalar
         )
 
         return new_camera
 
 
-        # return camera
+
+        # # 1. Define device and Trans_canonical (from your previous code)
+        # device = camera.world_view_transform.device
+        # Trans_canonical_full = torch.from_numpy(np.array(self.splatsim_background.object_config['transformation']['matrix'])).to(device=device).float()
+
+        # # 2. Scale Normalization: Create T_pose (scale-normalized transformation)
+        # scale = torch.pow(torch.linalg.det(Trans_canonical_full[:3, :3]), 1/3)
+        # Trans_pose = Trans_canonical_full.clone()
+        # Trans_pose[:3, :3] = Trans_pose[:3, :3] / scale
+        # # removed
+        # Trans_pose[:3, 3] = Trans_pose[:3, 3] / scale # CRITICAL: Scale the translation
+
+        # # 3. Calculate Original Camera-to-World Matrix (M_CW, original)
+        # # V_original is typically the transpose of M_CW_original, but since V_original
+        # # is not guaranteed to be a pure R|T matrix (it's V=P_inv @ P_full), we use the inverse.
+        # V_original_inv = torch.linalg.inv(camera.world_view_transform.clone()).T
+        # # The translation is in the 4th row, so ensure the inverse yields an R|T matrix.
+        # # For a row-vector V: M_CW = V^T. Let's assume M_CW = V_inv for safety.
+        # M_CW_original = V_original_inv
+
+        # # 4. Calculate New Camera-to-World Matrix (M_CW, new)
+        # # M_CW_new = M_CW_original @ T_pose
+        # M_CW_new = torch.matmul(M_CW_original, Trans_pose)
+
+        # # Extract and Normalize R_cw
+        # R_cw = M_CW_new[:3, :3]
+        # T_cw = M_CW_new[:3, 3] # This is the scale-normalized T_cw
+
+        # # The R_cw matrix here is already the scale-normalized rotation from the M_CW_new calculation.
+        # # You could re-normalize if needed, but M_CW_new should be scale-free in R.
+        # # scale_recheck = torch.pow(torch.linalg.det(R_cw[:3, :3]), 1 / 3) # Should be close to 1.0
+
+        # # Calculate T_wc (World-to- Translation)
+        # # T_wc is the translation component of the VIEW MATRIX (M_CW_new)^-1
+        # Rt_wc = torch.linalg.inv(M_CW_new) # This is the new V_new
+        # T_wc = Rt_wc[:3, 3]
+
+        # # Convert to numpy for the Camera constructor
+        # R_cw_np = R_cw.detach().cpu().numpy()
+        # T_wc_np = T_wc.detach().cpu().numpy()
+        # scale_np = scale.detach().cpu().numpy()
+
+        # # 5. Initialize the New Camera
+
+        # # Define placeholders for other parameters (assuming they are set elsewhere)
+        # depth_params = None
+
+        # # t doesnt have scale, but r has scale
+        # resolution = (camera.alpha_mask.shape[2], camera.alpha_mask.shape[1])
+        # image = torch.zeros((3, resolution[1], resolution[0])).float() # Dummy image
+
+        # # No way to get the original depth params, and it's only used to initialize invdepthmap, which we have
+        # depth_params = None
+
+        # new_camera = Camera(
+        #     resolution,
+        #     camera.colmap_id,
+        #     R_cw_np,           # R_cw (Camera-to-World Rotation)
+        #     T_wc_np,           # T_wc (World-to-Camera Translation)
+        #     camera.FoVx,
+        #     camera.FoVy,
+        #     depth_params,
+        #     to_pil_image(image), # to_pil_image utility needed here
+        #     camera.invdepthmap,
+        #     camera.image_name,
+        #     camera.uid,
+        #     scale=scale_np,
+        # )
+
+        # return new_camera
 
     def get_current_ee_pose(self):
         dummy_ee_pos, dummy_ee_quat = (

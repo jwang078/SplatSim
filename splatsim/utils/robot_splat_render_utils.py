@@ -120,6 +120,8 @@ def transform_means(splatsim_obj, splatsim_robot, xyz, segmented_list, transform
     # inv_rotation_matrix = inv_transformation_matrix[:3, :3] 
     # inv_translation = inv_transformation_matrix[:3, 3]
 
+    # Note: this function does NOT handle transformation matrices with scaling factors in the rotation matrix area
+    # Assume that it was handled already in object creation. The objects do not change size during runtime
     scales_obj = pc._scaling # pc.get_scaling is exp(pc._scaling)
     # # if splatsim_obj is splatsim_robot, the scale_obj and inv_scale_robot cancel out
     # scales_obj = scales_obj * scale_obj * inv_scale_robot
@@ -140,12 +142,7 @@ def transform_means(splatsim_obj, splatsim_robot, xyz, segmented_list, transform
         
         # Defining rotation matrix for the covariance
         rot_rotation_matrix = r_rel # (inv_rotation_matrix*scale_robot) @ r_rel @ rotation_matrix
-        
-        tranformed_rot = rot[segment]  
-        tranformed_rot = o3.quaternion_to_matrix(tranformed_rot) ### --> zyx    
-        transformed_rot = rot_rotation_matrix @ tranformed_rot # shape (N, 3, 3)
-        transformed_rot = o3.matrix_to_quaternion(transformed_rot)
-        rot[segment] = transformed_rot
+        rot[segment] = o3.matrix_to_quaternion(rot_rotation_matrix @ o3.quaternion_to_matrix(rot[segment]))
 
         #transform the shs features
         shs_feat = shs_featrest[segment]
@@ -176,8 +173,8 @@ def transform_object(splatsim_obj, splatsim_robot, pos=None, quat=None, transfor
     opacity_obj = pc.get_opacity_raw
     scales_obj = pc.get_scaling # This is exp(pc._scaling)
 
-    scales_obj = scales_obj * scale_obj
-    scales_obj = torch.log(scales_obj)
+    scales_obj = scales_obj * scale_obj # Apply scaling in exponentiated space
+    scales_obj = torch.log(scales_obj) # Prep to save this as pc._scaling--the unexponentiated form
 
     with torch.no_grad():
         features_dc_obj = pc._features_dc.clone()
