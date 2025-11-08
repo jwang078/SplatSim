@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import threading
 import queue
+from e3nn import o3
 
 
 import torch
@@ -47,7 +48,6 @@ from splatsim.utils.robot_splat_render_utils import (
     transform_object,
     get_curr_link_states,
     crop_splat,
-    transform_splat,
     SplatSimObject,
 )
 from gaussian_splatting.gaussian_renderer import GaussianModel
@@ -283,6 +283,9 @@ class PybulletRobotServerBase:
         #     self.splatsim_robot.sim_id, [0, 0, 0.4], [-1, 0, 0, 0]
         # )
 
+        # self.background_splat_name = self.robot_name
+        # self.splatsim_background = self.splatsim_robot
+
         self.background_splat_name = "bwa_open_space" # self.robot_name
         # The background uses the robot's full splat, but crops out the robot
         self.splatsim_background: SplatSimObject = self.create_object(
@@ -471,7 +474,7 @@ class PybulletRobotServerBase:
                     eval=False,
                 )
             )
-            self.cam_scale = 1 #2
+            self.cam_scale = 4 #1 #2
             temp_gaussian_model = GaussianModel(3)
             self.scene = Scene(
                 dataset,
@@ -770,6 +773,20 @@ class PybulletRobotServerBase:
             object_config=object_config
         )
 
+        # Transform the xyz, rotation, and shs features to the canonical frame (the world frame for the simulator)
+        # We will work in the coordinate frame of the simulator from now on
+        Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=splatsim_obj.gaussians.get_xyz.device).float() # shape (4, 4)
+        xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj = transform_object(
+            splatsim_obj=splatsim_obj, splatsim_robot=splatsim_obj, transform=Trans_canonical
+        )
+
+        splatsim_obj.gaussians._xyz = xyz_obj
+        splatsim_obj.gaussians._rot = rot_obj
+        splatsim_obj.gaussians._opacity = opacity_obj
+        splatsim_obj.gaussians._features_rest = features_rest_obj
+        splatsim_obj.gaussians._features_dc = features_dc_obj
+        splatsim_obj.gaussians._scaling = scales_obj
+
         if self.splatsim_robot is None and object_name == "robot":
             # This is trying to initialize the robot
             crop_splat(splatsim_obj, splatsim_obj, keep_within_aabb=keep_within_aabb)
@@ -961,6 +978,13 @@ class PybulletRobotServerBase:
 
     def prep_image_rendering(self, data) -> Dict[str, np.ndarray]:
         # Transform each object splat to be in the right pose
+        del self.scene_gaussian._xyz
+        del self.scene_gaussian._rotation
+        del self.scene_gaussian._opacity
+        del self.scene_gaussian._features_rest
+        del self.scene_gaussian._features_dc
+        del self.scene_gaussian._scaling
+
         xyz_obj_list = []
         rot_obj_list = []
         opacity_obj_list = []
@@ -984,7 +1008,7 @@ class PybulletRobotServerBase:
                 # Ah. it's because xyz gets overwritten
                 segmented_list, xyz = get_segmented_indices(
                     splatsim_obj=splatsim_obj,
-                    splatsim_robot=self.splatsim_robot,  # This is to get robot transformations
+                    # splatsim_robot=self.splatsim_robot,  # This is to get robot transformations
                     robot_labels=self.robot_labels,
                 )
 
@@ -1130,7 +1154,122 @@ class PybulletRobotServerBase:
             camera = self.scene.getTrainCameras(scale=self.cam_scale)[0]
         else:
             camera = self.scene.getTestCameras(scale=self.cam_scale)[0]
-        return camera
+
+        # The camera was saved in the world frame of the self.splatsim_background object.
+        # Transform it to be in the coordinate frame of the simulator
+
+    #         tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    # tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    # raster_settings = GaussianRasterizationSettings(
+    #     image_height=int(viewpoint_camera.image_height),
+    #     image_width=int(viewpoint_camera.image_width),
+    #     tanfovx=tanfovx,
+    #     tanfovy=tanfovy,
+    #     bg=bg_color,
+    #     scale_modifier=scaling_modifier,
+    #     viewmatrix=viewpoint_camera.world_view_transform,
+    #     projmatrix=viewpoint_camera.full_proj_transform,
+    #     sh_degree=pc.active_sh_degree,
+    #     campos=viewpoint_camera.camera_center,
+    #     prefiltered=False,
+    #     debug=pipe.debug,
+    #     antialiasing=pipe.antialiasing
+
+
+
+
+
+        # device = camera.world_view_transform.device
+        # Trans_canonical = torch.from_numpy(np.array(self.splatsim_background.object_config['transformation']['matrix'])).to(device=device).float() # shape (4, 4)
+        # scale_obj = torch.pow(torch.linalg.det(Trans_canonical[:3, :3]), 1/3)
+        # R = Trans_canonical[:3, :3].clone()
+        # T = Trans_canonical[:3, 3].clone()
+        # Trans_canonical[:3, :3] = Trans_canonical[:3, :3] / scale_obj
+        # Trans_canonical[:3, 3] = Trans_canonical[:3, 3] / scale_obj
+        
+        # P_matrix = torch.matmul(camera.full_proj_transform, torch.linalg.inv(camera.world_view_transform))
+
+        # camera.world_view_transform = camera.world_view_transform @ Trans_canonical.T
+        # # camera.world_view_transform = camera.world_view_transform @ torch.inverse(Trans_canonical).T
+        # camera.camera_center = R @ camera.camera_center + T
+        # # camera.camera_center = (Trans_canonical @ torch.concatenate([camera.camera_center, torch.tensor([1.0], dtype=torch.float32, device=device)]))[:3]
+        # # This is calculated with the updated camera.world_view_transform
+        # camera.full_proj_transform = torch.matmul(P_matrix, camera.world_view_transform)
+
+
+
+
+        # 1. Define device and Trans_canonical (from your previous code)
+        device = camera.world_view_transform.device
+        Trans_canonical_full = torch.from_numpy(np.array(self.splatsim_background.object_config['transformation']['matrix'])).to(device=device).float()
+
+        # 2. Scale Normalization: Create T_pose (scale-normalized transformation)
+        scale = torch.pow(torch.linalg.det(Trans_canonical_full[:3, :3]), 1/3)
+        Trans_pose = Trans_canonical_full.clone()
+        Trans_pose[:3, :3] = Trans_pose[:3, :3] / scale
+        Trans_pose[:3, 3] = Trans_pose[:3, 3] / scale # CRITICAL: Scale the translation
+
+        # 3. Calculate Original Camera-to-World Matrix (M_CW, original)
+        # V_original is typically the transpose of M_CW_original, but since V_original
+        # is not guaranteed to be a pure R|T matrix (it's V=P_inv @ P_full), we use the inverse.
+        V_original_inv = torch.linalg.inv(camera.world_view_transform.clone())
+        # The translation is in the 4th row, so ensure the inverse yields an R|T matrix.
+        # For a row-vector V: M_CW = V^T. Let's assume M_CW = V_inv for safety.
+        M_CW_original = V_original_inv
+
+        # 4. Calculate New Camera-to-World Matrix (M_CW, new)
+        # M_CW_new = M_CW_original @ T_pose
+        M_CW_new = torch.matmul(M_CW_original, Trans_pose)
+
+        # Extract and Normalize R_cw
+        R_cw = M_CW_new[:3, :3]
+        T_cw = M_CW_new[:3, 3] # This is the scale-normalized T_cw
+
+        # The R_cw matrix here is already the scale-normalized rotation from the M_CW_new calculation.
+        # You could re-normalize if needed, but M_CW_new should be scale-free in R.
+        # scale_recheck = torch.pow(torch.linalg.det(R_cw[:3, :3]), 1 / 3) # Should be close to 1.0
+
+        # Calculate T_wc (World-to-Camera Translation)
+        # T_wc is the translation component of the VIEW MATRIX (M_CW_new)^-1
+        Rt_wc = torch.linalg.inv(M_CW_new) # This is the new V_new
+        T_wc = Rt_wc[:3, 3]
+
+        # Convert to numpy for the Camera constructor
+        R_cw_np = R_cw.detach().cpu().numpy()
+        T_wc_np = T_wc.detach().cpu().numpy()
+        scale_np = scale.detach().cpu().numpy()
+
+        # 5. Initialize the New Camera
+
+        # Define placeholders for other parameters (assuming they are set elsewhere)
+        depth_params = None
+
+        # t doesnt have scale, but r has scale
+        resolution = (camera.alpha_mask.shape[2], camera.alpha_mask.shape[1])
+        image = torch.zeros((3, resolution[1], resolution[0])).float() # Dummy image
+        depth_params = None
+
+        new_camera = Camera(
+            resolution,
+            camera.colmap_id,
+            R_cw_np,           # R_cw (Camera-to-World Rotation)
+            T_wc_np,           # T_wc (World-to-Camera Translation)
+            camera.FoVx,
+            camera.FoVy,
+            depth_params,
+            # camera.depth_params,
+            to_pil_image(image), # to_pil_image utility needed here
+            camera.invdepthmap,
+            camera.image_name,
+            camera.uid,
+            scale=scale_np,
+        )
+
+        return new_camera
+
+
+        # return camera
 
     def get_current_ee_pose(self):
         dummy_ee_pos, dummy_ee_quat = (
