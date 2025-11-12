@@ -66,7 +66,9 @@ def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=Tru
 
 def crop_splat(splatsim_obj, keep_within_aabb=True):
     pc = splatsim_obj.gaussians
-    aabb = splatsim_obj.object_config['aabb']['bounding_box']
+    aabb = splatsim_obj.object_config.get("aabb", {"bounding_box": None})['bounding_box']
+    if aabb is None:
+        return
 
     xyz_obj = copy.deepcopy(pc._xyz)
 
@@ -126,7 +128,7 @@ def create_cuboid_gaussians(
     device: str = "cuda:0"
 ) -> dict[str, torch.Tensor]:
     """
-    Generates the parameters for a dense Gaussian splat cuboid.
+    Generates the parameters for a dense Gaussian splat cuboid. Center is in the middle of the block
 
     Args:
         side_lengths: (lx, ly, lz) of the cuboid.

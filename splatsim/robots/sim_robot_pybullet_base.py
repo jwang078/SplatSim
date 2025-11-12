@@ -620,6 +620,7 @@ class PybulletRobotServerBase:
                     position[2] * global_scaling,
                 ]
 
+                # TODO check if this box is created with (0,0,0) at the center of the box
                 object_loaded = create_box(lx, ly, lz, color=BLUE)
                 set_pose(object_loaded, Pose(point=position))
                 # TODO set orientation
@@ -669,6 +670,9 @@ class PybulletRobotServerBase:
         splatsim_obj.mass = mass
 
     def load_gaussian_splat(self, splatsim_obj):
+        # Most of these representations are in the splat frame, so we need to transform to simulator frame
+        need_transform_to_simulator_frame = True
+
         if "ply_path" in splatsim_obj.object_config:
             ply_path = splatsim_obj.object_config["ply_path"]
             splatsim_obj.gaussians.load_ply(ply_path)
@@ -708,6 +712,20 @@ class PybulletRobotServerBase:
                 test_cam_indices=[] ,
             )
             del scene
+        elif splatsim_obj.object_config.get("object_type", None) == "cuboid":
+            lx, ly, lz = splatsim_obj.object_config["size"]
+            cuboid_params = create_cuboid_gaussians(
+                side_lengths=(lx, ly, lz),
+                spacing=0.005,
+                color_rgb=(87, 51, 33), # Darker brown
+            )
+            splatsim_obj.gaussians._xyz = cuboid_params["_xyz"]
+            splatsim_obj.gaussians._rotation = cuboid_params["_rotation"]
+            splatsim_obj.gaussians._opacity = cuboid_params["_opacity"]
+            splatsim_obj.gaussians._features_rest = cuboid_params["_features_rest"]
+            splatsim_obj.gaussians._features_dc = cuboid_params["_features_dc"]
+            splatsim_obj.gaussians._scaling = cuboid_params["_scaling"]
+            need_transform_to_simulator_frame = False
         else:
             raise ValueError("Could not load gaussian splat")
         
@@ -721,16 +739,17 @@ class PybulletRobotServerBase:
 
         # Transform the xyz, rotation, and shs features to the canonical frame (the world frame for the simulator)
         # We will work in the coordinate frame of the simulator from now on
-        Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=splatsim_obj.gaussians.get_xyz.device).float() # shape (4, 4)
-        xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj = transform_object(
-            splatsim_obj=splatsim_obj, transform=Trans_canonical
-        )
-        splatsim_obj.gaussians._xyz = xyz_obj
-        splatsim_obj.gaussians._rotation = rot_obj
-        splatsim_obj.gaussians._opacity = opacity_obj
-        splatsim_obj.gaussians._features_rest = features_rest_obj
-        splatsim_obj.gaussians._features_dc = features_dc_obj
-        splatsim_obj.gaussians._scaling = scales_obj
+        if need_transform_to_simulator_frame:
+            Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=splatsim_obj.gaussians.get_xyz.device).float() # shape (4, 4)
+            xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj = transform_object(
+                splatsim_obj=splatsim_obj, transform=Trans_canonical
+            )
+            splatsim_obj.gaussians._xyz = xyz_obj
+            splatsim_obj.gaussians._rotation = rot_obj
+            splatsim_obj.gaussians._opacity = opacity_obj
+            splatsim_obj.gaussians._features_rest = features_rest_obj
+            splatsim_obj.gaussians._features_dc = features_dc_obj
+            splatsim_obj.gaussians._scaling = scales_obj
 
         return splatsim_obj
 
@@ -761,11 +780,6 @@ class PybulletRobotServerBase:
         # Find object config
         if splat_object_name is not None:
             object_config = self.object_config.get(splat_object_name, {})
-        if object_config.get("object_type", None) == "cuboid":
-            # Use the redblock object's gaussian splat b/c it's a nice rectangular prism
-            # object_config has higher priority than the redblock config if there are overlapping attributes
-            object_config = {**self.object_config["redblock"], **object_config}
-            splat_object_name = "redblock"
         elif len(object_config) == 0:
             print("WARNING: No object config found for ", splat_object_name)
 
@@ -780,35 +794,7 @@ class PybulletRobotServerBase:
             object_config=object_config
         )
 
-        if splatsim_obj.object_config.get("object_type", None) == "cuboid":
-            # Try to use a preloaded redblock
-            if self.base_cuboid_gaussians is None:
-                self.load_gaussian_splat(splatsim_obj)
-                self.base_cuboid_gaussians = gaussians
-            splatsim_obj.gaussians._xyz = self.base_cuboid_gaussians._xyz.clone()
-            splatsim_obj.gaussians._rotation = self.base_cuboid_gaussians._rotation.clone()
-            splatsim_obj.gaussians._opacity = self.base_cuboid_gaussians._opacity.clone()
-            splatsim_obj.gaussians._features_rest = self.base_cuboid_gaussians._features_rest.clone()
-            splatsim_obj.gaussians._features_dc = self.base_cuboid_gaussians._features_dc.clone()
-            splatsim_obj.gaussians._scaling = self.base_cuboid_gaussians._scaling.clone()
-
-            lx, ly, lz = splatsim_obj.object_config["size"]
-
-            # # 2. Generate the splat parameters
-            cuboid_params = create_cuboid_gaussians(
-                side_lengths=(lx, ly, lz),
-                spacing=0.005,
-                color_rgb=(87, 51, 33), # Darker brown
-            )
-
-            splatsim_obj.gaussians._xyz = cuboid_params["_xyz"]
-            splatsim_obj.gaussians._rotation = cuboid_params["_rotation"]
-            splatsim_obj.gaussians._opacity = cuboid_params["_opacity"]
-            splatsim_obj.gaussians._features_rest = cuboid_params["_features_rest"]
-            splatsim_obj.gaussians._features_dc = cuboid_params["_features_dc"]
-            splatsim_obj.gaussians._scaling = cuboid_params["_scaling"]
-        else:
-            self.load_gaussian_splat(splatsim_obj)
+        self.load_gaussian_splat(splatsim_obj)
 
         if load_urdf:
             self.load_urdf(splatsim_obj)
