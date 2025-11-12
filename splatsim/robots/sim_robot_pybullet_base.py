@@ -48,6 +48,7 @@ from splatsim.utils.robot_splat_render_utils import (
     transform_object,
     get_curr_link_states,
     crop_splat,
+    create_cuboid_gaussians,
     SplatSimObject,
 )
 from gaussian_splatting.gaussian_renderer import GaussianModel
@@ -245,6 +246,7 @@ class PybulletRobotServerBase:
         robot_name: str = "robot_iphone",
         camera_names: List[str] = ["base_rgb"],
         cam_i: int = 254,
+        image_width: int = 640,
         object_config_path: str = "./configs/object_configs/objects.yaml",
     ):
         self.serve_mode = serve_mode
@@ -252,13 +254,13 @@ class PybulletRobotServerBase:
         self.robot_name = robot_name
         self.camera_names = camera_names
         self.cam_i = cam_i
+        self.image_width = 640
 
         # load labels.npy
         self.robot_labels = np.load(
             "./data/labels_path/" + self.robot_name + "_labels.npy"
         )
         self.robot_labels = torch.from_numpy(self.robot_labels).to(device="cuda").long()
-        self.transformations_cache = None
 
         self._zmq_server = ZMQRobotServer(robot=self, host=host, port=port)
         self._zmq_server_thread = ZMQServerThread(self._zmq_server)
@@ -288,7 +290,9 @@ class PybulletRobotServerBase:
         # self.background_splat_name = self.robot_name
         # self.splatsim_background = self.splatsim_robot
 
-        self.background_splat_name = "bwa_open_space" # self.robot_name
+        self.background_splat_name = self.robot_name
+        # TODO implmeent config for different background than what robot had
+        # self.background_splat_name = "bwa_open_space" # self.robot_name
         # The background uses the robot's full splat, but crops out the robot
         self.splatsim_background: SplatSimObject = self.create_object(
             object_name="background",
@@ -349,6 +353,9 @@ class PybulletRobotServerBase:
             )
 
             splatsim_object.grasp_configs = grasp_config
+
+        # Populate this on the fly if it's needed
+        self.base_cuboid_gaussians = None
 
         self.randomize_object_pose()
 
@@ -476,7 +483,9 @@ class PybulletRobotServerBase:
                     eval=False,
                 )
             )
-            self.cam_scale = 1 #2
+            # arbitrary as long as it's consistent between initialization and setup_camera_from_dataset()
+            # because we're going to overwrite the resolution when transforming the camera
+            self.cam_scale = 1
             temp_gaussian_model = GaussianModel(3)
             self.scene = Scene(
                 dataset,
@@ -554,16 +563,121 @@ class PybulletRobotServerBase:
             print(f"Setting serve mode to {serve_mode}")
             self.serve_mode = serve_mode
 
-    def load_gaussian_splat(self, gaussians, object_config):
-        if "ply_path" in object_config:
-            ply_path = object_config["ply_path"]
-            gaussians.load_ply(ply_path)
-        elif "source_path" in object_config and "model_path" in object_config:
-            source_path = object_config["source_path"]
+    def load_urdf(self, splatsim_obj):
+        # This must be called after the gaussians are finalized
+        # ex: after the gaussians are transformed to be in the simulator's coordinate frame
+        use_fixed_base = splatsim_obj.object_config.get("use_fixed_base", False)
+        global_scaling = splatsim_obj.object_config.get("global_scaling", 1)
+        is_articulated = splatsim_obj.object_config.get("is_articulated", False)
+        base_position = splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0]
+
+        # Find possible URDF config
+        if splatsim_obj.name in self.models_lib.model_name_list:
+            urdf_path = self.models_lib[splatsim_obj.splat_name]
+        elif "urdf_path" in splatsim_obj.object_config:
+            urdf_path = splatsim_obj.object_config["urdf_path"][0]
+            if not os.path.exists(urdf_path):
+                raise FileNotFoundError(f"URDF file not found: {urdf_path}")
+        else:
+            urdf_path = None
+
+        if is_articulated:
+            flags = self.pybullet_client.URDF_USE_IMPLICIT_CYLINDER
+        else:
+            flags = 0
+
+        if urdf_path is not None:
+            # This object has an associated urdf file. Use that
+            # TODO possibly do custom quat
+            quat = self.pybullet_client.getQuaternionFromEuler([0, 0, 0])
+            object_loaded = self.pybullet_client.loadURDF(
+                urdf_path,
+                base_position,
+                quat,
+                globalScaling=global_scaling,
+                useFixedBase=use_fixed_base,
+                flags=flags,
+            )
+            mass = self.pybullet_client.getDynamicsInfo(object_loaded, -1)[0]
+        elif splatsim_obj.object_config.get("object_type", None) is not None:
+            # Find primitive shape config
+            object_type = splatsim_obj.object_config["object_type"]
+            if object_type == "cuboid":
+                # position, orientation, size
+                # TODO orientation
+                lx, ly, lz = splatsim_obj.object_config["size"]
+                position = splatsim_obj.object_config["position"]
+
+                # Apply global scaling
+                lx, ly, lz = (
+                    lx * global_scaling,
+                    ly * global_scaling,
+                    lz * global_scaling,
+                )
+                position = [
+                    position[0] * global_scaling,
+                    position[1] * global_scaling,
+                    position[2] * global_scaling,
+                ]
+
+                object_loaded = create_box(lx, ly, lz, color=BLUE)
+                set_pose(object_loaded, Pose(point=position))
+                # TODO set orientation
+                mass = (
+                    0
+                    if use_fixed_base or "mass" not in splatsim_obj.object_config
+                    else splatsim_obj.object_config["mass"]
+                )
+                self.pybullet_client.changeDynamics(object_loaded, -1, mass=mass)
+            else:
+                raise ValueError(f"Cannot create unknown object type {object_type}")
+        elif len(splatsim_obj.gaussians._xyz) > 0: # The gaussian splat was loaded, but there's no urdf
+            # Create a box that covers the gaussian means in the gaussian splat. This is an approximation
+            lx = max(splatsim_obj.gaussians._xyz[:, 0]) - min(splatsim_obj.gaussians._xyz[:, 0])
+            ly = max(splatsim_obj.gaussians._xyz[:, 1]) - min(splatsim_obj.gaussians._xyz[:, 1])
+            lz = max(splatsim_obj.gaussians._xyz[:, 2]) - min(splatsim_obj.gaussians._xyz[:, 2])
+
+            position = splatsim_obj.object_config.get("position", [0, 0, 0])
+
+            # Apply global scaling
+            lx, ly, lz = (
+                lx * global_scaling,
+                ly * global_scaling,
+                lz * global_scaling,
+            )
+            position = [
+                position[0] * global_scaling,
+                position[1] * global_scaling,
+                position[2] * global_scaling,
+            ]
+
+            object_loaded = create_box(lx, ly, lz, color=BLUE)
+            set_pose(object_loaded, Pose(point=position))
+            # TODO set orientation
+            mass = (
+                0
+                if use_fixed_base or "mass" not in splatsim_obj.object_config
+                else splatsim_obj.object_config["mass"]
+            )
+            self.pybullet_client.changeDynamics(object_loaded, -1, mass=mass)
+        else:
+            raise ValueError(
+                f"Could not parse object config for object name {splatsim_obj.name}"
+            )
+
+        splatsim_obj.sim_id = object_loaded
+        splatsim_obj.mass = mass
+
+    def load_gaussian_splat(self, splatsim_obj):
+        if "ply_path" in splatsim_obj.object_config:
+            ply_path = splatsim_obj.object_config["ply_path"]
+            splatsim_obj.gaussians.load_ply(ply_path)
+        elif "source_path" in splatsim_obj.object_config and "model_path" in splatsim_obj.object_config:
+            source_path = splatsim_obj.object_config["source_path"]
             if not os.path.exists(source_path):
                 raise FileNotFoundError(f"Source path not found: {source_path}")
 
-            model_path = object_config["model_path"]
+            model_path = splatsim_obj.object_config["model_path"]
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Model path not found: {model_path}")
 
@@ -586,7 +700,7 @@ class PybulletRobotServerBase:
             # This loads the .ply file into gaussians
             scene = Scene(
                 dataset,
-                gaussians,
+                splatsim_obj.gaussians,
                 load_iteration=-1,
                 shuffle=False,
                 resolution_scales=[],
@@ -598,14 +712,27 @@ class PybulletRobotServerBase:
             raise ValueError("Could not load gaussian splat")
         
         # Disable gradients on this gaussian splat b/c we're not optimizing
-        gaussians._xyz.requires_grad = False
-        gaussians._rotation.requires_grad = False
-        gaussians._opacity.requires_grad = False
-        gaussians._features_rest.requires_grad = False
-        gaussians._features_dc.requires_grad = False
-        gaussians._scaling.requires_grad = False
-            
-        return gaussians
+        splatsim_obj.gaussians._xyz.requires_grad = False
+        splatsim_obj.gaussians._rotation.requires_grad = False
+        splatsim_obj.gaussians._opacity.requires_grad = False
+        splatsim_obj.gaussians._features_rest.requires_grad = False
+        splatsim_obj.gaussians._features_dc.requires_grad = False
+        splatsim_obj.gaussians._scaling.requires_grad = False
+
+        # Transform the xyz, rotation, and shs features to the canonical frame (the world frame for the simulator)
+        # We will work in the coordinate frame of the simulator from now on
+        Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=splatsim_obj.gaussians.get_xyz.device).float() # shape (4, 4)
+        xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj = transform_object(
+            splatsim_obj=splatsim_obj, transform=Trans_canonical
+        )
+        splatsim_obj.gaussians._xyz = xyz_obj
+        splatsim_obj.gaussians._rotation = rot_obj
+        splatsim_obj.gaussians._opacity = opacity_obj
+        splatsim_obj.gaussians._features_rest = features_rest_obj
+        splatsim_obj.gaussians._features_dc = features_dc_obj
+        splatsim_obj.gaussians._scaling = scales_obj
+
+        return splatsim_obj
 
     def delete_object(self, object_name):
         index = [splatsim_obj.name for splatsim_obj in self.splatsim_objects].index(
@@ -638,161 +765,58 @@ class PybulletRobotServerBase:
             # Use the redblock object's gaussian splat b/c it's a nice rectangular prism
             # object_config has higher priority than the redblock config if there are overlapping attributes
             object_config = {**self.object_config["redblock"], **object_config}
+            splat_object_name = "redblock"
         elif len(object_config) == 0:
             print("WARNING: No object config found for ", splat_object_name)
 
-        use_fixed_base = object_config.get("use_fixed_base", False)
-        global_scaling = object_config.get("global_scaling", 1)
         is_articulated = object_config.get("is_articulated", False)
-        base_position = object_config.get("base_position", [[0, 0, 0]])[0]
-
-        self.load_gaussian_splat(gaussians, object_config)
-
-        # Find possible URDF config
-        if object_name in self.models_lib.model_name_list:
-            urdf_path = self.models_lib[splat_object_name]
-        elif "urdf_path" in object_config:
-            urdf_path = object_config["urdf_path"][0]
-            if not os.path.exists(urdf_path):
-                raise FileNotFoundError(f"URDF file not found: {urdf_path}")
-        else:
-            urdf_path = None
-
-        if load_urdf:
-            if is_articulated:
-                flags = self.pybullet_client.URDF_USE_IMPLICIT_CYLINDER
-            else:
-                flags = 0
-
-            if urdf_path is not None:
-                # This object has an associated urdf file. Use that
-                # TODO possibly do custom quat
-                quat = self.pybullet_client.getQuaternionFromEuler([0, 0, 0])
-                object_loaded = self.pybullet_client.loadURDF(
-                    urdf_path,
-                    base_position,
-                    quat,
-                    globalScaling=global_scaling,
-                    useFixedBase=use_fixed_base,
-                    flags=flags,
-                )
-                mass = self.pybullet_client.getDynamicsInfo(object_loaded, -1)[0]
-            elif object_config.get("object_type", None) is not None:
-                # Find primitive shape config
-                object_type = object_config["object_type"]
-                if object_type == "cuboid":
-                    # position, orientation, size
-                    # TODO orientation
-                    lx, ly, lz = object_config["size"]
-                    position = object_config["position"]
-
-                    if load_urdf:
-                        # Apply global scaling
-                        lx, ly, lz = (
-                            lx * global_scaling,
-                            ly * global_scaling,
-                            lz * global_scaling,
-                        )
-                        position = [
-                            position[0] * global_scaling,
-                            position[1] * global_scaling,
-                            position[2] * global_scaling,
-                        ]
-
-                        object_loaded = create_box(lx, ly, lz, color=BLUE)
-                        set_pose(object_loaded, Pose(point=position))
-                        # TODO set orientation
-                        mass = (
-                            0
-                            if use_fixed_base or "mass" not in object_config
-                            else object_config["mass"]
-                        )
-                        self.pybullet_client.changeDynamics(object_loaded, -1, mass=mass)
-                    else:
-                        object_loaded = None
-                        mass = 0
-
-                    # Customize the redblock splat rectanglular prism to have the right dimensions
-                    robot_scale = self.splatsim_robot.transformations_cache["transformation_scale"]
-                    for axis, actual_len in zip(range(3), [lx, ly, lz]):
-                        redblock_len = gaussians._xyz[:, axis].max() - gaussians._xyz[:, axis].min()
-                        ratio = actual_len / redblock_len / robot_scale
-                        gaussians._xyz[:, axis] = gaussians._xyz[:, axis] * ratio
-                        # Do the ratio in exponential space
-                        gaussians._scaling[:, axis] = torch.log(gaussians.get_scaling[:, axis] * ratio)
-
-                    # TODO change this to a brownish color and also adjust the size of the block to the size of the cuboid
-                else:
-                    raise ValueError(f"Cannot create unknown object type {object_type}")
-            elif len(gaussians._xyz) > 0: # The gaussian splat was loaded, but there's no urdf
-                # Create a box that covers the gaussian means in the gaussian splat. This is an approximation
-                lx = max(gaussians._xyz[:, 0]) - min(gaussians._xyz[:, 0])
-                ly = max(gaussians._xyz[:, 1]) - min(gaussians._xyz[:, 1])
-                lz = max(gaussians._xyz[:, 2]) - min(gaussians._xyz[:, 2])
-
-                position = object_config.get("position", [0, 0, 0])
-
-                # Apply global scaling
-                lx, ly, lz = (
-                    lx * global_scaling,
-                    ly * global_scaling,
-                    lz * global_scaling,
-                )
-                position = [
-                    position[0] * global_scaling,
-                    position[1] * global_scaling,
-                    position[2] * global_scaling,
-                ]
-
-                object_loaded = create_box(lx, ly, lz, color=BLUE)
-                set_pose(object_loaded, Pose(point=position))
-                # TODO set orientation
-                mass = (
-                    0
-                    if use_fixed_base or "mass" not in object_config
-                    else object_config["mass"]
-                )
-                self.pybullet_client.changeDynamics(object_loaded, -1, mass=mass)
-            else:
-                raise ValueError(
-                    f"Could not parse object config for object name {object_name}"
-                )
-        else:
-            object_loaded = None
-            mass = 0
-
-        transformations_cache = self.create_transformations_cache(object_config)
 
         splatsim_obj = SplatSimObject(
             name=object_name,
             splat_name=splat_object_name,
             gaussians=gaussians,
-            transformations_cache=transformations_cache,
             is_articulated=is_articulated,
-            sim_id=object_loaded,
-            mass=mass,
+            # set sim_id and mass later
             object_config=object_config
         )
 
-        # Transform the xyz, rotation, and shs features to the canonical frame (the world frame for the simulator)
-        # We will work in the coordinate frame of the simulator from now on
-        Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=splatsim_obj.gaussians.get_xyz.device).float() # shape (4, 4)
-        xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj = transform_object(
-            splatsim_obj=splatsim_obj, splatsim_robot=splatsim_obj, transform=Trans_canonical
-        )
+        if splatsim_obj.object_config.get("object_type", None) == "cuboid":
+            # Try to use a preloaded redblock
+            if self.base_cuboid_gaussians is None:
+                self.load_gaussian_splat(splatsim_obj)
+                self.base_cuboid_gaussians = gaussians
+            splatsim_obj.gaussians._xyz = self.base_cuboid_gaussians._xyz.clone()
+            splatsim_obj.gaussians._rotation = self.base_cuboid_gaussians._rotation.clone()
+            splatsim_obj.gaussians._opacity = self.base_cuboid_gaussians._opacity.clone()
+            splatsim_obj.gaussians._features_rest = self.base_cuboid_gaussians._features_rest.clone()
+            splatsim_obj.gaussians._features_dc = self.base_cuboid_gaussians._features_dc.clone()
+            splatsim_obj.gaussians._scaling = self.base_cuboid_gaussians._scaling.clone()
 
-        splatsim_obj.gaussians._xyz = xyz_obj
-        splatsim_obj.gaussians._rotation = rot_obj
-        splatsim_obj.gaussians._opacity = opacity_obj
-        splatsim_obj.gaussians._features_rest = features_rest_obj
-        splatsim_obj.gaussians._features_dc = features_dc_obj
-        splatsim_obj.gaussians._scaling = scales_obj
+            lx, ly, lz = splatsim_obj.object_config["size"]
 
-        if self.splatsim_robot is None and object_name == "robot":
-            # This is trying to initialize the robot
-            crop_splat(splatsim_obj, splatsim_obj, keep_within_aabb=keep_within_aabb)
+            # # 2. Generate the splat parameters
+            cuboid_params = create_cuboid_gaussians(
+                side_lengths=(lx, ly, lz),
+                spacing=0.005,
+                color_rgb=(87, 51, 33), # Darker brown
+            )
+
+            splatsim_obj.gaussians._xyz = cuboid_params["_xyz"]
+            splatsim_obj.gaussians._rotation = cuboid_params["_rotation"]
+            splatsim_obj.gaussians._opacity = cuboid_params["_opacity"]
+            splatsim_obj.gaussians._features_rest = cuboid_params["_features_rest"]
+            splatsim_obj.gaussians._features_dc = cuboid_params["_features_dc"]
+            splatsim_obj.gaussians._scaling = cuboid_params["_scaling"]
         else:
-            crop_splat(splatsim_obj, self.splatsim_robot, keep_within_aabb=keep_within_aabb)
+            self.load_gaussian_splat(splatsim_obj)
+
+        if load_urdf:
+            self.load_urdf(splatsim_obj)
+        else:
+            splatsim_obj.sim_id = None
+            splatsim_obj.mass = 0
+
+        crop_splat(splatsim_obj, keep_within_aabb=keep_within_aabb)
 
         self.splatsim_objects.append(splatsim_obj)
         return splatsim_obj
@@ -861,27 +885,6 @@ class PybulletRobotServerBase:
     def set_freedrive_mode(self, enable: bool):
         pass
 
-    def create_transformations_cache(self, object_config):
-        # object_config is in the format of an object in configs/object_configs/objects.yaml
-        object_transformation = np.array(object_config["transformation"]["matrix"])
-        object_transformation = (
-            torch.tensor(object_transformation).to(device="cuda").float()
-        )
-        object_transformation_scale = torch.pow(
-            torch.linalg.det(object_transformation[:3, :3]), 1 / 3
-        )
-        object_transformation_inv = torch.inverse(object_transformation)
-        object_transformation_inv_scale = torch.pow(
-            torch.linalg.det(object_transformation_inv[:3, :3]), 1 / 3
-        )
-        transformations_cache = {
-            "transformation": object_transformation,
-            "transformation_scale": object_transformation_scale,
-            "inv_transformation": object_transformation_inv,
-            "inv_transformation_scale": object_transformation_inv_scale,
-        }
-        return transformations_cache
-
     def get_wrist_camera(self):
         if self.wrist_camera_link_index is None:
             print("WARNING: No wrist camera index found")
@@ -900,19 +903,12 @@ class PybulletRobotServerBase:
         # robot_transformation = np.array(
         #     self.splatsim_robot.object_config["transformation"]["matrix"]
         # )
-        if self.transformations_cache is None:
-            robot_transformation = torch.tensor(
-                self.splatsim_robot.object_config["transformation"]["matrix"],
-                device="cuda",
-            )
-            robot_transformation_inv = torch.linalg.inv(robot_transformation)
-        else:
-            robot_transformation = self.transformations_cache[self.robot_name][
-                "transformation"
-            ]
-            robot_transformation_inv = self.transformations_cache[self.robot_name][
-                "inv_transformation"
-            ]
+        # TODO does the wrist camera still need to do this robot transformation?
+        robot_transformation = torch.tensor(
+            self.splatsim_robot.object_config["transformation"]["matrix"],
+            device="cuda",
+        )
+        robot_transformation_inv = torch.linalg.inv(robot_transformation)
 
         T = torch.tensor(
             link_state[0], device=robot_transformation.device
@@ -1009,7 +1005,6 @@ class PybulletRobotServerBase:
                 # Ah. it's because xyz gets overwritten
                 segmented_list, xyz = get_segmented_indices(
                     splatsim_obj=splatsim_obj,
-                    # splatsim_robot=self.splatsim_robot,  # This is to get robot transformations
                     robot_labels=self.robot_labels,
                 )
 
@@ -1022,7 +1017,6 @@ class PybulletRobotServerBase:
                     features_dc_obj,
                 ) = transform_means(
                     splatsim_obj=splatsim_obj,
-                    splatsim_robot=self.splatsim_robot,  # this is to get robot transformations
                     xyz=xyz,
                     segmented_list=segmented_list,
                     transformations_list=transformations_list,
@@ -1090,7 +1084,6 @@ class PybulletRobotServerBase:
                     features_rest_obj,
                 ) = transform_object(
                     splatsim_obj=splatsim_obj,
-                    splatsim_robot=self.splatsim_robot,
                     pos=cur_object_position,
                     quat=cur_object_rotation,
                 )
@@ -1156,52 +1149,7 @@ class PybulletRobotServerBase:
         else:
             camera = self.scene.getTestCameras(scale=self.cam_scale)[0]
 
-        # The camera was saved in the world frame of the self.splatsim_background object.
-        # Transform it to be in the coordinate frame of the simulator
-
-    #         tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    # tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    # raster_settings = GaussianRasterizationSettings(
-    #     image_height=int(viewpoint_camera.image_height),
-    #     image_width=int(viewpoint_camera.image_width),
-    #     tanfovx=tanfovx,
-    #     tanfovy=tanfovy,
-    #     bg=bg_color,
-    #     scale_modifier=scaling_modifier,
-    #     viewmatrix=viewpoint_camera.world_view_transform,
-    #     projmatrix=viewpoint_camera.full_proj_transform,
-    #     sh_degree=pc.active_sh_degree,
-    #     campos=viewpoint_camera.camera_center,
-    #     prefiltered=False,
-    #     debug=pipe.debug,
-    #     antialiasing=pipe.antialiasing
-
-
-
-
-
-        # device = camera.world_view_transform.device
-        # Trans_canonical = torch.from_numpy(np.array(self.splatsim_background.object_config['transformation']['matrix'])).to(device=device).float() # shape (4, 4)
-        # scale_obj = torch.pow(torch.linalg.det(Trans_canonical[:3, :3]), 1/3)
-        # R = Trans_canonical[:3, :3].clone()
-        # T = Trans_canonical[:3, 3].clone()
-        # Trans_canonical[:3, :3] = Trans_canonical[:3, :3] / scale_obj
-        # Trans_canonical[:3, 3] = Trans_canonical[:3, 3] / scale_obj
-        
-        # P_matrix = torch.matmul(camera.full_proj_transform, torch.linalg.inv(camera.world_view_transform))
-
-        # camera.world_view_transform = camera.world_view_transform @ Trans_canonical.T
-        # # camera.world_view_transform = camera.world_view_transform @ torch.inverse(Trans_canonical).T
-        # camera.camera_center = R @ camera.camera_center + T
-        # # camera.camera_center = (Trans_canonical @ torch.concatenate([camera.camera_center, torch.tensor([1.0], dtype=torch.float32, device=device)]))[:3]
-        # # This is calculated with the updated camera.world_view_transform
-        # camera.full_proj_transform = torch.matmul(P_matrix, camera.world_view_transform)
-
-
-
-
-
+        # Transform the camera to be in the simulator frame instead of the splatsim background object's splat frame
 
         # 1. Define device and Trans_canonical
         device = camera.world_view_transform.device
@@ -1222,7 +1170,6 @@ class PybulletRobotServerBase:
         # background camera to background frame; background frame to world
         # want: background camera to world
         M_CW_new_world_scaled = torch.matmul(Trans_canonical_full, M_CW_original_local)
-        # M_CW_new_world_scaled = torch.matmul(M_CW_original_local, Trans_canonical_full)
 
         # 4. Decompose the new world pose (just like get_wrist_camera)
         # We need to extract R_cw (scale-free), T_wc (scale-free), and scale (s)
@@ -1256,6 +1203,7 @@ class PybulletRobotServerBase:
         # 7. Initialize the New Camera
         # (Assuming other parameters are loaded as before)
         resolution = (camera.alpha_mask.shape[2], camera.alpha_mask.shape[1])
+        resolution = (self.image_width, int(resolution[1] * self.image_width / resolution[0]))
         image = torch.zeros((3, resolution[1], resolution[0])).float()
         depth_params = None
 
@@ -1275,78 +1223,6 @@ class PybulletRobotServerBase:
         )
 
         return new_camera
-
-
-
-        # # 1. Define device and Trans_canonical (from your previous code)
-        # device = camera.world_view_transform.device
-        # Trans_canonical_full = torch.from_numpy(np.array(self.splatsim_background.object_config['transformation']['matrix'])).to(device=device).float()
-
-        # # 2. Scale Normalization: Create T_pose (scale-normalized transformation)
-        # scale = torch.pow(torch.linalg.det(Trans_canonical_full[:3, :3]), 1/3)
-        # Trans_pose = Trans_canonical_full.clone()
-        # Trans_pose[:3, :3] = Trans_pose[:3, :3] / scale
-        # # removed
-        # Trans_pose[:3, 3] = Trans_pose[:3, 3] / scale # CRITICAL: Scale the translation
-
-        # # 3. Calculate Original Camera-to-World Matrix (M_CW, original)
-        # # V_original is typically the transpose of M_CW_original, but since V_original
-        # # is not guaranteed to be a pure R|T matrix (it's V=P_inv @ P_full), we use the inverse.
-        # V_original_inv = torch.linalg.inv(camera.world_view_transform.clone()).T
-        # # The translation is in the 4th row, so ensure the inverse yields an R|T matrix.
-        # # For a row-vector V: M_CW = V^T. Let's assume M_CW = V_inv for safety.
-        # M_CW_original = V_original_inv
-
-        # # 4. Calculate New Camera-to-World Matrix (M_CW, new)
-        # # M_CW_new = M_CW_original @ T_pose
-        # M_CW_new = torch.matmul(M_CW_original, Trans_pose)
-
-        # # Extract and Normalize R_cw
-        # R_cw = M_CW_new[:3, :3]
-        # T_cw = M_CW_new[:3, 3] # This is the scale-normalized T_cw
-
-        # # The R_cw matrix here is already the scale-normalized rotation from the M_CW_new calculation.
-        # # You could re-normalize if needed, but M_CW_new should be scale-free in R.
-        # # scale_recheck = torch.pow(torch.linalg.det(R_cw[:3, :3]), 1 / 3) # Should be close to 1.0
-
-        # # Calculate T_wc (World-to- Translation)
-        # # T_wc is the translation component of the VIEW MATRIX (M_CW_new)^-1
-        # Rt_wc = torch.linalg.inv(M_CW_new) # This is the new V_new
-        # T_wc = Rt_wc[:3, 3]
-
-        # # Convert to numpy for the Camera constructor
-        # R_cw_np = R_cw.detach().cpu().numpy()
-        # T_wc_np = T_wc.detach().cpu().numpy()
-        # scale_np = scale.detach().cpu().numpy()
-
-        # # 5. Initialize the New Camera
-
-        # # Define placeholders for other parameters (assuming they are set elsewhere)
-        # depth_params = None
-
-        # # t doesnt have scale, but r has scale
-        # resolution = (camera.alpha_mask.shape[2], camera.alpha_mask.shape[1])
-        # image = torch.zeros((3, resolution[1], resolution[0])).float() # Dummy image
-
-        # # No way to get the original depth params, and it's only used to initialize invdepthmap, which we have
-        # depth_params = None
-
-        # new_camera = Camera(
-        #     resolution,
-        #     camera.colmap_id,
-        #     R_cw_np,           # R_cw (Camera-to-World Rotation)
-        #     T_wc_np,           # T_wc (World-to-Camera Translation)
-        #     camera.FoVx,
-        #     camera.FoVy,
-        #     depth_params,
-        #     to_pil_image(image), # to_pil_image utility needed here
-        #     camera.invdepthmap,
-        #     camera.image_name,
-        #     camera.uid,
-        #     scale=scale_np,
-        # )
-
-        # return new_camera
 
     def get_current_ee_pose(self):
         dummy_ee_pos, dummy_ee_quat = (

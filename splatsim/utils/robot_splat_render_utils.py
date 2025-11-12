@@ -64,21 +64,11 @@ def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=Tru
 
     return transformations_list
 
-def crop_splat(splatsim_obj, splatsim_robot, keep_within_aabb=True):
+def crop_splat(splatsim_obj, keep_within_aabb=True):
     pc = splatsim_obj.gaussians
     aabb = splatsim_obj.object_config['aabb']['bounding_box']
 
-    # if splatsim_obj.transformations_cache is None:
-    #     Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=pc.get_xyz.device).float() # shape (4, 4)
-    # else:
-    #     Trans_canonical = splatsim_obj.transformations_cache["transformation"]
-    # rotation_matrix_c = Trans_canonical[:3, :3]
-    # translation_c = Trans_canonical[:3, 3]
-
     xyz_obj = copy.deepcopy(pc._xyz)
-
-    #transform the object to the canonical frame
-    # xyz_obj = torch.matmul(rotation_matrix_c, xyz_obj.T).T + translation_c
 
     #segment according to axis aligned bounding box
     segmented_indices = ((xyz_obj[:, 0] > aabb[0][0]) & (xyz_obj[:, 0] < aabb[1][0]) & (xyz_obj[:, 1] > aabb[0][1] ) & (xyz_obj[:, 1] < aabb[1][1]) & (xyz_obj[:, 2] > aabb[0][2] ) & (xyz_obj[:, 2] < aabb[1][2]))
@@ -95,37 +85,14 @@ def crop_splat(splatsim_obj, splatsim_robot, keep_within_aabb=True):
         splatsim_obj.gaussians._features_dc = pc._features_dc[segmented_indices]
         splatsim_obj.gaussians._scaling = pc._scaling[segmented_indices]
     
-def transform_means(splatsim_obj, splatsim_robot, xyz, segmented_list, transformations_list):
+def transform_means(splatsim_obj, xyz, segmented_list, transformations_list):
     # xyz is in global frame. pc is in splat frame
     pc = splatsim_obj.gaussians
-    robot_uid = splatsim_robot.sim_id
-
-    # if splatsim_robot.transformations_cache is None:
-    #     Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=pc.get_xyz.device).float() # shape (4, 4)
-    #     scale_obj = torch.pow(torch.linalg.det(Trans_canonical[:3, :3]), 1/3)
-    
-    #     Trans_robot = torch.tensor(splatsim_robot.object_config['transformation']['matrix']).to(device=xyz.get_xyz.device).float()
-    #     scale_robot = torch.pow(torch.linalg.det(Trans_robot[:3, :3]), 1/3)
-    #     inv_transformation_matrix = torch.inverse(Trans_robot)
-    #     inv_scale_robot = torch.pow(torch.linalg.det(inv_transformation_matrix[:3, :3]), 1/3)
-    # else:
-    #     Trans_canonical = splatsim_obj.transformations_cache["transformation"]
-    #     scale_obj = splatsim_obj.transformations_cache["transformation_scale"]
-    
-    #     Trans_robot = splatsim_robot.transformations_cache["transformation"]
-    #     scale_robot = splatsim_robot.transformations_cache["transformation_scale"]
-    #     inv_transformation_matrix = splatsim_robot.transformations_cache["inv_transformation"]
-    #     inv_scale_robot = splatsim_robot.transformations_cache["inv_transformation_scale"]
-    # rotation_matrix = Trans_robot[:3, :3] / scale_robot
-    # inv_rotation_matrix = inv_transformation_matrix[:3, :3] 
-    # inv_translation = inv_transformation_matrix[:3, 3]
+    robot_uid = splatsim_obj.sim_id
 
     # Note: this function does NOT handle transformation matrices with scaling factors in the rotation matrix area
     # Assume that it was handled already in object creation. The objects do not change size during runtime
     scales_obj = pc._scaling # pc.get_scaling is exp(pc._scaling)
-    # # if splatsim_obj is splatsim_robot, the scale_obj and inv_scale_robot cancel out
-    # scales_obj = scales_obj * scale_obj * inv_scale_robot
-    # scales_obj = torch.log(scales_obj)
 
     rot = pc.get_rotation
     opacity = pc.get_opacity_raw
@@ -150,94 +117,174 @@ def transform_means(splatsim_obj, splatsim_robot, xyz, segmented_list, transform
         with torch.no_grad():
             shs_featrest[segment] = shs_feat
            
-    #transform_back to splat frame
-    # xyz = torch.matmul(inv_rotation_matrix, xyz.T).T + inv_translation
-
     return xyz, rot, opacity, scales_obj, shs_featrest, shs_dc
 
-def transform_object(splatsim_obj, splatsim_robot, pos=None, quat=None, transform=None):
+def create_cuboid_gaussians(
+    side_lengths: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    spacing: float = 0.01,
+    color_rgb: tuple[int, int, int] = (139, 69, 19),  # A nice brown
+    device: str = "cuda:0"
+) -> dict[str, torch.Tensor]:
+    """
+    Generates the parameters for a dense Gaussian splat cuboid.
+
+    Args:
+        side_lengths: (lx, ly, lz) of the cuboid.
+        spacing: The distance between the center of each splat.
+                 Smaller spacing = higher resolution = more splats.
+        color_rgb: (R, G, B) tuple (0-255) for the brown color.
+        device: The torch device to create tensors on.
+
+    Returns:
+        A dictionary of tensors (xyz, scales, rotations, opacity,
+        features_dc, features_rest) that can be loaded into a 
+        Gaussian splat model.
+    """
+    
+    lx, ly, lz = side_lengths
+    
+    # 1. Create a 3D grid of points (the xyz)
+    x = torch.arange(-lx / 2, lx / 2, step=spacing, device=device)
+    y = torch.arange(-ly / 2, ly / 2, step=spacing, device=device)
+    z = torch.arange(-lz / 2, lz / 2, step=spacing, device=device)
+    
+    grid_x, grid_y, grid_z = torch.meshgrid(x, y, z, indexing="ij")
+    
+    xyz = torch.stack([grid_x.flatten(), grid_y.flatten(), grid_z.flatten()], dim=-1)
+    
+    num_points = xyz.shape[0]
+    if num_points == 0:
+        print("Warning: 0 points generated. Check side_lengths and spacing.")
+        return {}
+
+    # 2. Create small initial scales
+    # We set them in log-space (as _scaling)
+    # A small fraction of the spacing is a good start.
+    initial_scale = torch.log(torch.tensor(spacing * 0.1, device=device))
+    scales = torch.full((num_points, 3), initial_scale, device=device)
+
+    # 3. Create initial rotations (no rotation)
+    # (w, x, y, z) format for quaternion
+    rotations = torch.zeros((num_points, 4), device=device)
+    rotations[:, 0] = 1.0  # Identity quaternion
+
+    # 4. Create opacities
+    # We set them in logit-space (as _opacity)
+    # logit(0.95) is approx 2.94, so sigmoid(2.94) is 0.95 (very opaque)
+    opacity = torch.full((num_points, 1), 2.94, device=device)
+
+    # 5. Set the color (Spherical Harmonics)
+    
+    # Normalize color from [0, 255] to [0, 1]
+    color_normalized = torch.tensor(color_rgb, device=device, dtype=torch.float32) / 255.0
+    
+    # Convert to the format expected by the 3DGS SH DC component
+    # C0 = 0.28209479
+    # The DC (degree 0) feature is (color - 0.5) / C0
+    # We only set the first (DC) component
+    features_dc = torch.zeros((num_points, 1, 3), device=device)
+    features_dc[:, 0, :] = (color_normalized - 0.5) / 0.28209479
+    
+    # Set all other SH components (features_rest) to zero
+    # Assuming 15 other components (degree 3)
+    features_rest = torch.zeros((num_points, 15, 3), device=device)
+    
+    return {
+        "_xyz": xyz,
+        "_scaling": scales,
+        "_rotation": rotations,
+        "_opacity": opacity,
+        "_features_dc": features_dc,
+        "_features_rest": features_rest
+    }
+
+def transform_object(splatsim_obj, pos=None, quat=None, transform=None):
+    """
+    Transforms all properties of a Gaussian splat object (splatsim_obj)
+    using a 4x4 transformation matrix.
+    
+    This function correctly handles non-uniform scaling by using SVD
+    to decompose the transformation into its rotation and scaling components.
+    """
     assert (pos is not None and quat is not None) + (transform is not None) == 1, "Provide either (a pos and a quat) or (a 4x4 transform matrix)"
 
-    if transform is not None:
-        # Convert to pos and quat format
-        pos = transform[:3, 3]
-        scale_obj = torch.pow(torch.linalg.det(transform[:3, :3]), 1/3)
-        quat = o3.matrix_to_quaternion(transform[:3, :3] / scale_obj)
-    else:
-        scale_obj = 1
-
     pc = splatsim_obj.gaussians
+    device = pc.get_xyz.device
 
-    xyz_obj = pc.get_xyz
-    rot_obj = pc.get_rotation
+    # --- 1. Unify Input: Get one 4x4 transform matrix ---
+    if transform is None:
+        # Build the 4x4 transform matrix from pos and quat
+        transform = torch.eye(4, device=device, dtype=torch.float32)
+        
+        # Assuming o3.quaternion_to_matrix returns a torch tensor
+        # If not, you may need to cast it.
+        rot_mat_tensor = o3.quaternion_to_matrix(quat)
+        
+        # Ensure matrix and pos are on the correct device and type
+        if not isinstance(rot_mat_tensor, torch.Tensor):
+            rot_mat_tensor = torch.tensor(rot_mat_tensor, device=device, dtype=torch.float32)
+        if not isinstance(pos, torch.Tensor):
+            pos = torch.tensor(pos, device=device, dtype=torch.float32)
+            
+        transform[:3, :3] = rot_mat_tensor.to(device, torch.float32)
+        transform[:3, 3] = pos.to(device, torch.float32)
+
+    # --- 2. Decompose the 3x3 affine matrix A ---
+    A = transform[:3, :3] # Scaling + Rotation part
+    t = transform[:3, 3] # Translation part
+
+    try:
+        # Decompose A = U @ S_diag @ Vh
+        # U and Vh are rotation matrices. S_vec is a vector of singular values.
+        U, S_vec, Vh = torch.linalg.svd(A)
+    except torch._C._LinAlgError:
+        # Fallback if SVD fails (e.g., matrix is all zeros)
+        U = torch.eye(3, device=device)
+        S_vec = torch.ones(3, device=device)
+        Vh = torch.eye(3, device=device)
+
+    # --- 3. Find pure rotation R (and fix reflections) ---
+    # R = U @ Vh. (Vh is V.T)
+    R_mat = U @ Vh
+    # SVD can produce a reflection (det(R) = -1) if one scale is negative.
+    # We fix this to get a proper rotation matrix.
+    if torch.linalg.det(R_mat) < 0:
+        U[:, -1] *= -1 # Invert the last column of U
+        S_vec[-1] *= -1 # And invert the last scaling factor
+        R_mat = U @ Vh
+
+    # --- 4. Get all Gaussian properties ---
+    xyz_old = pc.get_xyz
+    rot_old = pc.get_rotation     # (N, 4) quaternions
+    scales_old = pc.get_scaling  # (N, 3) scales (already exp(log_scales))
     opacity_obj = pc.get_opacity_raw
-    scales_obj = pc.get_scaling # This is exp(pc._scaling)
-
-    scales_obj = scales_obj * scale_obj # Apply scaling in exponentiated space
-    scales_obj = torch.log(scales_obj) # Prep to save this as pc._scaling--the unexponentiated form
-
+    
     with torch.no_grad():
         features_dc_obj = pc._features_dc.clone()
         features_rest_obj = pc._features_rest.clone()
 
-    rot_rotation_matrix = o3.quaternion_to_matrix(quat)
-    rot_obj = o3.matrix_to_quaternion(rot_rotation_matrix @ o3.quaternion_to_matrix(rot_obj))
-    xyz_obj = torch.matmul(rot_rotation_matrix * scale_obj, xyz_obj.T).T + pos
-    features_rest_obj = transform_shs(features_rest_obj, rot_rotation_matrix)
+    # --- 5. Apply transformations to each property ---
+
+    # 1. Positions: Apply full A matrix and t
+    # (N, 3) @ (3, 3) -> (N, 3). Then add translation.
+    xyz_obj = (xyz_old @ A.T) + t
+
+    # 2. Rotations: Compose with pure rotation R_mat
+    # We must convert old rotations to matrices, multiply, then convert back
+    rot_old_mat = o3.quaternion_to_matrix(rot_old) # (N, 3, 3)
+    # (1, 3, 3) @ (N, 3, 3) -> (N, 3, 3)
+    rot_new_mat = R_mat.unsqueeze(0) @ rot_old_mat 
+    rot_obj = o3.matrix_to_quaternion(rot_new_mat) # (N, 4)
+
+    # 3. Scales: Multiply with pure scaling S_vec
+    # (N, 3) * (1, 3) -> (N, 3)
+    scales_new = scales_old * S_vec.unsqueeze(0)
+    scales_obj = torch.log(scales_new) # Save back in log space
+
+    # 4. SH Features: Transform with pure rotation R_mat
+    features_rest_obj = transform_shs(features_rest_obj, R_mat)
 
     return xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
-
-
-
-
-    # rot_rotation_matrix = (inv_rotation_matrix_r/inv_scale) @ o3.quaternion_to_matrix(quat)  @  (rotation_matrix_c/scale_obj)
-    # rotation_obj_matrix = o3.quaternion_to_matrix(rotation_obj)
-    # rotation_obj_matrix = rot_rotation_matrix @ rotation_obj_matrix 
-
-
-
-    # pc = splatsim_obj.gaussians
-
-    # if splatsim_obj.transformations_cache is None:
-    #     Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=pc.get_xyz.device).float() # shape (4, 4)
-    #     scale_obj = torch.pow(torch.linalg.det(Trans_canonical[:3, :3]), 1/3)
-        
-    #     Trans_robot = torch.tensor(splatsim_robot.object_config['transformation']['matrix']).to(device=pc.get_xyz.device).float()
-    #     inv_transformation_r = torch.inverse(Trans_robot)
-    #     inv_scale = torch.pow(torch.linalg.det(inv_transformation_r[:3, :3]), 1/3)
-    # else:
-    #     Trans_canonical = splatsim_obj.transformations_cache["transformation"]
-    #     scale_obj = splatsim_obj.transformations_cache["transformation_scale"]
-
-    #     Trans_robot = splatsim_robot.transformations_cache["transformation"]
-    #     inv_transformation_r = splatsim_robot.transformations_cache["inv_transformation"]
-    #     inv_scale = splatsim_robot.transformations_cache["inv_transformation_scale"]
-    # rotation_matrix_c = Trans_canonical[:3, :3]
-    # translation_c = Trans_canonical[:3, 3]
-    # inv_rotation_matrix_r = inv_transformation_r[:3, :3]
-    # inv_translation_r = inv_transformation_r[:3, 3]
-
-
-    
-    # #transform the object to the canonical frame
-    # xyz_obj = torch.matmul(rotation_matrix_c, xyz_obj.T).T + translation_c
-    
-    # rot_rotation_matrix = (inv_rotation_matrix_r/inv_scale) @ o3.quaternion_to_matrix(quat)  @  (rotation_matrix_c/scale_obj)
-    # rotation_obj_matrix = o3.quaternion_to_matrix(rotation_obj)
-    # rotation_obj_matrix = rot_rotation_matrix @ rotation_obj_matrix 
-    # rotation_obj = o3.matrix_to_quaternion(rotation_obj_matrix) 
-    
-    # # Assume that the aabb bounding box in the object_config has already been applied to the splat points
-    # # We will apply the transformations to all points in this gaussian splat
-
-    # #offset the object by the position and rotation
-    # xyz_obj = torch.matmul(o3.quaternion_to_matrix(quat), xyz_obj.T).T + pos
-    # # transform the object out of the canonical frame
-    # xyz_obj = torch.matmul(inv_rotation_matrix_r, xyz_obj.T).T + inv_translation_r
-
-    # features_rest_obj = transform_shs(features_rest_obj, rot_rotation_matrix)
-    
-    # return xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
 
 
 def transform_shs(shs_feat, rotation_matrix):
@@ -293,17 +340,8 @@ def get_segmented_indices(splatsim_obj, robot_labels=None):
 
     # Defining a cube in Gaussian space to segment out the robot
     means3D = pc.get_xyz # 3D means shape (N, 3)
-
-    # if splatsim_robot.transformations_cache is None:
-    #     Trans = torch.tensor(splatsim_robot.object_config['transformation']['matrix']).to(device=means3D.device).float() # shape (4, 4)
-    # else:
-    #     Trans = splatsim_robot.transformations_cache["transformation"]
-    # R = Trans[:3, :3]
-    # translation = Trans[:3, 3]
     
     xyz = copy.deepcopy(means3D)
-    #transform the points to the new frame
-    # xyz = torch.matmul(R, xyz.T).T + translation
     
     segmented_points = []
 
