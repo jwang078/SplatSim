@@ -171,6 +171,21 @@ def main(args):
             agent = DiffusionAgent(port="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT3M9NVB-if00-port0")
             startup_steps = 25
             query_new_joints_per_startup_step = True
+        elif args.agent == "policy_diffusion":
+            from splatsim.agents.policy_agent_new import DiffusionPolicyAgent
+            startup_steps = 2
+            agent = DiffusionPolicyAgent(env=env, save_images=False)
+            query_new_joints_per_startup_step = True
+        elif args.agent == "policy_diffusion_and_save":
+            from splatsim.agents.policy_agent_new import DiffusionPolicyAgent
+            startup_steps = 16
+            agent = DiffusionPolicyAgent(env=env, save_images=True, num_startup_steps=startup_steps)
+            query_new_joints_per_startup_step = True
+        elif args.agent == "policy_diffusion":
+            from splatsim.agents.policy_agent_new import DiffusionPolicyAgent
+            agent = DiffusionPolicyAgent(env=env, save_images=True)
+            startup_steps = 25
+            query_new_joints_per_startup_step = True
         elif args.agent == "servoing":
             from splatsim.agents.servoing_agent import ServoingAgent
             agent = ServoingAgent(port="/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT3M9NVB-if00-port0")

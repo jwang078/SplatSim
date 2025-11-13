@@ -24,10 +24,6 @@ class ReplayZarrTrajectoryAgent(Agent):
         self.last_action = np.array([0, 0, 0, 0, 0, 0, 1])  # 7-DoF
 
         self.traj_folder = traj_folder
-        traj_folder_basename = ".".join(os.path.basename(traj_folder).split(".")[:-1])
-        self.image_folder = os.path.join("output", traj_folder_basename + '_images')
-        if save_images:
-            os.makedirs(self.image_folder, exist_ok=True)
         self.save_images = save_images
         self.traj_index = -1 # for testing purposes, start with one with an obstacle
         self.t = 0
@@ -157,9 +153,6 @@ class ReplayZarrTrajectoryAgent(Agent):
                     frame = np.transpose(frame.detach().cpu().numpy(), (1, 2, 0))  # CxHxW -> HxWxC
                     frame = (frame * 255).astype(np.uint8)
                     self.image_buffers[image_name].append(frame)
-                    # image_index = len(os.listdir(self.image_folder))
-                    # image_path = os.path.join(self.image_folder, f"{image_name}_{image_index:05d}.png")
-                    # cv2.imwrite(image_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             self.last_action = angles
             return angles
         
