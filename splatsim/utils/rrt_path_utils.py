@@ -10,6 +10,9 @@ import pybullet_data
 from pybullet_planning import BASE_LINK, RED, BLUE, GREEN
 from pybullet_planning import Pose, Point, Euler
 from pybullet_planning import plan_joint_motion, get_movable_joints
+from pybullet_planning import connect, disconnect, set_camera_pose, load_pybullet, \
+    wait_for_user, set_joint_positions, get_movable_joints, plan_joint_motion, \
+    get_collision_fn, smooth_path, create_box, set_pose, Point, get_extend_fn
 from pybullet_planning import get_collision_fn, get_floating_body_collision_fn, expand_links, create_box
 from pybullet_planning import dump_world, set_pose
 from pybullet_planning import load_pybullet, connect, wait_for_user, LockRenderer, has_gui, WorldSaver, HideOutput, \
@@ -82,91 +85,31 @@ def contact_tuple_debug(pt):
     except Exception:
         pass
 
-def compute_collision_gradients_at_q(robot_id, joint_indices, q,
-                                     obstacle_ids, margin=0.1, link_indices_to_check=None,
-                                     safe_distance=0.05, obstacle_gain=1.0):
-    """
-    Compute joint-space gradient of collision penalty for a single robot configuration q.
-    Returns a gradient vector of size len(joint_indices) (numpy).
-    - margin: how far to query getClosestPoints (only returns pairs with distance <= margin)
-    - safe_distance: cost is active when d < safe_distance
-    - obstacle_gain: multiplier on gradient magnitude
-    """
-    dof = len(joint_indices)
-    grad_q = np.zeros(dof, dtype=float)
-
-    # set robot state (use resetJointState for faster non-sim)
-    for idx, qi in zip(joint_indices, q):
-        p.resetJointState(robot_id, idx, qi)
-
-    # which links to check: default all (0..n-1) + base (-1)
-    if link_indices_to_check is None:
-        # linkIndexA must be in [-1 .. n-1]. We'll skip -1 because calculateJacobian for -1 is not supported.
-        link_indices = list(range(0, p.getNumJoints(robot_id)))
-    else:
-        link_indices = link_indices_to_check
-
-    # cached zeros for jacobian call
-    zeros_q = [0.0]*dof
-    dq = [0.0]*dof
-    ddq = [0.0]*dof
-
-    for link_idx in link_indices:
-        for obs in obstacle_ids:
-            pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=margin, linkIndexA=link_idx, linkIndexB=-1)
-            if not pts:
-                continue
-            # process each close point (there can be multiple)
-            for pt in pts:
-                # tuple structure varies by pybullet version. Common mapping:
-                # pt[5] -> positionOnA_world, pt[6] -> positionOnB_world
-                # pt[7] -> contactNormalOnB (points from B -> A?), pt[8] -> contactDistance
-                try:
-                    pos_on_a = pt[5]
-                    pos_on_b = pt[6]
-                    normal_on_b = np.array(pt[7], dtype=float)
-                    dist = float(pt[8])
-                except Exception:
-                    # If indices don't match your version, print to debug
-                    contact_tuple_debug(pt)
-                    raise RuntimeError("Unexpected getClosestPoints tuple layout. Print tuple to inspect indices.")
-
-                # We need a normal that points from obstacle toward robot point (so steering away).
-                # If normal_on_b is normal on B pointing toward A, then it is the correct direction.
-                n_world = normal_on_b / (np.linalg.norm(normal_on_b) + 1e-12)
-
-                # signed distance convention: dist (positive if separated). We want cost when dist < safe_distance
-                if dist >= safe_distance:
-                    continue
-
-                # compute contact point in link-local coordinates for Jacobian
-                # need link world pose
-                link_state = p.getLinkState(robot_id, link_idx, computeForwardKinematics=1)
-                link_world_pos = link_state[0]
-                link_world_orn = link_state[1]
-                # convert pos_on_a (world) to local coordinates of the link
-                local_pos = world_to_local(link_world_pos, link_world_orn, pos_on_a)
-
-                # get linear jacobian (3 x dof) at local_pos
-                # calculateJacobian(robot, linkIndex, localPosition, jointPositions, jointVelocities, jointAccelerations)
-                import pdb; pdb.set_trace()
-                J_lin, J_ang = p.calculateJacobian(robot_id, link_idx, list(local_pos),
-                                                   list(q.tolist()), dq, ddq)
-                # J_lin is lists of lists; convert to numpy 3xdof
-                J_lin = np.array(J_lin)  # shape (3, dof)
-                # gradient of distance d wrt joints is J_lin^T * n_world (approx)
-                # cost c = 0.5 * (d - safe)^2  => dc/dd = (d - safe)
-                # d is contactDistance (positive if separated), but when penetrating it may be negative.
-                hinge = (dist - safe_distance)  # negative when inside margin
-                # gradient of cost w.r.t q: hinge * (d grad/dq) = hinge * (J^T * n)
-                grad_here = hinge * (J_lin.T.dot(n_world))  # shape (dof,)
-                grad_q += obstacle_gain * grad_here
-
-    return grad_q
-
 ###########################
 # Utility / Collision API #
 ###########################
+
+def state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01, link_indices_to_check=None, verbose=True):
+    """
+    Returns True if any robot link is closer than distance_threshold to any obstacle.
+    Uses pybullet.getClosestPoints.
+    link_indices_to_check: list of link indices to check; if None, we check all links (0..getNumJoints1)
+    """
+    set_robot_joint_positions(robot_id, joint_indices, q)
+    # Allow a small sleep for certain simulators, but generally resetJointState is immediate.
+    p.stepSimulation()
+
+    if link_indices_to_check is None:
+        link_indices_to_check = joint_indices
+
+    for link_i in link_indices_to_check:
+        for obs in obstacle_ids:
+            pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=distance_threshold, linkIndexA=link_i, linkIndexB=1)
+            if len(pts) > 0: # TODO I'm not sure why there's always 1 point in collision. setting the 1 to 0 made this always true
+                if verbose:
+                    print(f"Collision detected between link {link_i} and obstacle {obs} with points {len(pts)}")
+                return True
+    return False
 
 def get_movable_joints(robot_id):
     """Return list of joint indices for revolute/continuous/prismatic joints that we consider movable."""
@@ -200,28 +143,6 @@ def set_robot_joint_positions(robot_id, joint_indices, q):
     for idx, qi in zip(joint_indices, q):
         p.resetJointState(robot_id, idx, qi)
     p.stepSimulation()
-
-def state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01, link_indices_to_check=None, verbose=True):
-    """
-    Returns True if any robot link is closer than distance_threshold to any obstacle.
-    Uses pybullet.getClosestPoints.
-    link_indices_to_check: list of link indices to check; if None, we check all links (0..getNumJoints-1)
-    """
-    set_robot_joint_positions(robot_id, joint_indices, q)
-    # Allow a small sleep for certain simulators, but generally resetJointState is immediate.
-    p.stepSimulation()
-
-    if link_indices_to_check is None:
-        link_indices_to_check = joint_indices
-
-    for link_i in link_indices_to_check:
-        for obs in obstacle_ids:
-            pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=distance_threshold, linkIndexA=link_i, linkIndexB=-1)
-            if len(pts) > 0: # TODO I'm not sure why there's always 1 point in collision. setting the 1 to 0 made this always true
-                if verbose:
-                    print(f"Collision detected between link {link_i} and obstacle {obs} with points {len(pts)}")
-                return True
-    return False
 
 def min_distance_to_obstacles(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, max_dist=5.0):
     """Return minimum distance between robot (at q) and the set of obstacles (useful for soft cost)."""
@@ -313,16 +234,11 @@ def setup_env(args, robot_base_position):
 
     ll, ul = get_joint_limits(robot_id, joint_indices)
 
-    # For demo: create a few cuboid obstacles (user should replace with their own obstacles and keep their ids)
     obstacle_ids = []
-    # Example random obstacles (comment out and use your actual obstacles)
     for cuboid_bbox in cuboid_bboxes:
         cx, cy, cz, lx, ly, lz = cuboid_bbox
         obs = create_box(lx, ly, lz, color=RED)
         set_pose(obs, Pose(point=[cx, cy, cz]))
-        # col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[lx/2, ly/2, lz/2])
-        # vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[lx/2, ly/2, lz/2], rgbaColor=[0.8, 0.3, 0.3, 1])
-        # obs = p.createMultiBody(baseCollisionShapeIndex=col, baseVisualShapeIndex=vis, basePosition=[cx, cy, cz])
         obstacle_ids.append(obs)
     obstacle_ids.append(plane)
     obstacle_ids.append(wall)
@@ -420,7 +336,6 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limi
         print("Planning with pybullet planning...")
     # move robot to q_start
     set_robot_joint_positions(robot_id, joint_indices, q_start)
-    movable_joints = get_movable_joints(robot_id)
 
     path = plan_joint_motion(
         robot_id,
@@ -439,6 +354,7 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limi
         if verbose:
             print("PyBullet planning failed.")
         return None
+    
     path = np.array(path)
 
     # Sometimes, the plan is from end to start
@@ -448,21 +364,81 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limi
         print("RRT raw path length:", len(path))
     return path
 
+def resample_path(path: np.ndarray, n_points: int) -> np.ndarray:
+    """
+    Resamples a path to have a specific number of points using linear interpolation.
+
+    Args:
+        path: The original path (N, DOF) array.
+        n_points: The desired number of points (e.g., 120).
+
+    Returns:
+        The new, resampled path (n_points, DOF) array.
+    """
+    if not isinstance(path, np.ndarray):
+        path = np.array(path)
+        
+    n_original_points, dof = path.shape
+    
+    # 1. Create the "x" axis for the original and new paths
+    # Original: [0, 1, 2, ..., N-1]
+    original_x = np.linspace(0, 1, num=n_original_points)
+    
+    # New: [0, 0.008, 0.016, ..., 1]
+    new_x = np.linspace(0, 1, num=n_points)
+    
+    # 2. Create an empty array for the new path
+    resampled_path = np.zeros((n_points, dof))
+    
+    # 3. Interpolate each joint (column)
+    for i in range(dof):
+        joint_original = path[:, i]
+        joint_new = np.interp(new_x, original_x, joint_original)
+        resampled_path[:, i] = joint_new
+        
+    return resampled_path
+
 def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, time_per_traj, robot_update_rate, rrt_vis_fps=5, use_gui=False, verbose=True):
     N_SAMPLES = int(robot_update_rate * time_per_traj)
     # Set joints to q_start
     set_robot_joint_positions(robot_id, joint_indices, q_start)
 
+    movable_joints = get_movable_joints(robot_id)[:7]
+
     # RRT-Connect planner
     rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, ll, ul, q_start, q_goal, step_size=0.1, max_iters=40000, collision_distance=0.01, verbose=verbose)
-    # rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, ll, ul, q_start, q_goal, step_size=0.2, max_iters=20000, collision_distance=0.01)
     if rrt_path is None:
         return None
+    
+    collision_fn = get_collision_fn(
+        robot_id, 
+        movable_joints, 
+        obstacles=obstacle_ids,
+        self_collisions=True
+    )
+
+    # 0.05 radians
+    resolutions = [0.05] * len(movable_joints)
+    extend_fn = get_extend_fn(
+        robot_id, 
+        movable_joints, 
+        resolutions=resolutions
+    )
+    
+    smoothed_path = smooth_path(
+        rrt_path.tolist(),
+        extend_fn,
+        collision_fn,     # The function to check for collisions
+        iterations=50     # Number of shortcutting attempts
+    )
 
     # Convert to time-parametrized trajectory
+    # Don't use cubic spline because that might introduce obstacle collisions. Do a lerp
     num_samples = max(N_SAMPLES, len(rrt_path))
-    sampler = joints_to_trajectory(rrt_path, total_time=time_per_traj, use_cubic_spline=True)
-    ts, time_parametrized_path = sampler(n_samples=num_samples)
+    time_parametrized_path = resample_path(smoothed_path, num_samples)
+
+    # sampler = joints_to_trajectory(rrt_path, total_time=time_per_traj, use_cubic_spline=True)
+    # ts, time_parametrized_path = sampler(n_samples=num_samples)
 
     # Visualize in GUI if requested
     if use_gui:

@@ -30,6 +30,7 @@ from pybullet_planning import dump_world, set_pose
 from pybullet_planning import get_collision_fn, get_floating_body_collision_fn, expand_links, create_box
 from pybullet_planning import pairwise_collision, pairwise_collision_info, draw_collision_diagnosis, body_collision_info
 
+
 # -0.2 for x because we don't want to put obstacles in the wall
 TABLE_SPACE = ((-0.2, 0.5), (-0.5, 0.5), (0.0, 0.8))  # x,y,z
 
@@ -177,7 +178,6 @@ def add_random_obstacles(min_obstacles, max_obstacles, robot_id, robot_qs_to_avo
             for robot_q in robot_qs_to_avoid:
                 set_robot_joint_positions(robot_id, list(range(p.getNumJoints(robot_id))), robot_q)
                 p.stepSimulation()
-                # Set a slightly bigger margin to make sure RRT works ok
                 collisions = p.getClosestPoints(bodyA=body_id, bodyB=robot_id, distance=0.05)
                 if len(collisions) > 0:
                     success = False
@@ -276,12 +276,12 @@ def main(args):
             shutil.rmtree(output_dir)
         root_output = zarr.open(output_dir, mode="a")
 
-        trajs_group = root_output.require_group("trajectories")
+        scenarios_group = root_output.require_group("trajectories")
 
         # Find existing traj indices like traj_0007, traj_0123, ...
         traj_re = re.compile(r"^traj_(\d+)$")
         existing_ids = []
-        for name, node in trajs_group.items():
+        for name, node in scenarios_group.items():
             if isinstance(node, zarr.hierarchy.Group):
                 m = traj_re.match(name)
                 if m:
@@ -301,9 +301,12 @@ def main(args):
         q_start = get_random_joint_angles_without_collision(
             robot_id, joint_indices, obstacle_ids, ll, ul, verbose=args.verbose
         )
-        q_goal = get_random_joint_angles_without_collision(
-            robot_id, joint_indices, obstacle_ids, ll, ul, verbose=args.verbose
-        )
+        if args.q_goal is None:
+            q_goal = get_random_joint_angles_without_collision(
+                robot_id, joint_indices, obstacle_ids, ll, ul, verbose=args.verbose
+            )
+        else:
+            q_goal = args.q_goal
 
         base_traj = get_path(
             q_start, q_goal,
@@ -332,10 +335,10 @@ def main(args):
             for q in base_traj
         ])
 
-        obstacle_i = 0
-        obstacle_pbar = tqdm(total=args.obstacles_per_base_trajectory, desc="Obstacle Configurations")
+        obstacle_i = 1
+        obstacle_pbar = tqdm(total=args.obstacles_per_base_trajectory + 1, desc="Obstacle Configurations")
         num_obstacle_fails = 0
-        while obstacle_i < args.obstacles_per_base_trajectory and num_obstacle_fails < args.max_obstacle_fails_per_base_traj:
+        while obstacle_i < args.obstacles_per_base_trajectory + 1 and num_obstacle_fails < args.max_obstacle_fails_per_base_traj:
             num_paths_for_this_obstacle = 0
             # This also checks for collisions with the robot
             robot_qs_to_avoid = [q_start, q_goal]
@@ -378,20 +381,26 @@ def main(args):
             if not args.no_save and len(modified_trajs) > 0 and len(modified_trajs) > 0:
                 # Save one Zarr subgroup per base trajectory
                 if not saved_base_traj:
-                    traj_name = f"traj_{base_traj_i + num_prev_traj:04d}"
-                    if traj_name in trajs_group:
-                        del trajs_group[traj_name]  # replace if re-running
-                    traj_grp = trajs_group.create_group(traj_name)
-                    traj_grp.create_dataset("base_q", data=base_traj, dtype="f4", chunks=(N_SAMPLES, args.dof))
+                    traj_name = f"scenario_{base_traj_i + num_prev_traj:04d}"
+                    if traj_name in scenarios_group:
+                        del scenarios_group[traj_name]  # replace if re-running
+                    scenario_grp = scenarios_group.create_group(traj_name)
+                    no_obstacle_scenario_grp = scenario_grp.create_group("obstacle_config_00")
+                    traj_grp = no_obstacle_scenario_grp.create_group("traj_00")
+                    traj_grp.create_dataset("qs", data=base_traj, dtype="f4", chunks=(N_SAMPLES, args.dof))
+                    no_obstacle_scenario_grp.attrs["metadata"] = json.dumps({"obstacles": []})
                     saved_base_traj = True
                     base_traj_i += 1
 
-                obstacle_grp = traj_grp.create_group(f"obstacle_config_{obstacle_i:02d}")
+                obstacle_grp = scenario_grp.create_group(f"obstacle_config_{obstacle_i:02d}")
                 obstacle_grp.attrs["metadata"] = json.dumps(obstacle_info)
 
                 # Save modified trajectory as concatenated array
-                all_modified_trajs = np.stack(modified_trajs, axis=0)  # (num_modified, N_SAMPLES, dof)
-                obstacle_grp.create_dataset("modified_q", data=all_modified_trajs, dtype="f4", chunks=(1, N_SAMPLES, args.dof))
+                for i in range(len(modified_trajs)):
+                    traj_grp = obstacle_grp.create_group(f"traj_{i:02d}")
+                    traj_grp.create_dataset(f"qs", data=modified_trajs[i], dtype="f4")
+                # all_modified_trajs = np.stack(modified_trajs, axis=0)  # (num_modified, N_SAMPLES, dof)
+                # obstacle_grp.create_dataset("qs", data=all_modified_trajs, dtype="f4", chunks=(1, N_SAMPLES, args.dof))
                 if args.verbose:
                     print(f"  Saved {traj_name} with {len(modified_trajs)} modified trajectories")
                 obstacle_i += 1
@@ -478,5 +487,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--verbose", "-v", action="store_true"
     )
+    parser.add_argument(
+        "--q_goal",
+        nargs='+',  # Expect one or more arguments
+        type=float, # Convert each argument to a float
+        default=None,
+        help="Set to None to use a random goal. Otherwise, provide a space-separated list of floats."
+    )
+    # To the left side of the engine
+    # (0.8704628188464882, -2.4071832524933336, 2.190265808315341, -2.6430289436412373, -1.255085236341607, -1.9464706594109809, 0.4383191524999254)
     args = parser.parse_args()
     main(args)

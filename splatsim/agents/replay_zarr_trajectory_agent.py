@@ -1,16 +1,12 @@
 import numpy as np
-from typing import List
-import pybullet as p
 import pybullet_data
 from splatsim.agents.agent import Agent
-import pickle
 import os
-from tqdm import tqdm
 from gello.env import RobotEnv
-import cv2
 import zarr
 import re
 import json
+from collections import defaultdict
 
 
 class ReplayZarrTrajectoryAgent(Agent): 
@@ -20,6 +16,7 @@ class ReplayZarrTrajectoryAgent(Agent):
         # TODO does this need to be set?
         self.joint_signs = [1] * 6
         self.step_size = step_size
+        self.image_buffers = defaultdict(lambda: [])
 
         # env is using for setting the pose of recorded objects in the scene
         self.env = env
@@ -32,55 +29,64 @@ class ReplayZarrTrajectoryAgent(Agent):
         if save_images:
             os.makedirs(self.image_folder, exist_ok=True)
         self.save_images = save_images
-        self.traj_index = 1 #0 # for testing purposes, start with one with an obstacle
+        self.traj_index = -1 # for testing purposes, start with one with an obstacle
         self.t = 0
 
         assert traj_folder.endswith('.zarr'), "Currently only .zarr trajectory folder is supported."
         # Load the entire zarr file into memory
-        self.trajs_groups = zarr.open(traj_folder, mode='r')['trajectories']
-        traj_re = re.compile(r"^traj_(\d+)$")
+        self.scenarios_groups = zarr.open(traj_folder, mode='a')['trajectories']
+        scenario_re = re.compile(r"^scenario_(\d+)$")
         existing_ids = []
-        for name, node in self.trajs_groups.items():
-            if isinstance(node, zarr.hierarchy.Group):
-                m = traj_re.match(name)
-                if m:
-                    existing_ids.append(int(m.group(1)))
+        for name in self.scenarios_groups.keys():
+            m = scenario_re.match(name)
+            if m:
+                existing_ids.append(int(m.group(1)))
 
         # Get the list of traj_xxxx subfolders that exist in self.trajectories and use regex to get only those folders
         existing_ids.sort()
         self.trajectories = []
-        for traj_id in existing_ids:
-            traj_name = f'traj_{traj_id:04d}'
-            trajs_group = self.trajs_groups[traj_name]
-            base_q = trajs_group['base_q'][:]
-            self.trajectories.append({
-                "qs": base_q,
-                "metadata": {},
-                "path_type": "base_traj",
-                "name": f"{traj_name}_no_obstacles"
-            })
-            
+        for scenario_id in existing_ids:
+            scenario_name = f'scenario_{scenario_id:04d}'
+            scenarios_group = self.scenarios_groups[scenario_name]
+
             obstacle_re = re.compile(r"^obstacle_config_(\d+)$")
-            for obstacle_name, node in trajs_group.items():
-                m = obstacle_re.match(obstacle_name)
-                if m:
-                    obstacle_config = trajs_group[obstacle_name]
-
-                    modified_q = np.array(obstacle_config["modified_q"]).reshape(-1, 120, 7) # TODO test if this is right
-                    # obstacle config is inside attrs
+            for obstacle_name in scenarios_group.keys():
+                if obstacle_re.match(obstacle_name):
+                    obstacle_config = scenarios_group[obstacle_name]
+                    # obstacle config is inside .zattrs
                     obstacle_config_json = json.loads(obstacle_config.attrs['metadata'])
-                    for path_i in range(len(modified_q)):
-                        self.trajectories.append({
-                            "qs": modified_q[path_i],
-                            "metadata": obstacle_config_json,
-                            "path_type": "modified_traj",
-                            "name": f"{traj_name}_{obstacle_name}_{path_i+1}"
-                        })
 
-            path_names = [traj["name"] for traj in self.trajectories]
+                    traj_re = re.compile(r"^traj_(\d+)$")
+                    for trajs_name in obstacle_config.keys():
+                        if traj_re.match(trajs_name):
+                            traj_group = obstacle_config[trajs_name]
+                            qs = np.array(traj_group['qs'])
+                            assert qs.ndim == 2 and qs.shape[1] == len(self.last_action)
+                            
+                            self.trajectories.append({
+                                "qs": qs,
+                                "metadata": obstacle_config_json,
+                                "path_type": "modified_traj",
+                                "name": f"{scenario_name}_{obstacle_name}_{trajs_name}",
+                                "zarr_group": traj_group,
+                            })
         self.loaded_obstacle_names = []
 
+        self.load_next_recorded_trajectory()
+
     def load_next_recorded_trajectory(self):
+        if self.save_images:
+            for key in self.image_buffers.keys():
+                if len(self.image_buffers[key]) > 0:
+                    # Create the zarr dataset
+                    zarr_group = self.trajectories[self.traj_index]["zarr_group"]
+                    if key in zarr_group:
+                        del zarr_group[key] # replace if re-running
+                    # images_group = zarr_group.create_group("images")
+                    images = np.stack(self.image_buffers[key], axis=0)
+                    zarr_group.create_dataset(key, data=images, dtype="f4")
+                self.image_buffers[key] = []
+
         self.traj_index += 1
         self.t = 0
 
@@ -118,13 +124,12 @@ class ReplayZarrTrajectoryAgent(Agent):
                 return None  # No more trajectory steps available
             
         # TODO save it corrrectly so it doesn't need this :7
-        
         cur_joint = traj[self.t, :7]
         cur_joint = cur_joint.tolist()
         # Add the world joint to the recorded joint state
         # cur_joint = [0] + cur_joint 
         cur_joint = np.array(cur_joint)
-        self.t += 1 * 3
+        self.t += 1
 
         # TODO Other objects not supported at the moment
         # object_list = [object_position_key[:-len("_position")] for object_position_key in data.keys() if object_position_key.endswith("_position")]
@@ -151,9 +156,10 @@ class ReplayZarrTrajectoryAgent(Agent):
                     frame = obs[image_name]
                     frame = np.transpose(frame.detach().cpu().numpy(), (1, 2, 0))  # CxHxW -> HxWxC
                     frame = (frame * 255).astype(np.uint8)
-                    image_index = len(os.listdir(self.image_folder))
-                    image_path = os.path.join(self.image_folder, f"{image_name}_{image_index:05d}.png")
-                    cv2.imwrite(image_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    self.image_buffers[image_name].append(frame)
+                    # image_index = len(os.listdir(self.image_folder))
+                    # image_path = os.path.join(self.image_folder, f"{image_name}_{image_index:05d}.png")
+                    # cv2.imwrite(image_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             self.last_action = angles
             return angles
         

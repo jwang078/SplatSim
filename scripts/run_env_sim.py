@@ -211,7 +211,7 @@ def main(args):
             from splatsim.agents.replay_zarr_trajectory_agent import ReplayZarrTrajectoryAgent
             with open("configs/folder_configs.yaml", "r") as file:
                 folder_config = yaml.safe_load(file)
-            traj_folder = "./output/obstacles_on_path.zarr" # temporary hardcoding
+            traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
             # traj_folder = "./output/test_obstacles.zarr" # temporary hardcoding
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
             startup_steps = 2
@@ -220,7 +220,7 @@ def main(args):
             from splatsim.agents.replay_zarr_trajectory_agent import ReplayZarrTrajectoryAgent
             with open("configs/folder_configs.yaml", "r") as file:
                 folder_config = yaml.safe_load(file)
-            traj_folder = "./output/obstacles_on_path.zarr" # temporary hardcoding
+            traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
             # traj_folder = "./output/test_obstacles.zarr" # temporary hardcoding
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=True)
             startup_steps = 2

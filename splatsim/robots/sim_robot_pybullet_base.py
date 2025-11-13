@@ -247,6 +247,7 @@ class PybulletRobotServerBase:
         camera_names: List[str] = ["base_rgb"],
         cam_i: int = 254,
         image_width: int = 640,
+        image_height: Optional[int] = None,
         object_config_path: str = "./configs/object_configs/objects.yaml",
     ):
         self.serve_mode = serve_mode
@@ -254,7 +255,8 @@ class PybulletRobotServerBase:
         self.robot_name = robot_name
         self.camera_names = camera_names
         self.cam_i = cam_i
-        self.image_width = 640
+        self.image_width = image_width
+        self.image_height = image_height
 
         # load labels.npy
         self.robot_labels = np.load(
@@ -1189,7 +1191,22 @@ class PybulletRobotServerBase:
         # 7. Initialize the New Camera
         # (Assuming other parameters are loaded as before)
         resolution = (camera.alpha_mask.shape[2], camera.alpha_mask.shape[1])
-        resolution = (self.image_width, int(resolution[1] * self.image_width / resolution[0]))
+        if self.image_width is None:
+            if self.image_height is None:
+                image_width = resolution[0]
+                image_height = resolution[1]
+            else:
+                image_width = int(resolution[0] * self.image_width / resolution[1])
+                image_height = self.image_height
+        else:
+            if self.image_height is None:
+                image_width = self.image_width
+                image_height = int(resolution[1] * self.image_width / resolution[0])
+            else:
+                image_width = self.image_width
+                image_height = self.image_height
+
+        resolution = (image_width, image_height)
         image = torch.zeros((3, resolution[1], resolution[0])).float()
         depth_params = None
 
