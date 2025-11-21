@@ -19,7 +19,21 @@ class DiffusionPolicyAgent(Agent):
         self,
         env: RobotEnv,
         save_images: bool = False,
-        ckpt_path="/home/jennyw2/code/diffusion_policy/data/outputs/2025.11.13/16.04.06_train_diffusion_unet_hybrid_splatsim_obstacle_avoidance/checkpoints/epoch=0050-test_mean_score=0.000.ckpt",
+        # ckpt_path="/home/jennyw2/code/diffusion_policy/data/outputs/2025.11.13/16.04.06_train_diffusion_unet_hybrid_splatsim_obstacle_avoidance/checkpoints/epoch=0050-test_mean_score=0.000.ckpt",
+        # residual_to_first_step: bool = False, #True,
+        
+        # good ish
+        # ckpt_path="/home/jennyw2/code/diffusion_policy/data/outputs/2025.11.14/10.39.52_train_diffusion_unet_hybrid_splatsim_obstacle_avoidance/checkpoints/latest.ckpt",
+        # residual_to_first_step: bool = False, #True,
+        
+        # 11/18/25 residual policy
+        # ckpt_path="/home/jennyw2/code/diffusion_policy/data/outputs/2025.11.18/15.42.35_train_diffusion_unet_hybrid_splatsim_obstacle_avoidance/checkpoints/epoch=0060-test_mean_score=0.000.ckpt",
+        # residual_to_first_step: bool = True,
+
+        # 11/19/25 umi repo
+        ckpt_path="/home/jennyw2/code/universal_manipulation_interface/data/outputs/2025.11.19/11.39.12_train_diffusion_unet_timm_splatsim_umi/checkpoints/epoch=0050-train_loss=0.035.ckpt",
+        residual_to_first_step: bool = False,
+
         image_names=["base_rgb"],
     ):
         # TODO later put the step size to 1 when using a better machine
@@ -30,15 +44,23 @@ class DiffusionPolicyAgent(Agent):
         self.image_names = image_names
         self.obs_buffers = {**{key: [] for key in self.image_names}, **{"agent_pos": []}}
 
+        self.residual_to_first_step = residual_to_first_step
+
         # env is using for setting the pose of recorded objects in the scene
         self.env = env
 
         self.obs_buffer = defaultdict(lambda: [])
         self.save_images = save_images
+        self.last_action = None
 
         self.policy = None
         self.policy_cfg = None
         self.load_policy()
+
+        self.env._robot.enable_rendering()
+
+        self.pred_trajectory_buffer = []
+        self.pred_trajectory_buffer_i = float("inf")
 
     def load_policy(self):
         print("Loading policy from:", self.ckpt_path)
@@ -61,36 +83,23 @@ class DiffusionPolicyAgent(Agent):
         # set inference params
         self.policy.num_inference_steps = 16  # DDIM inference iterations
         self.policy.n_action_steps = (
-            self.policy.horizon - self.policy.n_obs_steps + 1
+            16 - 2 + 1
+            # self.policy.horizon - self.policy.n_obs_steps + 1
         )
+        self.target_obs_buffer_len = 2
 
-        self.policy.reset()
+        # self.policy.reset()
         print("Successfully loaded policy")
 
     def get_obs_for_policy(self):
         # TODO this format can be taken from the configs probably
-        # TODO uh is it true that you don't need normalization on the observations? is it done internally?
-        return {key: np.stack(self.obs_buffer[key])[None] for key in self.obs_buffer}
-
-    def next_trajectory_step(self):
-        if self.traj_index >= len(self.trajectories):
-            return None
-
-        traj = np.array(self.trajectories[self.traj_index]["qs"])
-
-        if self.t >= len(traj):
-            self.load_next_recorded_trajectory()
-            if self.traj_index >= len(self.trajectories):
-                return None  # No more trajectory steps available
-
-        # TODO save it corrrectly so it doesn't need this :7
-        cur_joint = traj[self.t, :7]
-        cur_joint = cur_joint.tolist()
-        # Add the world joint to the recorded joint state
-        # cur_joint = [0] + cur_joint
-        cur_joint = np.array(cur_joint)
-
-        return cur_joint
+        obs = {key: torch.tensor(np.stack(self.obs_buffer[key])[None], device="cuda") for key in self.obs_buffer}
+        actual_obs = {
+            "robot0_base_rgb": obs["base_rgb"],
+            "robot0_qs": obs["agent_pos"][:, :, :6],
+            "robot0_gripper_width": obs["agent_pos"][:, :, 6:7],
+        }
+        return actual_obs
     
     def add_obs_to_buffer(self, obs):
         # The buffers have the oldest image at the 0th index
@@ -98,20 +107,42 @@ class DiffusionPolicyAgent(Agent):
         self.obs_buffer["agent_pos"].append(obs["joint_positions"])
         for image_name in self.image_names:
             self.obs_buffer[image_name].append(obs[image_name])
-        if len(self.obs_buffer[self.image_names[0]]) > self.policy_cfg.horizon:
+        if len(self.obs_buffer[self.image_names[0]]) > self.target_obs_buffer_len:
             for obs_name in self.obs_buffer.keys():
                 self.obs_buffer[obs_name].pop(0)
 
     def act(self, obs):
         # Fill the time horizon buffer until it represents the full time horizon
-        while not len(self.obs_buffer[self.image_names[0]]) == self.policy_cfg.horizon:
+        while len(self.obs_buffer[self.image_names[0]]) < self.target_obs_buffer_len - 1:
             self.add_obs_to_buffer(obs)
+
+        self.add_obs_to_buffer(obs)
         
-        policy_obs = self.get_obs_for_policy()
-        action = self.policy.predict_action(policy_obs)
-        # has keys action and action_pred
-        # action_pred is (1, 16, 7). Take the 7 DOF angles
-        angles = action["action_pred"][0, 1].detach().cpu().numpy()
+        if self.pred_trajectory_buffer_i >= 1 * len(self.pred_trajectory_buffer):
+            policy_obs = self.get_obs_for_policy()
+            print("obs", policy_obs['robot0_qs'][:, :, 0])
+            action = self.policy.predict_action(policy_obs)
+            # action_pred is (1, 16, 7). Take the 7 DOF angles
+            self.pred_trajectory_buffer = action["action"][0].detach().cpu().numpy()
+            print("action", self.pred_trajectory_buffer[:, 0])
+            if self.residual_to_first_step:
+                # TODO make sure that the action really is in residual form
+                import pdb; pdb.set_trace()
+                self.pred_trajectory_buffer[1:] += self.pred_trajectory_buffer[0]
+            self.pred_trajectory_buffer_i = 0
+
+            # This does not help. the similarity scores are bad
+            # compute cosine similarity between self.last_action and each step of self.pred_trajectory_buffer
+            # if self.last_action is not None:
+            #     sim = [np.linalg.norm(np.array(self.last_action) - self.pred_trajectory_buffer[i]) for i in range(len(self.pred_trajectory_buffer))]
+            #     # sim = [np.array(self.last_action) @ self.pred_trajectory_buffer[i] / (np.linalg.norm(self.last_action) * np.linalg.norm(self.pred_trajectory_buffer[i]) + 1e-8) for i in range(len(self.pred_trajectory_buffer))]
+            #     sim_i = np.argmax(sim)
+            #     print(f"Similarity index: {sim_i}, sims: {sim}")
+            #     self.pred_trajectory_buffer_i = sim_i
+            print("update!")
+
+        angles = self.pred_trajectory_buffer[self.pred_trajectory_buffer_i]
+        self.pred_trajectory_buffer_i += 1
 
         if self.save_images:
             for image_name in [
@@ -126,7 +157,7 @@ class DiffusionPolicyAgent(Agent):
                 frame = (frame * 255).astype(np.uint8)
                 self.obs_buffers[image_name].append(frame)
 
-        self.add_obs_to_buffer(obs)
+        self.last_action = angles
 
         return angles
 

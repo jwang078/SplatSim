@@ -227,7 +227,7 @@ def main(args):
             with open("configs/folder_configs.yaml", "r") as file:
                 folder_config = yaml.safe_load(file)
             traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
-            # traj_folder = "./output/test_obstacles.zarr" # temporary hardcoding
+            # traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
             startup_steps = 2
             query_new_joints_per_startup_step = False
@@ -236,7 +236,7 @@ def main(args):
             with open("configs/folder_configs.yaml", "r") as file:
                 folder_config = yaml.safe_load(file)
             traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
-            # traj_folder = "./output/test_obstacles.zarr" # temporary hardcoding
+            # traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=True)
             startup_steps = 2
             query_new_joints_per_startup_step = False
@@ -260,7 +260,7 @@ def main(args):
     #if start pose is of dimension 7 and joints is of dimension 6, then add last element to joints
     if start_pos.shape[0] == 7 and joints.shape[0] == 6:
         joints = np.append(joints, start_pos[-1])
-        
+
     
     print('start_pos:', start_pos)
     print('joints:', joints)

@@ -8,8 +8,16 @@ import re
 import json
 from collections import defaultdict
 
+from dataclasses import dataclass
 
 class ReplayZarrTrajectoryAgent(Agent): 
+    NUM_STEPS_TO_SETTLE_BETWEEN_TRAJS = 100
+
+    @dataclass
+    class STATE:
+        EXECUTING_TRAJ: str = "EXECUTING_TRAJ"
+        SETTLING: str = "SETTLING"
+
     def __init__(self, traj_folder: str, env: RobotEnv, save_images: bool = False, step_size=5):
         # TODO later put the step size to 1 when using a better machine
         self.robot = None
@@ -18,10 +26,16 @@ class ReplayZarrTrajectoryAgent(Agent):
         self.step_size = step_size
         self.image_buffers = defaultdict(lambda: [])
 
+
+        self.settle_steps_remaining = self.NUM_STEPS_TO_SETTLE_BETWEEN_TRAJS
+
         # env is using for setting the pose of recorded objects in the scene
         self.env = env
 
-        self.last_action = np.array([0, 0, 0, 0, 0, 0, 1])  # 7-DoF
+        self.state = self.STATE.SETTLING
+        self.env._robot.disable_rendering()
+
+        self.last_action = None
 
         self.traj_folder = traj_folder
         self.save_images = save_images
@@ -57,7 +71,7 @@ class ReplayZarrTrajectoryAgent(Agent):
                         if traj_re.match(trajs_name):
                             traj_group = obstacle_config[trajs_name]
                             qs = np.array(traj_group['qs'])
-                            assert qs.ndim == 2 and qs.shape[1] == len(self.last_action)
+                            assert qs.ndim == 2
                             
                             self.trajectories.append({
                                 "qs": qs,
@@ -71,6 +85,15 @@ class ReplayZarrTrajectoryAgent(Agent):
         self.load_next_recorded_trajectory()
 
     def load_next_recorded_trajectory(self):
+        # Clean up the previous trajectory
+        # This clears everything, even if the object was created by another script
+        deleted_obj_names = self.env._robot.clear_temp_objects()
+
+        for obstacle_name in self.loaded_obstacle_names:
+            if obstacle_name not in deleted_obj_names:
+                # Still have to clean it up
+                self.env._robot.delete_object(obstacle_name)
+        
         if self.save_images:
             for key in self.image_buffers.keys():
                 if len(self.image_buffers[key]) > 0:
@@ -86,9 +109,9 @@ class ReplayZarrTrajectoryAgent(Agent):
         self.traj_index += 1
         self.t = 0
 
+        # Load new trajectory
+
         # Load new static obstacles
-        for obstacle_name in self.loaded_obstacle_names:
-            self.env._robot.delete_object(obstacle_name)
         self.loaded_obstacle_names = []
     
         obstacle_config_json = self.trajectories[self.traj_index]["metadata"]
@@ -109,35 +132,42 @@ class ReplayZarrTrajectoryAgent(Agent):
                 raise ValueError(f"Unknown obstacle type {obstacle['type']}")
 
     def next_trajectory_step(self):
-        if self.traj_index >= len(self.trajectories):
-            return None
-        
-        traj = np.array(self.trajectories[self.traj_index]['qs'])
-
-        if self.t >= len(traj):
-            self.load_next_recorded_trajectory()
+        if self.last_action is not None and self.state == self.STATE.SETTLING:
+            if self.settle_steps_remaining > 0:
+                self.settle_steps_remaining -= 1
+            else:
+                # Finished settling, switch to executing trajectory
+                # TODO check for off by one errors
+                self.state = self.STATE.EXECUTING_TRAJ
+                self.env._robot.enable_rendering()
+                print("Shifting from settling to executing")
+            cur_joint = self.last_action
+        elif self.last_action is None or self.state == self.STATE.EXECUTING_TRAJ:
             if self.traj_index >= len(self.trajectories):
-                return None  # No more trajectory steps available
+                return None
             
-        # TODO save it corrrectly so it doesn't need this :7
-        cur_joint = traj[self.t, :7]
-        cur_joint = cur_joint.tolist()
-        # Add the world joint to the recorded joint state
-        # cur_joint = [0] + cur_joint 
-        cur_joint = np.array(cur_joint)
-        self.t += 1
+            traj = np.array(self.trajectories[self.traj_index]['qs'])
 
-        # TODO Other objects not supported at the moment
-        # object_list = [object_position_key[:-len("_position")] for object_position_key in data.keys() if object_position_key.endswith("_position")]
-        # # gripper_position is for gello integration. Ignore this value
-        # if "gripper" in object_list:
-        #     object_list.remove("gripper")
-        # for object_name in object_list:
-        #     cur_object_position = np.array(data[object_name + '_position'])
-        #     cur_object_rotation = np.array(data[object_name + '_orientation'])
-        #     # cur_object_rotation = np.roll(cur_object_rotation, 1)
-        #     # Disable gravity for objects when replaying a trajectory so that there's no jittering
-        #     self.env._robot.set_object_pose(object_name, cur_object_position, cur_object_rotation, use_gravity=False)
+            if self.t >= len(traj):
+                self.load_next_recorded_trajectory()
+                if self.traj_index >= len(self.trajectories):
+                    return None  # No more trajectory steps available
+                self.state = self.STATE.SETTLING
+                # TODO check for off by one errors
+                self.settle_steps_remaining = self.NUM_STEPS_TO_SETTLE_BETWEEN_TRAJS
+                self.env._robot.disable_rendering()
+                print("Shifting from executing to settling")
+                
+            # TODO save it corrrectly so it doesn't need this :7
+            cur_joint = traj[self.t, :7]
+            cur_joint = cur_joint.tolist()
+            cur_joint = np.array(cur_joint)
+            self.t += 1
+        else:
+            raise ValueError(f"Unknown state {self.state}")
+        
+        if cur_joint.shape[0] == 6:
+            cur_joint = np.append(cur_joint, 0) # assume gripper is in the open position (1)
 
         return cur_joint
 

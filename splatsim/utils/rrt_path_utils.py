@@ -3,7 +3,7 @@ import math
 import pybullet as p
 import pybullet_data
 import time
-import random
+import itertools
 
 import pybullet as p
 import pybullet_data
@@ -137,11 +137,13 @@ def get_joint_limits(robot_id, joint_indices):
             lower, upper = -math.pi, math.pi
         lowers.append(lower)
         uppers.append(upper)
-    return np.array(lowers)[:7], np.array(uppers)[:7]
+    return np.array(lowers), np.array(uppers)
 
 def set_robot_joint_positions(robot_id, joint_indices, q):
     for idx, qi in zip(joint_indices, q):
         p.resetJointState(robot_id, idx, qi)
+    # Always assume that the robot gripper is open in these demos
+    open_gripper(robot_id)
     p.stepSimulation()
 
 def min_distance_to_obstacles(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, max_dist=5.0):
@@ -228,9 +230,9 @@ def setup_env(args, robot_base_position):
     # get joints
     joint_indices = get_movable_joints(robot_id)
     if len(joint_indices) != 7:
-        print("Warning: detected movable joints:", len(joint_indices), "expected 7 .")
+        print("Warning: detected movable joints:", len(joint_indices), "expected 6 (no dof for gripper) .")
         print("taking the first 7")
-        joint_indices = joint_indices[:7]
+        joint_indices = joint_indices[:6]
 
     ll, ul = get_joint_limits(robot_id, joint_indices)
 
@@ -273,63 +275,7 @@ def are_adjacent_links(robot_id, linkA, linkB):
     parentB = p.getJointInfo(robot_id, linkB)[16]
     return parentA == linkB or parentB == linkA
 
-def is_in_collision_pybullet(robot_id, joint_indices, q, obstacle_ids):
-    set_robot_joint_positions(robot_id, joint_indices, q)
-
-    # collision_fn = get_collision_fn(
-    #     robot_id,
-    #     joint_indices,
-    #     obstacles=obstacle_ids,
-    #     attachments=[],
-    #     self_collisions=True,
-    #     disabled_collisions=set(),
-    # )
-    
-    # 1. Build a map of link index -> link name for readable output
-    # This is crucial for debugging!
-    index_to_link_name = {}
-    try:
-        # The base link is always index -1
-        base_name = p.getBodyInfo(robot_id)[0].decode('UTF-8')
-        index_to_link_name[-1] = base_name
-    except Exception:
-        index_to_link_name[-1] = "base_link" # Fallback
-
-    for i in range(p.getNumJoints(robot_id)):
-        info = p.getJointInfo(robot_id, i)
-        link_name = info[12].decode('UTF-8')
-        index_to_link_name[i] = link_name
-        
-    # 3. Perform the collision check
-    # We must call this *after* setting the joint states
-    contacts = p.getContactPoints(bodyA=robot_id, bodyB=robot_id)
-
-    # 4. Process and print the results
-    colliding_pairs = set()
-    if len(contacts) > 0:
-        print(f"Found {len(contacts)} contact points (possible self-collisions):")
-        for contact in contacts:
-            link_a_index = contact[3]
-            link_b_index = contact[4]
-
-            # Sort indices to avoid duplicates (e.g., (1, 2) and (2, 1))
-            pair = tuple(sorted((link_a_index, link_b_index)))
-            
-            if pair not in colliding_pairs:
-                link_a_name = index_to_link_name.get(link_a_index, f"UnknownLink({link_a_index})")
-                link_b_name = index_to_link_name.get(link_b_index, f"UnknownLink({link_b_index})")
-                
-                print(f"  - Collision between: {link_a_name} (idx {link_a_index}) and {link_b_name} (idx {link_b_index})")
-                colliding_pairs.add(pair)
-        
-        import pdb; pdb.set_trace()
-        return True # Collision detected
-    else:
-        print("No self-collisions detected.")
-        return False # No collision
-    return collision_fn(q)
-
-def get_rrt_plan(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, q_start, q_goal, step_size=0.1, max_iters=20000, collision_distance=0.01, verbose=True):
+def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal, verbose=True):
     # Use pybullet planning
 
     if verbose:
@@ -363,6 +309,55 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limi
     if verbose:
         print("RRT raw path length:", len(path))
     return path
+
+def resample_path_by_distance(path: np.ndarray, n_points: int) -> np.ndarray:
+    """
+    Resamples a path to have a specific number of points, spaced
+    evenly by distance (arc length) along the path.
+
+    Args:
+        path: The original path (N, DOF) array.
+        n_points: The desired number of points.
+
+    Returns:
+        The new, resampled path (n_points, DOF) array.
+    """
+    if not isinstance(path, np.ndarray):
+        path = np.array(path)
+        
+    n_original_points, dof = path.shape
+    if n_original_points < 2:
+        # Not enough points to interpolate
+        return path
+
+    # 1. Calculate the distance between each original point
+    # diffs is (N-1, DOF)
+    diffs = np.diff(path, axis=0)
+    # dists is (N-1,)
+    dists = np.linalg.norm(diffs, axis=1)
+
+    # 2. Calculate the cumulative distance (arc length) at each original point
+    # cum_dists is (N,)
+    cum_dists = np.zeros(n_original_points)
+    cum_dists[1:] = np.cumsum(dists)
+    total_dist = cum_dists[-1]
+
+    # 3. Create the new, evenly spaced distance markers
+    # new_dists is (n_points,)
+    new_dists = np.linspace(0, total_dist, num=n_points)
+    
+    # 4. Create an empty array for the new path
+    resampled_path = np.zeros((n_points, dof))
+    
+    # 5. Interpolate each joint (column)
+    for i in range(dof):
+        joint_original = path[:, i]
+        # Use cum_dists as the 'x' axis and joint_original as the 'y' axis
+        # Use new_dists as the new 'x' axis to query
+        joint_new = np.interp(new_dists, cum_dists, joint_original)
+        resampled_path[:, i] = joint_new
+        
+    return resampled_path
 
 def resample_path(path: np.ndarray, n_points: int) -> np.ndarray:
     """
@@ -398,30 +393,60 @@ def resample_path(path: np.ndarray, n_points: int) -> np.ndarray:
         
     return resampled_path
 
+def open_gripper(robot_id):
+    # A very hardcoded and temporary solution
+    for idx in range(7, p.getNumJoints(robot_id)):
+        p.resetJointState(robot_id, idx, 0.0)
+    p.stepSimulation()
+
 def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, time_per_traj, robot_update_rate, rrt_vis_fps=5, use_gui=False, verbose=True):
     N_SAMPLES = int(robot_update_rate * time_per_traj)
     # Set joints to q_start
     set_robot_joint_positions(robot_id, joint_indices, q_start)
 
-    movable_joints = get_movable_joints(robot_id)[:7]
+    # movable_joints = get_movable_joints(robot_id)
 
     # RRT-Connect planner
-    rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, ll, ul, q_start, q_goal, step_size=0.1, max_iters=40000, collision_distance=0.01, verbose=verbose)
+    rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal, verbose=verbose)
     if rrt_path is None:
         return None
     
-    collision_fn = get_collision_fn(
-        robot_id, 
-        movable_joints, 
-        obstacles=obstacle_ids,
-        self_collisions=True
-    )
+    
+    def collision_all_links(q, distance=0.0):
+        # q is a sequence for movable_joints
+        set_robot_joint_positions(robot_id, joint_indices, q)
+        open_gripper(robot_id)
+
+        # let the solver update (resetJointState is immediate but step once to be safe)
+        p.stepSimulation()
+        # check base link (-1) and all child links
+        for link_i in range(-1, p.getNumJoints(robot_id)):
+            for obs in obstacle_ids:
+                pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=distance,
+                                         linkIndexA=link_i, linkIndexB=-1)
+                if len(pts) > 0:
+                    return True
+        # Optionally check self-collisions (uncomment if desired)
+        for a,b in itertools.combinations(range(-1, p.getNumJoints(robot_id)), 2):
+            if not are_adjacent_links(robot_id, a, b):
+                if len(p.getClosestPoints(robot_id, robot_id, distance, linkIndexA=a, linkIndexB=b))>0:
+                    return True
+        return False
+    collision_fn = collision_all_links
+    
+    # Only checks a subset of all movable joints (aka doesn't check gripper fingers)
+    # collision_fn = get_collision_fn(
+    #     robot_id, 
+    #     joint_indices, 
+    #     obstacles=obstacle_ids,
+    #     self_collisions=True
+    # )
 
     # 0.05 radians
-    resolutions = [0.05] * len(movable_joints)
+    resolutions = [0.05] * len(joint_indices)
     extend_fn = get_extend_fn(
         robot_id, 
-        movable_joints, 
+        joint_indices, 
         resolutions=resolutions
     )
     
@@ -435,7 +460,7 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, tim
     # Convert to time-parametrized trajectory
     # Don't use cubic spline because that might introduce obstacle collisions. Do a lerp
     num_samples = max(N_SAMPLES, len(rrt_path))
-    time_parametrized_path = resample_path(smoothed_path, num_samples)
+    time_parametrized_path = resample_path_by_distance(smoothed_path, num_samples)
 
     # sampler = joints_to_trajectory(rrt_path, total_time=time_per_traj, use_cubic_spline=True)
     # ts, time_parametrized_path = sampler(n_samples=num_samples)

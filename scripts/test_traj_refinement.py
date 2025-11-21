@@ -158,22 +158,6 @@ def add_random_obstacles(min_obstacles, max_obstacles, robot_id, robot_qs_to_avo
             body_id = create_box(lx, ly, lz, color=BLUE)
             set_pose(body_id, Pose(point=pos))
 
-            # collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[half_l, half_w, half_h])
-            # visual_shape = p.createVisualShape(
-            #     p.GEOM_BOX,
-            #     halfExtents=[half_l, half_w, half_h],
-            #     rgbaColor=[0, 0, 1, 1]
-            # )
-
-            # # Create the actual rigid body in the world
-            # body_id = p.createMultiBody(
-            #     baseMass=0,  # static obstacle (no gravity)
-            #     baseCollisionShapeIndex=collision_shape,
-            #     baseVisualShapeIndex=visual_shape,
-            #     basePosition=pos,
-            #     baseOrientation=orn
-            # )
-
             # Check for collisions with the robot
             for robot_q in robot_qs_to_avoid:
                 set_robot_joint_positions(robot_id, list(range(p.getNumJoints(robot_id))), robot_q)
@@ -181,11 +165,6 @@ def add_random_obstacles(min_obstacles, max_obstacles, robot_id, robot_qs_to_avo
                 collisions = p.getClosestPoints(bodyA=body_id, bodyB=robot_id, distance=0.05)
                 if len(collisions) > 0:
                     success = False
-
-            # check if the box lies on the trajectory
-            # import pdb; pdb.set_trace()
-            # if not check_intersection_raycast(body_id, base_ee_traj):
-            #     success = False
 
             if not success:
                 p.removeBody(body_id)  # remove and try again
@@ -443,7 +422,7 @@ if __name__ == "__main__":
         help="Path to npz file with cuboids",
     )
 
-    parser.add_argument("--dof", type=int, default=7)
+    parser.add_argument("--dof", type=int, default=6)
     parser.add_argument("--rrt_vis_fps", type=int, default=10)
     parser.add_argument("--time_per_traj", type=float, default=6.0, help="seconds")
     parser.add_argument("--robot_update_rate", type=int, default=20, help="Hz")

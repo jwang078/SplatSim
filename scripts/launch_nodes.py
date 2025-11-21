@@ -122,28 +122,35 @@ def launch_robot_server(args: Args):
 
         server = UprightRobotSmallEnginePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=UprightRobotSmallEnginePybulletRobotServer.SERVE_MODES.INTERACTIVE,
+        #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper, 
            camera_names=camera_names, robot_name=args.robot_name, cam_i=5, use_gripper=use_gripper, 
            
-           image_width=96, image_height=96
+           image_width=224, image_height=224
            
            # with the actual engine on table
         #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
         )
 
-    elif args.robot == "sim_ur_pybullet_apple_search":
-        from splatsim.robots.sim_robot_pybullet_apple_search import AppleSearchPybulletRobotServer
+    elif args.robot == "sim_ur_pybullet_small_engine_interactive_norender":
+        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEnginePybulletRobotServer
 
-        server = AppleSearchPybulletRobotServer(
-           port=port, host=args.hostname, serve_mode=AppleSearchPybulletRobotServer.SERVE_MODES.GENERATE_DEMOS,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+        server = UprightRobotSmallEnginePybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=UprightRobotSmallEnginePybulletRobotServer.SERVE_MODES.INTERACTIVE,
+           camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper, 
+           image_width=96, image_height=96
         )
 
-    elif args.robot == "sim_ur_pybullet_apple_search_interactive":
-        from splatsim.robots.sim_robot_pybullet_apple_search import AppleSearchPybulletRobotServer
+    elif args.robot == "sim_ur_pybullet_open_bwa_interactive":
+        from splatsim.robots.sim_robot_pybullet_robot_in_bwa import OpenSpaceBWAPybulletRobotServer
 
-        server = AppleSearchPybulletRobotServer(
-           port=port, host=args.hostname, serve_mode=AppleSearchPybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+        server = OpenSpaceBWAPybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=OpenSpaceBWAPybulletRobotServer.SERVE_MODES.INTERACTIVE,
+           camera_names=camera_names, robot_name=args.robot_name, cam_i=5, use_gripper=use_gripper, 
+           
+        #    image_width=224, image_height=224
+           
+           # with the actual engine on table
+        #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
         )
 
     elif args.robot == "sim_ur_pybullet_banana":
