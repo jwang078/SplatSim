@@ -264,6 +264,7 @@ class PybulletRobotServerBase:
         self.cam_i = cam_i
         self.image_width = image_width
         self.image_height = image_height
+        self.use_gripper = use_gripper
 
         # load labels.npy
         self.robot_labels = np.load(
@@ -290,8 +291,10 @@ class PybulletRobotServerBase:
         self.splatsim_robot: SplatSimObject = self.create_object(
             object_name="robot", splat_object_name=self.robot_name
         )
+        
         # pybullet quaternion convention is (x, y, z, w)
         self.pybullet_client.resetBasePositionAndOrientation(
+            # self.splatsim_robot.sim_id, [0, 0.5, 0.5], [0, 0, 0, 1],
             self.splatsim_robot.sim_id, [0, 0, 0.8], [1, 0, 0, 0]
         )
         (
@@ -302,8 +305,22 @@ class PybulletRobotServerBase:
         )
         
         print('after reset base and orientation: object pos', object_pos, 'object_quat', object_quat)
+        # base_position = self.splatsim_robot.object_config.get("base_position", [[0, 0, 0]])[0]
+        # object_pos = (object_pos[0] - base_position[0], object_pos[1] - base_position[1], object_pos[2] - base_position[2])
+
+        # Transform the base_position vector by the rotation too
         base_position = self.splatsim_robot.object_config.get("base_position", [[0, 0, 0]])[0]
-        object_pos = (object_pos[0] - base_position[0], object_pos[1] - base_position[1], object_pos[2] - base_position[2])
+        base_position_tensor = torch.tensor(base_position, device='cuda').float()
+
+        # Convert quaternion to rotation matrix and rotate base_position
+        quat_tensor = torch.tensor(object_quat, device='cuda').float().roll(1)  # convert to (w,x,y,z)
+        R = o3.quaternion_to_matrix(quat_tensor)
+        rotated_base_position = R @ base_position_tensor
+
+        # Now subtract the rotated base position
+        object_pos_tensor = torch.tensor(object_pos, device='cuda').float()
+        object_pos_corrected = object_pos_tensor - rotated_base_position
+
         (
             xyz_obj,
             rot_obj,
@@ -314,9 +331,11 @@ class PybulletRobotServerBase:
         ) = transform_object(
             splatsim_obj=self.splatsim_robot,
             # transform=transform,
-            pos=torch.tensor(object_pos),
+            pos=torch.tensor(object_pos_corrected),
+            quat=quat_tensor,
+            # pos=torch.tensor(object_pos),
             # # transform object is (w, x, y, z) quat convention
-            quat=torch.tensor(object_quat).roll(1),
+            # quat=torch.tensor(object_quat).roll(1),
         )
         print('quat', torch.tensor(object_quat).roll(1))
         self.splatsim_robot.gaussians._xyz = xyz_obj
@@ -357,13 +376,6 @@ class PybulletRobotServerBase:
             if joint_name == "ee_fixed_joint":
                 self.ur5e_ee_id = joint_id
 
-        self.use_gripper = use_gripper
-        if self.use_gripper:
-            self.setup_gripper()
-        # else:
-        #     self.setup_spatula()
-        #     pass
-
         # self.offsets = [np.pi / 2, 0, 0, 0, 0, 0, 0]
         # This has an extra 0 at the beginning for the world joint, and then another 0 for a fixed joint, I think
         # self.initial_joint_state = self.splatsim_robot.object_config["joint_states"][0]
@@ -377,14 +389,8 @@ class PybulletRobotServerBase:
             )
             self.splatsim_robot.articulation_config.initial_joint_positions = self.splatsim_robot.articulation_config.initial_joint_positions[:num_joints]
 
-        # self.initial_joint_state = [0, -np.pi / 2, np.pi / 2, -np.pi / 2, -np.pi / 2, 0]
-
         # model_lib = md.model_lib()
         # objectid = self.pybullet_client.loadURDF(model_lib['potato_chip_1'], [0.5, 0.15, 0])
-
-        # random euler angles for the orientation of the object
-        # euler_z = random.uniform(-np.pi, np.pi)
-        # random quaternion for the orientation of the object
 
         for object_cfg in self.ENV_CONFIG["objects"]:
             object_name = object_cfg["object_name"]
@@ -861,6 +867,15 @@ class PybulletRobotServerBase:
 
         if is_articulated:
             assert object_name == "robot", "Only the robot can be articulated for now"
+            if object_name == "robot":
+                self.splatsim_robot = splatsim_obj
+                if self.use_gripper:
+                    self.setup_gripper()
+                # else:
+                #     self.setup_spatula()
+                #     pass
+                self.open_gripper()
+
             initial_joint_positions = splatsim_obj.object_config["joint_states"][0]
             # remove world joint
             initial_joint_positions = initial_joint_positions[1:]
@@ -877,6 +892,9 @@ class PybulletRobotServerBase:
 
             # Use the config to find these values
             self.teleport_joint_state(splatsim_obj, initial_joint_positions)
+            # Let the gripper move (it isn't teleporting rn)
+            for _ in range(100):
+                self.pybullet_client.stepSimulation()
             initial_link_poses = get_curr_link_states(
                 splatsim_obj.sim_id, self.use_link_centers
             )
@@ -1087,56 +1105,6 @@ class PybulletRobotServerBase:
                     splatsim_obj == self.splatsim_robot
                 ), "Other articulated objects are not implemented yet"
 
-                xyz_obj = splatsim_obj.gaussians._xyz
-                rot_obj = splatsim_obj.gaussians._rotation
-                opacity_obj = splatsim_obj.gaussians._opacity
-                scales_obj = splatsim_obj.gaussians._scaling
-                features_dc_obj = splatsim_obj.gaussians._features_dc
-                features_rest_obj = splatsim_obj.gaussians._features_rest
-
-
-
-
-                # cur_object_position = torch.tensor([0, 0, 0], device="cuda").float()
-                # base_position = torch.tensor([0, 0, 0], device="cuda").float()
-                # cur_object_rotation = torch.tensor(
-                #     [0, 0, 0, 1], device="cuda"
-                # ).float()
-
-                # cur_object_position = cur_object_position - base_position
-                # cur_object_rotation = torch.roll(
-                #     cur_object_rotation,
-                #     1,
-                # )
-
-                # cur_object_position = torch.tensor([[0, 0.5, 0]], device="cuda").float()
-                # cur_object_rotation = torch.roll(
-                #     torch.tensor([[0, 0, 0, 1]], device="cuda").float(),
-                #     1,
-                # )
-
-                # (
-                #     xyz_obj,
-                #     rot_obj,
-                #     opacity_obj,
-                #     scales_obj,
-                #     features_dc_obj,
-                #     features_rest_obj,
-                # ) = transform_object(
-                #     splatsim_obj=splatsim_obj,
-                #     pos=cur_object_position,
-                #     quat=cur_object_rotation,
-                # )
-
-
-
-
-
-
-
-
-
-
                 # Gets transformations for all links of the robot based on the current simulation
                 transformations_list = get_transfomration_list(
                     splatsim_obj.sim_id,  splatsim_obj.articulation_config.initial_link_poses,
@@ -1154,51 +1122,6 @@ class PybulletRobotServerBase:
                     splatsim_obj=splatsim_obj,
                     transformations_list=transformations_list,
                 )
-
-
-                # # Now, apply the object's transformation within the simulation. Assume there is no scaling within pybullet
-                # # xyz_obj and rot_obj need to be changed
-
-
-                # # xyz_obj, rotation_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
-                # Horrendous code but yes
-                # base_xyz_obj = splatsim_obj.gaussians._xyz
-                # base_rot_obj = splatsim_obj.gaussians._rotation
-                # base_opacity_obj = splatsim_obj.gaussians._opacity
-                # base_scales_obj = splatsim_obj.gaussians._scaling
-                # base_features_dc_obj = splatsim_obj.gaussians._features_dc
-                # base_features_rest_obj = splatsim_obj.gaussians._features_rest
-
-                # splatsim_obj.gaussians._xyz = xyz_obj
-                # splatsim_obj.gaussians._rotation = rot_obj
-                # splatsim_obj.gaussians._opacity = opacity_obj
-                # splatsim_obj.gaussians._scaling = scales_obj
-                # splatsim_obj.gaussians._features_dc = features_dc_obj
-                # splatsim_obj.gaussians._features_rest = features_rest_obj
-
-                # (
-                #     xyz_obj,
-                #     rot_obj,
-                #     opacity_obj,
-                #     scales_obj,
-                #     features_dc_obj,
-                #     features_rest_obj,
-                # ) = transform_object(
-                #     splatsim_obj=splatsim_obj,
-                #     pos=torch.tensor(object_pos),
-                #     # pytorch uses (w, x, y, z) convention
-                #     # Converting from quat to rotation matrix uses (x, y, z, w) convention
-                #     quat=torch.tensor(object_quat).roll(1),
-                # )
-
-                # print(object_pos, object_quat)
-
-                # splatsim_obj.gaussians._xyz = base_xyz_obj
-                # splatsim_obj.gaussians._rotation = base_rot_obj
-                # splatsim_obj.gaussians._opacity = base_opacity_obj
-                # splatsim_obj.gaussians._scaling = base_scales_obj
-                # splatsim_obj.gaussians._features_dc = base_features_dc_obj
-                # splatsim_obj.gaussians._features_rest = base_features_rest_obj
 
             else:
                 continue
@@ -1273,9 +1196,213 @@ class PybulletRobotServerBase:
                 dim=0,
             )
 
+    def get_pybullet_debug_camera_as_splat_camera(self):
+        """Convert PyBullet's debug camera to a Camera object for Gaussian splatting."""
+        # Get PyBullet camera info
+        camera_info = p.getDebugVisualizerCamera()
+        view_matrix = np.array(camera_info[2]).reshape(4, 4).T
+        
+        R_fix = np.diag([-1, -1, -1]) @ np.diag([1, -1, 1]) @ np.diag([-1, 1, -1]) @ np.array([
+            [ 0.0, 0.0, 1.0],  # X_B = -Y_P
+            [ -1.0, 0.0, 0.0],   # Y_B = Z_P
+            [0.0, -1.0, 0.0]    # Z_B = -X_P
+        ]) @ np.array([
+            [ 0.0, -1.0, 0.0],  # X_B = -Y_P
+            [ 0.0, 0.0, 1.0],   # Y_B = Z_P
+            [-1.0, 0.0, 0.0]    # Z_B = -X_P
+        ])
+
+        # 1. Extract PyBullet Camera Pose (C2W)
+        # R_cw_pybullet: Camera-to-World Rotation in PyBullet's frame
+        R_cw_pybullet = view_matrix[:3, :3].T 
+        # T_cw: World-in-Camera Translation
+        T_cw = view_matrix[:3, 3]
+        # T_wc_pybullet: Camera Center in PyBullet World Coordinates
+        T_wc_pybullet = -R_cw_pybullet @ T_cw
+        
+        
+        # 3. Apply the Transformation
+        # Apply R_fix to transform the camera's orientation into the target coordinate system.
+        # R_cw_final = R_cw_pybullet @ R_fix
+        # This transforms the camera's internal frame (from PyBullet) to the target frame.
+        
+        # For full matrix transformation (World_Splat = R_fix @ World_Pybullet):
+        # The new camera position is transformed by R_fix
+        T_wc_final = R_fix @ T_wc_pybullet / self.base_camera.scale
+        T_wc_final = [T_wc_final[1], -T_wc_final[2], -T_wc_final[0]]
+        
+        # The new camera rotation is transformed as:
+        # R_cw_final = R_fix @ R_cw_pybullet
+        R_cw_final = R_fix @ R_cw_pybullet
+
+        # T_wc_final = np.array([-0.2063907,  1.5897055, 6.2722306,   ])
+        
+        
+        print(f"R_cw_final:\n{R_cw_final}")
+        print(f"T_wc_final: {T_wc_final}\n")
+        
+        # scale = self.base_camera.scale if self.base_camera is not None else 1.0
+        resolution = (self.base_camera.image_width, self.base_camera.image_height)
+        colmap_id = 0
+        uid = 0
+        depth_params = None
+        invdepthmap = None
+        image_name = "pybullet_debug_camera"
+        image = torch.zeros((3, resolution[0], resolution[1]), dtype=torch.float32)
+
+        new_camera = Camera(
+            resolution,
+            colmap_id,
+            R_cw_final, # Use the fixed rotation
+            T_wc_final, # Use the fixed translation
+            self.base_camera.FoVx,
+            self.base_camera.FoVy,
+            depth_params,
+            to_pil_image(image),
+            invdepthmap,
+            image_name,
+            uid,
+            scale=1, #scale,
+        )
+        return new_camera
+
+    # def get_pybullet_debug_camera_as_splat_camera(self):
+    #     """Convert PyBullet's debug camera to a Camera object for Gaussian splatting."""
+        
+    #     # Get PyBullet camera info
+    #     camera_info = p.getDebugVisualizerCamera()
+        
+    #     view_matrix = np.array(camera_info[2]).reshape(4, 4).T
+
+    #     R_cw = view_matrix[:3, :3].T
+    #     T_wc = -R_cw.T @ view_matrix[:3, 3]
+    #     T_wc = np.array([T_wc[0], T_wc[2], T_wc[1]])
+
+    #     scale = self.base_camera.scale if self.base_camera is not None else 1.0
+        
+    #     print(f"R_cw:\n{R_cw}")
+    #     print(f"T_wc: {T_wc}\n")
+        
+    #     resolution = (self.base_camera.image_width, self.base_camera.image_height)
+    #     colmap_id = 0
+    #     uid = 0
+    #     depth_params = None
+    #     invdepthmap = None
+    #     image_name = "pybullet_debug_camera"
+    #     image = torch.zeros((3, resolution[0], resolution[1]), dtype=torch.float32)
+
+    #     new_camera = Camera(
+    #         resolution,
+    #         colmap_id,
+    #         R_cw,
+    #         T_wc,
+    #         self.base_camera.FoVx,
+    #         self.base_camera.FoVy,
+    #         depth_params,
+    #         to_pil_image(image),
+    #         invdepthmap,
+    #         image_name,
+    #         uid,
+    #         scale=scale,
+    #     )
+        
+    #     return new_camera
+    
+    def set_pybullet_camera_to_match_base(self):
+        """Set PyBullet's debug camera to match the base camera view."""
+        
+        if self.base_camera is None:
+            print("No base camera available")
+            return
+        
+        # Get base camera parameters
+        R_cw = self.base_camera.R
+        T_wc = self.base_camera.T
+        scale = self.base_camera.scale
+        
+        # Camera position in world space
+        camera_pos = -R_cw.T @ T_wc
+        camera_pos = np.array([camera_pos[0], camera_pos[2], camera_pos[1]])
+
+        # good
+        # camera_pos = np.array([-0.2063907, -6.2722306,  1.5897055]) * scale
+
+        # bad
+        # camera_pos = np.array([-0.2063907,  1.5897055,  6.2722306])
+        # camera_pos = T_wc * scale
+        
+        # Camera's forward direction (camera looks down -Z axis)
+        forward_cam = np.array([0, 0, -1])
+        forward_world = R_cw @ forward_cam
+        
+        # Find target by ray-casting forward from camera
+        # Use a reasonable distance (e.g., distance to origin)
+        target_distance = np.linalg.norm(camera_pos)  # Distance to origin as estimate
+        target = camera_pos + forward_world * target_distance
+        
+        # Or directly use origin if robot is there
+        target = np.array([0.0, 0.0, 0.0])
+        
+        # Distance from camera to target
+        distance = np.linalg.norm(target - camera_pos)
+        
+        # Compute yaw and pitch
+        # Forward vector from camera to target
+        forward = target - camera_pos
+        forward = forward / np.linalg.norm(forward)
+        
+        # Yaw: angle in XY plane
+        yaw = np.rad2deg(np.arctan2(forward[1], forward[0]))
+        
+        # Pitch: angle from XY plane
+        pitch = np.rad2deg(np.arcsin(forward[2]))
+        
+        print(f"Setting PyBullet camera to match base camera:")
+        print(f"  Camera position: {camera_pos}")
+        print(f"  Target: {target}")
+        print(f"  Distance: {distance:.3f}")
+        print(f"  Yaw: {yaw:.1f}°")
+        print(f"  Pitch: {pitch:.1f}°")
+        
+        # Set PyBullet camera
+        p.resetDebugVisualizerCamera(
+            cameraDistance=distance,
+            cameraYaw=yaw,
+            cameraPitch=pitch,
+            cameraTargetPosition=list(target)
+        )
+        
+        print("PyBullet camera updated!\n")
+    
     def render_image(self, camera_name):
+        # self.debug_match_base_camera_to_pybullet()
+        
+        camera = self.get_pybullet_debug_camera_as_splat_camera()
+        # print("\n=== DEBUG TO SPLAT CAM ===")
+        # print(f"Resolution: {camera.image_width} x {camera.image_height}")
+        # print(f"R matrix:\n{camera.R}")
+        # print(f"T vector: {camera.T}")
+        # print(f"FoVx: {np.rad2deg(camera.FoVx):.2f}°")
+        # print(f"FoVy: {np.rad2deg(camera.FoVy):.2f}°")
+        # print(f"Scale: {camera.scale}")
+        # print("==============================\n")
+        # self.set_pybullet_camera_to_match_base()
+
+        # self.capture_pybullet_camera_params()
+
+        # self.debug_camera_coordinate_systems()
         if camera_name == "base_rgb":
-            camera = self.base_camera
+            base_camera = self.base_camera
+            # camera = base_camera
+
+            print("\n=== BASE CAMERA (working) ===")
+            print(f"Resolution: {base_camera.image_width} x {base_camera.image_height}")
+            print(f"R matrix:\n{base_camera.R}")
+            print(f"T vector: {base_camera.T}")
+            print(f"FoVx: {np.rad2deg(base_camera.FoVx):.2f}°")
+            print(f"FoVy: {np.rad2deg(base_camera.FoVy):.2f}°")
+            print(f"Scale: {base_camera.scale}")
+            print("==============================\n")
         elif camera_name == "wrist_rgb":
             camera = self.get_wrist_camera()
             if camera is None:
