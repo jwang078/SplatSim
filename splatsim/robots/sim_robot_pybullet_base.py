@@ -1124,7 +1124,6 @@ class PybulletRobotServerBase:
                 )
 
             else:
-                continue
                 if splatsim_obj.sim_id is not None:
                     cur_object_position = torch.tensor(
                         data[splatsim_obj.name + "_position"], device="cuda"
@@ -1198,9 +1197,62 @@ class PybulletRobotServerBase:
 
     def get_pybullet_debug_camera_as_splat_camera(self):
         """Convert PyBullet's debug camera to a Camera object for Gaussian splatting."""
+        # For reference:
+        def cvPose2BulletView(q, t):
+            """
+            From: https://stackoverflow.com/a/75355212
+
+            cvPose2BulletView gets orientation and position as used 
+            in ROS-TF and opencv and coverts it to the view matrix used 
+            in openGL and pyBullet.
+            
+            :param q: ROS orientation expressed as quaternion [qx, qy, qz, qw] 
+            :param t: ROS postion expressed as [tx, ty, tz]
+            :return:  4x4 view matrix as used in pybullet and openGL
+            
+            """
+            q = Quaternion([q[3], q[0], q[1], q[2]])
+            R = q.rotation_matrix
+
+            T = np.vstack([np.hstack([R, np.array(t).reshape(3,1)]),
+                                    np.array([0, 0, 0, 1])])
+            # Convert opencv convention to python convention
+            # By a 180 degrees rotation along X
+            Tc = np.array([[1,   0,    0,  0],
+                        [0,  -1,    0,  0],
+                        [0,   0,   -1,  0],
+                        [0,   0,    0,  1]]).reshape(4,4)
+            
+            # pybullet pse is the inverse of the pose from the ROS-TF
+            T=Tc@np.linalg.inv(T)
+            # The transpose is needed for respecting the array structure of the OpenGL
+            viewMatrix = T.T.reshape(16)
+            return viewMatrix
+        
+
         # Get PyBullet camera info
         camera_info = p.getDebugVisualizerCamera()
+        # Pybullet view matrix is major-column order 
         view_matrix = np.array(camera_info[2]).reshape(4, 4).T
+
+        Tc = np.array([[1,   0,    0,  0],
+                        [0,  -1,    0,  0],
+                        [0,   0,   -1,  0],
+                        [0,   0,    0,  1]]).reshape(4,4)
+        
+        T = np.linalg.inv(view_matrix) @ Tc
+
+        R = T[:3, :3]
+        t = T[:3, 3]
+
+        R_cw_final = R
+        T_wc_final = -R.T @ t
+        # T_wc_final = np.array([t[1], t[2], t[0]])
+
+
+
+
+        """
         
         R_fix = np.diag([-1, -1, -1]) @ np.diag([1, -1, 1]) @ np.diag([-1, 1, -1]) @ np.array([
             [ 0.0, 0.0, 1.0],  # X_B = -Y_P
@@ -1234,6 +1286,10 @@ class PybulletRobotServerBase:
         # The new camera rotation is transformed as:
         # R_cw_final = R_fix @ R_cw_pybullet
         R_cw_final = R_fix @ R_cw_pybullet
+
+        # T_wc_final = np.array([-0.2063907,  1.5897055, 6.2722306,   ])
+
+        """
 
         # T_wc_final = np.array([-0.2063907,  1.5897055, 6.2722306,   ])
         
