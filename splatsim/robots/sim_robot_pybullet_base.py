@@ -170,6 +170,9 @@ class PybulletRobotServerBase:
 
     TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
 
+    # This is the default splat name. Overwrite it in a child class of PybulletRobotServerBase
+    background_splat_name = "robot_iphone"
+
     # Enum for serve modes
     class SERVE_MODES(enum.Enum):
         GENERATE_DEMOS = "generate_demos"
@@ -249,7 +252,6 @@ class PybulletRobotServerBase:
         print_joints: bool = False,
         use_gripper: bool = True,
         serve_mode: str = SERVE_MODES.GENERATE_DEMOS,
-        use_link_centers: bool = True,
         robot_name: str = "robot_iphone",
         camera_names: List[str] = ["base_rgb"],
         cam_i: int = 254,
@@ -258,7 +260,6 @@ class PybulletRobotServerBase:
         object_config_path: str = "./configs/object_configs/objects.yaml",
     ):
         self.serve_mode = serve_mode
-        self.use_link_centers = use_link_centers
         self.robot_name = robot_name
         self.camera_names = camera_names
         self.cam_i = cam_i
@@ -288,84 +289,26 @@ class PybulletRobotServerBase:
 
         self.models_lib = md.model_lib()
 
+        # For plane.urdf
+        self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
+
         self.splatsim_objects: List[SplatSimObject] = []
         self.splatsim_robot: SplatSimObject = self.create_object(
             object_name="robot", splat_object_name=self.robot_name
         )
         
-        # pybullet quaternion convention is (x, y, z, w)
-        self.pybullet_client.resetBasePositionAndOrientation(
-            self.splatsim_robot.sim_id, [0, 0, 1.0], [0, 1, 0, 0]
-        )
-        (
-            object_pos,
-            object_quat,
-        ) = self.pybullet_client.getBasePositionAndOrientation(
-            self.splatsim_robot.sim_id
-        )
-        
-        print('after reset base and orientation: object pos', object_pos, 'object_quat', object_quat)
-        # base_position = self.splatsim_robot.object_config.get("base_position", [[0, 0, 0]])[0]
-        # object_pos = (object_pos[0] - base_position[0], object_pos[1] - base_position[1], object_pos[2] - base_position[2])
-
-        # Transform the base_position vector by the rotation too
-        base_position = self.splatsim_robot.object_config.get("base_position", [[0, 0, 0]])[0]
-        base_position_tensor = torch.tensor(base_position, device='cuda').float()
-
-        # Convert quaternion to rotation matrix and rotate base_position
-        quat_tensor = torch.tensor(object_quat, device='cuda').float().roll(1)  # convert to (w,x,y,z)
-        R = o3.quaternion_to_matrix(quat_tensor)
-        rotated_base_position = R @ base_position_tensor
-
-        # Now subtract the rotated base position
-        object_pos_tensor = torch.tensor(object_pos, device='cuda').float()
-        object_pos_corrected = object_pos_tensor - rotated_base_position
-
-        (
-            xyz_obj,
-            rot_obj,
-            opacity_obj,
-            scales_obj,
-            features_dc_obj,
-            features_rest_obj,
-        ) = transform_object(
-            splatsim_obj=self.splatsim_robot,
-            # transform=transform,
-            pos=torch.tensor(object_pos_corrected),
-            quat=quat_tensor,
-            # pos=torch.tensor(object_pos),
-            # # transform object is (w, x, y, z) quat convention
-            # quat=torch.tensor(object_quat).roll(1),
-        )
-        print('quat', torch.tensor(object_quat).roll(1))
-        self.splatsim_robot.gaussians._xyz = xyz_obj
-        self.splatsim_robot.gaussians._rotation = rot_obj
-        self.splatsim_robot.gaussians._opacity = opacity_obj
-        self.splatsim_robot.gaussians._features_dc = features_dc_obj
-        self.splatsim_robot.gaussians._features_rest = features_rest_obj
-        self.splatsim_robot.gaussians._scaling = scales_obj
-        self.splatsim_robot.articulation_config.initial_link_poses = get_curr_link_states(
-            self.splatsim_robot.sim_id, self.use_link_centers
-        )
-
-        # self.pybullet_client.resetBasePositionAndOrientation(
-        #     self.splatsim_robot.sim_id, [0, 0, 0.4], [-1, 0, 0, 0]
-        # )
-
         # self.background_splat_name = self.robot_name
         # self.splatsim_background = self.splatsim_robot
 
         # self.background_splat_name = self.robot_name
-        # TODO implement config for different background than what robot had
-        self.background_splat_name = "bwa_open_space" # self.robot_name
         # The background uses the robot's full splat, but crops out the robot
         self.splatsim_background: SplatSimObject = self.create_object(
             object_name="background",
             splat_object_name=self.background_splat_name,
             keep_within_aabb=False,
             load_urdf=False,
+            can_articulate=False,
         )
-        self.splatsim_background.is_articulated = False
 
         self.skip_recording_first = 0
 
@@ -382,12 +325,7 @@ class PybulletRobotServerBase:
         # Remove the extra 0 for the world joint
         # self.initial_joint_state = self.initial_joint_state[1:]
         # + 1 joint for the world joint at the beginning which will be skipped
-        num_joints = self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id)
-        if len(self.splatsim_robot.articulation_config.initial_joint_positions) > num_joints:
-            print(
-                f"Warning: Provided initial joint positions ({len(self.splatsim_robot.articulation_config.initial_joint_positions)}) exceed the number of joints ({num_joints}). Truncating to {num_joints} positions."
-            )
-            self.splatsim_robot.articulation_config.initial_joint_positions = self.splatsim_robot.articulation_config.initial_joint_positions[:num_joints]
+
 
         # model_lib = md.model_lib()
         # objectid = self.pybullet_client.loadURDF(model_lib['potato_chip_1'], [0.5, 0.15, 0])
@@ -469,26 +407,6 @@ class PybulletRobotServerBase:
 
         # add gravity
         self.pybullet_client.setGravity(0, 0, -9.81)
-
-        # This is for the tabletop env
-        """
-        # add plane
-        self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
-        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
-
-        # place a wall in -0.4 at x axis using plane.urdf
-        # wall is perpendicular to the plane
-        quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
-        self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
-        """
-        # add plane
-        self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
-        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
-
-        # place a wall in -0.4 at x axis using plane.urdf
-        # wall is perpendicular to the plane
-        quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
-        self.wall = self.pybullet_client.loadURDF("plane.urdf", [-1, 0, 0.0], quat)
 
         ## add stage
         self.stage = 0
@@ -593,6 +511,59 @@ class PybulletRobotServerBase:
                 raise ValueError(
                     f"wrist_camera_link_name attribute not defined in object config of robot {self.robot_name}, yet wrist camera was requested"
                 )
+            
+        # Prepare for teleport by removing forces
+        for i in range(len(self.splatsim_robot.articulation_config.initial_joint_positions)):
+            self.pybullet_client.setJointMotorControl2(
+                self.splatsim_robot.sim_id,
+                i,
+                self.pybullet_client.VELOCITY_CONTROL,
+                force=0,
+            )
+        # Reset joint states by teleporting
+        self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.articulation_config.initial_joint_positions)
+        # for i in range(1, len(self.initial_joint_state)):
+        #     self.pybullet_client.resetJointState(
+        #         self.splatsim_robot.sim_id,
+        #         i,
+        #         self.initial_joint_state[i - 1] * self.joint_signs[i - 1],
+        #     )
+
+        # get end effector position and orientation
+        ee_pos, ee_quat = self.get_current_ee_pose()
+        self.iniital_ee_quat = ee_quat
+
+        for i in range(1, self.num_dofs()):
+            self.pybullet_client.setJointMotorControl2(
+                self.splatsim_robot.sim_id,
+                i,
+                p.VELOCITY_CONTROL,
+                targetPosition=self.splatsim_robot.articulation_config.initial_joint_positions[i - 1]
+                * self.splatsim_robot.articulation_config.joint_signs[i - 1],
+                force=250,
+                maxVelocity=0.2,
+            )
+        self.close_gripper()
+
+        # get initial ee position and orientation
+        self.initial_ee_pos, self.initial_ee_quat = self.get_current_ee_pose()
+        # print joint angles
+        joint_states = []
+        for i in range(1, len(self.splatsim_robot.articulation_config.initial_joint_positions)):
+            joint_states.append(
+                self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
+            )
+
+        # set to initial joint state
+        for i in range(10000):
+            for i in range(1, len(self.splatsim_robot.articulation_config.initial_joint_positions)):
+                self.pybullet_client.resetJointState(
+                    self.splatsim_robot.sim_id,
+                    i,
+                    self.splatsim_robot.articulation_config.initial_joint_positions[i - 1]
+                        * self.splatsim_robot.articulation_config.joint_signs[i - 1],
+                )
+            self.pybullet_client.stepSimulation()
 
     def num_dofs(self) -> int:
         return 7
@@ -804,15 +775,13 @@ class PybulletRobotServerBase:
         # We will work in the coordinate frame of the simulator from now on
         if need_transform_to_simulator_frame:
             Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=splatsim_obj.gaussians.get_xyz.device).float() # shape (4, 4)
-            xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj = transform_object(
-                splatsim_obj=splatsim_obj, transform=Trans_canonical
+            _ = transform_object(
+                splatsim_obj=splatsim_obj,
+                transform=Trans_canonical,
+                # This transform_object is to go from splat frame to simulator frame. the transformation matrix already accounted for the base position
+                use_base_position=False,
+                inplace=True,
             )
-            splatsim_obj.gaussians._xyz = xyz_obj
-            splatsim_obj.gaussians._rotation = rot_obj
-            splatsim_obj.gaussians._opacity = opacity_obj
-            splatsim_obj.gaussians._features_rest = features_rest_obj
-            splatsim_obj.gaussians._features_dc = features_dc_obj
-            splatsim_obj.gaussians._scaling = scales_obj
 
         return splatsim_obj
 
@@ -845,6 +814,7 @@ class PybulletRobotServerBase:
         splat_object_name=None,
         keep_within_aabb=True,
         load_urdf=True,
+        can_articulate=True,
     ):
         if len(object_config) == 0 and splat_object_name is None:
             splat_object_name = object_name  # TODO when is this wrong?
@@ -855,7 +825,7 @@ class PybulletRobotServerBase:
         elif len(object_config) == 0:
             print("WARNING: No object config found for ", splat_object_name)
 
-        is_articulated = object_config.get("is_articulated", False)
+        is_articulated = can_articulate and object_config.get("is_articulated", False)
 
         splatsim_obj = SplatSimObject(
             name=object_name,
@@ -890,16 +860,26 @@ class PybulletRobotServerBase:
             initial_joint_positions = splatsim_obj.object_config["joint_states"][0]
             # remove world joint
             initial_joint_positions = initial_joint_positions[1:]
-            segmented_list = get_segmented_indices(
-                splatsim_obj=splatsim_obj,
-                robot_labels=self.robot_labels,
-            )
-            articulation_config = ArticulationConfig(
+            num_joints = self.pybullet_client.getNumJoints(splatsim_obj.sim_id)
+            if len(initial_joint_positions) > num_joints:
+                print(
+                    f"Warning: Provided initial joint positions ({len(initial_joint_positions)}) exceed the number of joints ({num_joints}). Truncating to {num_joints} positions."
+                )
+                initial_joint_positions = initial_joint_positions[:num_joints]
+
+            segmentation_labels = np.load('./data/labels_path/'+splatsim_obj.splat_name+'_labels.npy')
+            segmentation_labels = torch.from_numpy(segmentation_labels).to(device=splatsim_obj.gaussians._xyz.device).long()
+
+            splatsim_obj.articulation_config = ArticulationConfig(
                 initial_joint_positions=initial_joint_positions,
                 joint_signs=[1] * len(initial_joint_positions), # placeholder values; integration with gello
-                segmented_list=segmented_list,
+                segmentation_labels=segmentation_labels
             )
-            splatsim_obj.articulation_config = articulation_config
+            
+            segmented_list = get_segmented_indices(
+                splatsim_obj=splatsim_obj,
+            )
+            splatsim_obj.articulation_config.segmented_list = segmented_list
 
             # Use the config to find these values
             self.teleport_joint_state(splatsim_obj, initial_joint_positions)
@@ -907,10 +887,9 @@ class PybulletRobotServerBase:
             for _ in range(100):
                 self.pybullet_client.stepSimulation()
             initial_link_poses = get_curr_link_states(
-                splatsim_obj.sim_id, self.use_link_centers
+                splatsim_obj.sim_id
             )
             splatsim_obj.articulation_config.initial_link_poses = initial_link_poses
-
 
         self.splatsim_objects.append(splatsim_obj)
         return splatsim_obj
@@ -1139,6 +1118,9 @@ class PybulletRobotServerBase:
                     splatsim_obj=splatsim_obj,
                     pos=cur_object_position,
                     quat=cur_object_rotation,
+                    # TODO Figure out why setting to True and commenting out the base position stuff above doesn't work
+                    use_base_position=False,
+                    inplace=False
                 )
 
             xyz_obj_list.append(xyz_obj)
@@ -1769,59 +1751,6 @@ class PybulletRobotServerBase:
             return False
 
     def serve(self) -> None:
-        # Prepare for teleport by removing forces
-        for i in range(len(self.splatsim_robot.articulation_config.initial_joint_positions)):
-            self.pybullet_client.setJointMotorControl2(
-                self.splatsim_robot.sim_id,
-                i,
-                self.pybullet_client.VELOCITY_CONTROL,
-                force=0,
-            )
-        # Reset joint states by teleporting
-        self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.articulation_config.initial_joint_positions)
-        # for i in range(1, len(self.initial_joint_state)):
-        #     self.pybullet_client.resetJointState(
-        #         self.splatsim_robot.sim_id,
-        #         i,
-        #         self.initial_joint_state[i - 1] * self.joint_signs[i - 1],
-        #     )
-
-        # get end effector position and orientation
-        ee_pos, ee_quat = self.get_current_ee_pose()
-        self.iniital_ee_quat = ee_quat
-
-        for i in range(1, self.num_dofs()):
-            self.pybullet_client.setJointMotorControl2(
-                self.splatsim_robot.sim_id,
-                i,
-                p.VELOCITY_CONTROL,
-                targetPosition=self.splatsim_robot.articulation_config.initial_joint_positions[i - 1]
-                * self.splatsim_robot.articulation_config.joint_signs[i - 1],
-                force=250,
-                maxVelocity=0.2,
-            )
-        self.close_gripper()
-
-        # get initial ee position and orientation
-        self.initial_ee_pos, self.initial_ee_quat = self.get_current_ee_pose()
-        # print joint angles
-        joint_states = []
-        for i in range(1, len(self.splatsim_robot.articulation_config.initial_joint_positions)):
-            joint_states.append(
-                self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
-            )
-
-        # set to initial joint state
-        for i in range(10000):
-            for i in range(1, len(self.splatsim_robot.articulation_config.initial_joint_positions)):
-                self.pybullet_client.resetJointState(
-                    self.splatsim_robot.sim_id,
-                    i,
-                    self.splatsim_robot.articulation_config.initial_joint_positions[i - 1]
-                        * self.splatsim_robot.articulation_config.joint_signs[i - 1],
-                )
-            self.pybullet_client.stepSimulation()
-
         # start the zmq server
         self._zmq_server_thread.start()
 

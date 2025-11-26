@@ -2,25 +2,11 @@ import time
 
 import torch
 import numpy as np
-import mujoco
-import mujoco.viewer
 import zmq
-
-assert mujoco.viewer is mujoco.viewer
-import pybullet as p
-from pybullet_planning import plan_joint_motion, get_movable_joints
 
 from splatsim.robots.sim_robot_pybullet_base import (
     PybulletRobotServerBase,
-    TrajectoryPathSegment,
-    GripperPathSegment,
-    GripperState,
 )
-from splatsim.utils.transform_utils import rotation_matrix_to_euler_angles
-from scipy.optimize import minimize
-
-from tqdm import tqdm
-
 
 class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
@@ -29,6 +15,14 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+        # add plane
+        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
+
+        # place a wall in -0.4 at x axis using plane.urdf
+        # wall is perpendicular to the plane
+        quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
+        self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
 
     def plan_given_this_state(self, initial_joint_positions):
         all_paths = []

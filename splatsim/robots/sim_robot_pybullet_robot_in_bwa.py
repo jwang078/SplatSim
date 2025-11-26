@@ -8,24 +8,19 @@ import zmq
 
 assert mujoco.viewer is mujoco.viewer
 import pybullet as p
-from pybullet_planning import plan_joint_motion, get_movable_joints
 
 from splatsim.robots.sim_robot_pybullet_base import (
     PybulletRobotServerBase,
-    TrajectoryPathSegment,
-    GripperPathSegment,
-    GripperState,
 )
-from splatsim.utils.transform_utils import rotation_matrix_to_euler_angles
-from scipy.optimize import minimize
 
-from tqdm import tqdm
+from splatsim.utils.robot_splat_render_utils import transform_object, get_curr_link_states
 
 
 class BWAPybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
     ENV_CONFIG_NAME = None
     ENV_CONFIG = None
+    background_splat_name = "bwa_open_space"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -87,3 +82,35 @@ class OpenSpaceBWAPybulletRobotServer(BWAPybulletRobotServer):
             # },
         ]
     }
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        # add plane
+        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
+
+        # place a wall in -0.4 at x axis using plane.urdf
+        # wall is perpendicular to the plane
+        quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
+        self.wall = self.pybullet_client.loadURDF("plane.urdf", [-1, 0, 0.0], quat)
+
+
+        # Put the robot upside down and facing the back
+        # pybullet quaternion convention is (x, y, z, w)
+        self.pybullet_client.resetBasePositionAndOrientation(
+            self.splatsim_robot.sim_id, [0, 0, 1.0], [0, 1, 0, 0]
+        )
+        (
+            object_pos,
+            object_quat,
+        ) = self.pybullet_client.getBasePositionAndOrientation(
+            self.splatsim_robot.sim_id
+        )
+        _ = transform_object(
+            splatsim_obj=self.splatsim_robot,
+            pos=torch.tensor(object_pos, device='cuda').float(),
+            quat=torch.tensor(object_quat, device='cuda').float().roll(1),
+            use_base_position=True,
+            inplace=True
+        )
+

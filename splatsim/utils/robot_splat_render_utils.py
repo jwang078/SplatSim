@@ -15,6 +15,7 @@ from splatsim.utils.utils_fk import *
 class ArticulationConfig:
     initial_joint_positions: List[float]
     joint_signs: List[int] # To handle joint direction conventions
+    segmentation_labels: Optional[List[int]] = None # List of which link each point belongs to
     segmented_list: Optional[List[List[int]]] = None # List of splat indices per joint
     initial_link_poses: Optional[List[Tuple[List[float], List[float]]]] = None # List of (pos, quat) per link at initial joint positions]]
 
@@ -242,7 +243,7 @@ def build_matrix_from_r_t(r, t, device='cuda'):
     transform[:3, 3] = t.to(device, torch.float32)
     return transform
 
-def transform_object(splatsim_obj, pos=None, quat=None, transform=None):
+def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base_position=True, inplace=False):
     """
     Transforms all properties of a Gaussian splat object (splatsim_obj)
     using a 4x4 transformation matrix.
@@ -254,30 +255,22 @@ def transform_object(splatsim_obj, pos=None, quat=None, transform=None):
 
     pc = splatsim_obj.gaussians
     device = pc.get_xyz.device
+    base_position = torch.tensor(splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0], device='cuda').float()
 
     # --- 1. Unify Input: Get one 4x4 transform matrix ---
     if transform is None:
         # Build the 4x4 transform matrix from pos and quat
-        # transform = torch.eye(4, device=device, dtype=torch.float32)
-        
-        # Assuming o3.quaternion_to_matrix returns a torch tensor
-        # If not, you may need to cast it.
-        # takes quat in (w,x,y,z) format
         transform = transform_from_pos_quat(pos, quat, device)
-        # rot_mat_tensor = o3.quaternion_to_matrix(quat)
-        
-        # # Ensure matrix and pos are on the correct device and type
-        # if not isinstance(rot_mat_tensor, torch.Tensor):
-        #     rot_mat_tensor = torch.tensor(rot_mat_tensor, device=device, dtype=torch.float32)
-        # if not isinstance(pos, torch.Tensor):
-        #     pos = torch.tensor(pos, device=device, dtype=torch.float32)
-            
-        # transform[:3, :3] = rot_mat_tensor.to(device, torch.float32)
-        # transform[:3, 3] = pos.to(device, torch.float32)
 
     # --- 2. Decompose the 3x3 affine matrix A ---
     A = transform[:3, :3] # Scaling + Rotation part
     t = transform[:3, 3] # Translation part
+
+    if use_base_position:
+        # Convert quaternion to rotation matrix and rotate base_position
+        rotated_base_position = A @ base_position
+        # Now subtract the rotated base position
+        t = t - rotated_base_position
 
     try:
         # Decompose A = U @ S_diag @ Vh
@@ -330,6 +323,19 @@ def transform_object(splatsim_obj, pos=None, quat=None, transform=None):
     # 4. SH Features: Transform with pure rotation R_mat
     features_rest_obj = transform_shs(features_rest_obj, R_mat)
 
+    if inplace:
+        splatsim_obj.gaussians._xyz = xyz_obj
+        splatsim_obj.gaussians._rotation = rot_obj
+        splatsim_obj.gaussians._opacity = opacity_obj
+        splatsim_obj.gaussians._features_dc = features_dc_obj
+        splatsim_obj.gaussians._features_rest = features_rest_obj
+        splatsim_obj.gaussians._scaling = scales_obj
+        if splatsim_obj.articulation_config is not None:
+            # Update the initial link poses after transforming the robot
+            splatsim_obj.articulation_config.initial_link_poses = get_curr_link_states(
+                splatsim_obj.sim_id
+            )
+
     return xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
 
 
@@ -380,7 +386,7 @@ def transform_shs(shs_feat, rotation_matrix):
     return shs_feat
 
 
-def get_segmented_indices(splatsim_obj, robot_labels=None):
+def get_segmented_indices(splatsim_obj: SplatSimObject):
     pc = splatsim_obj.gaussians
     aabb = splatsim_obj.object_config["aabb"]["bounding_box"]
 
@@ -389,16 +395,10 @@ def get_segmented_indices(splatsim_obj, robot_labels=None):
     
     segmented_points = []
 
-    if robot_labels is None:
-        # For best speed, load labels outside of this function so that it's not loaded every loop
-        #load labels.npy
-        robot_labels = np.load('./data/labels_path/'+splatsim_obj.splat_name+'_labels.npy')
-        robot_labels = torch.from_numpy(robot_labels).to(device=xyz.device).long()
-
     # TODO can't this just be a list of xyz points, not the mask and the original points?
     condition = (xyz[:, 0] > aabb[0][0]) & (xyz[:, 0] < aabb[1][0]) & (xyz[:, 1] > aabb[0][1]) & (xyz[:, 1] < aabb[1][1]) & (xyz[:, 2] > aabb[0][2]) & (xyz[:, 2] < aabb[1][2])
     condition = torch.where(condition)[0]
     for i in range(p.getNumJoints(splatsim_obj.sim_id)):
-        segmented_points.append(condition[robot_labels==i])
+        segmented_points.append(condition[splatsim_obj.articulation_config.segmentation_labels==i])
     
     return segmented_points

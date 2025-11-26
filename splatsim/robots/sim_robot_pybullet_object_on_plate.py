@@ -24,9 +24,19 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
     ENV_CONFIG_NAME = None
     ENV_CONFIG = None
+    background_splat_name = "robot_iphone"
+
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+        # add plane
+        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
+
+        # place a wall in -0.4 at x axis using plane.urdf
+        # wall is perpendicular to the plane
+        quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
+        self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
 
     def plan_given_this_state(self, initial_joint_positions):
         all_paths = []
