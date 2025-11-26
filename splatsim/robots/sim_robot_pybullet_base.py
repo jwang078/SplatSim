@@ -281,6 +281,7 @@ class PybulletRobotServerBase:
         self.pybullet_client.setAdditionalSearchPath(
             "./submodules/pybullet-playground-wrapper/pybullet_playground/urdf/pybullet_ur5_gripper/urdf"
         )
+        self.pybullet_client.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
 
         with open(self.object_config_path, "r") as file:
             self.object_config = yaml.safe_load(file)
@@ -294,8 +295,7 @@ class PybulletRobotServerBase:
         
         # pybullet quaternion convention is (x, y, z, w)
         self.pybullet_client.resetBasePositionAndOrientation(
-            # self.splatsim_robot.sim_id, [0, 0.5, 0.5], [0, 0, 0, 1],
-            self.splatsim_robot.sim_id, [0, 0, 0.8], [1, 0, 0, 0]
+            self.splatsim_robot.sim_id, [0, 0, 1.0], [0, 1, 0, 0]
         )
         (
             object_pos,
@@ -356,7 +356,7 @@ class PybulletRobotServerBase:
         # self.splatsim_background = self.splatsim_robot
 
         # self.background_splat_name = self.robot_name
-        # TODO implmeent config for different background than what robot had
+        # TODO implement config for different background than what robot had
         self.background_splat_name = "bwa_open_space" # self.robot_name
         # The background uses the robot's full splat, but crops out the robot
         self.splatsim_background: SplatSimObject = self.create_object(
@@ -470,6 +470,8 @@ class PybulletRobotServerBase:
         # add gravity
         self.pybullet_client.setGravity(0, 0, -9.81)
 
+        # This is for the tabletop env
+        """
         # add plane
         self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
         self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
@@ -478,6 +480,15 @@ class PybulletRobotServerBase:
         # wall is perpendicular to the plane
         quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
         self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
+        """
+        # add plane
+        self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
+        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
+
+        # place a wall in -0.4 at x axis using plane.urdf
+        # wall is perpendicular to the plane
+        quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
+        self.wall = self.pybullet_client.loadURDF("plane.urdf", [-1, 0, 0.0], quat)
 
         ## add stage
         self.stage = 0
@@ -953,12 +964,12 @@ class PybulletRobotServerBase:
             )
 
         num_joints = self.pybullet_client.getNumJoints(splatsim_obj.sim_id)
-        if len(joint_state) != num_joints - 1:
+        if len(joint_state) > num_joints - 1:
             raise ValueError(
-                f"Expected {num_joints - 1} joint states, got {len(joint_state)}."
+                f"Expected at most {num_joints - 1} joint states, got {len(joint_state)}."
             )
 
-        for i in range(1, num_joints):
+        for i in range(1, min(len(joint_state), num_joints)):
             self.pybullet_client.resetJointState(
                 splatsim_obj.sim_id, i, joint_state[i - 1] * splatsim_obj.articulation_config.joint_signs[i - 1]
             )
@@ -1010,75 +1021,45 @@ class PybulletRobotServerBase:
             computeForwardKinematics=True,
         )
 
-        # robot_transformation = np.array(
-        #     self.splatsim_robot.object_config["transformation"]["matrix"]
-        # )
-        # TODO does the wrist camera still need to do this robot transformation?
-        robot_transformation = torch.tensor(
-            self.splatsim_robot.object_config["transformation"]["matrix"],
-            device="cuda",
-        )
-        robot_transformation_inv = torch.linalg.inv(robot_transformation)
+        # Original camera-to-world transform
+        T_cw = np.array(
+            link_state[0]
+        ).astype(np.float32)  # xyz position in world frame
 
-        T = torch.tensor(
-            link_state[0], device=robot_transformation.device
-        ).float()  # xyz position in world frame
         quat = link_state[1]
-        R = (
-            torch.tensor(
-                p.getMatrixFromQuaternion(quat), device=robot_transformation.device
+        R_cw = (
+            np.array(
+                p.getMatrixFromQuaternion(quat)
             )
             .reshape(3, 3)
-            .float()
+            .astype(np.float32)
         )
-        Trans_cam_world = torch.eye(4, device=R.device)
-        Trans_cam_world[:3, :3] = R
-        Trans_cam_world[:3, 3] = T
 
-        robot_transformation[:3, 3] = robot_transformation[:3, 3]
-        Trans_cam_splat = torch.matmul(robot_transformation_inv, Trans_cam_world)
+        T_wc = - R_cw.T @ T_cw
 
-        FoVx = 1.375955594372348
-        FoVy = 1.1025297299614814
-
-        image_width = 640
-        image_height = 480
-        image_name = "wrist_rgb"
-        image = torch.zeros((3, image_height, image_width)).float()
-
-        # Original camera-to-world transform
-        R_cw = Trans_cam_splat[:3, :3]
-        T_cw = Trans_cam_splat[:3, 3]
-        scale = torch.pow(torch.linalg.det(R_cw[:3, :3]), 1 / 3)
-        R_cw = R_cw / scale
-        T_cw = T_cw / scale
-        Trans_cam_splat_wo_scale = torch.eye(4, device=R_cw.device)
-        Trans_cam_splat_wo_scale[:3, :3] = R_cw
-        Trans_cam_splat_wo_scale[:3, 3] = T_cw
-
-        # Convert to world-to-camera
-        Rt_wc = torch.linalg.inv(Trans_cam_splat_wo_scale)
-        T_wc = Rt_wc[:3, 3]
-
-        resolution = (image_width, image_height)
+        # TODO is this needed?
+        # scale = self.base_camera.scale if self.base_camera is not None else 1.0
+        resolution = (self.base_camera.image_width, self.base_camera.image_height)
+        colmap_id = 0
+        uid = 0
         depth_params = None
         invdepthmap = None
+        image_name = "wrist_camera"
+        image = torch.zeros((3, resolution[0], resolution[1]), dtype=torch.float32)
 
-        # I really don't understand why this combination of rotation and translation matrices fixes calibration...
         camera = Camera(
             resolution,
             colmap_id,
-            R_cw.detach().cpu().numpy(),
-            T_wc.detach().cpu().numpy(),
-            FoVx,
-            FoVy,
+            R_cw,
+            T_wc,
+            self.base_camera.FoVx,
+            self.base_camera.FoVy,
             depth_params,
             to_pil_image(image),
             invdepthmap,
-            # gt_mask_alpha,
             image_name,
             uid,
-            scale=scale.detach().cpu().numpy(),
+            scale=1, # scale
         )
 
         return camera
@@ -1247,56 +1228,8 @@ class PybulletRobotServerBase:
 
         R_cw_final = R
         T_wc_final = -R.T @ t
-        # T_wc_final = np.array([t[1], t[2], t[0]])
-
-
-
-
-        """
         
-        R_fix = np.diag([-1, -1, -1]) @ np.diag([1, -1, 1]) @ np.diag([-1, 1, -1]) @ np.array([
-            [ 0.0, 0.0, 1.0],  # X_B = -Y_P
-            [ -1.0, 0.0, 0.0],   # Y_B = Z_P
-            [0.0, -1.0, 0.0]    # Z_B = -X_P
-        ]) @ np.array([
-            [ 0.0, -1.0, 0.0],  # X_B = -Y_P
-            [ 0.0, 0.0, 1.0],   # Y_B = Z_P
-            [-1.0, 0.0, 0.0]    # Z_B = -X_P
-        ])
-
-        # 1. Extract PyBullet Camera Pose (C2W)
-        # R_cw_pybullet: Camera-to-World Rotation in PyBullet's frame
-        R_cw_pybullet = view_matrix[:3, :3].T 
-        # T_cw: World-in-Camera Translation
-        T_cw = view_matrix[:3, 3]
-        # T_wc_pybullet: Camera Center in PyBullet World Coordinates
-        T_wc_pybullet = -R_cw_pybullet @ T_cw
-        
-        
-        # 3. Apply the Transformation
-        # Apply R_fix to transform the camera's orientation into the target coordinate system.
-        # R_cw_final = R_cw_pybullet @ R_fix
-        # This transforms the camera's internal frame (from PyBullet) to the target frame.
-        
-        # For full matrix transformation (World_Splat = R_fix @ World_Pybullet):
-        # The new camera position is transformed by R_fix
-        T_wc_final = R_fix @ T_wc_pybullet / self.base_camera.scale
-        T_wc_final = [T_wc_final[1], -T_wc_final[2], -T_wc_final[0]]
-        
-        # The new camera rotation is transformed as:
-        # R_cw_final = R_fix @ R_cw_pybullet
-        R_cw_final = R_fix @ R_cw_pybullet
-
-        # T_wc_final = np.array([-0.2063907,  1.5897055, 6.2722306,   ])
-
-        """
-
-        # T_wc_final = np.array([-0.2063907,  1.5897055, 6.2722306,   ])
-        
-        
-        print(f"R_cw_final:\n{R_cw_final}")
-        print(f"T_wc_final: {T_wc_final}\n")
-        
+        # TODO is this needed?
         # scale = self.base_camera.scale if self.base_camera is not None else 1.0
         resolution = (self.base_camera.image_width, self.base_camera.image_height)
         colmap_id = 0
@@ -1321,48 +1254,6 @@ class PybulletRobotServerBase:
             scale=1, #scale,
         )
         return new_camera
-
-    # def get_pybullet_debug_camera_as_splat_camera(self):
-    #     """Convert PyBullet's debug camera to a Camera object for Gaussian splatting."""
-        
-    #     # Get PyBullet camera info
-    #     camera_info = p.getDebugVisualizerCamera()
-        
-    #     view_matrix = np.array(camera_info[2]).reshape(4, 4).T
-
-    #     R_cw = view_matrix[:3, :3].T
-    #     T_wc = -R_cw.T @ view_matrix[:3, 3]
-    #     T_wc = np.array([T_wc[0], T_wc[2], T_wc[1]])
-
-    #     scale = self.base_camera.scale if self.base_camera is not None else 1.0
-        
-    #     print(f"R_cw:\n{R_cw}")
-    #     print(f"T_wc: {T_wc}\n")
-        
-    #     resolution = (self.base_camera.image_width, self.base_camera.image_height)
-    #     colmap_id = 0
-    #     uid = 0
-    #     depth_params = None
-    #     invdepthmap = None
-    #     image_name = "pybullet_debug_camera"
-    #     image = torch.zeros((3, resolution[0], resolution[1]), dtype=torch.float32)
-
-    #     new_camera = Camera(
-    #         resolution,
-    #         colmap_id,
-    #         R_cw,
-    #         T_wc,
-    #         self.base_camera.FoVx,
-    #         self.base_camera.FoVy,
-    #         depth_params,
-    #         to_pil_image(image),
-    #         invdepthmap,
-    #         image_name,
-    #         uid,
-    #         scale=scale,
-    #     )
-        
-    #     return new_camera
     
     def set_pybullet_camera_to_match_base(self):
         """Set PyBullet's debug camera to match the base camera view."""
@@ -1431,34 +1322,12 @@ class PybulletRobotServerBase:
         print("PyBullet camera updated!\n")
     
     def render_image(self, camera_name):
-        # self.debug_match_base_camera_to_pybullet()
-        
+        # TODO make this into a config        
         camera = self.get_pybullet_debug_camera_as_splat_camera()
-        # print("\n=== DEBUG TO SPLAT CAM ===")
-        # print(f"Resolution: {camera.image_width} x {camera.image_height}")
-        # print(f"R matrix:\n{camera.R}")
-        # print(f"T vector: {camera.T}")
-        # print(f"FoVx: {np.rad2deg(camera.FoVx):.2f}°")
-        # print(f"FoVy: {np.rad2deg(camera.FoVy):.2f}°")
-        # print(f"Scale: {camera.scale}")
-        # print("==============================\n")
-        # self.set_pybullet_camera_to_match_base()
-
-        # self.capture_pybullet_camera_params()
-
-        # self.debug_camera_coordinate_systems()
         if camera_name == "base_rgb":
             base_camera = self.base_camera
             # camera = base_camera
-
-            print("\n=== BASE CAMERA (working) ===")
-            print(f"Resolution: {base_camera.image_width} x {base_camera.image_height}")
-            print(f"R matrix:\n{base_camera.R}")
-            print(f"T vector: {base_camera.T}")
-            print(f"FoVx: {np.rad2deg(base_camera.FoVx):.2f}°")
-            print(f"FoVy: {np.rad2deg(base_camera.FoVy):.2f}°")
-            print(f"Scale: {base_camera.scale}")
-            print("==============================\n")
+            # TODO make this into a config
         elif camera_name == "wrist_rgb":
             camera = self.get_wrist_camera()
             if camera is None:

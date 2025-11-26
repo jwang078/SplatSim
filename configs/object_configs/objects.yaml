@@ -53,6 +53,7 @@ robot_iphone_w_engine:
   use_gripper: true
   is_articulated: true
   use_fixed_base: true
+  wrist_camera_link_name: wrist_camera_link
 bwa_open_space:
   transformation:
     matrix:
