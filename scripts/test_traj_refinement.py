@@ -277,9 +277,12 @@ def main(args):
     base_traj_pbar = tqdm(total=args.num_base_trajectories, desc="Base Trajectories")
     while base_traj_i < args.num_base_trajectories:
         saved_base_traj = False
-        q_start = get_random_joint_angles_without_collision(
-            robot_id, joint_indices, obstacle_ids, ll, ul, verbose=args.verbose
-        )
+        if args.q_start is None:
+            q_start = get_random_joint_angles_without_collision(
+                robot_id, joint_indices, obstacle_ids, ll, ul, verbose=args.verbose
+            )
+        else:
+            q_start = args.q_start
         if args.q_goal is None:
             q_goal = get_random_joint_angles_without_collision(
                 robot_id, joint_indices, obstacle_ids, ll, ul, verbose=args.verbose
@@ -472,6 +475,13 @@ if __name__ == "__main__":
         type=float, # Convert each argument to a float
         default=None,
         help="Set to None to use a random goal. Otherwise, provide a space-separated list of floats."
+    )
+    parser.add_argument(
+        "--q_start",
+        nargs='+',  # Expect one or more arguments
+        type=float, # Convert each argument to a float
+        default=None,
+        help="Set to None to use a random start. Otherwise, provide a space-separated list of floats."
     )
     # To the left side of the engine
     # (0.8704628188464882, -2.4071832524933336, 2.190265808315341, -2.6430289436412373, -1.255085236341607, -1.9464706594109809, 0.4383191524999254)

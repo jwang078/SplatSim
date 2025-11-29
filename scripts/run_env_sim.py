@@ -240,6 +240,15 @@ def main(args):
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=True)
             startup_steps = 2
             query_new_joints_per_startup_step = False
+        elif args.agent == "replay_zarr_trajectory_user_study":
+            from splatsim.agents.replay_zarr_trajectory_userstudy_agent import ReplayZarrTrajectoryUserStudyAgent
+            with open("configs/folder_configs.yaml", "r") as file:
+                folder_config = yaml.safe_load(file)
+            traj_folder = "output/obstacles_on_path_10_userstudy.zarr"
+
+            agent = ReplayZarrTrajectoryUserStudyAgent(traj_folder=traj_folder, env=env, save_images=False, gello_port=args.gello_port, gello_start_joints=args.start_joints)
+            startup_steps = 2
+            query_new_joints_per_startup_step = False
         else:
             raise ValueError("Invalid agent name")
         

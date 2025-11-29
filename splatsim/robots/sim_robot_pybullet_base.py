@@ -99,8 +99,12 @@ class ZMQRobotServer:
                     result = self._robot.num_dofs()
                 elif method == "get_joint_state":
                     result = self._robot.get_joint_state()
+                elif method == "get_ee_pos":
+                    result = self._robot.get_current_ee_pose()
                 elif method == "command_joint_state":
                     result = self._robot.command_joint_state(**args)
+                elif method == "teleport_joint_state":
+                    result = self._robot.teleport_joint_state(self._robot.splatsim_robot, **args)
                 elif method == "set_object_pose":
                     result = self._robot.set_object_pose(**args)
                 elif method == "get_observations":
@@ -466,7 +470,7 @@ class PybulletRobotServerBase:
             )
             # arbitrary as long as it's consistent between initialization and setup_camera_from_dataset()
             # because we're going to overwrite the resolution when transforming the camera
-            self.cam_scale = 1
+            self.cam_scale = 2
             temp_gaussian_model = GaussianModel(3)
             self.scene = Scene(
                 dataset,
@@ -1306,6 +1310,7 @@ class PybulletRobotServerBase:
     def render_image(self, camera_name):
         # TODO make this into a config        
         camera = self.get_pybullet_debug_camera_as_splat_camera()
+        
         if camera_name == "base_rgb":
             base_camera = self.base_camera
             # camera = base_camera
@@ -1751,6 +1756,11 @@ class PybulletRobotServerBase:
             return False
 
     def serve(self) -> None:
+        # Put all the articulated objects into their original states
+        for splatsim_obj in self.splatsim_objects:
+            if splatsim_obj.articulation_config is not None and splatsim_obj.articulation_config.initial_joint_positions is not None:
+                self.teleport_joint_state(splatsim_obj=splatsim_obj, joint_state=splatsim_obj.articulation_config.initial_joint_positions)
+
         # start the zmq server
         self._zmq_server_thread.start()
 
