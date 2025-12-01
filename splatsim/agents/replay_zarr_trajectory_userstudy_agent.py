@@ -47,7 +47,7 @@ class ReplayZarrTrajectoryUserStudyAgent(Agent):
         GELLO: str = "GELLO"
         QUITTING_GELLO: str = "QUITTING_GELLO"
 
-    def __init__(self, traj_folder: str, env: RobotEnv, save_images: bool = False, step_size=2,
+    def __init__(self, traj_folder: str, env: RobotEnv, save_images: bool = False, step_size=3,
                  gello_port=None, gello_start_joints=None):
         # TODO later put the step size to 1 when using a better machine
         self.robot = None
@@ -61,7 +61,6 @@ class ReplayZarrTrajectoryUserStudyAgent(Agent):
         self.gello_port = gello_port
         self.gello_start_joints = gello_start_joints
         self.init_gello()
-
 
         self.user_name = input("Name? ").strip()
 
@@ -78,7 +77,7 @@ class ReplayZarrTrajectoryUserStudyAgent(Agent):
 
         self.traj_folder = traj_folder
         self.save_images = save_images
-        self.traj_index = -1 # for testing purposes, start with one with an obstacle
+        self.traj_index = 2*4 - 1 #-1 # for testing purposes, start with one with an obstacle
         self.t = 0
 
         assert traj_folder.endswith('.zarr'), "Currently only .zarr trajectory folder is supported."
@@ -299,37 +298,38 @@ class ReplayZarrTrajectoryUserStudyAgent(Agent):
             else:
                 raise ValueError(f"Unknown obstacle type {obstacle['type']}")
             
-        self.env._robot.teleport_joint_state(self.trajectories[self.traj_index]["qs"][0])
+        if self.trajectories is not None and self.trajectories[self.traj_index] is not None and self.trajectories[self.traj_index]["qs"] is not None:
+            self.env._robot.teleport_joint_state(self.trajectories[self.traj_index]["qs"][0])
             
     def ask_user_questions_and_record(self, trajectory):
         print("\n\n\n")
 
         answer_goal_alignment = get_answer_on_1_to_5_scale(
-            "To what extent did the robot's behavior align with the trajectory you intended?"
+            "Did the robot move as you intended?"
         )
 
-        if trajectory["path_type"] in ["modified_traj", "modified_traj_no_obstacles"]:
-            print("\nThe robot was avoiding obstacles")
-        elif trajectory["path_type"] == "original_traj":
-            print("\nThe robot was taking a shorter path to the goal")
-        elif trajectory["path_type"] == "gello_traj":
-            print("\nThe robot was following your trajectory")
-        else:
-            raise ValueError(f"Unknown trajectory path type {trajectory['path_type']}")
+        # if trajectory["path_type"] in ["modified_traj", "modified_traj_no_obstacles"]:
+        #     print("\nThe robot was avoiding obstacles")
+        # elif trajectory["path_type"] == "original_traj":
+        #     print("\nThe robot was taking a shorter path to the goal")
+        # elif trajectory["path_type"] == "gello_traj":
+        #     print("\nThe robot was following your trajectory")
+        # else:
+        #     raise ValueError(f"Unknown trajectory path type {trajectory['path_type']}")
         
-        if trajectory["path_type"] != "user_traj":
-            answer_trust_obstacle = get_answer_on_1_to_5_scale("To what extent did you feel the robot had reasons for deviating from your intended path, even if you couldn't see the reason?")
-        else:
-            answer_trust_obstacle = None
+        # if trajectory["path_type"] != "user_traj":
+        #     answer_trust_obstacle = get_answer_on_1_to_5_scale("To what extent did you feel the robot had reasons for deviating from your intended path, even if you couldn't see the reason?")
+        # else:
+        #     answer_trust_obstacle = None
 
-        answer_safety = get_answer_on_1_to_5_scale("How safe did you perceive the robot's motion to be?")
+        answer_safety = get_answer_on_1_to_5_scale("How safe was the robot?")
 
         # answer_trust_autonomous = get_answer_on_1_to_5_scale("How much would you trust this robot to execute your intended trajectory autonomously?")
         
         answers_dict = {
-            "To what extent did the robot's behavior align with the trajectory you intended?": answer_goal_alignment,
-            "To what extent did you feel the robot had reasons for deviating from your intended path, even if you couldn't see the reason?": answer_trust_obstacle,
-            "How safe did you perceive the robot's motion to be?": answer_safety,
+            "Did the robot move as you intended?": answer_goal_alignment,
+            # "To what extent did you feel the robot had reasons for deviating from your intended path, even if you couldn't see the reason?": answer_trust_obstacle,
+            "How safe was the robot?": answer_safety,
             # "How much would you trust this robot to execute your intended trajectory autonomously?": answer_trust_autonomous
         }
 
