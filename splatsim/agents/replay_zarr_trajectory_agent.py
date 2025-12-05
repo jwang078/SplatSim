@@ -18,7 +18,7 @@ class ReplayZarrTrajectoryAgent(Agent):
         EXECUTING_TRAJ: str = "EXECUTING_TRAJ"
         SETTLING: str = "SETTLING"
 
-    def __init__(self, traj_folder: str, env: RobotEnv, save_images: bool = False, step_size=5):
+    def __init__(self, traj_folder: str, env: RobotEnv, save_images: bool = False, step_size=1):
         # TODO later put the step size to 1 when using a better machine
         self.robot = None
         # TODO does this need to be set?
@@ -39,7 +39,7 @@ class ReplayZarrTrajectoryAgent(Agent):
 
         self.traj_folder = traj_folder
         self.save_images = save_images
-        self.traj_index = -1 # for testing purposes, start with one with an obstacle
+        self.traj_index = 6 #-1 # for testing purposes, start with one with an obstacle
         self.t = 0
 
         assert traj_folder.endswith('.zarr'), "Currently only .zarr trajectory folder is supported."

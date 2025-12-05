@@ -114,10 +114,14 @@ def create_replay_buffer_from_splatsim_data(input_zarr_path: str, output_zarr_pa
                     # 4. Prepare data dictionary for ReplayBuffer.add_episode
                     # Use qs for both 'state' and 'action'
                     non_gripper_qs = qs_data[:, :6]
-                    if qs_data.shape[1] == 6:
-                        gripper_width = np.ones((qs_data.shape[0], 1)) * 1
-                    else:
-                        gripper_width = qs_data[:, 6:7]
+                    gripper_width = np.ones((qs_data.shape[0], 1)) * 1
+
+                    # TODO this doesn't use the gripper width
+                    print("WARNING: this isn't using gripper width in the dataset rn")
+                    # if qs_data.shape[1] == 6:
+                    #     gripper_width = np.ones((qs_data.shape[0], 1)) * 1
+                    # else:
+                    #     gripper_width = qs_data[:, 6:7]
                     data_to_add = {
                         # # State is the past
                         # 'state': qs_data.astype(np.float32)[:-horizon + 1],    # (T-1, DOF)
@@ -132,7 +136,7 @@ def create_replay_buffer_from_splatsim_data(input_zarr_path: str, output_zarr_pa
                         'robot0_base_rgb': base_rgb_data.astype(np.float32), # (T, image_height, image_width, 3)
 
                         # Action is the future
-                        'action': qs_data.astype(np.float32),   # (T, DOF)
+                        'action': non_gripper_qs, # qs_data.astype(np.float32),   # (T, DOF)
                     }
 
                     # 6. Add the episode to the ReplayBuffer
@@ -141,21 +145,28 @@ def create_replay_buffer_from_splatsim_data(input_zarr_path: str, output_zarr_pa
     else:
         trajectory_count = "N/A (only converting cache)"
 
-    with zarr.ZipStore(output_zarr_path + ".zip", mode='w') as zip_store:
-        replay_buffer.save_to_store(
-            store=zip_store
-        )
+    # with zarr.ZipStore(output_zarr_path + ".zip", mode='w') as zip_store:
+    #     replay_buffer.save_to_store(
+    #         store=zip_store
+    #     )
 
     print(f"\n✅ Flattening complete. Added {trajectory_count} trajectories.")
     print(f"Total steps in ReplayBuffer: {replay_buffer.n_steps}")
-    print(f"Output saved to: {output_zarr_path}.zip")
+    print(f"Output saved to: {output_zarr_path}")
 
 # --- Example of How to Call ---
 # You would need to adjust the DOF in your SplatsimObstacleAvoidanceDataset class
 # to 'DOF = 7' to match your data.
 
 dof_count = 7
-input_path = 'output/obstacles_on_path_onegoal_100dataset.zarr'
-output_path = f'output/obstacles_on_path_onegoal_noshift_6dof_100dataset_diffusionpolicy.zarr'
+# input_path = 'output/obstacles_on_path_onegoal_100dataset.zarr'
+# output_path = f'output/obstacles_on_path_onegoal_noshift_6dof_100dataset_diffusionpolicy.zarr'
+
+# input_path = 'output/obstacles_on_path_onegoal_5traj.zarr'
+# output_path = f'output/obstacles_on_path_onegoal_noshift_6dof_5traj_diffusionpolicy.zarr'
+
+input_path = 'output/obstacles_on_path_onegoal_20dataset_simple.zarr'
+output_path = f'output/obstacles_on_path_onegoal_20dataset_simple_noshift_6dof_diffusionpolicy.zarr'
+
 only_convert_cache = False
 create_replay_buffer_from_splatsim_data(input_path, output_path, dof=dof_count, only_convert_cache=only_convert_cache)

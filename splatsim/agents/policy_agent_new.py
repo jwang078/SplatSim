@@ -30,8 +30,18 @@ class DiffusionPolicyAgent(Agent):
         # ckpt_path="/home/jennyw2/code/diffusion_policy/data/outputs/2025.11.18/15.42.35_train_diffusion_unet_hybrid_splatsim_obstacle_avoidance/checkpoints/epoch=0060-test_mean_score=0.000.ckpt",
         # residual_to_first_step: bool = True,
 
-        # 11/19/25 umi repo
-        ckpt_path="/home/jennyw2/code/universal_manipulation_interface/data/outputs/2025.11.19/11.39.12_train_diffusion_unet_timm_splatsim_umi/checkpoints/epoch=0050-train_loss=0.035.ckpt",
+        # 11/19/25 umi repo with 100 scenario dataset
+        # ckpt_path="/home/jennyw2/code/universal_manipulation_interface/data/outputs/2025.11.19/11.39.12_train_diffusion_unet_timm_splatsim_umi/checkpoints/epoch=0050-train_loss=0.035.ckpt",
+        # residual_to_first_step: bool = False,
+
+        # 12/1/25 umi repo with 5traj dataset
+        # ckpt_path="/home/jennyw2/code/universal_manipulation_interface/data/outputs/2025.12.01/14.23.13_train_diffusion_unet_timm_splatsim_umi/checkpoints/epoch=0051-train_loss=0.039.ckpt",
+        # residual_to_first_step: bool = False,
+
+        # 12/1/25 umi repo with 20 traj simple dataset
+        # ckpt_path="/home/jennyw2/code/universal_manipulation_interface/data/outputs/2025.12.01/18.02.45_train_diffusion_unet_timm_splatsim_umi/checkpoints/epoch=0009-train_loss=0.074.ckpt",
+        # but with the images rescaled to 224 224 for the training dataset
+        ckpt_path="/home/jennyw2/code/universal_manipulation_interface/data/outputs/2025.12.01/19.10.44_train_diffusion_unet_timm_splatsim_umi/checkpoints/epoch=0025-train_loss=0.046.ckpt",
         residual_to_first_step: bool = False,
 
         image_names=["base_rgb"],
@@ -114,6 +124,7 @@ class DiffusionPolicyAgent(Agent):
     def act(self, obs):
         # Fill the time horizon buffer until it represents the full time horizon
         while len(self.obs_buffer[self.image_names[0]]) < self.target_obs_buffer_len - 1:
+            print("doing init obs")
             self.add_obs_to_buffer(obs)
 
         self.add_obs_to_buffer(obs)
@@ -156,6 +167,10 @@ class DiffusionPolicyAgent(Agent):
                 )  # CxHxW -> HxWxC
                 frame = (frame * 255).astype(np.uint8)
                 self.obs_buffers[image_name].append(frame)
+
+        if len(angles) == 6:
+            # add the gripper
+            angles = np.concatenate([angles, [0]])
 
         self.last_action = angles
 

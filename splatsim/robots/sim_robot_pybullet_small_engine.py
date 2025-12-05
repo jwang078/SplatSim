@@ -73,6 +73,23 @@ class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer)
                 "rotation_range_z": [0, 0],
             },
             # {
+            #     "object_name": "cuboid",
+            #     "splat_object_name": None,
+            #     "object_config": {
+            #         'use_gravity': False,
+            #         'use_fixed_base': False,
+            #         'mass': 10,
+            #         'object_type': 'cuboid',
+            #         'position': [-0.12196745458597882, 0.3332110115538118, 0.6671160820242428],
+            #         'orn': [0, 0, 0, 1],
+            #         'size': [0.25771765977910144, 0.23341448288006256, 0.02383446705446522]
+            #     },
+            #     "grasp_config": [],
+            #     "randomize_pose": False,
+            #     "rotation_range_z": [0, 0],
+            # },
+            
+            # {
             #     "object_name": "redblock",
             #     "splat_object_name": "redblock",
             #     "grasp_config": [],

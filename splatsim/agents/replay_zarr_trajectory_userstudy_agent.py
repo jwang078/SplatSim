@@ -77,7 +77,7 @@ class ReplayZarrTrajectoryUserStudyAgent(Agent):
 
         self.traj_folder = traj_folder
         self.save_images = save_images
-        self.traj_index = 2*4 - 1 #-1 # for testing purposes, start with one with an obstacle
+        self.traj_index = 4*5 -1 # for testing purposes, start with one with an obstacle
         self.t = 0
 
         assert traj_folder.endswith('.zarr'), "Currently only .zarr trajectory folder is supported."
@@ -154,11 +154,6 @@ class ReplayZarrTrajectoryUserStudyAgent(Agent):
                             traj_group = obstacle_group[trajs_name]
                             qs = np.array(traj_group['qs'])
                             assert qs.ndim == 2
-
-                            user_traj_name = f"qs_{self.user_name}"
-                            if user_traj_name in traj_group:
-                                del traj_group[user_traj_name]
-                                # Later, do a create_dataset
 
                             if obstacle_name == "obstacle_config_00":
                                 # User sees this trajectory with default settings only (no obstalces)
@@ -256,7 +251,10 @@ class ReplayZarrTrajectoryUserStudyAgent(Agent):
 
         if len(self.gello_traj_to_save) > 0:
             trajectory = self.trajectories[self.traj_index]
-            trajectory["traj_group"].create_dataset(f"qs_{self.user_name}", data=self.gello_traj_to_save, dtype="f4")
+            user_traj_name = f"qs_{self.user_name}"
+            if user_traj_name in trajectory["traj_group"]:
+                del trajectory["traj_group"][user_traj_name]
+            trajectory["traj_group"].create_dataset(user_traj_name, data=self.gello_traj_to_save, dtype="f4")
             self.gello_traj_to_save = []
         
         if self.save_images:
