@@ -39,7 +39,7 @@ class ReplayZarrTrajectoryAgent(Agent):
 
         self.traj_folder = traj_folder
         self.save_images = save_images
-        self.traj_index = 6 #-1 # for testing purposes, start with one with an obstacle
+        self.traj_index = -1 # for testing purposes, start with one with an obstacle
         self.t = 0
 
         assert traj_folder.endswith('.zarr'), "Currently only .zarr trajectory folder is supported."
@@ -113,7 +113,7 @@ class ReplayZarrTrajectoryAgent(Agent):
 
         # Load new static obstacles
         self.loaded_obstacle_names = []
-    
+
         obstacle_config_json = self.trajectories[self.traj_index]["metadata"]
         path_name = self.trajectories[self.traj_index]["name"]
         for i, obstacle in enumerate(obstacle_config_json['obstacles']):

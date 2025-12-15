@@ -219,25 +219,39 @@ def get_path_through_keyframes(keyframes, robot_id, joint_indices, obstacle_ids,
         gripper_goal = kf_goal[6] if len(kf_goal) > 6 else 0.0
 
         if verbose:
-            gripper_str_start = "closed" if gripper_start > 0.5 else "open"
-            gripper_str_goal = "closed" if gripper_goal > 0.5 else "open"
+            gripper_str_start = "closed" if gripper_start > 0.1 else "open"
+            gripper_str_goal = "closed" if gripper_goal > 0.1 else "open"
             print(f"  Planning segment {i+1}/{len(keyframes)-1}: keyframe {i} (gripper {gripper_str_start}) -> keyframe {i+1} (gripper {gripper_str_goal})")
 
-        segment_path = get_path(
-            q_start, q_goal,
-            robot_id, joint_indices,
-            obstacle_ids,
-            ll, ul,
-            time_per_segment, robot_update_rate,
-            rrt_vis_fps=rrt_vis_fps,
-            use_gui=use_gui,
-            verbose=verbose
-        )
+        # CHECK: If joint angles unchanged but gripper changed, create stationary trajectory
+        joints_identical = np.allclose(q_start, q_goal, atol=1e-6)
+        gripper_changed = abs(gripper_start - gripper_goal) > 1e-6
 
-        if segment_path is None:
+        if joints_identical and gripper_changed:
+            # Gripper-only transition: hardcode 2-second stationary trajectory
             if verbose:
-                print(f"  Failed to generate path for segment {i+1}")
-            return None
+                print(f"    Joints unchanged, gripper transition only - generating 2-second stationary path")
+
+            GRIPPER_ACTION_TIME = 2.0  # seconds
+            num_gripper_points = int(robot_update_rate * GRIPPER_ACTION_TIME)
+            segment_path = np.tile(q_start, (num_gripper_points, 1))  # Repeat same joint positions
+        else:
+            # Normal case: plan arm motion with RRT
+            segment_path = get_path(
+                q_start, q_goal,
+                robot_id, joint_indices,
+                obstacle_ids,
+                ll, ul,
+                time_per_segment, robot_update_rate,
+                rrt_vis_fps=rrt_vis_fps,
+                use_gui=use_gui,
+                verbose=verbose
+            )
+
+            if segment_path is None:
+                if verbose:
+                    print(f"  Failed to generate path for segment {i+1}")
+                return None
 
         segment_path = np.array(segment_path)
         all_segments.append(segment_path)
@@ -279,7 +293,7 @@ def main(args):
     initial_joint_positions = np.array(robot_config["joint_states"][0][1:8])
     robot_base_position = robot_config["base_position"][0]
 
-    experiment_name = f"{args.keyframes_file.split("/")[-1]}_{args.experiment_name}"
+    experiment_name = f"{".".join(args.keyframes_file.split("/")[-1].split(".")[:-1])}_{args.experiment_name if args.experiment_name is not None else 'default'}"
 
     # Load keyframes from file if provided
     if args.keyframes_file is not None:

@@ -187,7 +187,7 @@ small_engine_new:
   joint_states:
   - [0]
   base_position:
-  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.145]
   use_fixed_base: true
 plastic_apple:
   transformation:

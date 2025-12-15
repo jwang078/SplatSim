@@ -228,7 +228,8 @@ def main(args):
                 folder_config = yaml.safe_load(file)
             # traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
             # traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
-            traj_folder = "/home/jennyw2/code/SplatSim/output/obstacles_on_path_onegoal_20dataset_simple.zarr"
+            # traj_folder = "/home/jennyw2/code/SplatSim/output/obstacles_on_path_onegoal_20dataset_simple.zarr"
+            traj_folder = "/home/jennyw2/code/SplatSim/output/small_engine_keyframes_default.zarr"
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
             startup_steps = 2
             query_new_joints_per_startup_step = False
