@@ -142,6 +142,28 @@ def launch_robot_server(args: Args):
            image_width=96, image_height=96
         )
 
+    elif args.robot == "sim_ur_pybullet_small_engine_new_interactive":
+        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEngineNewPybulletRobotServer
+
+        server = UprightRobotSmallEngineNewPybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.INTERACTIVE,
+        #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper, 
+
+        #    camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper, 
+
+           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper, 
+        #    image_width=224, image_height=224
+        )
+
+    elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_norender":
+        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEngineNewPybulletRobotServer
+
+        server = UprightRobotSmallEngineNewPybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.INTERACTIVE,
+           camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper, 
+           image_width=96, image_height=96
+        )
+
     elif args.robot == "sim_ur_pybullet_open_bwa_interactive":
         from splatsim.robots.sim_robot_pybullet_robot_in_bwa import OpenSpaceBWAPybulletRobotServer
 

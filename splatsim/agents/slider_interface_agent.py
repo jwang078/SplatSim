@@ -7,7 +7,7 @@ class SliderInterfaceAgent(Agent):
     def __init__(self):
         self.robot = None
         self.joint_signs = [1] * 6
-        self.default_joint = [0, -1.57, 1.57, -1.57, -1.57, 0, 1]
+        self.default_joint = [1.57, -1.57, 1.57, -1.57, -1.57, 0, 1]
         self.num_joints = len(self.default_joint)
         self.last_action = np.array(self.default_joint)
         self.slider_ids = []

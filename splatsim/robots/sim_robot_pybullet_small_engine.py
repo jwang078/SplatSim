@@ -16,14 +16,6 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # add plane
-        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
-
-        # place a wall in -0.4 at x axis using plane.urdf
-        # wall is perpendicular to the plane
-        quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
-        self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
-
     def plan_given_this_state(self, initial_joint_positions):
         all_paths = []
         return all_paths
@@ -37,7 +29,7 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
             initial_joint_positions = self.randomize_ee_pose()
 
             success = self.plan_execute_record_trajectory(
-                initial_joint_positions, self.joint_signs
+                initial_joint_positions, self.splatsim_robot.articulation_config.joint_signs
             )
             if success:
                 self.trajectory_count += 1
@@ -72,29 +64,54 @@ class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer)
                 "randomize_pose": True,
                 "rotation_range_z": [0, 0],
             },
-            # {
-            #     "object_name": "cuboid",
-            #     "splat_object_name": None,
-            #     "object_config": {
-            #         'use_gravity': False,
-            #         'use_fixed_base': False,
-            #         'mass': 10,
-            #         'object_type': 'cuboid',
-            #         'position': [-0.12196745458597882, 0.3332110115538118, 0.6671160820242428],
-            #         'orn': [0, 0, 0, 1],
-            #         'size': [0.25771765977910144, 0.23341448288006256, 0.02383446705446522]
-            #     },
-            #     "grasp_config": [],
-            #     "randomize_pose": False,
-            #     "rotation_range_z": [0, 0],
-            # },
-            
-            # {
-            #     "object_name": "redblock",
-            #     "splat_object_name": "redblock",
-            #     "grasp_config": [],
-            #     "randomize_pose": True,
-            #     "rotation_range_z": [0, 0],
-            # },
         ]
     }
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # add plane
+        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
+
+        # place a wall in -0.4 at x axis using plane.urdf
+        # wall is perpendicular to the plane
+        quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
+        self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
+
+class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServer):
+    # This new lab bench scene has the robot rotated 90 degrees because it was installed rotated D:
+    ENV_CONFIG_NAME = "upright_robot_small_engine_new"
+    background_splat_name = "robot_iphone_w_engine_new"
+
+    ENV_CONFIG = {
+        "objects": [
+            {
+                "object_name": "small_engine_new",
+                "splat_object_name": "small_engine_new",
+                "grasp_config": [],
+                "randomize_pose": False,
+                "table_pos": [-0.565, 0.35],
+                # "table_pos": [-0.445, 0.348],
+                "table_quat": [0, 0, -0.7071068, 0.7071068],
+                "rotation_range_z": [0, 0],
+            },
+        ]
+    }
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # add plane
+        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
+
+        # place a wall in -0.6 at x axis using plane.urdf
+        # wall is perpendicular to the plane
+        quat = self.pybullet_client.getQuaternionFromEuler([-np.pi/2, np.pi / 2, 0])
+        self.wall = self.pybullet_client.loadURDF("plane.urdf", [0.0, -0.4, 0.0], quat)
+
+        # Set initial camera position on the opposite side of the wall (positive y side)
+        # Camera looks at the origin from the positive y side, above the floor
+        self.pybullet_client.resetDebugVisualizerCamera(
+            cameraDistance=2.0,      # Distance from target
+            cameraYaw=180,             # 0 degrees = looking from +y towards origin
+            cameraPitch=-30,         # -30 degrees = looking down at ~30 degree angle
+            cameraTargetPosition=[0, 0, 0.3]  # Look at point above the floor
+        )
