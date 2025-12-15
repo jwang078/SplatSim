@@ -167,7 +167,7 @@ class ReplayZarrTrajectoryAgent(Agent):
             raise ValueError(f"Unknown state {self.state}")
         
         if cur_joint.shape[0] == 6:
-            cur_joint = np.append(cur_joint, 0) # assume gripper is in the open position (1)
+            cur_joint = np.append(cur_joint, 0) # assume gripper is in the open position
 
         return cur_joint
 

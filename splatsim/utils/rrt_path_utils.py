@@ -204,7 +204,7 @@ def joints_to_trajectory(path, total_time=5.0, use_cubic_spline=True):
             return ts, np.array(qs)
         return sample_traj
 
-def setup_env(args, robot_base_position):
+def setup_env(args, robot_base_position, use_old_walls=False, use_obstacles=True):
     if args.gui:
         cid = p.connect(p.GUI)
     else:
@@ -216,12 +216,19 @@ def setup_env(args, robot_base_position):
     # load plane + obstacles here for demo; user should load their 30-300 cuboids and collect their body ids
     plane = p.loadURDF("plane.urdf")
 
-    # place a wall in -0.4 at x axis using plane.urdf
-    # wall is perpendicular to the plane
-    quat = p.getQuaternionFromEuler([0, np.pi / 2, 0])
-    wall = p.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
+    if use_old_walls:
+        # place a wall in -0.4 at x axis using plane.urdf
+        # wall is perpendicular to the plane
+        quat = p.getQuaternionFromEuler([0, np.pi / 2, 0])
+        wall = p.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
+    else:
+        quat = p.getQuaternionFromEuler([-np.pi/2, np.pi / 2, 0])
+        wall = p.loadURDF("plane.urdf", [0.0, -0.4, 0.0], quat)
 
-    cuboid_bboxes = load_cuboids(args.cuboids_fn)
+    if use_obstacles:
+        cuboid_bboxes = load_cuboids(args.cuboids_fn)
+    else:
+        cuboid_bboxes = None
 
     # load robot
     flags = p.URDF_USE_INERTIA_FROM_FILE
@@ -237,11 +244,12 @@ def setup_env(args, robot_base_position):
     ll, ul = get_joint_limits(robot_id, joint_indices)
 
     obstacle_ids = []
-    for cuboid_bbox in cuboid_bboxes:
-        cx, cy, cz, lx, ly, lz = cuboid_bbox
-        obs = create_box(lx, ly, lz, color=RED)
-        set_pose(obs, Pose(point=[cx, cy, cz]))
-        obstacle_ids.append(obs)
+    if use_obstacles:
+        for cuboid_bbox in cuboid_bboxes:
+            cx, cy, cz, lx, ly, lz = cuboid_bbox
+            obs = create_box(lx, ly, lz, color=RED)
+            set_pose(obs, Pose(point=[cx, cy, cz]))
+            obstacle_ids.append(obs)
     obstacle_ids.append(plane)
     obstacle_ids.append(wall)
 
@@ -480,6 +488,7 @@ def playback_path_in_gui(path, robot_id, joint_indices, path_name, fps=240, play
     if not p.isConnected():
         print("Not connected to PyBullet GUI.")
         return
+    set_robot_joint_positions(robot_id, joint_indices, path[0])
     input(f"Press Enter to play back the {path_name} path...")
     for q in path:
         set_robot_joint_positions(robot_id, joint_indices, q)
