@@ -171,7 +171,7 @@ class GripperPathSegment(PathSegment):
 @dataclass
 class SplatSimCamera:
     camera: Camera
-    pipeline: Any
+    pipeline: PipelineParams
     background: torch.tensor
 
 
@@ -462,9 +462,6 @@ class PybulletRobotServerBase:
             )
         else:
             self.base_camera = None
-            self.scene = None
-            self.pipeline = None
-            self.background = None
 
         self.wrist_camera_link_index = None
         if "wrist_rgb" in self.camera_names:
@@ -1006,7 +1003,7 @@ class PybulletRobotServerBase:
 
         # TODO is this needed?
         # scale = self.base_camera.scale if self.base_camera is not None else 1.0
-        resolution = (self.base_camera.image_width, self.base_camera.image_height)
+        resolution = (self.base_camera.camera.image_width, self.base_camera.camera.image_height)
 
         # Use actual camera resolution and FOV from COLMAP calibration
         # COLMAP camera model: OPENCV_FISHEYE
@@ -1026,8 +1023,8 @@ class PybulletRobotServerBase:
         image = torch.zeros((3, resolution[0], resolution[1]), dtype=torch.float32)
 
         fov_scale_x = 1
-        fovx = self.base_camera.FoVx * fov_scale_x
-        fovy = 2 * np.atan(np.tan(self.base_camera.FoVy / 2) * fov_scale_x)
+        fovx = self.base_camera.camera.FoVx * fov_scale_x
+        fovy = 2 * np.atan(np.tan(self.base_camera.camera.FoVy / 2) * fov_scale_x)
 
         camera = Camera(
             resolution,
@@ -1044,7 +1041,13 @@ class PybulletRobotServerBase:
             scale=1, # scale
         )
 
-        return camera
+        splatsim_camera = SplatSimCamera(
+            camera=camera,
+            pipeline=self.base_camera.pipeline,
+            background=self.base_camera.background
+        )
+
+        return splatsim_camera
 
     def prep_image_rendering(self, data) -> Dict[str, np.ndarray]:
         # Transform each object splat to be in the right pose
@@ -1180,7 +1183,7 @@ class PybulletRobotServerBase:
                 dim=0,
             )
 
-    def get_pybullet_debug_camera_as_splat_camera(self):
+    def get_pybullet_debug_camera_as_splat_camera(self) -> SplatSimCamera:
         """Convert PyBullet's debug camera to a Camera object for Gaussian splatting."""
         # This function is the inverse of this post: https://stackoverflow.com/a/75355212
 
@@ -1204,7 +1207,7 @@ class PybulletRobotServerBase:
         
         # TODO is this needed?
         # scale = self.base_camera.scale if self.base_camera is not None else 1.0
-        resolution = (self.base_camera.image_width, self.base_camera.image_height)
+        resolution = (self.base_camera.camera.image_width, self.base_camera.camera.image_height)
         colmap_id = 0
         uid = 0
         depth_params = None
@@ -1217,8 +1220,8 @@ class PybulletRobotServerBase:
             colmap_id,
             R_cw_final, # Use the fixed rotation
             T_wc_final, # Use the fixed translation
-            self.base_camera.FoVx,
-            self.base_camera.FoVy,
+            self.base_camera.camera.FoVx,
+            self.base_camera.camera.FoVy,
             depth_params,
             to_pil_image(image),
             invdepthmap,
@@ -1226,7 +1229,14 @@ class PybulletRobotServerBase:
             uid,
             scale=1, #scale,
         )
-        return new_camera
+
+        splatsim_camera = SplatSimCamera(
+            camera=new_camera,
+            pipeline=self.base_camera.pipeline,
+            background=self.base_camera.background,
+        )
+
+        return splatsim_camera
     
     def set_pybullet_camera_to_match_base(self):
         """Set PyBullet's debug camera to match the base camera view."""
@@ -1236,9 +1246,9 @@ class PybulletRobotServerBase:
             return
         
         # Get base camera parameters
-        R_cw = self.base_camera.R
-        T_wc = self.base_camera.T
-        scale = self.base_camera.scale
+        R_cw = self.base_camera.camera.R
+        T_wc = self.base_camera.camera.T
+        scale = self.base_camera.camera.scale
         
         # Camera position in world space
         camera_pos = -R_cw.T @ T_wc
@@ -1309,7 +1319,7 @@ class PybulletRobotServerBase:
         else:
             raise ValueError(f"Unknown camera name {camera_name}")
 
-        rendering = render(camera, self.scene_gaussian, self.pipeline, self.background)[
+        rendering = render(camera.camera, self.scene_gaussian, camera.pipeline, camera.background)[
             "render"
         ].cpu()
         # If you index "depth" instead of "render", you get the depth image
@@ -1317,7 +1327,7 @@ class PybulletRobotServerBase:
         # save the image
         return rendering
 
-    def setup_camera_from_dataset(self, splatsim_obj, cam_i, use_train=True):
+    def setup_camera_from_dataset(self, splatsim_obj: SplatSimObject, cam_i, use_train=True) -> SplatSimCamera:
         ###################################################################
         # Load the gaussian splat dataset to get camera parameters
         ###################################################################
@@ -1371,9 +1381,9 @@ class PybulletRobotServerBase:
         # Assume that self.cam_train_indices and self.cam_test_indices have already singled out
         # the camera of interest. Return the first camera in the list
         if use_train:
-            camera = scene.getTrainCameras(scale=self.cam_scale)[0]
+            camera = scene.getTrainCameras(scale=cam_scale)[0]
         else:
-            camera = scene.getTestCameras(scale=self.cam_scale)[0]
+            camera = scene.getTestCameras(scale=cam_scale)[0]
 
         ###################################################################
         # Transform the camera to be in the simulator frame instead of the splatsim background object's splat frame
@@ -1476,7 +1486,13 @@ class PybulletRobotServerBase:
             scale=camera.scale,    # Uniform scale extracted from transformation
         )
 
-        return new_camera
+        splatsim_camera = SplatSimCamera(
+            camera=new_camera,
+            pipeline=pipeline,
+            background=background,
+        )
+
+        return splatsim_camera
 
     def get_current_ee_pose(self):
         dummy_ee_pos, dummy_ee_quat = (
