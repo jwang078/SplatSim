@@ -105,7 +105,7 @@ bwa_open_space:
   - [0, 0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
     0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/2025-10-24_new_bedford_engine_visit_GX010016_notwideangle_better_images_500_20match_540height/sfm_disk_disk+lightglue/undistorted
-  model_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/2025-10-24_new_bedford_engine_visit_GX010016_notwideangle_better_images_500_20match_540height
+  model_path: /home/jennyw2/code/gaussian-splatting/output/2025-10-24_new_bedford_engine_visit_GX010016_notwideangle_better_images_500_20match_540height
   use_gripper: true
   is_articulated: false
   use_fixed_base: true

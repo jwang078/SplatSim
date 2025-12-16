@@ -173,6 +173,7 @@ class SplatSimCamera:
     camera: Camera
     pipeline: PipelineParams
     background: torch.tensor
+    tracked_link_index: Optional[str] = None
 
 
 class PybulletRobotServerBase:
@@ -458,13 +459,16 @@ class PybulletRobotServerBase:
 
         if "base_rgb" in self.camera_names:
             self.base_camera = self.setup_camera_from_dataset(
-                self.splatsim_background, cam_i=self.cam_i, use_train=True
+                self.splatsim_background.object_config, cam_i=self.cam_i, use_train=True
             )
         else:
             self.base_camera = None
 
-        self.wrist_camera_link_index = None
         if "wrist_rgb" in self.camera_names:
+            # Hardcoding a splat dataset / recovered camera from a GoPro
+            self.wrist_camera = self.setup_camera_from_dataset(
+                self.object_config["bwa_open_space"], cam_i=3, use_train=True
+            )
             # Get the index of the wrist_camera_link
             if "wrist_camera_link_name" in self.splatsim_robot.object_config:
                 wrist_camera_link_name = self.splatsim_robot.object_config[
@@ -474,9 +478,9 @@ class PybulletRobotServerBase:
                 for i in range(num_joints):
                     info = p.getJointInfo(self.splatsim_robot.sim_id, i)
                     if info[12].decode("utf-8") == wrist_camera_link_name:
-                        self.wrist_camera_link_index = i
+                        self.wrist_camera.tracked_link_index = i
                         break
-                if self.wrist_camera_link_index is None:
+                if self.wrist_camera.tracked_link_index is None:
                     raise ValueError(
                         f"Cannot find wrist camera link name {wrist_camera_link_name}"
                     )
@@ -971,7 +975,7 @@ class PybulletRobotServerBase:
         self.do_render_from_splat = True
 
     def get_wrist_camera(self):
-        if self.wrist_camera_link_index is None:
+        if self.wrist_camera.tracked_link_index is None:
             print("WARNING: No wrist camera index found")
             return None
 
@@ -981,7 +985,7 @@ class PybulletRobotServerBase:
         # Get the pose of the wrist_camera_link
         link_state = p.getLinkState(
             self.splatsim_robot.sim_id,
-            self.wrist_camera_link_index,
+            self.wrist_camera.tracked_link_index,
             computeForwardKinematics=True,
         )
 
@@ -1327,15 +1331,15 @@ class PybulletRobotServerBase:
         # save the image
         return rendering
 
-    def setup_camera_from_dataset(self, splatsim_obj: SplatSimObject, cam_i, use_train=True) -> SplatSimCamera:
+    def setup_camera_from_dataset(self, splatsim_obj_object_config, cam_i, use_train=True) -> SplatSimCamera:
         ###################################################################
         # Load the gaussian splat dataset to get camera parameters
         ###################################################################
-        source_path = splatsim_obj.object_config["source_path"]
+        source_path = splatsim_obj_object_config["source_path"]
         if not os.path.exists(source_path):
             raise FileNotFoundError(f"Source path not found: {source_path}")
 
-        model_path = splatsim_obj.object_config["model_path"]
+        model_path = splatsim_obj_object_config["model_path"]
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model path not found: {model_path}")
 
@@ -1392,7 +1396,7 @@ class PybulletRobotServerBase:
         # 1. Define device and Trans_canonical
         device = camera.world_view_transform.device
         Trans_canonical_full = torch.from_numpy(
-            np.array(splatsim_obj.object_config['transformation']['matrix'])
+            np.array(splatsim_obj_object_config['transformation']['matrix'])
         ).to(device=device).float()
 
         # 2. Get the camera's pose in the SPLAT'S LOCAL FRAME
@@ -1490,6 +1494,7 @@ class PybulletRobotServerBase:
             camera=new_camera,
             pipeline=pipeline,
             background=background,
+            tracked_link_index=None, # Set this outside of this loop
         )
 
         return splatsim_camera
