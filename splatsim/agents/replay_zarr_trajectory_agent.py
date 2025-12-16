@@ -39,7 +39,7 @@ class ReplayZarrTrajectoryAgent(Agent):
 
         self.traj_folder = traj_folder
         self.save_images = save_images
-        self.traj_index = -1 # for testing purposes, start with one with an obstacle
+        self.traj_index = 0 # for testing purposes, start with one with an obstacle
         self.t = 0
 
         assert traj_folder.endswith('.zarr'), "Currently only .zarr trajectory folder is supported."
@@ -85,6 +85,7 @@ class ReplayZarrTrajectoryAgent(Agent):
         self.load_next_recorded_trajectory()
 
     def load_next_recorded_trajectory(self):
+        import pdb; pdb.set_trace()
         # Clean up the previous trajectory
         # This clears everything, even if the object was created by another script
         deleted_obj_names = self.env._robot.clear_temp_objects()
