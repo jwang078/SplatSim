@@ -168,6 +168,12 @@ class GripperPathSegment(PathSegment):
     def __post_init__(self):
         self.path_type = "gripper"
 
+@dataclass
+class SplatSimCamera:
+    camera: Camera
+    pipeline: Any
+    background: torch.tensor
+
 
 class PybulletRobotServerBase:
     MAX_TRAJECTORY_COUNT = 500
@@ -291,6 +297,7 @@ class PybulletRobotServerBase:
         with open(self.object_config_path, "r") as file:
             self.object_config = yaml.safe_load(file)
 
+        # TODO this mock class fails for the apple on plate task, etc
         class MockModelsLib:
             model_name_list = {}
         self.models_lib = MockModelsLib #md.model_lib()
@@ -450,51 +457,8 @@ class PybulletRobotServerBase:
         self.scene_gaussian = GaussianModel(3)
 
         if "base_rgb" in self.camera_names:
-            source_path = self.splatsim_background.object_config["source_path"]
-            if not os.path.exists(source_path):
-                raise FileNotFoundError(f"Source path not found: {source_path}")
-
-            model_path = self.splatsim_background.object_config["model_path"]
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(f"Model path not found: {model_path}")
-
-            parser = ArgumentParser(description="Testing script parameters")
-            self.pipeline = PipelineParams(parser)
-            model = ModelParams(parser, sentinel=True)
-            dataset = model.extract(
-                Namespace(
-                    sh_degree=3,
-                    # TODO get these from the object config
-                    source_path=source_path,
-                    model_path=model_path,
-                    images="images",
-                    depths="",
-                    resolution=-1,
-                    white_background=False,
-                    train_test_exp=False,
-                    data_device="cuda",
-                    eval=False,
-                )
-            )
-            # arbitrary as long as it's consistent between initialization and setup_camera_from_dataset()
-            # because we're going to overwrite the resolution when transforming the camera
-            self.cam_scale = 2
-            temp_gaussian_model = GaussianModel(3)
-            self.scene = Scene(
-                dataset,
-                temp_gaussian_model, # This is just used for camera initialization
-                load_iteration=-1,
-                shuffle=False,
-                resolution_scales=[self.cam_scale],
-                train_cam_indices=[self.cam_i],
-                test_cam_indices=[], # we're using train cameras
-            )
-
-            bg_color = [1, 1, 1]
-            self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
             self.base_camera = self.setup_camera_from_dataset(
-                cam_i=self.cam_i, use_train=True
+                self.splatsim_background, cam_i=self.cam_i, use_train=True
             )
         else:
             self.base_camera = None
@@ -1042,14 +1006,14 @@ class PybulletRobotServerBase:
 
         # TODO is this needed?
         # scale = self.base_camera.scale if self.base_camera is not None else 1.0
-        # resolution = (self.base_camera.image_width, self.base_camera.image_height)
+        resolution = (self.base_camera.image_width, self.base_camera.image_height)
 
         # Use actual camera resolution and FOV from COLMAP calibration
         # COLMAP camera model: OPENCV_FISHEYE
         # COLMAP params: width=960, height=540, fx=1152, fy=1152, cx=480, cy=270
         # Distortion k1-k4 = [0,0,0,0] (no distortion, lucky!)
         # Computed FOV: FoVx=0.789582 rad (45.24°), FoVy=0.460439 rad (26.38°)
-        resolution = (960, 540)
+        # resolution = (960, 540)
         # resolution = (960, 540)
         # fovx = 0.789582  # radians
         # fovy = 0.460439  # radians
@@ -1061,8 +1025,7 @@ class PybulletRobotServerBase:
         image_name = "wrist_camera"
         image = torch.zeros((3, resolution[0], resolution[1]), dtype=torch.float32)
 
-        # Old incorrect approach (kept for reference):
-        fov_scale_x = 2
+        fov_scale_x = 1
         fovx = self.base_camera.FoVx * fov_scale_x
         fovy = 2 * np.atan(np.tan(self.base_camera.FoVy / 2) * fov_scale_x)
 
@@ -1078,7 +1041,7 @@ class PybulletRobotServerBase:
             invdepthmap,
             image_name,
             uid,
-            scale=1, #1, # scale
+            scale=1, # scale
         )
 
         return camera
@@ -1354,20 +1317,72 @@ class PybulletRobotServerBase:
         # save the image
         return rendering
 
-    def setup_camera_from_dataset(self, cam_i, use_train=True):
+    def setup_camera_from_dataset(self, splatsim_obj, cam_i, use_train=True):
+        ###################################################################
+        # Load the gaussian splat dataset to get camera parameters
+        ###################################################################
+        source_path = splatsim_obj.object_config["source_path"]
+        if not os.path.exists(source_path):
+            raise FileNotFoundError(f"Source path not found: {source_path}")
+
+        model_path = splatsim_obj.object_config["model_path"]
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model path not found: {model_path}")
+
+        parser = ArgumentParser(description="Testing script parameters")
+        pipeline = PipelineParams(parser)
+        model = ModelParams(parser, sentinel=True)
+        dataset = model.extract(
+            Namespace(
+                sh_degree=3,
+                # TODO get these from the object config
+                source_path=source_path,
+                model_path=model_path,
+                images="images",
+                depths="",
+                resolution=-1,
+                white_background=False,
+                train_test_exp=False,
+                data_device="cuda",
+                eval=False,
+            )
+        )
+        # arbitrary as long as it's consistent between initialization and setup_camera_from_dataset()
+        # because we're going to overwrite the resolution when transforming the camera
+        cam_scale = 2
+        temp_gaussian_model = GaussianModel(3)
+        scene = Scene(
+            dataset,
+            temp_gaussian_model, # This is just used for camera initialization
+            load_iteration=-1,
+            shuffle=False,
+            resolution_scales=[cam_scale],
+            train_cam_indices=[cam_i],
+            test_cam_indices=[], # we're using train cameras
+        )
+
+        bg_color = [1, 1, 1]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        ###################################################################
+        # Load the camera from the dataset
+        ###################################################################
+
         # Assume that self.cam_train_indices and self.cam_test_indices have already singled out
         # the camera of interest. Return the first camera in the list
         if use_train:
-            camera = self.scene.getTrainCameras(scale=self.cam_scale)[0]
+            camera = scene.getTrainCameras(scale=self.cam_scale)[0]
         else:
-            camera = self.scene.getTestCameras(scale=self.cam_scale)[0]
+            camera = scene.getTestCameras(scale=self.cam_scale)[0]
 
+        ###################################################################
         # Transform the camera to be in the simulator frame instead of the splatsim background object's splat frame
+        ####################################################################
 
         # 1. Define device and Trans_canonical
         device = camera.world_view_transform.device
         Trans_canonical_full = torch.from_numpy(
-            np.array(self.splatsim_background.object_config['transformation']['matrix'])
+            np.array(splatsim_obj.object_config['transformation']['matrix'])
         ).to(device=device).float()
 
         # 2. Get the camera's pose in the SPLAT'S LOCAL FRAME
