@@ -9,7 +9,9 @@ import numpy as np
 import tyro
 import termcolor
 
-import cv2
+import os
+
+from splatsim.utils.image_utils import letterbox
 
 
 from splatsim.agents.agent import BimanualAgent, DummyAgent
@@ -19,6 +21,11 @@ from gello.env import RobotEnv
 from splatsim.robots.robot import PrintRobot
 from gello.zmq_core.robot_node import ZMQClientRobot
 from gello.zmq_core.camera_node import ZMQClientCamera
+from splatsim.utils.agent_state_utils import AGENT_STATE
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig, ImageTransformConfig
+
+
 
 import yaml
 
@@ -47,6 +54,9 @@ class Args:
     data_dir: str = "~/data/bc_data"
     bimanual: bool = False
     verbose: bool = False
+
+    save_lerobot_dataset: bool = False
+    lerobot_dataset_repo_id: str = "JennyWWW/splatsim_lerobot_dataset"
 
 
 def main(args):
@@ -229,7 +239,9 @@ def main(args):
             # traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
             # traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
             # traj_folder = "/home/jennyw2/code/SplatSim/output/obstacles_on_path_onegoal_20dataset_simple.zarr"
-            traj_folder = "/home/jennyw2/code/SplatSim/output/small_engine_keyframes_default.zarr"
+            # traj_folder = "/home/jennyw2/code/SplatSim/output/small_engine_keyframes_default.zarr"
+            traj_folder = "/home/jennyw2/code/SplatSim/output/eval_go_to_nominal_10.zarr"
+            # traj_folder = "/home/jennyw2/code/SplatSim/output/go_to_nominal_10.zarr"
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
             startup_steps = 2
             query_new_joints_per_startup_step = False
@@ -252,6 +264,15 @@ def main(args):
             agent = ReplayZarrTrajectoryUserStudyAgent(traj_folder=traj_folder, env=env, save_images=False, gello_port=args.gello_port, gello_start_joints=args.start_joints)
             startup_steps = 2
             query_new_joints_per_startup_step = False
+
+        elif args.agent == "lerobot":
+            # Point to your local checkpoint or Hugging Face hub ID
+            # checkpoint = "outputs/pi05_finetune/checkpoints/last/pretrained_model"
+            checkpoint = "outputs/pi05_training/checkpoints/last/pretrained_model"
+            from splatsim.agents.lerobot_agent import LeRobotAgent
+            agent = LeRobotAgent(checkpoint_path=checkpoint)
+            startup_steps = 16
+            query_new_joints_per_startup_step = False
         else:
             raise ValueError("Invalid agent name")
         
@@ -262,8 +283,11 @@ def main(args):
 
     # going to start position
     print("Going to start position")
-    start_pos = agent.act(env.get_obs())
     obs = env.get_obs()
+    if query_new_joints_per_startup_step:
+        start_pos = agent.act(obs)
+    else:
+        start_pos = obs["joint_positions"]
     joints = obs["joint_positions"]
     
     if not isinstance(joints, np.ndarray):
@@ -320,12 +344,17 @@ def main(args):
         max_joint_delta = np.abs(delta).max()
         if max_joint_delta > max_delta:
             delta = delta / max_joint_delta * max_delta
+        print("command:", command_joints)
+        print("current:", current_joints)
+        print("delta:", delta)
+        print("")
         
             
         if flag:
             delta = delta[:-1]
             current_joints = current_joints[:-1]
         env.step(current_joints + delta) # ------------------------------
+
 
     obs = env.get_obs()
     joints = obs["joint_positions"]
@@ -351,66 +380,163 @@ def main(args):
     if args.use_save_interface:
         kb_interface = KBReset()
 
+    if args.save_lerobot_dataset:
+        # Standard LeRobot cache path
+        local_dir = os.path.expanduser(f"~/.cache/huggingface/lerobot/{args.lerobot_dataset_repo_id}")
+
+        if os.path.exists(local_dir):
+            print(f"Appending to existing LeRobot dataset at {local_dir}")
+            lerobot_saver = LeRobotDataset(args.lerobot_dataset_repo_id) #, root=local_dir)
+        else:
+            print(f"Creating new LeRobot dataset at {local_dir}")
+            # https://huggingface.co/docs/lerobot/en/lerobot-dataset-v3#available-transform-types
+            custom_transforms_config = ImageTransformsConfig(
+                enable=True,
+                max_num_transforms=2,
+                random_order=True,
+                tfs={
+                    "brightness": ImageTransformConfig(
+                        weight=1.0,
+                        type="ColorJitter",
+                        kwargs={"brightness": (0.7, 1.3)}  # Adjust brightness range
+                    ),
+                    "contrast": ImageTransformConfig(
+                        weight=2.0,  # Higher weight = more likely to be selected
+                        type="ColorJitter",
+                        kwargs={"contrast": (0.8, 1.2)}
+                    ),
+                    "sharpness": ImageTransformConfig(
+                        weight=0.5,  # Lower weight = less likely to be selected
+                        type="SharpnessJitter",
+                        kwargs={"sharpness": (0.3, 2.0)}
+                    ),
+                }
+            )
+
+            lerobot_saver = LeRobotDataset.create(
+                repo_id=args.lerobot_dataset_repo_id,
+                fps=50,
+                robot_type="lerobot_splatsim",
+                use_videos=True,
+                features={
+                    "observation.images.base_rgb": {
+                        "dtype": "image",
+                        "shape": (3, 224, 224), #obs['base_rgb'].shape,
+                        "names": ["channels", "height", "width"],
+                    },
+                    "observation.state": {
+                        "dtype": "float32",
+                        "shape": (7,),
+                        "names": [
+                            "joint_1",
+                            "joint_2",
+                            "joint_3",
+                            "joint_4",
+                            "joint_5",
+                            "joint_6",
+                            "gripper",
+                        ],
+                    },
+                    "action": {
+                        "dtype": "float32",
+                        "shape": (7,),
+                        "names": [
+                            "joint_1",
+                            "joint_2",
+                            "joint_3",
+                            "joint_4",
+                            "joint_5",
+                            "joint_6",
+                            "gripper",
+                        ],
+                    },
+                },
+                # image_transforms=custom_transforms_config,
+            )
+
     print_color("\nStart 🚀🚀🚀", color="green", attrs=("bold",))
 
     save_path = None
     start_time = time.time()
-    while True:
-        loop_start = time.time()
+    started_executing_traj = False
+    try:
+        while True:
+            loop_start = time.time()
 
-        num = time.time() - start_time
-        message = f"\rTime passed: {round(num, 2)}          "
-        print_color(
-            message,
-            color="white",
-            attrs=("bold",),
-            end="",
-            flush=True,
-        )
-        action = agent.act(obs)
-        dt = datetime.datetime.now()
-        if args.use_save_interface:
-            state = kb_interface.update()
-            if state == "start":
-                dt_time = datetime.datetime.now()
-                save_path = (
-                    Path(args.data_dir).expanduser()
-                    / args.agent
-                    / dt_time.strftime("%m%d_%H%M%S")
-                )
-                save_path.mkdir(parents=True, exist_ok=True)
-                print(f"Saving to {save_path}")
-            elif state == "save":
-                assert save_path is not None, "something went wrong"
-                #check whether each element of dict is not None
-                if all(value is not None for value in obs.values()):
-                    save_frame(save_path, dt, obs, action)
-                    print('success')
-    
-            elif state == "normal":
-                save_path = None
-            else:
-                raise ValueError(f"Invalid state {state}")
-            
-        if flag:
-            action = action[:-1]
-        obs = env.step(action)
+            num = time.time() - start_time
+            message = f"\rTime passed: {round(num, 2)}          "
+            print_color(
+                message,
+                color="white",
+                attrs=("bold",),
+                end="",
+                flush=True,
+            )
+            action = agent.act(obs)
 
-        for img_obs_name in ["wrist_rgb", "base_rgb"]:
-            if img_obs_name not in obs or obs[img_obs_name] is None:
-                continue
-            frame = obs[img_obs_name]
-            frame = np.transpose(frame.detach().cpu().numpy(), (1, 2, 0))  # CxHxW -> HxWxC
-            frame = (frame * 255).astype(np.uint8)
-            cv2.imshow(img_obs_name, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            cv2.waitKey(1)
+            if getattr(agent, 'state', AGENT_STATE.UNKNOWN) == AGENT_STATE.EXECUTING_TRAJ:
+                started_executing_traj = True
 
-        loop_end = time.time()
-        loop_duration = loop_end - loop_start
-        # Keep the time locked at a fixed rate
-        sleep_time = max(0, (1 / 50) - (loop_duration))
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+            if getattr(agent, 'state', AGENT_STATE.EXECUTING_TRAJ) == AGENT_STATE.EXECUTING_TRAJ and args.save_lerobot_dataset:
+                # We save the obs and the action that was generated from it
+                lerobot_saver.add_frame({
+                    # base_rgb is (c, h, w) format
+                    "observation.images.base_rgb": letterbox(obs["base_rgb"].detach().cpu().numpy(), (224, 224)),
+                    "observation.state": obs["joint_positions"].astype(np.float32),
+                    "action": action.astype(np.float32),
+                    "task": "test", # TODO why is this necessary
+                })
+
+            if getattr(agent, 'state', AGENT_STATE.UNKNOWN) == AGENT_STATE.SETTLING and started_executing_traj:
+                if args.save_lerobot_dataset:
+                    lerobot_saver.save_episode()
+                    print("In run env sim saving episode")
+                started_executing_traj = False
+
+            dt = datetime.datetime.now()
+            if args.use_save_interface:
+                state = kb_interface.update()
+                if state == "start":
+                    dt_time = datetime.datetime.now()
+                    save_path = (
+                        Path(args.data_dir).expanduser()
+                        / args.agent
+                        / dt_time.strftime("%m%d_%H%M%S")
+                    )
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    print(f"Saving to {save_path}")
+                elif state == "save":
+                    assert save_path is not None, "something went wrong"
+                    #check whether each element of dict is not None
+                    if all(value is not None for value in obs.values()):
+                        save_frame(save_path, dt, obs, action)
+                        print('success')
+        
+                elif state == "normal":
+                    save_path = None
+                else:
+                    raise ValueError(f"Invalid state {state}")
+                
+            if flag:
+                action = action[:-1]
+            obs = env.step(action)
+
+            loop_end = time.time()
+            loop_duration = loop_end - loop_start
+            # Keep the time locked at a fixed rate
+            sleep_time = max(0, (1 / 50) - (loop_duration))
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    except KeyboardInterrupt:
+        print_color("\nStopping run_env_sim.py", color="red", attrs=("bold",))
+    finally:
+        if args.save_lerobot_dataset:
+            # TODO it's possible the last episode of a successful replay isn't saved
+            print("Finalizing lerobot_saver...")
+            lerobot_saver.finalize()
+            print("Pushing to hub...")
+            lerobot_saver.push_to_hub()
+            print("Done!")
 
 
 if __name__ == "__main__":

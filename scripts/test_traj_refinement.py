@@ -260,7 +260,8 @@ def main(args):
         # Find existing traj indices like traj_0007, traj_0123, ...
         traj_re = re.compile(r"^traj_(\d+)$")
         existing_ids = []
-        for name, node in scenarios_group.items():
+        for name in scenarios_group.keys():
+            node = scenarios_group[name]
             if isinstance(node, zarr.hierarchy.Group):
                 m = traj_re.match(name)
                 if m:
@@ -271,7 +272,7 @@ def main(args):
         print(f"Resuming at traj index {num_prev_traj}")
 
     # Environment setup
-    ll, ul, obstacle_ids, robot_id, joint_indices = setup_env(args, robot_base_position)
+    ll, ul, obstacle_ids, robot_id, joint_indices = setup_env(args, robot_base_position, use_obstacles=args.cuboids_fn != "None")
 
     base_traj_i = 0
     base_traj_pbar = tqdm(total=args.num_base_trajectories, desc="Base Trajectories")
@@ -320,6 +321,21 @@ def main(args):
         obstacle_i = 1
         obstacle_pbar = tqdm(total=args.obstacles_per_base_trajectory + 1, desc="Obstacle Configurations")
         num_obstacle_fails = 0
+
+        if args.obstacles_per_base_trajectory == 0:
+            traj_name = f"scenario_{base_traj_i + num_prev_traj:04d}"
+            if traj_name in scenarios_group:
+                del scenarios_group[traj_name]  # replace if re-running
+            scenario_grp = scenarios_group.create_group(traj_name)
+            no_obstacle_scenario_grp = scenario_grp.create_group("obstacle_config_00")
+            traj_grp = no_obstacle_scenario_grp.create_group("traj_00")
+            traj_grp.create_dataset("qs", data=base_traj, dtype="f4", chunks=(N_SAMPLES, args.dof))
+            no_obstacle_scenario_grp.attrs["metadata"] = json.dumps({"obstacles": []})
+            saved_base_traj = True
+            base_traj_i += 1
+            base_traj_pbar.update(1)
+            continue
+
         while obstacle_i < args.obstacles_per_base_trajectory + 1 and num_obstacle_fails < args.max_obstacle_fails_per_base_traj:
             num_paths_for_this_obstacle = 0
             # This also checks for collisions with the robot

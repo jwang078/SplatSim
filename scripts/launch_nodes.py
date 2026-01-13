@@ -149,9 +149,9 @@ def launch_robot_server(args: Args):
            port=port, host=args.hostname, serve_mode=UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.INTERACTIVE,
         #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper, 
 
-        #    camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper, 
+           camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper, 
 
-           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper, 
+        #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper, 
         #    image_width=224, image_height=224
         )
 

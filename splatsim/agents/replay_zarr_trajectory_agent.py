@@ -7,16 +7,10 @@ import zarr
 import re
 import json
 from collections import defaultdict
-
-from dataclasses import dataclass
+from splatsim.utils.agent_state_utils import AGENT_STATE
 
 class ReplayZarrTrajectoryAgent(Agent): 
     NUM_STEPS_TO_SETTLE_BETWEEN_TRAJS = 100
-
-    @dataclass
-    class STATE:
-        EXECUTING_TRAJ: str = "EXECUTING_TRAJ"
-        SETTLING: str = "SETTLING"
 
     def __init__(self, traj_folder: str, env: RobotEnv, save_images: bool = False, step_size=1):
         # TODO later put the step size to 1 when using a better machine
@@ -32,7 +26,7 @@ class ReplayZarrTrajectoryAgent(Agent):
         # env is using for setting the pose of recorded objects in the scene
         self.env = env
 
-        self.state = self.STATE.SETTLING
+        self.state = AGENT_STATE.SETTLING
         self.env._robot.disable_rendering()
 
         self.last_action = None
@@ -132,22 +126,25 @@ class ReplayZarrTrajectoryAgent(Agent):
                 raise ValueError(f"Unknown obstacle type {obstacle['type']}")
 
     def next_trajectory_step(self):
-        if self.last_action is not None and self.state == self.STATE.SETTLING:
+        if self.last_action is not None and self.state == AGENT_STATE.SETTLING:
             if self.settle_steps_remaining > 0:
                 self.settle_steps_remaining -= 1
+                if self.settle_steps_remaining == 0:
+                    # Tell the simulator to get the rendering for the next timestep ready
+                    self.env._robot.enable_rendering()
             else:
                 # Finished settling, switch to executing trajectory
                 # TODO check for off by one errors
-                self.state = self.STATE.EXECUTING_TRAJ
+                self.state = AGENT_STATE.EXECUTING_TRAJ
                 self.env._robot.enable_rendering()
                 print("Shifting from settling to executing")
             cur_joint = self.last_action
-        elif self.last_action is None or self.state == self.STATE.EXECUTING_TRAJ:
+        elif self.last_action is None or self.state == AGENT_STATE.EXECUTING_TRAJ:
             if self.traj_index >= len(self.trajectories):
                 return None
 
-            if self.t == 1:
-                import pdb; pdb.set_trace()
+            # if self.t == 1:
+            #     import pdb; pdb.set_trace()
             
             traj = np.array(self.trajectories[self.traj_index]['qs'])
 
@@ -155,7 +152,7 @@ class ReplayZarrTrajectoryAgent(Agent):
                 self.load_next_recorded_trajectory()
                 if self.traj_index >= len(self.trajectories):
                     return None  # No more trajectory steps available
-                self.state = self.STATE.SETTLING
+                self.state = AGENT_STATE.SETTLING
                 # TODO check for off by one errors
                 self.settle_steps_remaining = self.NUM_STEPS_TO_SETTLE_BETWEEN_TRAJS
                 self.env._robot.disable_rendering()

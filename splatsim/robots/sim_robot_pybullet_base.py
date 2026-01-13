@@ -1587,11 +1587,40 @@ class PybulletRobotServerBase:
             with torch.no_grad():
                 for camera_name in self.camera_names:
                     observations[camera_name] = self.render_image(camera_name=camera_name)
+
+            # Display the rendered observations
+            self.display_observations(observations)
+
         for camera_name in ["base_rgb", "wrist_rgb"]:
             if camera_name not in observations:
                 observations[camera_name] = None
 
         return observations
+
+    def display_observations(self, observations: Dict[str, Any]) -> None:
+        """Display rendered RGB observations using cv2.imshow()
+
+        Args:
+            observations: Dictionary containing rendered images as torch tensors (C, H, W)
+        """
+        for img_obs_name in ["wrist_rgb", "base_rgb"]:
+            if img_obs_name not in observations or observations[img_obs_name] is None:
+                continue
+            frame = observations[img_obs_name]
+
+            # Convert from tensor if needed
+            if isinstance(frame, torch.Tensor):
+                frame = frame.detach().cpu().numpy()
+
+            # Convert from CxHxW to HxWxC
+            frame = np.transpose(frame, (1, 2, 0))
+
+            # Convert from [0, 1] float to [0, 255] uint8
+            frame = (frame * 255).astype(np.uint8)
+
+            # Display (OpenCV uses BGR, our tensors are RGB, so convert)
+            cv2.imshow(img_obs_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            cv2.waitKey(1)
 
     def randomize_object_pose(self):
         collison_between_objects = True
