@@ -97,7 +97,7 @@ def crop_splat(splatsim_obj: SplatSimObject, keep_within_aabb=True):
         splatsim_obj.gaussians._features_dc = pc._features_dc[segmented_indices]
         splatsim_obj.gaussians._scaling = pc._scaling[segmented_indices]
     
-def transform_means(splatsim_obj: SplatSimObject, transformations_list):
+def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base_position=True, inplace=False):
     # xyz is in global frame. pc is in splat frame
     pc = splatsim_obj.gaussians
     robot_uid = splatsim_obj.sim_id
@@ -114,12 +114,18 @@ def transform_means(splatsim_obj: SplatSimObject, transformations_list):
         shs_dc = pc._features_dc.clone()
         shs_featrest = pc._features_rest.clone()
 
+    if use_base_position:
+        base_position = torch.tensor(splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0], device='cuda').float()
+
     for joint_index in range(p.getNumJoints(robot_uid)):
         r_rel, t = transformations_list[joint_index] # T between initial link and current link
         segment = segmented_list[joint_index]
 
-        transformed_segment = torch.matmul(r_rel, xyz[segment].T).T + t
-        xyz[segment] = transformed_segment
+        if use_base_position:
+            rotated_base_position = base_position @ r_rel.T
+            xyz[segment] = torch.matmul(r_rel, xyz[segment].T + base_position[:, None]).T - rotated_base_position + t
+        else:
+            xyz[segment] = torch.matmul(r_rel, xyz[segment].T).T + t
         
         # Defining rotation matrix for the covariance
         rot_rotation_matrix = r_rel # (inv_rotation_matrix*scale_robot) @ r_rel @ rotation_matrix
@@ -255,22 +261,13 @@ def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base
 
     pc = splatsim_obj.gaussians
     device = pc.get_xyz.device
-    base_position = torch.tensor(splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0], device='cuda').float()
 
-    # --- 1. Unify Input: Get one 4x4 transform matrix ---
+    # Unify the representation to a 4x4 transform matrix
     if transform is None:
-        # Build the 4x4 transform matrix from pos and quat
         transform = transform_from_pos_quat(pos, quat, device)
 
-    # --- 2. Decompose the 3x3 affine matrix A ---
     A = transform[:3, :3] # Scaling + Rotation part
     t = transform[:3, 3] # Translation part
-
-    if use_base_position:
-        # Convert quaternion to rotation matrix and rotate base_position
-        rotated_base_position = A @ base_position
-        # Now subtract the rotated base position
-        t = t - rotated_base_position
 
     try:
         # Decompose A = U @ S_diag @ Vh
@@ -303,10 +300,16 @@ def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base
         features_rest_obj = pc._features_rest.clone()
 
     # --- 5. Apply transformations to each property ---
-
     # 1. Positions: Apply full A matrix and t
     # (N, 3) @ (3, 3) -> (N, 3). Then add translation.
-    xyz_obj = (xyz_old @ A.T) + t
+    if use_base_position:
+        base_position = torch.tensor(splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0], device='cuda').float()
+        rotated_base_position = base_position @ A.T
+        # The transform's t includes the base position offset because it was computed in world frame
+        # xyz is in the object frame, so we need to remove the base position effect
+        xyz_obj = (xyz_old + base_position) @ A.T - rotated_base_position + t
+    else:
+        xyz_obj = xyz_old @ A.T + t
 
     # 2. Rotations: Compose with pure rotation R_mat
     # We must convert old rotations to matrices, multiply, then convert back

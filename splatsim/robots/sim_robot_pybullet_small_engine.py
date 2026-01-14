@@ -89,10 +89,10 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 "splat_object_name": "small_engine_new",
                 "grasp_config": [],
                 "randomize_pose": False,
-                "table_pos": [-0.565, 0.35],
-                # "table_pos": [-0.445, 0.348],
-                "table_quat": [0, 0, -0.7071068, 0.7071068],
                 "rotation_range_z": [0, 0],
+                "is_in_scene_splat": True,
+                "table_pos": [-0.565, 0.35],
+                "table_quat": [0, 0, -0.7071068, 0.7071068],
             },
         ]
     }
@@ -100,7 +100,7 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         # add plane
-        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
+        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, 0])
 
         # place a wall in -0.6 at x axis using plane.urdf
         # wall is perpendicular to the plane

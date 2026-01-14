@@ -269,6 +269,7 @@ class PybulletRobotServerBase:
         image_width: int = 640,
         image_height: Optional[int] = None,
         object_config_path: str = "./configs/object_configs/objects.yaml",
+        debug_mode: Optional[str] = "rotate",
     ):
         self.serve_mode = serve_mode
         self.robot_name = robot_name
@@ -277,6 +278,7 @@ class PybulletRobotServerBase:
         self.image_width = image_width
         self.image_height = image_height
         self.use_gripper = use_gripper
+        self.debug_mode = debug_mode
 
         # load labels.npy
         self.robot_labels = np.load(
@@ -311,18 +313,21 @@ class PybulletRobotServerBase:
             object_name="robot", splat_object_name=self.robot_name
         )
         
-        # self.background_splat_name = self.robot_name
-        # self.splatsim_background = self.splatsim_robot
-
-        # self.background_splat_name = self.robot_name
-        # The background uses the robot's full splat, but crops out the robot
-        self.splatsim_background: SplatSimObject = self.create_object(
-            object_name="background",
-            splat_object_name=self.background_splat_name,
-            keep_within_aabb=False,
-            load_urdf=False,
-            can_articulate=False,
-        )
+        if self.debug_mode == "no_background":
+            print("[Debug mode] no_background, using robot as background")
+            self.background_splat_name = self.robot_name
+            self.splatsim_background = self.splatsim_robot
+        else:
+            # The background uses the robot's full splat, but crops out the robot
+            self.splatsim_background: SplatSimObject = self.create_object(
+                object_name="background",
+                splat_object_name=self.background_splat_name,
+                keep_within_aabb=False,
+                load_urdf=False,
+                can_articulate=False,
+            )
+        if self.debug_mode is not None:
+            print("[Debug Mode] Setting base_rgb camera to be adjustable using pybullet GUI debug camera")
 
         self.skip_recording_first = 0
 
@@ -347,7 +352,11 @@ class PybulletRobotServerBase:
         for object_cfg in self.ENV_CONFIG["objects"]:
             object_name = object_cfg["object_name"]
             splat_object_name = object_cfg.get("splat_object_name", None)
-            object_config = object_cfg.get("object_config", {})
+            object_config = {
+                **self.object_config.get(object_name, {}), 
+                **object_cfg.get("object_config", {}),
+                **object_cfg
+            }
             grasp_config = object_cfg.get("grasp_config", None)
 
             # Already adds the splatsim_object to self.splatsim_objects
@@ -765,7 +774,7 @@ class PybulletRobotServerBase:
                 splatsim_obj=splatsim_obj,
                 transform=Trans_canonical,
                 # This transform_object is to go from splat frame to simulator frame. the transformation matrix already accounted for the base position
-                use_base_position=False,
+                use_base_position=False, #False,
                 inplace=True,
             )
 
@@ -807,7 +816,7 @@ class PybulletRobotServerBase:
 
         # Find object config
         if splat_object_name is not None:
-            object_config = self.object_config.get(splat_object_name, {})
+            object_config = {**self.object_config.get(splat_object_name, {}), **object_config}
         elif len(object_config) == 0:
             print("WARNING: No object config found for ", splat_object_name)
 
@@ -1091,18 +1100,19 @@ class PybulletRobotServerBase:
                 ) = transform_means(
                     splatsim_obj=splatsim_obj,
                     transformations_list=transformations_list,
+                    use_base_position=True,
+                    inplace=False
                 )
 
             else:
                 if splatsim_obj.name == "small_engine_new":
+                    import pdb; pdb.set_trace()
+                if self.debug_mode != "no_background" and splatsim_obj.object_config.get("is_in_scene_splat", False) and not splatsim_obj.object_config.get("randomize_pose", True):
+                    # Don't render this object because it's already in the scene splat. That calibration is the most accurate
                     continue
                 if splatsim_obj.sim_id is not None:
                     cur_object_position = torch.tensor(
                         data[splatsim_obj.name + "_position"], device="cuda"
-                    ).float()
-                    base_position = torch.tensor(
-                        splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0],
-                        device="cuda",
                     ).float()
                     cur_object_rotation = torch.tensor(
                         data[splatsim_obj.name + "_orientation"], device="cuda"
@@ -1110,31 +1120,13 @@ class PybulletRobotServerBase:
                 else:
                     # TODO currently, objects that aren't urdfs in sim don't ever move
                     cur_object_position = torch.tensor([0, 0, 0], device="cuda").float()
-                    base_position = torch.tensor([0, 0, 0], device="cuda").float()
                     cur_object_rotation = torch.tensor(
                         [0, 0, 0, 1], device="cuda"
                     ).float()
-                cur_object_position = cur_object_position - base_position
                 cur_object_rotation = torch.roll(
                     cur_object_rotation,
                     1,
                 )
-
-                # (
-                #     xyz_obj,
-                #     rot_obj,
-                #     opacity_obj,
-                #     scales_obj,
-                #     features_dc_obj,
-                #     features_rest_obj,
-                # ) = transform_object(
-                #     splatsim_obj=splatsim_obj,
-                #     pos=cur_object_position,
-                #     quat=cur_object_rotation,
-                #     # TODO Figure out why setting to True and commenting out the base position stuff above doesn't work
-                #     use_base_position=True,
-                #     inplace=False
-                # )
 
                 (
                     xyz_obj,
@@ -1147,8 +1139,7 @@ class PybulletRobotServerBase:
                     splatsim_obj=splatsim_obj,
                     pos=cur_object_position,
                     quat=cur_object_rotation,
-                    # TODO Figure out why setting to True and commenting out the base position stuff above doesn't work
-                    use_base_position=False,
+                    use_base_position=True,
                     inplace=False
                 )
 
@@ -1310,12 +1301,12 @@ class PybulletRobotServerBase:
     
     def render_image(self, camera_name):
         # TODO make this into a config
-        camera = self.get_pybullet_debug_camera_as_splat_camera()
 
         if camera_name == "base_rgb":
-            base_camera = self.base_camera
-            camera = base_camera
-            # TODO make this into a config
+            if self.debug_mode is None:
+                camera = self.base_camera
+            else:
+                camera = self.get_pybullet_debug_camera_as_splat_camera()
         elif camera_name == "wrist_rgb":
             camera = self.get_wrist_camera()
             if camera is None:
