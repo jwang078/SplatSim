@@ -32,6 +32,7 @@ from torchvision.transforms.functional import to_pil_image
 assert mujoco.viewer is mujoco.viewer
 from gaussian_splatting.scene.cameras import Camera
 from gaussian_renderer import render
+
 # import urdf_models.models_data as md
 import pybullet as p
 from pybullet_planning.interfaces.robots.collision import pairwise_collision
@@ -50,7 +51,7 @@ from splatsim.utils.robot_splat_render_utils import (
     crop_splat,
     create_cuboid_gaussians,
     SplatSimObject,
-    ArticulationConfig
+    ArticulationConfig,
 )
 from gaussian_splatting.gaussian_renderer import GaussianModel
 from gaussian_splatting.arguments import ModelParams, PipelineParams, Namespace
@@ -104,7 +105,9 @@ class ZMQRobotServer:
                 elif method == "command_joint_state":
                     result = self._robot.command_joint_state(**args)
                 elif method == "teleport_joint_state":
-                    result = self._robot.teleport_joint_state(self._robot.splatsim_robot, **args)
+                    result = self._robot.teleport_joint_state(
+                        self._robot.splatsim_robot, **args
+                    )
                 elif method == "set_object_pose":
                     result = self._robot.set_object_pose(**args)
                 elif method == "get_observations":
@@ -167,6 +170,7 @@ class GripperPathSegment(PathSegment):
 
     def __post_init__(self):
         self.path_type = "gripper"
+
 
 @dataclass
 class SplatSimCamera:
@@ -303,7 +307,8 @@ class PybulletRobotServerBase:
         # TODO this mock class fails for the apple on plate task, etc
         class MockModelsLib:
             model_name_list = {}
-        self.models_lib = MockModelsLib #md.model_lib()
+
+        self.models_lib = MockModelsLib  # md.model_lib()
 
         # For plane.urdf
         self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
@@ -312,7 +317,7 @@ class PybulletRobotServerBase:
         self.splatsim_robot: SplatSimObject = self.create_object(
             object_name="robot", splat_object_name=self.robot_name
         )
-        
+
         if self.debug_mode == "no_background":
             print("[Debug mode] no_background, using robot as background")
             self.background_splat_name = self.robot_name
@@ -327,7 +332,9 @@ class PybulletRobotServerBase:
                 can_articulate=False,
             )
         if self.debug_mode is not None:
-            print("[Debug Mode] Setting base_rgb camera to be adjustable using pybullet GUI debug camera")
+            print(
+                "[Debug Mode] Setting base_rgb camera to be adjustable using pybullet GUI debug camera"
+            )
 
         self.skip_recording_first = 0
 
@@ -345,7 +352,6 @@ class PybulletRobotServerBase:
         # self.initial_joint_state = self.initial_joint_state[1:]
         # + 1 joint for the world joint at the beginning which will be skipped
 
-
         # model_lib = md.model_lib()
         # objectid = self.pybullet_client.loadURDF(model_lib['potato_chip_1'], [0.5, 0.15, 0])
 
@@ -353,9 +359,9 @@ class PybulletRobotServerBase:
             object_name = object_cfg["object_name"]
             splat_object_name = object_cfg.get("splat_object_name", None)
             object_config = {
-                **self.object_config.get(object_name, {}), 
+                **self.object_config.get(object_name, {}),
                 **object_cfg.get("object_config", {}),
-                **object_cfg
+                **object_cfg,
             }
             grasp_config = object_cfg.get("grasp_config", None)
 
@@ -391,9 +397,13 @@ class PybulletRobotServerBase:
         )
 
         # set initial joint positions
-        for i in range(1, len(self.splatsim_robot.articulation_config.initial_joint_positions)):
+        for i in range(
+            1, len(self.splatsim_robot.articulation_config.initial_joint_positions)
+        ):
             self.pybullet_client.resetJointState(
-                self.splatsim_robot.sim_id, i, self.splatsim_robot.articulation_config.initial_joint_positions[i - 1]
+                self.splatsim_robot.sim_id,
+                i,
+                self.splatsim_robot.articulation_config.initial_joint_positions[i - 1],
             )
 
         # limits are +-pi of the initial joint positions
@@ -497,9 +507,11 @@ class PybulletRobotServerBase:
                 raise ValueError(
                     f"wrist_camera_link_name attribute not defined in object config of robot {self.robot_name}, yet wrist camera was requested"
                 )
-            
+
         # Prepare for teleport by removing forces
-        for i in range(len(self.splatsim_robot.articulation_config.initial_joint_positions)):
+        for i in range(
+            len(self.splatsim_robot.articulation_config.initial_joint_positions)
+        ):
             self.pybullet_client.setJointMotorControl2(
                 self.splatsim_robot.sim_id,
                 i,
@@ -507,7 +519,10 @@ class PybulletRobotServerBase:
                 force=0,
             )
         # Reset joint states by teleporting
-        self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.articulation_config.initial_joint_positions)
+        self.teleport_joint_state(
+            self.splatsim_robot,
+            self.splatsim_robot.articulation_config.initial_joint_positions,
+        )
         # for i in range(1, len(self.initial_joint_state)):
         #     self.pybullet_client.resetJointState(
         #         self.splatsim_robot.sim_id,
@@ -536,19 +551,25 @@ class PybulletRobotServerBase:
         self.initial_ee_pos, self.initial_ee_quat = self.get_current_ee_pose()
         # print joint angles
         joint_states = []
-        for i in range(1, len(self.splatsim_robot.articulation_config.initial_joint_positions)):
+        for i in range(
+            1, len(self.splatsim_robot.articulation_config.initial_joint_positions)
+        ):
             joint_states.append(
                 self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
             )
 
         # set to initial joint state
         for i in range(10000):
-            for i in range(1, len(self.splatsim_robot.articulation_config.initial_joint_positions)):
+            for i in range(
+                1, len(self.splatsim_robot.articulation_config.initial_joint_positions)
+            ):
                 self.pybullet_client.resetJointState(
                     self.splatsim_robot.sim_id,
                     i,
-                    self.splatsim_robot.articulation_config.initial_joint_positions[i - 1]
-                        * self.splatsim_robot.articulation_config.joint_signs[i - 1],
+                    self.splatsim_robot.articulation_config.initial_joint_positions[
+                        i - 1
+                    ]
+                    * self.splatsim_robot.articulation_config.joint_signs[i - 1],
                 )
             self.pybullet_client.stepSimulation()
 
@@ -654,11 +675,19 @@ class PybulletRobotServerBase:
                 self.pybullet_client.changeDynamics(object_loaded, -1, mass=mass)
             else:
                 raise ValueError(f"Cannot create unknown object type {object_type}")
-        elif len(splatsim_obj.gaussians._xyz) > 0: # The gaussian splat was loaded, but there's no urdf
+        elif (
+            len(splatsim_obj.gaussians._xyz) > 0
+        ):  # The gaussian splat was loaded, but there's no urdf
             # Create a box that covers the gaussian means in the gaussian splat. This is an approximation
-            lx = max(splatsim_obj.gaussians._xyz[:, 0]) - min(splatsim_obj.gaussians._xyz[:, 0])
-            ly = max(splatsim_obj.gaussians._xyz[:, 1]) - min(splatsim_obj.gaussians._xyz[:, 1])
-            lz = max(splatsim_obj.gaussians._xyz[:, 2]) - min(splatsim_obj.gaussians._xyz[:, 2])
+            lx = max(splatsim_obj.gaussians._xyz[:, 0]) - min(
+                splatsim_obj.gaussians._xyz[:, 0]
+            )
+            ly = max(splatsim_obj.gaussians._xyz[:, 1]) - min(
+                splatsim_obj.gaussians._xyz[:, 1]
+            )
+            lz = max(splatsim_obj.gaussians._xyz[:, 2]) - min(
+                splatsim_obj.gaussians._xyz[:, 2]
+            )
 
             position = splatsim_obj.object_config.get("position", [0, 0, 0])
 
@@ -687,12 +716,12 @@ class PybulletRobotServerBase:
             raise ValueError(
                 f"Could not parse object config for object name {splatsim_obj.name}"
             )
-        
+
         # import pdb; pdb.set_trace()
         # if not use_gravity:
         #     import pdb; pdb.set_trace()
 
-            # p.setGravity(0, 0, 0, body=object_loaded) # Override world gravity for this body
+        # p.setGravity(0, 0, 0, body=object_loaded) # Override world gravity for this body
 
         splatsim_obj.sim_id = object_loaded
         splatsim_obj.mass = mass
@@ -704,7 +733,10 @@ class PybulletRobotServerBase:
         if "ply_path" in splatsim_obj.object_config:
             ply_path = splatsim_obj.object_config["ply_path"]
             splatsim_obj.gaussians.load_ply(ply_path)
-        elif "source_path" in splatsim_obj.object_config and "model_path" in splatsim_obj.object_config:
+        elif (
+            "source_path" in splatsim_obj.object_config
+            and "model_path" in splatsim_obj.object_config
+        ):
             source_path = splatsim_obj.object_config["source_path"]
             if not os.path.exists(source_path):
                 raise FileNotFoundError(f"Source path not found: {source_path}")
@@ -737,7 +769,7 @@ class PybulletRobotServerBase:
                 shuffle=False,
                 resolution_scales=[],
                 train_cam_indices=[],
-                test_cam_indices=[] ,
+                test_cam_indices=[],
             )
             del scene
         elif splatsim_obj.object_config.get("object_type", None) == "cuboid":
@@ -745,7 +777,7 @@ class PybulletRobotServerBase:
             cuboid_params = create_cuboid_gaussians(
                 side_lengths=(lx, ly, lz),
                 spacing=0.005,
-                color_rgb=(87, 51, 33), # Darker brown
+                color_rgb=(87, 51, 33),  # Darker brown
             )
             splatsim_obj.gaussians._xyz = cuboid_params["_xyz"]
             splatsim_obj.gaussians._rotation = cuboid_params["_rotation"]
@@ -755,9 +787,11 @@ class PybulletRobotServerBase:
             splatsim_obj.gaussians._scaling = cuboid_params["_scaling"]
             need_transform_to_simulator_frame = False
         else:
-            import pdb; pdb.set_trace()
+            import pdb
+
+            pdb.set_trace()
             raise ValueError("Could not load gaussian splat")
-        
+
         # Disable gradients on this gaussian splat b/c we're not optimizing
         splatsim_obj.gaussians._xyz.requires_grad = False
         splatsim_obj.gaussians._rotation.requires_grad = False
@@ -769,12 +803,18 @@ class PybulletRobotServerBase:
         # Transform the xyz, rotation, and shs features to the canonical frame (the world frame for the simulator)
         # We will work in the coordinate frame of the simulator from now on
         if need_transform_to_simulator_frame:
-            Trans_canonical = torch.from_numpy(np.array(splatsim_obj.object_config['transformation']['matrix'])).to(device=splatsim_obj.gaussians.get_xyz.device).float() # shape (4, 4)
+            Trans_canonical = (
+                torch.from_numpy(
+                    np.array(splatsim_obj.object_config["transformation"]["matrix"])
+                )
+                .to(device=splatsim_obj.gaussians.get_xyz.device)
+                .float()
+            )  # shape (4, 4)
             _ = transform_object(
                 splatsim_obj=splatsim_obj,
                 transform=Trans_canonical,
                 # This transform_object is to go from splat frame to simulator frame. the transformation matrix already accounted for the base position
-                use_base_position=False, #False,
+                use_base_position=False,  # False,
                 inplace=True,
             )
 
@@ -792,8 +832,10 @@ class PybulletRobotServerBase:
             p.removeBody(splatsim_obj.sim_id)
 
     def clear_temp_objects(self):
-        non_temp_object_names = [self.splatsim_robot.name, self.splatsim_background.name] \
-            + [obj_cfg["object_name"] for obj_cfg in self.ENV_CONFIG["objects"]]
+        non_temp_object_names = [
+            self.splatsim_robot.name,
+            self.splatsim_background.name,
+        ] + [obj_cfg["object_name"] for obj_cfg in self.ENV_CONFIG["objects"]]
         all_object_names = [splatsim_obj.name for splatsim_obj in self.splatsim_objects]
         deleted_obj_names = []
         for obj_name in all_object_names:
@@ -816,7 +858,10 @@ class PybulletRobotServerBase:
 
         # Find object config
         if splat_object_name is not None:
-            object_config = {**self.object_config.get(splat_object_name, {}), **object_config}
+            object_config = {
+                **self.object_config.get(splat_object_name, {}),
+                **object_config,
+            }
         elif len(object_config) == 0:
             print("WARNING: No object config found for ", splat_object_name)
 
@@ -828,7 +873,7 @@ class PybulletRobotServerBase:
             gaussians=GaussianModel(3),
             is_articulated=is_articulated,
             # set sim_id and mass later
-            object_config=object_config
+            object_config=object_config,
         )
 
         self.load_gaussian_splat(splatsim_obj)
@@ -862,18 +907,24 @@ class PybulletRobotServerBase:
                 )
                 initial_joint_positions = initial_joint_positions[:num_joints]
 
-            segmentation_labels = np.load('./data/labels_path/'+splatsim_obj.splat_name+'_labels.npy')
-            segmentation_labels = torch.from_numpy(segmentation_labels).to(device=splatsim_obj.gaussians._xyz.device).long()
+            segmentation_labels = np.load(
+                "./data/labels_path/" + splatsim_obj.splat_name + "_labels.npy"
+            )
+            segmentation_labels = (
+                torch.from_numpy(segmentation_labels)
+                .to(device=splatsim_obj.gaussians._xyz.device)
+                .long()
+            )
 
             joint_signs = [1] * len(initial_joint_positions)
             # TODO doesn't the ur5 have some joint signs inverted based on the gello repo documentation / readme?
             # joint_signs[2] = -1
             splatsim_obj.articulation_config = ArticulationConfig(
                 initial_joint_positions=initial_joint_positions,
-                joint_signs=joint_signs, # placeholder values; integration with gello
-                segmentation_labels=segmentation_labels
+                joint_signs=joint_signs,  # placeholder values; integration with gello
+                segmentation_labels=segmentation_labels,
             )
-            
+
             segmented_list = get_segmented_indices(
                 splatsim_obj=splatsim_obj,
             )
@@ -884,11 +935,9 @@ class PybulletRobotServerBase:
             # Let the gripper move (it isn't teleporting rn)
             for _ in range(100):
                 self.pybullet_client.stepSimulation()
-            initial_link_poses = get_curr_link_states(
-                splatsim_obj.sim_id
-            )
+            initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
             splatsim_obj.articulation_config.initial_link_poses = initial_link_poses
-        
+
         self.splatsim_objects.append(splatsim_obj)
         return splatsim_obj
 
@@ -915,7 +964,7 @@ class PybulletRobotServerBase:
             raise ValueError(
                 "Cannot set pose of object not represented in pybullet (ex: has urdf)"
             )
-    
+
         self.pybullet_client.resetBasePositionAndOrientation(
             splatsim_obj.sim_id, position, orientation
         )
@@ -930,7 +979,9 @@ class PybulletRobotServerBase:
                 mass=splatsim_obj.mass,
             )
 
-    def teleport_joint_state(self, splatsim_obj: SplatSimObject, joint_state: List[float]) -> None:
+    def teleport_joint_state(
+        self, splatsim_obj: SplatSimObject, joint_state: List[float]
+    ) -> None:
         """Set the joint states of an articulated object in the simulation."""
         if not splatsim_obj.is_articulated:
             raise ValueError(f"Object {splatsim_obj.name} is not articulated.")
@@ -948,7 +999,10 @@ class PybulletRobotServerBase:
 
         for i in range(1, min(len(joint_state), num_joints)):
             self.pybullet_client.resetJointState(
-                splatsim_obj.sim_id, i, joint_state[i - 1] * splatsim_obj.articulation_config.joint_signs[i - 1]
+                splatsim_obj.sim_id,
+                i,
+                joint_state[i - 1]
+                * splatsim_obj.articulation_config.joint_signs[i - 1],
             )
 
     def command_joint_state(self, joint_state: np.ndarray) -> None:
@@ -999,24 +1053,21 @@ class PybulletRobotServerBase:
         )
 
         # Original camera-to-world transform
-        T_cw = np.array(
-            link_state[0]
-        ).astype(np.float32)  # xyz position in world frame
+        T_cw = np.array(link_state[0]).astype(np.float32)  # xyz position in world frame
 
         quat = link_state[1]
         R_cw = (
-            np.array(
-                p.getMatrixFromQuaternion(quat)
-            )
-            .reshape(3, 3)
-            .astype(np.float32)
+            np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3).astype(np.float32)
         )
 
-        T_wc = - R_cw.T @ T_cw
+        T_wc = -R_cw.T @ T_cw
 
         # TODO is this needed?
         # scale = self.base_camera.scale if self.base_camera is not None else 1.0
-        resolution = (self.base_camera.camera.image_width, self.base_camera.camera.image_height)
+        resolution = (
+            self.base_camera.camera.image_width,
+            self.base_camera.camera.image_height,
+        )
 
         # Use actual camera resolution and FOV from COLMAP calibration
         # COLMAP camera model: OPENCV_FISHEYE
@@ -1051,13 +1102,13 @@ class PybulletRobotServerBase:
             invdepthmap,
             image_name,
             uid,
-            scale=1, # scale
+            scale=1,  # scale
         )
 
         splatsim_camera = SplatSimCamera(
             camera=camera,
             pipeline=self.base_camera.pipeline,
-            background=self.base_camera.background
+            background=self.base_camera.background,
         )
 
         return splatsim_camera
@@ -1086,7 +1137,8 @@ class PybulletRobotServerBase:
 
                 # Gets transformations for all links of the robot based on the current simulation
                 transformations_list = get_transfomration_list(
-                    splatsim_obj.sim_id,  splatsim_obj.articulation_config.initial_link_poses,
+                    splatsim_obj.sim_id,
+                    splatsim_obj.articulation_config.initial_link_poses,
                 )
 
                 # TODO generalize this to "every articulated object" instead of just the robot
@@ -1101,13 +1153,15 @@ class PybulletRobotServerBase:
                     splatsim_obj=splatsim_obj,
                     transformations_list=transformations_list,
                     use_base_position=True,
-                    inplace=False
+                    inplace=False,
                 )
 
             else:
-                if splatsim_obj.name == "small_engine_new":
-                    import pdb; pdb.set_trace()
-                if self.debug_mode != "no_background" and splatsim_obj.object_config.get("is_in_scene_splat", False) and not splatsim_obj.object_config.get("randomize_pose", True):
+                if (
+                    self.debug_mode != "no_background"
+                    and splatsim_obj.object_config.get("is_in_scene_splat", False)
+                    and not splatsim_obj.object_config.get("randomize_pose", True)
+                ):
                     # Don't render this object because it's already in the scene splat. That calibration is the most accurate
                     continue
                 if splatsim_obj.sim_id is not None:
@@ -1140,7 +1194,7 @@ class PybulletRobotServerBase:
                     pos=cur_object_position,
                     quat=cur_object_rotation,
                     use_base_position=True,
-                    inplace=False
+                    inplace=False,
                 )
 
             xyz_obj_list.append(xyz_obj)
@@ -1184,14 +1238,13 @@ class PybulletRobotServerBase:
 
         # Get PyBullet camera info
         camera_info = p.getDebugVisualizerCamera()
-        # Pybullet view matrix is major-column order 
+        # Pybullet view matrix is major-column order
         view_matrix = np.array(camera_info[2]).reshape(4, 4).T
 
-        Tc = np.array([[1,   0,    0,  0],
-                        [0,  -1,    0,  0],
-                        [0,   0,   -1,  0],
-                        [0,   0,    0,  1]]).reshape(4,4)
-        
+        Tc = np.array(
+            [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]]
+        ).reshape(4, 4)
+
         T = np.linalg.inv(view_matrix) @ Tc
 
         R = T[:3, :3]
@@ -1199,10 +1252,13 @@ class PybulletRobotServerBase:
 
         R_cw_final = R
         T_wc_final = -R.T @ t
-        
+
         # TODO is this needed?
         # scale = self.base_camera.scale if self.base_camera is not None else 1.0
-        resolution = (self.base_camera.camera.image_width, self.base_camera.camera.image_height)
+        resolution = (
+            self.base_camera.camera.image_width,
+            self.base_camera.camera.image_height,
+        )
         colmap_id = 0
         uid = 0
         depth_params = None
@@ -1213,8 +1269,8 @@ class PybulletRobotServerBase:
         new_camera = Camera(
             resolution,
             colmap_id,
-            R_cw_final, # Use the fixed rotation
-            T_wc_final, # Use the fixed translation
+            R_cw_final,  # Use the fixed rotation
+            T_wc_final,  # Use the fixed translation
             self.base_camera.camera.FoVx,
             self.base_camera.camera.FoVy,
             depth_params,
@@ -1222,7 +1278,7 @@ class PybulletRobotServerBase:
             invdepthmap,
             image_name,
             uid,
-            scale=1, #scale,
+            scale=1,  # scale,
         )
 
         splatsim_camera = SplatSimCamera(
@@ -1232,19 +1288,19 @@ class PybulletRobotServerBase:
         )
 
         return splatsim_camera
-    
+
     def set_pybullet_camera_to_match_base(self):
         """Set PyBullet's debug camera to match the base camera view."""
-        
+
         if self.base_camera is None:
             print("No base camera available")
             return
-        
+
         # Get base camera parameters
         R_cw = self.base_camera.camera.R
         T_wc = self.base_camera.camera.T
         scale = self.base_camera.camera.scale
-        
+
         # Camera position in world space
         camera_pos = -R_cw.T @ T_wc
         camera_pos = np.array([camera_pos[0], camera_pos[2], camera_pos[1]])
@@ -1255,50 +1311,50 @@ class PybulletRobotServerBase:
         # bad
         # camera_pos = np.array([-0.2063907,  1.5897055,  6.2722306])
         # camera_pos = T_wc * scale
-        
+
         # Camera's forward direction (camera looks down -Z axis)
         forward_cam = np.array([0, 0, -1])
         forward_world = R_cw @ forward_cam
-        
+
         # Find target by ray-casting forward from camera
         # Use a reasonable distance (e.g., distance to origin)
         target_distance = np.linalg.norm(camera_pos)  # Distance to origin as estimate
         target = camera_pos + forward_world * target_distance
-        
+
         # Or directly use origin if robot is there
         target = np.array([0.0, 0.0, 0.0])
-        
+
         # Distance from camera to target
         distance = np.linalg.norm(target - camera_pos)
-        
+
         # Compute yaw and pitch
         # Forward vector from camera to target
         forward = target - camera_pos
         forward = forward / np.linalg.norm(forward)
-        
+
         # Yaw: angle in XY plane
         yaw = np.rad2deg(np.arctan2(forward[1], forward[0]))
-        
+
         # Pitch: angle from XY plane
         pitch = np.rad2deg(np.arcsin(forward[2]))
-        
+
         print(f"Setting PyBullet camera to match base camera:")
         print(f"  Camera position: {camera_pos}")
         print(f"  Target: {target}")
         print(f"  Distance: {distance:.3f}")
         print(f"  Yaw: {yaw:.1f}°")
         print(f"  Pitch: {pitch:.1f}°")
-        
+
         # Set PyBullet camera
         p.resetDebugVisualizerCamera(
             cameraDistance=distance,
             cameraYaw=yaw,
             cameraPitch=pitch,
-            cameraTargetPosition=list(target)
+            cameraTargetPosition=list(target),
         )
-        
+
         print("PyBullet camera updated!\n")
-    
+
     def render_image(self, camera_name):
         # TODO make this into a config
 
@@ -1314,15 +1370,17 @@ class PybulletRobotServerBase:
         else:
             raise ValueError(f"Unknown camera name {camera_name}")
 
-        rendering = render(camera.camera, self.scene_gaussian, camera.pipeline, camera.background)[
-            "render"
-        ].cpu()
+        rendering = render(
+            camera.camera, self.scene_gaussian, camera.pipeline, camera.background
+        )["render"].cpu()
         # If you index "depth" instead of "render", you get the depth image
 
         # save the image
         return rendering
 
-    def setup_camera_from_dataset(self, splatsim_obj_object_config, cam_i, use_train=True) -> SplatSimCamera:
+    def setup_camera_from_dataset(
+        self, splatsim_obj_object_config, cam_i, use_train=True
+    ) -> SplatSimCamera:
         ###################################################################
         # Load the gaussian splat dataset to get camera parameters
         ###################################################################
@@ -1358,12 +1416,12 @@ class PybulletRobotServerBase:
         temp_gaussian_model = GaussianModel(3)
         scene = Scene(
             dataset,
-            temp_gaussian_model, # This is just used for camera initialization
+            temp_gaussian_model,  # This is just used for camera initialization
             load_iteration=-1,
             shuffle=False,
             resolution_scales=[cam_scale],
             train_cam_indices=[cam_i],
-            test_cam_indices=[], # we're using train cameras
+            test_cam_indices=[],  # we're using train cameras
         )
 
         bg_color = [1, 1, 1]
@@ -1386,9 +1444,13 @@ class PybulletRobotServerBase:
 
         # 1. Define device and Trans_canonical
         device = camera.world_view_transform.device
-        Trans_canonical_full = torch.from_numpy(
-            np.array(splatsim_obj_object_config['transformation']['matrix'])
-        ).to(device=device).float()
+        Trans_canonical_full = (
+            torch.from_numpy(
+                np.array(splatsim_obj_object_config["transformation"]["matrix"])
+            )
+            .to(device=device)
+            .float()
+        )
 
         # 2. Get the camera's pose in the SPLAT'S LOCAL FRAME
         # V_original is the view matrix in the splat's local frame.
@@ -1407,7 +1469,7 @@ class PybulletRobotServerBase:
         # 4. Extract rotation, translation, and scale from the transformation
         # Use SVD to properly decompose the scaled transformation (same as transform_object)
         A = M_CW_new_world_scaled[:3, :3]  # Rotation + Scale
-        t = M_CW_new_world_scaled[:3, 3]   # Translation
+        t = M_CW_new_world_scaled[:3, 3]  # Translation
 
         # Decompose A = U @ S @ Vh to get pure rotation and scale
         U, S_vec, Vh = torch.linalg.svd(A)
@@ -1420,7 +1482,7 @@ class PybulletRobotServerBase:
             R_mat = U @ Vh
 
         # Get uniform scale (use geometric mean of singular values)
-        scale = torch.pow(S_vec.prod(), 1/3)
+        scale = torch.pow(S_vec.prod(), 1 / 3)
         scale_np = scale.detach().cpu().numpy()
 
         # Build C2W matrix with pure rotation and original translation
@@ -1469,23 +1531,23 @@ class PybulletRobotServerBase:
         new_camera = Camera(
             resolution,
             camera.colmap_id,
-            R_cw_np,           # Pure rotation (orthonormal)
-            T_wc_np,           # W2C translation (scale-free)
-            camera.FoVx,     # FoV adjusted for scene scaling
-            camera.FoVy,     # FoV adjusted for scene scaling
+            R_cw_np,  # Pure rotation (orthonormal)
+            T_wc_np,  # W2C translation (scale-free)
+            camera.FoVx,  # FoV adjusted for scene scaling
+            camera.FoVy,  # FoV adjusted for scene scaling
             depth_params,
             to_pil_image(image),
             camera.invdepthmap,
             camera.image_name,
             camera.uid,
-            scale=camera.scale,    # Uniform scale extracted from transformation
+            scale=camera.scale,  # Uniform scale extracted from transformation
         )
 
         splatsim_camera = SplatSimCamera(
             camera=new_camera,
             pipeline=pipeline,
             background=background,
-            tracked_link_index=None, # Set this outside of this loop
+            tracked_link_index=None,  # Set this outside of this loop
         )
 
         return splatsim_camera
@@ -1577,7 +1639,9 @@ class PybulletRobotServerBase:
             self.prep_image_rendering(data=observations)
             with torch.no_grad():
                 for camera_name in self.camera_names:
-                    observations[camera_name] = self.render_image(camera_name=camera_name)
+                    observations[camera_name] = self.render_image(
+                        camera_name=camera_name
+                    )
 
             # Display the rendered observations
             self.display_observations(observations)
@@ -1850,10 +1914,22 @@ class PybulletRobotServerBase:
         # Put all the articulated objects into their original states
         for i in range(100):
             for splatsim_obj in self.splatsim_objects:
-                if splatsim_obj.articulation_config is not None and splatsim_obj.articulation_config.initial_joint_positions is not None:
-                    self.teleport_joint_state(splatsim_obj=splatsim_obj, joint_state=splatsim_obj.articulation_config.initial_joint_positions)
+                if (
+                    splatsim_obj.articulation_config is not None
+                    and splatsim_obj.articulation_config.initial_joint_positions
+                    is not None
+                ):
+                    self.teleport_joint_state(
+                        splatsim_obj=splatsim_obj,
+                        joint_state=splatsim_obj.articulation_config.initial_joint_positions,
+                    )
                 elif not splatsim_obj.object_config.get("use_gravity", True):
-                    self.set_object_pose(splatsim_obj.name, splatsim_obj.object_config.get("position"), splatsim_obj.object_config.get("orn"), use_gravity=True)
+                    self.set_object_pose(
+                        splatsim_obj.name,
+                        splatsim_obj.object_config.get("position"),
+                        splatsim_obj.object_config.get("orn"),
+                        use_gravity=True,
+                    )
             self.pybullet_client.stepSimulation()
         # start the zmq server
         self._zmq_server_thread.start()
@@ -1862,7 +1938,9 @@ class PybulletRobotServerBase:
 
         # Set motors to hold current position to prevent arm from falling due to gravity
         for i in range(1, self.num_dofs()):
-            current_pos = self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
+            current_pos = self.pybullet_client.getJointState(
+                self.splatsim_robot.sim_id, i
+            )[0]
             self.pybullet_client.setJointMotorControl2(
                 self.splatsim_robot.sim_id,
                 i,
