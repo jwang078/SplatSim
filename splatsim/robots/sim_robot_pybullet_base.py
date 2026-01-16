@@ -212,6 +212,14 @@ class PybulletRobotServerBase:
         "cuboids_fn": None,
         "render_images": False,
         "save_base_trajectory": True,
+        # Camera-aware path scoring
+        "disable_camera_scoring_for_rrt": False,
+        "num_path_candidates": 5,
+        "max_path_attempts": 20,
+        "k_exp": 5.0,
+        "k_sig": 15.0,
+        "threshold": 0.4,
+        "rrt_perturbation_scale": 0.001,  # Radians to perturb start/goal for path diversity
     }
 
     # object_rot is only x and y. Since it's a tabletop, z is randomized
@@ -359,6 +367,9 @@ class PybulletRobotServerBase:
             # Get movable joint indices (first 6 joints, excluding gripper)
             movable_joints = list(range(1, 7))
 
+            # Get wrist camera link name from robot config
+            wrist_camera_link_name = self.splatsim_robot.object_config.get("wrist_camera_link_name", None)
+
             self.trajectory_generator = TrajectoryGenerator(
                 pybullet_client=self.pybullet_client,
                 robot_id=self.splatsim_robot.sim_id,
@@ -367,6 +378,7 @@ class PybulletRobotServerBase:
                 env_config_name=self.ENV_CONFIG_NAME if hasattr(self, 'ENV_CONFIG_NAME') else "default",
                 get_ee_link_fn=get_ee_link,
                 splatsim_objects=self.splatsim_objects,
+                wrist_camera_link_name=wrist_camera_link_name,
             )
         else:
             self.trajectory_generator = None

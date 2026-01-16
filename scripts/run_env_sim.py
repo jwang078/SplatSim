@@ -242,7 +242,8 @@ def main(args):
             # traj_folder = "/home/jennyw2/code/SplatSim/output/small_engine_keyframes_default.zarr"
             # traj_folder = "/home/jennyw2/code/SplatSim/output/eval_go_to_nominal_10.zarr"
             # traj_folder = "/home/jennyw2/code/SplatSim/output/go_to_nominal_10.zarr"
-            traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_trajectories.zarr"
+            traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_test_trajectories.zarr"
+            # traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_trajectories.zarr"
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
             startup_steps = 2
             query_new_joints_per_startup_step = False

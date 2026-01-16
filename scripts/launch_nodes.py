@@ -28,6 +28,16 @@ class Args:
     q_start: list[float] | None = None
     q_goal: list[float] | None = None
     render_images: bool = False
+    experiment_name: str | None = None
+
+    # Camera-aware path scoring parameters
+    disable_camera_scoring_for_rrt: bool = False
+    num_path_candidates: int | None = None
+    max_path_attempts: int | None = None
+    k_exp: float | None = None
+    k_sig: float | None = None
+    threshold: float | None = None
+    rrt_perturbation_scale: float | None = None
 
     # Debug mode for PyBullet visualization
     debug_mode: str | None = None
@@ -210,6 +220,24 @@ def launch_robot_server(args: Args):
             traj_gen_config["q_goal"] = args.q_goal
         if args.render_images:
             traj_gen_config["render_images"] = True
+        if args.experiment_name is not None:
+            traj_gen_config["experiment_name"] = args.experiment_name
+
+        # Camera-aware path scoring parameters
+        if args.disable_camera_scoring_for_rrt:
+            traj_gen_config["disable_camera_scoring_for_rrt"] = True
+        if args.num_path_candidates is not None:
+            traj_gen_config["num_path_candidates"] = args.num_path_candidates
+        if args.max_path_attempts is not None:
+            traj_gen_config["max_path_attempts"] = args.max_path_attempts
+        if args.k_exp is not None:
+            traj_gen_config["k_exp"] = args.k_exp
+        if args.k_sig is not None:
+            traj_gen_config["k_sig"] = args.k_sig
+        if args.threshold is not None:
+            traj_gen_config["threshold"] = args.threshold
+        if args.rrt_perturbation_scale is not None:
+            traj_gen_config["rrt_perturbation_scale"] = args.rrt_perturbation_scale
 
         # Determine camera names based on rendering config
         camera_names_to_use = camera_names if traj_gen_config.get("render_images", False) else []

@@ -257,12 +257,12 @@ def setup_env(args, robot_base_position, use_old_walls=False, use_obstacles=True
 
     return ll, ul, obstacle_ids, robot_id, joint_indices
 
-def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, max_tries=10000, verbose=True):
+def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, max_tries=10000, verbose=True) -> np.ndarray:
     sample_fn = get_sample_fn(robot_id, joint_indices)
     for _ in range(max_tries):
         q = sample_fn()
         if not state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01, verbose=verbose):
-            return q
+            return np.array(q)
     raise RuntimeError("Failed to find collision-free joint angles after many tries")
 
 def check_self_collision(robot_id, joint_indices, distance=0.0):
@@ -467,7 +467,7 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, tim
         joint_indices, 
         resolutions=resolutions
     )
-    
+
     smoothed_path = smooth_path(
         rrt_path.tolist(),
         extend_fn,

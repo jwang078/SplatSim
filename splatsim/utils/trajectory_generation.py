@@ -20,6 +20,7 @@ class TrajectoryGenerator:
         env_config_name: str,
         get_ee_link_fn,  # Callback to get EE link index
         splatsim_objects: List[SplatSimObject],
+        wrist_camera_link_name: Optional[str] = None,
     ):
         """
         Initialize trajectory generator.
@@ -31,6 +32,7 @@ class TrajectoryGenerator:
             config: Trajectory generation configuration dictionary
             env_config_name: Environment name for output directory
             get_ee_link_fn: Function that returns EE link index
+            wrist_camera_link_name: Name of wrist camera link for camera-aware scoring
         """
         self.pb = pybullet_client
         self.robot_id = robot_id
@@ -39,6 +41,22 @@ class TrajectoryGenerator:
         self.env_config_name = env_config_name
         self.get_ee_link_fn = get_ee_link_fn
         self.splatsim_objects = splatsim_objects
+
+        # Store and resolve camera link for scoring
+        self.wrist_camera_link_name = wrist_camera_link_name
+        self.camera_link_index = None
+
+        if self.wrist_camera_link_name:
+            num_joints = self.pb.getNumJoints(self.robot_id)
+            for i in range(num_joints):
+                info = self.pb.getJointInfo(self.robot_id, i)
+                link_name = info[12].decode("utf-8")
+                if link_name == self.wrist_camera_link_name:
+                    self.camera_link_index = i
+                    break
+
+            if self.camera_link_index is None:
+                print(f"Warning: Camera link '{self.wrist_camera_link_name}' not found. Camera scoring disabled.")
 
         # Load joint limits
         self.lower_limits, self.upper_limits = rrt_path_utils.get_joint_limits(
@@ -84,7 +102,11 @@ class TrajectoryGenerator:
 
     def _init_zarr_storage(self):
         """Initialize Zarr storage for trajectory data."""
-        output_dir = os.path.join("output", f"{self.env_config_name}_trajectories.zarr")
+        experiment_name = self.config.get("experiment_name", None)
+        if experiment_name:
+            output_dir = os.path.join("output", f"{self.env_config_name}_{experiment_name}_trajectories.zarr")
+        else:
+            output_dir = os.path.join("output", f"{self.env_config_name}_trajectories.zarr")
         self.zarr_root = zarr.open(output_dir, mode="a")
         self.scenarios_group = self.zarr_root.require_group("trajectories")
 
@@ -112,15 +134,65 @@ class TrajectoryGenerator:
         q_start = self.config.get("q_start")
         if q_start is None:
             q_start = self._get_random_collision_free_q()
+        else:
+            q_start = np.array(q_start)
 
         q_goal = self.config.get("q_goal")
         if q_goal is None:
             q_goal = self._get_random_collision_free_q()
+        else:
+            q_goal = np.array(q_goal)
 
-        # 2. Generate base trajectory
-        base_traj = self._plan_rrt_path(q_start, q_goal)
-        if base_traj is None:
-            return  # Failed, will retry next iteration
+
+        # 2. Generate base trajectory (with optional camera scoring)
+        if not self.config.get("disable_camera_scoring_for_rrt", False):
+            # Camera-aware mode: verify camera link is available BEFORE generating paths
+            if self.camera_link_index is None:
+                raise ValueError(
+                    "Camera scoring enabled (disable_camera_scoring_for_rrt=False) but camera link not available. "
+                    f"Check that wrist_camera_link_name='{self.wrist_camera_link_name}' exists in robot URDF."
+                )
+
+            # Generate multiple candidates and select best
+            num_candidates = self.config.get("num_path_candidates", 5)
+            max_attempts = self.config.get("max_path_attempts", 20)
+
+            candidate_paths = self._generate_multiple_path_candidates(
+                q_start, q_goal, num_candidates, max_attempts
+            )
+
+            if len(candidate_paths) == 0:
+                return  # Failed, will retry next iteration
+
+            # Compute target position (camera pose at goal)
+            target_position, _ = self._get_camera_link_pose(q_goal)
+
+            # Score all candidates
+            k_exp = self.config.get("k_exp", 5.0)
+            k_sig = self.config.get("k_sig", 15.0)
+            threshold = self.config.get("threshold", 0.4)
+
+            scored_paths = []
+            for i, path in enumerate(candidate_paths):
+                score = self._compute_camera_score(path, target_position, k_exp, k_sig, threshold)
+                scored_paths.append((score, i, path))
+
+                if self.config.get("verbose", False):
+                    print(f"Path {i}: score = {score:.4f}")
+
+            # Select path with highest score
+            scored_paths.sort(key=lambda x: x[0], reverse=True)
+            best_score, best_idx, base_traj = scored_paths[0]
+            print("All scores:", [score for score, _, _ in scored_paths])
+
+            if self.config.get("verbose", False):
+                print(f"Selected path {best_idx} with score {best_score:.4f}")
+        else:
+            # Standard mode: generate single path
+            base_traj = self._plan_rrt_path(q_start, q_goal)
+
+            if base_traj is None:
+                return  # Failed, will retry next iteration
 
         # 3. Get EE trajectory for obstacle placement
         base_ee_traj = self._get_ee_trajectory(base_traj)
@@ -216,6 +288,154 @@ class TrajectoryGenerator:
             ee_positions.append(list(link_state[0]))
 
         return np.array(ee_positions)
+
+    def _get_camera_link_pose(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get camera link pose for a joint configuration.
+
+        Args:
+            q: Joint configuration (DOF,)
+
+        Returns:
+            position: Camera position in world frame (3,)
+            rotation_matrix: Camera orientation as 3x3 rotation matrix
+        """
+        # Set robot to configuration q
+        for idx, qi in zip(self.joint_indices, q):
+            self.pb.resetJointState(self.robot_id, idx, qi)
+
+        # Get camera link state
+        link_state = self.pb.getLinkState(
+            self.robot_id, self.camera_link_index, computeForwardKinematics=True
+        )
+
+        position = np.array(link_state[0])
+        orientation_quat = np.array(link_state[1])  # [x, y, z, w]
+
+        # Convert quaternion to rotation matrix
+        rotation_matrix = np.array(self.pb.getMatrixFromQuaternion(orientation_quat)).reshape(3, 3)
+
+        return position, rotation_matrix
+
+    def _compute_camera_score(
+        self,
+        path: np.ndarray,
+        target_position: np.ndarray,
+        k_exp: float,
+        k_sig: float,
+        threshold: float,
+    ) -> float:
+        """
+        Compute camera-aware score for a trajectory path.
+
+        Higher score = camera better aligned with target throughout path.
+        Combines exponential reward with sigmoid gating.
+
+        Args:
+            path: Trajectory (N_SAMPLES, DOF)
+            target_position: Target position in world frame (3,)
+            k_exp: Exponential sharpness (default: 5.0)
+            k_sig: Sigmoid sharpness (default: 15.0)
+            threshold: Alignment threshold (default: 0.4)
+
+        Returns:
+            Average score across sampled waypoints
+        """
+        if self.camera_link_index is None:
+            return 0.0  # Camera scoring unavailable
+
+        # Sample waypoints (use 10 points max to reduce computation)
+        num_samples = min(len(path), 10)
+        sample_indices = np.linspace(0, len(path) - 1, num_samples, dtype=int)
+
+        scores = []
+        for idx in sample_indices:
+            q = path[idx]
+
+            # Get camera pose
+            cam_position, cam_rotation = self._get_camera_link_pose(q)
+
+            # Camera forward direction (assumes +Z axis in local frame)
+            cam_forward = cam_rotation[:, 2]
+
+            # Direction from camera to target
+            target_direction = target_position - cam_position
+            target_distance = np.linalg.norm(target_direction)
+
+            if target_distance < 1e-6:
+                alignment = 0.0  # Camera at target
+            else:
+                target_direction_normalized = target_direction / target_distance
+                alignment = np.dot(cam_forward, target_direction_normalized)
+
+            # Scoring function components
+            exp_reward = np.exp(k_exp * alignment)
+            sigmoid_gate = 1.0 / (1.0 + np.exp(-k_sig * (alignment - threshold)))
+
+            waypoint_score = exp_reward * sigmoid_gate
+            scores.append(waypoint_score)
+
+        return float(np.mean(scores))
+
+    def _generate_multiple_path_candidates(
+        self,
+        q_start: np.ndarray,
+        q_goal: np.ndarray,
+        num_candidates: int,
+        max_attempts: int,
+        additional_obstacles: List[int] = None,
+    ) -> List[np.ndarray]:
+        """
+        Generate multiple candidate paths using RRT (adaptive approach).
+
+        Attempts to generate num_candidates valid paths, up to max_attempts tries.
+        Uses perturbations to start/goal configurations to ensure path diversity.
+
+        Args:
+            q_start: Start configuration
+            q_goal: Goal configuration
+            num_candidates: Target number of valid paths
+            max_attempts: Maximum planning attempts
+            additional_obstacles: Optional obstacle IDs
+
+        Returns:
+            List of valid paths (each: (N_SAMPLES, DOF))
+        """
+        paths = []
+        attempts = 0
+
+        # Perturbation magnitude (radians) - configurable via config
+        perturbation_scale = self.config.get("rrt_perturbation_scale", 0.001)
+
+        while len(paths) < num_candidates and attempts < max_attempts:
+            attempts += 1
+
+            # First path uses exact start/goal, subsequent paths use perturbations
+            if len(paths) == 0:
+                plan_start = q_start
+                plan_goal = q_goal
+            else:
+                # Add small random perturbations to force RRT to explore different paths
+                start_perturbation = np.random.uniform(-perturbation_scale, perturbation_scale, size=q_start.shape)
+                goal_perturbation = np.random.uniform(-perturbation_scale, perturbation_scale, size=q_goal.shape)
+
+                # Clip to joint limits
+                plan_start = np.clip(q_start + start_perturbation, self.lower_limits, self.upper_limits)
+                plan_goal = np.clip(q_goal + goal_perturbation, self.lower_limits, self.upper_limits)
+
+            path = self._plan_rrt_path(plan_start, plan_goal, additional_obstacles)
+
+            if path is not None:
+                paths.append(path)
+
+                if self.config.get("verbose", False):
+                    perturbation_info = "" if len(paths) == 1 else f", perturbed={perturbation_scale:.3f}"
+                    print(f"Generated path {len(paths)}/{num_candidates} (attempt {attempts}/{max_attempts}{perturbation_info})")
+
+        if self.config.get("verbose", False) and len(paths) < num_candidates:
+            print(f"Warning: Only generated {len(paths)}/{num_candidates} valid paths after {max_attempts} attempts")
+
+        return paths
 
     def _add_random_obstacles(
         self, robot_qs_to_avoid: List[np.ndarray], base_ee_traj: np.ndarray
