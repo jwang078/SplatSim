@@ -18,6 +18,20 @@ class Args:
     gaussian_path : str = "/home/jennyw2/data/output/robot_iphone/point_cloud/iteration_30000/point_cloud.ply"
     robot_name: str = "robot_iphone"
 
+    # Trajectory generation parameters (all optional, will use environment defaults if not provided)
+    num_base_trajectories: int | None = None
+    obstacles_per_base_trajectory: int | None = None
+    paths_per_obstacle: int | None = None
+    min_obstacles: int | None = None
+    max_obstacles: int | None = None
+    cuboids_fn: str | None = None
+    q_start: list[float] | None = None
+    q_goal: list[float] | None = None
+    render_images: bool = False
+
+    # Debug mode for PyBullet visualization
+    debug_mode: str | None = None
+
 
 def launch_robot_server(args: Args):
     with open("configs/object_configs/objects.yaml", "r") as f:
@@ -82,7 +96,8 @@ def launch_robot_server(args: Args):
 
         server = OrangeOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=OrangeOnPlatePybulletRobotServer.SERVE_MODES.GENERATE_DEMOS,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_orange_interactive":
@@ -90,7 +105,8 @@ def launch_robot_server(args: Args):
 
         server = OrangeOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=OrangeOnPlatePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-            camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+            camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+            debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_apple":
@@ -98,7 +114,8 @@ def launch_robot_server(args: Args):
 
         server = AppleOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=AppleOnPlatePybulletRobotServer.SERVE_MODES.GENERATE_DEMOS,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_apple_interactive":
@@ -106,7 +123,8 @@ def launch_robot_server(args: Args):
 
         server = AppleOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=AppleOnPlatePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_apple_interactive-nosplat":
@@ -114,7 +132,8 @@ def launch_robot_server(args: Args):
 
         server = AppleOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=AppleOnPlatePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_interactive":
@@ -122,15 +141,16 @@ def launch_robot_server(args: Args):
 
         server = UprightRobotSmallEnginePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=UprightRobotSmallEnginePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-        #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper, 
+        #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper,
 
-           camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper, 
+           camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
 
-        #    camera_names=camera_names, robot_name=args.robot_name, cam_i=5, use_gripper=use_gripper, 
+        #    camera_names=camera_names, robot_name=args.robot_name, cam_i=5, use_gripper=use_gripper,
         #    image_width=224, image_height=224
-           
+
            # with the actual engine on table
         #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_interactive_norender":
@@ -138,8 +158,9 @@ def launch_robot_server(args: Args):
 
         server = UprightRobotSmallEnginePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=UprightRobotSmallEnginePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper, 
-           image_width=96, image_height=96
+           camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper,
+           image_width=96, image_height=96,
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive":
@@ -147,12 +168,13 @@ def launch_robot_server(args: Args):
 
         server = UprightRobotSmallEngineNewPybulletRobotServer(
            port=port, host=args.hostname, serve_mode=UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.INTERACTIVE,
-        #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper, 
+        #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper,
 
-           camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper, 
+        #    camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
 
-        #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper, 
+           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
         #    image_width=224, image_height=224
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_norender":
@@ -160,8 +182,47 @@ def launch_robot_server(args: Args):
 
         server = UprightRobotSmallEngineNewPybulletRobotServer(
            port=port, host=args.hostname, serve_mode=UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper, 
-           image_width=96, image_height=96
+           camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper,
+           image_width=96, image_height=96,
+           debug_mode=args.debug_mode
+        )
+
+    elif args.robot == "sim_ur_pybullet_small_engine_new_traj_gen":
+        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEngineNewPybulletRobotServer
+
+        # Build trajectory generation config from command-line args (only non-None values)
+        traj_gen_config = {}
+        if args.num_base_trajectories is not None:
+            traj_gen_config["num_base_trajectories"] = args.num_base_trajectories
+        if args.obstacles_per_base_trajectory is not None:
+            traj_gen_config["obstacles_per_base_trajectory"] = args.obstacles_per_base_trajectory
+        if args.paths_per_obstacle is not None:
+            traj_gen_config["paths_per_obstacle"] = args.paths_per_obstacle
+        if args.min_obstacles is not None:
+            traj_gen_config["min_obstacles"] = args.min_obstacles
+        if args.max_obstacles is not None:
+            traj_gen_config["max_obstacles"] = args.max_obstacles
+        if args.cuboids_fn is not None:
+            traj_gen_config["cuboids_fn"] = args.cuboids_fn
+        if args.q_start is not None:
+            traj_gen_config["q_start"] = args.q_start
+        if args.q_goal is not None:
+            traj_gen_config["q_goal"] = args.q_goal
+        if args.render_images:
+            traj_gen_config["render_images"] = True
+
+        # Determine camera names based on rendering config
+        camera_names_to_use = camera_names if traj_gen_config.get("render_images", False) else []
+
+        server = UprightRobotSmallEngineNewPybulletRobotServer(
+            port=port,
+            host=args.hostname,
+            serve_mode=UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.GENERATE_TRAJECTORIES,
+            camera_names=camera_names_to_use,
+            robot_name=args.robot_name,
+            use_gripper=use_gripper,
+            trajectory_gen_config=traj_gen_config,
+            debug_mode=args.debug_mode,
         )
 
     elif args.robot == "sim_ur_pybullet_open_bwa_interactive":
@@ -169,12 +230,13 @@ def launch_robot_server(args: Args):
 
         server = OpenSpaceBWAPybulletRobotServer(
            port=port, host=args.hostname, serve_mode=OpenSpaceBWAPybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=camera_names, robot_name=args.robot_name, cam_i=5, use_gripper=use_gripper, 
-           
+           camera_names=camera_names, robot_name=args.robot_name, cam_i=5, use_gripper=use_gripper,
+
         #    image_width=224, image_height=224
-           
+
            # with the actual engine on table
         #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_banana":
@@ -182,7 +244,8 @@ def launch_robot_server(args: Args):
 
         server = BananaOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=BananaOnPlatePybulletRobotServer.SERVE_MODES.GENERATE_DEMOS,
-           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=[], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_pybullet_banana_interactive":
@@ -190,7 +253,8 @@ def launch_robot_server(args: Args):
 
         server = BananaOnPlatePybulletRobotServer(
            port=port, host=args.hostname, serve_mode=BananaOnPlatePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
+           camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+           debug_mode=args.debug_mode
         )
 
     elif args.robot == "sim_ur_splat":

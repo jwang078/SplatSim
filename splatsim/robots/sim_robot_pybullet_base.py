@@ -192,6 +192,27 @@ class PybulletRobotServerBase:
     class SERVE_MODES(enum.Enum):
         GENERATE_DEMOS = "generate_demos"
         INTERACTIVE = "interactive"
+        GENERATE_TRAJECTORIES = "generate_trajectories"
+
+    # Default configuration for trajectory generation
+    DEFAULT_TRAJECTORY_GEN_CONFIG = {
+        "num_base_trajectories": 10_000,
+        "obstacles_per_base_trajectory": 3,
+        "paths_per_obstacle": 2,
+        "min_obstacles": 1,
+        "max_obstacles": 3,
+        "max_fails": 2,
+        "max_obstacle_fails_per_base_traj": 20,
+        "time_per_traj": 6.0,
+        "robot_update_rate": 20,
+        "rrt_vis_fps": 10,
+        "use_obstacles": True,
+        "q_start": None,
+        "q_goal": None,
+        "cuboids_fn": None,
+        "render_images": False,
+        "save_base_trajectory": True,
+    }
 
     # object_rot is only x and y. Since it's a tabletop, z is randomized
     GRASP_CONFIGS = {
@@ -273,7 +294,8 @@ class PybulletRobotServerBase:
         image_width: int = 640,
         image_height: Optional[int] = None,
         object_config_path: str = "./configs/object_configs/objects.yaml",
-        debug_mode: Optional[str] = "rotate",
+        debug_mode: Optional[str] = None,
+        trajectory_gen_config: dict = None,
     ):
         self.serve_mode = serve_mode
         self.robot_name = robot_name
@@ -317,6 +339,37 @@ class PybulletRobotServerBase:
         self.splatsim_robot: SplatSimObject = self.create_object(
             object_name="robot", splat_object_name=self.robot_name
         )
+
+        # Initialize trajectory generation config and generator
+        cli_config = trajectory_gen_config or {}
+        self.trajectory_gen_config = {
+            **self.DEFAULT_TRAJECTORY_GEN_CONFIG,
+            **getattr(self, 'TRAJECTORY_GEN_CONFIG', {}),
+            **cli_config
+        }
+
+        # Initialize trajectory generator if in trajectory generation mode
+        if serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+            from splatsim.utils.trajectory_generation import TrajectoryGenerator
+
+            # Get EE link index function
+            def get_ee_link():
+                return self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id) - 1
+
+            # Get movable joint indices (first 6 joints, excluding gripper)
+            movable_joints = list(range(1, 7))
+
+            self.trajectory_generator = TrajectoryGenerator(
+                pybullet_client=self.pybullet_client,
+                robot_id=self.splatsim_robot.sim_id,
+                joint_indices=movable_joints,
+                config=self.trajectory_gen_config,
+                env_config_name=self.ENV_CONFIG_NAME if hasattr(self, 'ENV_CONFIG_NAME') else "default",
+                get_ee_link_fn=get_ee_link,
+                splatsim_objects=self.splatsim_objects,
+            )
+        else:
+            self.trajectory_generator = None
 
         if self.debug_mode == "no_background":
             print("[Debug mode] no_background, using robot as background")
@@ -1646,7 +1699,8 @@ class PybulletRobotServerBase:
             # Display the rendered observations
             self.display_observations(observations)
 
-        for camera_name in ["base_rgb", "wrist_rgb"]:
+        for camera_name in self.camera_names:
+            # For example, when self.do-render_from_splat is False
             if camera_name not in observations:
                 observations[camera_name] = None
 

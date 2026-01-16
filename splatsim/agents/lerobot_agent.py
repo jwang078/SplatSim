@@ -25,10 +25,15 @@ class LeRobotAgent:
 
     def act(self, obs: dict) -> np.ndarray:
         # 1. Prepare observations (LeRobot expects dict of tensors with batch dim)
-        # Assuming your ZMQ obs already has "base_rgb" in (3, H, W)
-        base_rgb_resized = letterbox(obs["base_rgb"].detach().cpu().numpy(), output_size=(224, 224)) # 224x224 is the usual size for paligemma / pi0 (224x224, 448x448, and 896x896 pixels)
+        # Add all possible image keys in the observation
+        img_keys = [key for key in obs.keys() if key.endswith("_rgb")]
         lerobot_obs = {
-            "observation.images.base_rgb": torch.from_numpy(base_rgb_resized).unsqueeze(0).to(self.device),
+            **{
+                f"observation.images.{key}": torch.from_numpy(
+                    letterbox(obs[key].detach().cpu().numpy(), (224, 224))
+                ).unsqueeze(0).to(self.device)
+                for key in img_keys
+            },
             "observation.state": torch.from_numpy(obs["joint_positions"]).unsqueeze(0).to(self.device),
             "observation.language.tokens": self.language_inputs["input_ids"],
             "observation.language.attention_mask": self.language_inputs["attention_mask"].bool(),
@@ -37,7 +42,6 @@ class LeRobotAgent:
         # 2. Inference
         with torch.no_grad():
             action_tensor = self.policy.select_action(lerobot_obs)
-
 
         # 3. Return to sim
         return np.concatenate([action_tensor.squeeze(0).cpu().numpy()[:6], [0.0]])  # Append gripper open command

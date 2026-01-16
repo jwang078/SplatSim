@@ -104,11 +104,13 @@ def state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_thresh
 
     for link_i in link_indices_to_check:
         for obs in obstacle_ids:
-            pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=distance_threshold, linkIndexA=link_i, linkIndexB=1)
-            if len(pts) > 0: # TODO I'm not sure why there's always 1 point in collision. setting the 1 to 0 made this always true
-                if verbose:
-                    print(f"Collision detected between link {link_i} and obstacle {obs} with points {len(pts)}")
-                return True
+            for base_link_id in [-1, 1]:
+                # Use -1 for base link of obstacle (works for simple URDFs like plane.urdf)
+                pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=distance_threshold, linkIndexA=link_i, linkIndexB=base_link_id)
+                if len(pts) > 0: # TODO I'm not sure why there's always 1 point in collision. setting the 1 to 0 made this always true
+                    if verbose:
+                        print(f"Collision detected between link {link_i} and obstacle {obs} with points {len(pts)}. linkIndexB={base_link_id}")
+                    return True
     return False
 
 def get_movable_joints(robot_id):
@@ -254,6 +256,14 @@ def setup_env(args, robot_base_position, use_old_walls=False, use_obstacles=True
     obstacle_ids.append(wall)
 
     return ll, ul, obstacle_ids, robot_id, joint_indices
+
+def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, max_tries=10000, verbose=True):
+    sample_fn = get_sample_fn(robot_id, joint_indices)
+    for _ in range(max_tries):
+        q = sample_fn()
+        if not state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01, verbose=verbose):
+            return q
+    raise RuntimeError("Failed to find collision-free joint angles after many tries")
 
 def check_self_collision(robot_id, joint_indices, distance=0.0):
     """

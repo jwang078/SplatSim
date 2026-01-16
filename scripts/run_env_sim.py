@@ -56,7 +56,7 @@ class Args:
     verbose: bool = False
 
     save_lerobot_dataset: bool = False
-    lerobot_dataset_repo_id: str = "JennyWWW/splatsim_lerobot_dataset"
+    lerobot_dataset_repo_id_base: str = "JennyWWW/splatsim_lerobot_dataset"
 
 
 def main(args):
@@ -240,8 +240,9 @@ def main(args):
             # traj_folder = "./output/obstacles_on_path_onegoal.zarr" # temporary hardcoding
             # traj_folder = "/home/jennyw2/code/SplatSim/output/obstacles_on_path_onegoal_20dataset_simple.zarr"
             # traj_folder = "/home/jennyw2/code/SplatSim/output/small_engine_keyframes_default.zarr"
-            traj_folder = "/home/jennyw2/code/SplatSim/output/eval_go_to_nominal_10.zarr"
+            # traj_folder = "/home/jennyw2/code/SplatSim/output/eval_go_to_nominal_10.zarr"
             # traj_folder = "/home/jennyw2/code/SplatSim/output/go_to_nominal_10.zarr"
+            traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_trajectories.zarr"
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
             startup_steps = 2
             query_new_joints_per_startup_step = False
@@ -268,7 +269,12 @@ def main(args):
         elif args.agent == "lerobot":
             # Point to your local checkpoint or Hugging Face hub ID
             # checkpoint = "outputs/pi05_finetune/checkpoints/last/pretrained_model"
-            checkpoint = "outputs/pi05_training/checkpoints/last/pretrained_model"
+
+            # Does ok with going to nominal position
+            # checkpoint = "outputs/pi05_training/checkpoints/last/pretrained_model"
+
+            # Approach lever of engine
+            checkpoint = "/home/jennyw2/code/SplatSim/outputs/pi05_training_approach_lever/checkpoints/last/pretrained_model"
             from splatsim.agents.lerobot_agent import LeRobotAgent
             agent = LeRobotAgent(checkpoint_path=checkpoint)
             startup_steps = 16
@@ -381,12 +387,19 @@ def main(args):
         kb_interface = KBReset()
 
     if args.save_lerobot_dataset:
+        # Get *_rgb keys from obs
+        image_keys = [key for key in obs.keys() if key.endswith("_rgb")]
+        print(f"Saving {len(image_keys)} image keys in observation to lerobot dataset:", image_keys)
+
+        dataset_repo_id = f"{args.lerobot_dataset_repo_id_base}_image{'-'.join(image_keys)}"
+        print(f"Saving to LeRobot dataset with repo ID: {dataset_repo_id}")
+
         # Standard LeRobot cache path
-        local_dir = os.path.expanduser(f"~/.cache/huggingface/lerobot/{args.lerobot_dataset_repo_id}")
+        local_dir = os.path.expanduser(f"~/.cache/huggingface/lerobot/{dataset_repo_id}")
 
         if os.path.exists(local_dir):
             print(f"Appending to existing LeRobot dataset at {local_dir}")
-            lerobot_saver = LeRobotDataset(args.lerobot_dataset_repo_id) #, root=local_dir)
+            lerobot_saver = LeRobotDataset(dataset_repo_id) #, root=local_dir)
         else:
             print(f"Creating new LeRobot dataset at {local_dir}")
             # https://huggingface.co/docs/lerobot/en/lerobot-dataset-v3#available-transform-types
@@ -414,15 +427,19 @@ def main(args):
             )
 
             lerobot_saver = LeRobotDataset.create(
-                repo_id=args.lerobot_dataset_repo_id,
+                repo_id=dataset_repo_id,
                 fps=50,
                 robot_type="lerobot_splatsim",
                 use_videos=True,
                 features={
-                    "observation.images.base_rgb": {
-                        "dtype": "image",
-                        "shape": (3, 224, 224), #obs['base_rgb'].shape,
-                        "names": ["channels", "height", "width"],
+                     # All images are resized + letterboxed to 224x224 for the VLM in PI05
+                    **{
+                        f"observation.images.{key}": {
+                            "dtype": "image",
+                            "shape": (3, 224, 224),
+                            "names": ["channels", "height", "width"],
+                        }
+                        for key in image_keys
                     },
                     "observation.state": {
                         "dtype": "float32",
@@ -451,7 +468,6 @@ def main(args):
                         ],
                     },
                 },
-                # image_transforms=custom_transforms_config,
             )
 
     print_color("\nStart 🚀🚀🚀", color="green", attrs=("bold",))
@@ -480,11 +496,11 @@ def main(args):
             if getattr(agent, 'state', AGENT_STATE.EXECUTING_TRAJ) == AGENT_STATE.EXECUTING_TRAJ and args.save_lerobot_dataset:
                 # We save the obs and the action that was generated from it
                 lerobot_saver.add_frame({
-                    # base_rgb is (c, h, w) format
-                    "observation.images.base_rgb": letterbox(obs["base_rgb"].detach().cpu().numpy(), (224, 224)),
+                    # images are (c, h, w) format
+                    **{f"observation.images.{key}": letterbox(obs[key].detach().cpu().numpy(), (224, 224)) for key in image_keys},
                     "observation.state": obs["joint_positions"].astype(np.float32),
                     "action": action.astype(np.float32),
-                    "task": "test", # TODO why is this necessary
+                    "task": "test", # TODO this is probably more necessary if there are multiple tasks
                 })
 
             if getattr(agent, 'state', AGENT_STATE.UNKNOWN) == AGENT_STATE.SETTLING and started_executing_traj:
