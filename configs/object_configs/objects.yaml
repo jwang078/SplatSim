@@ -65,8 +65,8 @@ robot_iphone_w_engine_new:
     - [0.0, 0.0, 0.0, 1.0]
   aabb:
     bounding_box:
-    - [-0.2044, -0.11, -0.0033]
-    - [0.0734, 0.6847, 0.5749]
+    - [-0.2044, -0.11, 0.0082]
+    - [0.0734, 0.6925, 0.5867]
     urdf_bbox_adjustment:
     - [0.0, 0.0]
     - [0.0, 0.1]
@@ -74,7 +74,7 @@ robot_iphone_w_engine_new:
   urdf_path:
   - ./splatsim/robot_definitions/urdf/sisbot.urdf
   base_position:
-  - [0.0, 0.0, -0.078]
+  - [0.0, 0.0, -0.088]
   joint_states:
   - [0, 1.5707963267948966, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966,
     -1.5707963267948966, 0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
@@ -176,8 +176,8 @@ small_engine_new:
     - [0.0, 0.0, 0.0, 1.0]
   aabb:
     bounding_box:
-    - [-0.1791, -0.0767, -0.1727]
-    - [0.1631, 0.2999, 0.1648]
+    - [-0.1791, -0.0767, -0.1626]
+    - [0.1631, 0.2995, 0.1748]
     urdf_bbox_adjustment:
     - [0.0, 0.0]
     - [0.0, 0.0]
@@ -189,7 +189,7 @@ small_engine_new:
   joint_states:
   - [0]
   base_position:
-  - [0.0, 0.0, 0.170955]
+  - [0.0, 0.0, 0.180955]
   use_fixed_base: true
 plastic_apple:
   transformation:

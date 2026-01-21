@@ -242,8 +242,10 @@ def main(args):
             # traj_folder = "/home/jennyw2/code/SplatSim/output/small_engine_keyframes_default.zarr"
             # traj_folder = "/home/jennyw2/code/SplatSim/output/eval_go_to_nominal_10.zarr"
             # traj_folder = "/home/jennyw2/code/SplatSim/output/go_to_nominal_10.zarr"
-            traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_test_trajectories.zarr"
+            # traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_test_trajectories.zarr"
             # traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_trajectories.zarr"
+            # traj_folder = "output/upright_robot_small_engine_new_trajectories_sapi05.zarr"
+            traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_1strrtpath_trajectories.zarr"
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
             startup_steps = 2
             query_new_joints_per_startup_step = False
@@ -392,7 +394,7 @@ def main(args):
         image_keys = [key for key in obs.keys() if key.endswith("_rgb")]
         print(f"Saving {len(image_keys)} image keys in observation to lerobot dataset:", image_keys)
 
-        dataset_repo_id = f"{args.lerobot_dataset_repo_id_base}_image{'-'.join(image_keys)}"
+        dataset_repo_id = f"{args.lerobot_dataset_repo_id_base}_{'_'.join(image_keys)}"
         print(f"Saving to LeRobot dataset with repo ID: {dataset_repo_id}")
 
         # Standard LeRobot cache path

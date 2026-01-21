@@ -11,6 +11,8 @@ from splatsim.utils.robot_splat_render_utils import SplatSimObject
 class TrajectoryGenerator:
     """Helper class for RRT-based trajectory generation."""
 
+    RRT_PERTURBATION_SCALE = 0.001  # Radians to perturb start/goal for path diversity. Setting numpy random seeds didn't work
+
     def __init__(
         self,
         pybullet_client,
@@ -405,7 +407,7 @@ class TrajectoryGenerator:
         attempts = 0
 
         # Perturbation magnitude (radians) - configurable via config
-        perturbation_scale = self.config.get("rrt_perturbation_scale", 0.001)
+        perturbation_scale = self.RRT_PERTURBATION_SCALE
 
         while len(paths) < num_candidates and attempts < max_attempts:
             attempts += 1
@@ -426,6 +428,12 @@ class TrajectoryGenerator:
             path = self._plan_rrt_path(plan_start, plan_goal, additional_obstacles)
 
             if path is not None:
+                # Extend the path so that it stays at the last position for half a second
+                num_extra_steps = int(0.5 * self.config["robot_update_rate"])
+                last_q = path[-1]
+                extra_steps = np.tile(last_q, (num_extra_steps, 1))
+                path = np.vstack((path, extra_steps))
+                
                 paths.append(path)
 
                 if self.config.get("verbose", False):

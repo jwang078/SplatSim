@@ -37,7 +37,6 @@ class Args:
     k_exp: float | None = None
     k_sig: float | None = None
     threshold: float | None = None
-    rrt_perturbation_scale: float | None = None
 
     # Debug mode for PyBullet visualization
     debug_mode: str | None = None
@@ -236,8 +235,6 @@ def launch_robot_server(args: Args):
             traj_gen_config["k_sig"] = args.k_sig
         if args.threshold is not None:
             traj_gen_config["threshold"] = args.threshold
-        if args.rrt_perturbation_scale is not None:
-            traj_gen_config["rrt_perturbation_scale"] = args.rrt_perturbation_scale
 
         # Determine camera names based on rendering config
         camera_names_to_use = camera_names if traj_gen_config.get("render_images", False) else []

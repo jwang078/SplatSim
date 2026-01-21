@@ -219,7 +219,6 @@ class PybulletRobotServerBase:
         "k_exp": 5.0,
         "k_sig": 15.0,
         "threshold": 0.4,
-        "rrt_perturbation_scale": 0.001,  # Radians to perturb start/goal for path diversity
     }
 
     # object_rot is only x and y. Since it's a tabletop, z is randomized

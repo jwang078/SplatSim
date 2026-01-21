@@ -123,7 +123,8 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 "randomize_pose": False,
                 "rotation_range_z": [0, 0],
                 "is_in_scene_splat": True,
-                "table_pos": [-0.565, 0.35],
+                "table_pos": [-0.48, 0.36],
+                # "table_pos": [-0.565, 0.35],
                 "table_quat": [0, 0, -0.7071068, 0.7071068],
             },
         ]
