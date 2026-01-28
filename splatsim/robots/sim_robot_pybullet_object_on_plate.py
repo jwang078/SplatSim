@@ -277,6 +277,12 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
 
     def serve_loop(self) -> None:
         # To be called in the parent's serve()
+
+        # Check mode dropdown for mode changes
+        new_mode = self._check_mode_buttons()
+        if new_mode is not None:
+            self._handle_mode_transition(new_mode)
+
         if self.serve_mode == self.SERVE_MODES.INTERACTIVE:
             self.pybullet_client.stepSimulation()
             time.sleep(1 / 240)
@@ -309,7 +315,14 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
                 print(
                     f"Exiting record_demos mode because max trajectory count of {self.MAX_TRAJECTORY_COUNT} was reached in folder {self.path}"
                 )
-                self.set_serve_mode(self.SERVE_MODES.INTERACTIVE)
+                self._handle_mode_transition(self.SERVE_MODES.INTERACTIVE)
+        elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+            # Handle trajectory generation mode
+            self.trajectory_generator.generate_trajectory_batch()
+
+            if self.trajectory_generator.is_complete():
+                print(f"[GUI] Completed trajectory generation. Switching to interactive mode.")
+                self._handle_mode_transition(self.SERVE_MODES.INTERACTIVE)
         else:
             raise ValueError(f"Unknown serve mode {self.serve_mode}. ")
 
@@ -390,9 +403,8 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
 
 
 class AppleOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
-    ENV_CONFIG_NAME = "apple_on_plate"
-
     ENV_CONFIG = {
+        "name": "apple_on_plate",
         "objects": [
             {
                 "object_name": "plastic_apple",

@@ -30,16 +30,51 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+    def _register_trajectory_obstacles(self):
+        """Register static obstacles with the trajectory generator. Override in subclasses."""
+        pass
+
     def plan_given_this_state(self, initial_joint_positions):
         all_paths = []
         return all_paths
 
     def serve_loop(self) -> None:
         # To be called in the parent's serve()
+
+        # Check mode dropdown for mode changes
+        new_mode = self._check_mode_buttons()
+        if new_mode is not None:
+            self._handle_mode_transition(new_mode)
+
+        # Check GUI buttons for trajectory generation control (start/stop)
+        start_pressed, stop_pressed = self._splatsim_gui.check_traj_buttons()
+
+        if start_pressed and self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
+            # Sync GUI values to config before starting
+            self._splatsim_gui.save_to_config(self.trajectory_generator.config)
+            # Register static obstacles with the trajectory generator
+            self._register_trajectory_obstacles()
+            # Switch to active trajectory generation
+            self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES)
+            print(f"[GUI] Started trajectory generation with config: {self.trajectory_generator.config}")
+
+        if stop_pressed:
+            if self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+                # Stop active generation, go back to idle
+                self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE)
+            elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
+                # From idle, go back to interactive
+                self._handle_mode_transition(self.SERVE_MODES.INTERACTIVE)
+
         if self.serve_mode == self.SERVE_MODES.INTERACTIVE:
             self.pybullet_client.stepSimulation()
             time.sleep(1 / 240)
+        elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
+            # Idle mode - just step simulation while user configures settings
+            self.pybullet_client.stepSimulation()
+            time.sleep(1 / 240)
         elif self.serve_mode == self.SERVE_MODES.GENERATE_DEMOS:
+            raise NotImplementedError()
             initial_joint_positions = self.randomize_ee_pose()
 
             success = self.plan_execute_record_trajectory(
@@ -52,14 +87,14 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
                 print(
                     f"Exiting record_demos mode because max trajectory count of {self.MAX_TRAJECTORY_COUNT} was reached in folder {self.path}"
                 )
-                self.set_serve_mode(self.SERVE_MODES.INTERACTIVE)
+                self._handle_mode_transition(self.SERVE_MODES.INTERACTIVE)
         elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-            # Handle trajectory generation mode
+            # Handle active trajectory generation mode
             self.trajectory_generator.generate_trajectory_batch()
 
             if self.trajectory_generator.is_complete():
-                print(f"Completed trajectory generation. Exiting.")
-                self.set_serve_mode(self.SERVE_MODES.INTERACTIVE)
+                print(f"[GUI] Completed trajectory generation. Switching to idle mode.")
+                self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE)
         else:
             raise ValueError(f"Unknown serve mode {self.serve_mode}. ")
 
@@ -90,7 +125,6 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         self.teleport_joint_state(self.splatsim_robot, initial_joints)
         self.open_gripper()
 
-        # TODO why is the robot not holding its position during this step simulation settle period?
         # Let simulation settle
         for _ in range(100):
             self.pybullet_client.stepSimulation()
@@ -147,11 +181,10 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
 
 class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer):
-    ENV_CONFIG_NAME = "upright_robot_small_engine"
-
     TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
 
     ENV_CONFIG = {
+        "name": "upright_robot_small_engine",
         "objects": [
             {
                 "object_name": "small_engine",
@@ -182,19 +215,24 @@ class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer)
         quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
         self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
 
-        # TODO temporary until wall and plane are splatsim objects
+        # Register obstacles if trajectory generator was initialized via CLI
+        if self.trajectory_generator is not None:
+            self._register_trajectory_obstacles()
+
+    def _register_trajectory_obstacles(self):
+        """Register wall and plane as obstacles for trajectory generation."""
         if self.trajectory_generator is not None:
             self.trajectory_generator.register_obstacle(self.wall)
             self.trajectory_generator.register_obstacle(self.plane)
 
 class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServer):
     # This new lab bench scene has the robot rotated 90 degrees because it was installed rotated D:
-    ENV_CONFIG_NAME = "upright_robot_small_engine_new"
     background_splat_name = "robot_iphone_w_engine_new"
 
     TABLE_LIMITS = ((-0.5, 0.5), (0.2, 0.6))
 
     ENV_CONFIG = {
+        "name": "upright_robot_small_engine_new",
         "objects": [
             {
                 "object_name": "small_engine_new",
@@ -230,7 +268,12 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
             cameraTargetPosition=[0, 0, 0.3]  # Look at point above the floor
         )
 
-        # TODO temporary until wall and plane are splatsim objects
+        # Register obstacles if trajectory generator was initialized via CLI
+        if self.trajectory_generator is not None:
+            self._register_trajectory_obstacles()
+
+    def _register_trajectory_obstacles(self):
+        """Register wall and plane as obstacles for trajectory generation."""
         if self.trajectory_generator is not None:
             self.trajectory_generator.register_obstacle(self.wall)
             self.trajectory_generator.register_obstacle(self.plane)

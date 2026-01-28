@@ -18,11 +18,32 @@ class TrajectoryGenerator:
         pybullet_client,
         robot_id: int,
         joint_indices: list,
-        config: dict,
         env_config_name: str,
         get_ee_link_fn,  # Callback to get EE link index
         splatsim_objects: List[SplatSimObject],
         wrist_camera_link_name: Optional[str] = None,
+        num_base_trajectories: int = 1000,
+        obstacles_per_base_trajectory: int = 3,
+        paths_per_obstacle: int = 2,
+        min_obstacles: int = 1,
+        max_obstacles: int = 3,
+        max_fails: int = 2,
+        max_obstacle_fails_per_base_traj: int = 20,
+        time_per_traj: float = 6.0,
+        robot_update_rate: int = 20,
+        rrt_vis_fps: int = 10,
+        use_obstacles: bool = True,
+        q_start: Optional[np.ndarray] = None,
+        q_goal: Optional[np.ndarray] = None,
+        cuboids_fn: Optional[str] = None,
+        render_images: bool = False,
+        save_base_trajectory: bool = True,
+        disable_camera_scoring_for_rrt: bool = False,
+        num_path_candidates: int = 5,
+        max_path_attempts: int = 20,
+        k_exp: float = 5.0,
+        k_sig: float = 15.0,
+        threshold: float = 0.4,
     ):
         """
         Initialize trajectory generator.
@@ -31,15 +52,42 @@ class TrajectoryGenerator:
             pybullet_client: PyBullet client instance
             robot_id: Robot body ID in PyBullet
             joint_indices: List of movable joint indices
-            config: Trajectory generation configuration dictionary
             env_config_name: Environment name for output directory
             get_ee_link_fn: Function that returns EE link index
+            splatsim_objects: List of SplatSimObject instances
             wrist_camera_link_name: Name of wrist camera link for camera-aware scoring
+            (other kwargs): Trajectory generation configuration parameters
         """
         self.pb = pybullet_client
         self.robot_id = robot_id
         self.joint_indices = joint_indices
-        self.config = config
+
+        # Store all config parameters
+        self.config = {
+            "num_base_trajectories": num_base_trajectories,
+            "obstacles_per_base_trajectory": obstacles_per_base_trajectory,
+            "paths_per_obstacle": paths_per_obstacle,
+            "min_obstacles": min_obstacles,
+            "max_obstacles": max_obstacles,
+            "max_fails": max_fails,
+            "max_obstacle_fails_per_base_traj": max_obstacle_fails_per_base_traj,
+            "time_per_traj": time_per_traj,
+            "robot_update_rate": robot_update_rate,
+            "rrt_vis_fps": rrt_vis_fps,
+            "use_obstacles": use_obstacles,
+            "q_start": q_start,
+            "q_goal": q_goal,
+            "cuboids_fn": cuboids_fn,
+            "render_images": render_images,
+            "save_base_trajectory": save_base_trajectory,
+            "disable_camera_scoring_for_rrt": disable_camera_scoring_for_rrt,
+            "num_path_candidates": num_path_candidates,
+            "max_path_attempts": max_path_attempts,
+            "k_exp": k_exp,
+            "k_sig": k_sig,
+            "threshold": threshold,
+            "experiment_name": "",
+        }
         self.env_config_name = env_config_name
         self.get_ee_link_fn = get_ee_link_fn
         self.splatsim_objects = splatsim_objects
@@ -69,12 +117,13 @@ class TrajectoryGenerator:
         self.loaded_obstacle_ids = []
 
         # Load cuboid obstacles if specified
-        if config.get("use_obstacles") and config.get("cuboids_fn"):
-            self.loaded_obstacle_ids = self._load_cuboid_obstacles(config["cuboids_fn"])
+        if self.config.get("use_obstacles") and self.config.get("cuboids_fn"):
+            self.loaded_obstacle_ids = self._load_cuboid_obstacles(self.config["cuboids_fn"])
 
-        # Initialize Zarr storage
+        # Zarr storage (initialized lazily when start_generation() is called)
         self.trajectory_count = 0
-        self._init_zarr_storage()
+        self.zarr_root = None
+        self.scenarios_group = None
 
     def get_obstacle_ids(self) -> List[int]:
         return self.loaded_obstacle_ids + [
@@ -104,7 +153,7 @@ class TrajectoryGenerator:
 
     def _init_zarr_storage(self):
         """Initialize Zarr storage for trajectory data."""
-        experiment_name = self.config.get("experiment_name", None)
+        experiment_name = self.config.get("experiment_name", "")
         if experiment_name:
             output_dir = os.path.join("output", f"{self.env_config_name}_{experiment_name}_trajectories.zarr")
         else:
@@ -124,7 +173,7 @@ class TrajectoryGenerator:
 
         # Resume from next index
         self.trajectory_count = (max(existing_ids) + 1) if existing_ids else 0
-        print(f"Resuming trajectory generation at index {self.trajectory_count}")
+        print(f"[TrajectoryGenerator] Initialized storage. Resuming at index {self.trajectory_count}")
 
     def is_complete(self) -> bool:
         """Check if we've generated all requested trajectories."""
@@ -132,6 +181,9 @@ class TrajectoryGenerator:
 
     def generate_trajectory_batch(self):
         """Generate one base trajectory with multiple obstacle configurations."""
+        # Take into account any folder naming from experiment_name
+        self._init_zarr_storage()
+
         # 1. Get start/goal configurations
         q_start = self.config.get("q_start")
         if q_start is None:

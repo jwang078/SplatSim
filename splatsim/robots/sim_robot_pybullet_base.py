@@ -61,8 +61,11 @@ from gaussian_splatting.scene import Scene
 
 from splatsim.utils.transform_utils import rotation_matrix_to_euler_angles
 from splatsim.utils.image_utils import letterbox
+from splatsim.utils.trajectory_generation import TrajectoryGenerator
+from splatsim.utils.splatsim_gui import SplatSimGui
 
 from pathlib import Path
+
 # Get the splatsim package root directory
 SPLATSIM_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -214,35 +217,11 @@ class PybulletRobotServerBase:
     # Enum for serve modes
     class SERVE_MODES(enum.Enum):
         GENERATE_DEMOS = "generate_demos"
-        INTERACTIVE = "interactive"
-        GENERATE_TRAJECTORIES = "generate_trajectories"
 
-    # Default configuration for trajectory generation
-    DEFAULT_TRAJECTORY_GEN_CONFIG = {
-        "num_base_trajectories": 10_000,
-        "obstacles_per_base_trajectory": 3,
-        "paths_per_obstacle": 2,
-        "min_obstacles": 1,
-        "max_obstacles": 3,
-        "max_fails": 2,
-        "max_obstacle_fails_per_base_traj": 20,
-        "time_per_traj": 6.0,
-        "robot_update_rate": 20,
-        "rrt_vis_fps": 10,
-        "use_obstacles": True,
-        "q_start": None,
-        "q_goal": None,
-        "cuboids_fn": None,
-        "render_images": False,
-        "save_base_trajectory": True,
-        # Camera-aware path scoring
-        "disable_camera_scoring_for_rrt": False,
-        "num_path_candidates": 5,
-        "max_path_attempts": 20,
-        "k_exp": 5.0,
-        "k_sig": 15.0,
-        "threshold": 0.4,
-    }
+        INTERACTIVE = "interactive"
+
+        GENERATE_TRAJECTORIES = "generate_trajectories"
+        GENERATE_TRAJECTORIES_IDLE = "generate_trajectories_idle"
 
     # object_rot is only x and y. Since it's a tabletop, z is randomized
     GRASP_CONFIGS = {
@@ -312,7 +291,7 @@ class PybulletRobotServerBase:
     lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
     upper_limits = [np.pi, 0, np.pi, np.pi, np.pi, np.pi]
 
-    ENV_CONFIG = None  # To be set in a subclass
+    ENV_CONFIG = {} # To be set in a subclass
 
     def __init__(
         self,
@@ -320,14 +299,14 @@ class PybulletRobotServerBase:
         port: int = 5556,
         print_joints: bool = False,
         use_gripper: bool = True,
-        serve_mode: str = SERVE_MODES.GENERATE_DEMOS,
+        serve_mode: SERVE_MODES = SERVE_MODES.GENERATE_DEMOS,
         robot_name: str = "robot_iphone",
         camera_names: List[str] = ["base_rgb"],
         cam_i: int = 254,
         image_width: int = 640,
         image_height: Optional[int] = None,
         debug_mode: Optional[str] = None,
-        trajectory_gen_config: dict = None,
+        trajectory_gen_config: Optional[dict] = None,
     ):
         self.serve_mode = serve_mode
         self.robot_name = robot_name
@@ -353,7 +332,8 @@ class PybulletRobotServerBase:
         self.pybullet_client.setAdditionalSearchPath(
             str(SPLATSIM_ROOT.parent / "submodules" / "pybullet-playground-wrapper" / "pybullet_playground" / "urdf" / "pybullet_ur5_gripper" / "urdf")
         )
-        self.pybullet_client.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+        # Enable GUI for trajectory generation controls (sliders/buttons)
+        self.pybullet_client.configureDebugVisualizer(p.COV_ENABLE_GUI, 1)
 
         with open(self.object_config_path, "r") as file:
             self.object_config = yaml.safe_load(file)
@@ -372,40 +352,38 @@ class PybulletRobotServerBase:
             object_name="robot", splat_object_name=self.robot_name
         )
 
+        # Always initialize trajectory generator (for GUI defaults and potential mode switching)
+        # Get EE link index function
+        def get_ee_link():
+            return self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id) - 1
+
+        # Get movable joint indices (first 6 joints, excluding gripper)
+        movable_joints = list(range(1, 7))
+
+        # Get wrist camera link name from robot config
+        wrist_camera_link_name = self.splatsim_robot.object_config.get("wrist_camera_link_name", None)
+
         # Initialize trajectory generation config and generator
+        # TrajectoryGenerator has the default values; we only merge subclass and CLI overrides
         cli_config = trajectory_gen_config or {}
-        self.trajectory_gen_config = {
-            **self.DEFAULT_TRAJECTORY_GEN_CONFIG,
+        trajectory_gen_config = {
+            # For example, from a child class
             **getattr(self, 'TRAJECTORY_GEN_CONFIG', {}),
             **cli_config
         }
 
-        # Initialize trajectory generator if in trajectory generation mode
-        if serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-            from splatsim.utils.trajectory_generation import TrajectoryGenerator
+        self.trajectory_generator = TrajectoryGenerator(
+            pybullet_client=self.pybullet_client,
+            robot_id=self.splatsim_robot.sim_id,
+            joint_indices=movable_joints,
+            env_config_name=self.ENV_CONFIG.get("name", "default"),
+            get_ee_link_fn=get_ee_link,
+            splatsim_objects=self.splatsim_objects,
+            wrist_camera_link_name=wrist_camera_link_name,
+            **trajectory_gen_config,
+        )
 
-            # Get EE link index function
-            def get_ee_link():
-                return self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id) - 1
-
-            # Get movable joint indices (first 6 joints, excluding gripper)
-            movable_joints = list(range(1, 7))
-
-            # Get wrist camera link name from robot config
-            wrist_camera_link_name = self.splatsim_robot.object_config.get("wrist_camera_link_name", None)
-
-            self.trajectory_generator = TrajectoryGenerator(
-                pybullet_client=self.pybullet_client,
-                robot_id=self.splatsim_robot.sim_id,
-                joint_indices=movable_joints,
-                config=self.trajectory_gen_config,
-                env_config_name=self.ENV_CONFIG_NAME if hasattr(self, 'ENV_CONFIG_NAME') else "default",
-                get_ee_link_fn=get_ee_link,
-                splatsim_objects=self.splatsim_objects,
-                wrist_camera_link_name=wrist_camera_link_name,
-            )
-        else:
-            self.trajectory_generator = None
+        self._setup_interactive_gui()
 
         if self.debug_mode == "no_background":
             print("[Debug mode] no_background, using robot as background")
@@ -616,8 +594,6 @@ class PybulletRobotServerBase:
         #     )
 
         # get end effector position and orientation
-        ee_pos, ee_quat = self.get_current_ee_pose()
-        self.iniital_ee_quat = ee_quat
 
         # TODO re-enable
         # for i in range(1, self.num_dofs()):
@@ -632,8 +608,6 @@ class PybulletRobotServerBase:
         #     )
         # self.close_gripper()
 
-        # get initial ee position and orientation
-        self.initial_ee_pos, self.initial_ee_quat = self.get_current_ee_pose()
         # print joint angles
         joint_states = []
         for i in range(
@@ -686,15 +660,6 @@ class PybulletRobotServerBase:
                 self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
             )
         return np.array(joint_states)
-
-    def set_serve_mode(self, serve_mode: SERVE_MODES) -> None:
-        if not isinstance(serve_mode, self.SERVE_MODES):
-            print(
-                f"ERROR: Expected serve_mode to be an enum instance of SERVE_MODES, got {type(serve_mode)}"
-            )
-        else:
-            print(f"Setting serve mode to {serve_mode}")
-            self.serve_mode = serve_mode
 
     def load_urdf(self, splatsim_obj):
         # This must be called after the gaussians are finalized
@@ -1927,6 +1892,10 @@ class PybulletRobotServerBase:
         return initial_joint_positions
 
     def get_random_ee_pose(self):
+        if self.TABLE_LIMITS is None:
+            raise NotImplementedError(
+                "TABLE_LIMITS must be set in the environment to randomize end effector pose."
+            )
         # random end effector position
         # if random.uniform(0, 1) > 0.2:
         random_ee_pos = np.array(
@@ -1963,7 +1932,17 @@ class PybulletRobotServerBase:
 
         # get the euler angles from the quaternion
         # get quaternion from euler angles
-        random_ee_quat = self.initial_ee_quat
+        # TODO move this logic to the object_on_plate environment (end effector pointing down)
+        # random_ee_quat = self.initial_ee_quat
+
+        # random_ee_quat is any an arbitrary orientation
+        random_ee_quat = self.pybullet_client.getQuaternionFromEuler(
+            [
+                random.uniform(-np.pi, np.pi),
+                random.uniform(-np.pi, np.pi),
+                random.uniform(-np.pi, np.pi),
+            ]
+        )
 
         return random_ee_pos, random_ee_quat
 
@@ -2655,6 +2634,65 @@ class PybulletRobotServerBase:
         """
         raise NotImplementedError("Subclasses must implement check_terminated()")
 
+    # =========================================================================
+    # Mode-based GUI Controls
+    # =========================================================================
+
+    def _setup_interactive_gui(self):
+        """Create GUI controls using Tkinter.
+
+        This launches the SplatSimGui window which includes:
+        - Mode switching buttons (Interactive / Trajectory Gen)
+        - Trajectory generation parameters
+        - Start/Stop trajectory generation buttons
+        """
+        # Initialize the Tkinter GUI (runs in separate thread)
+        config = self.trajectory_generator.config
+        initial_mode = self.serve_mode.value  # Use the enum's string value
+        self._splatsim_gui: SplatSimGui = SplatSimGui(config, initial_mode)
+        self._splatsim_gui.start()
+
+    def _check_mode_buttons(self) -> Optional['PybulletRobotServerBase.SERVE_MODES']:
+        """Check if a mode button was pressed and return new mode if so.
+
+        Returns:
+            New SERVE_MODES value if a button was pressed, None otherwise.
+        """
+        interactive_pressed, traj_gen_pressed = self._splatsim_gui.check_mode_buttons()
+
+        if interactive_pressed and self.serve_mode != self.SERVE_MODES.INTERACTIVE:
+            return self.SERVE_MODES.INTERACTIVE
+
+        # Trajectory gen button goes to IDLE mode first (user must click Start to begin)
+        if traj_gen_pressed and self.serve_mode not in (
+            self.SERVE_MODES.GENERATE_TRAJECTORIES,
+            self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
+        ):
+            return self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
+
+        return None
+
+    def _handle_mode_transition(self, new_mode: 'PybulletRobotServerBase.SERVE_MODES'):
+        """Handle mode transition.
+
+        Args:
+            new_mode: The new SERVE_MODES value to transition to.
+        """
+        if new_mode == self.SERVE_MODES.INTERACTIVE:
+            print(f"[GUI] Switched to Interactive mode")
+
+        elif new_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
+            print(f"[GUI] Switched to Trajectory Generation mode (idle - click Start to begin)")
+
+        elif new_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+            print(f"[GUI] Trajectory generation started")
+
+        self.serve_mode = new_mode
+
+        # Update the GUI mode display
+        self._splatsim_gui.set_mode(new_mode.value)
+
     def shutdown(self):
-        # Say to shut down
-        pass
+        """Clean up resources."""
+        # Stop the GUI if running
+        self._splatsim_gui.stop()

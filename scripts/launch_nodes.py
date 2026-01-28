@@ -18,26 +18,6 @@ class Args:
     gaussian_path : str = "/home/jennyw2/data/output/robot_iphone/point_cloud/iteration_30000/point_cloud.ply"
     robot_name: str = "robot_iphone"
 
-    # Trajectory generation parameters (all optional, will use environment defaults if not provided)
-    num_base_trajectories: int | None = None
-    obstacles_per_base_trajectory: int | None = None
-    paths_per_obstacle: int | None = None
-    min_obstacles: int | None = None
-    max_obstacles: int | None = None
-    cuboids_fn: str | None = None
-    q_start: list[float] | None = None
-    q_goal: list[float] | None = None
-    render_images: bool = False
-    experiment_name: str | None = None
-
-    # Camera-aware path scoring parameters
-    disable_camera_scoring_for_rrt: bool = False
-    num_path_candidates: int | None = None
-    max_path_attempts: int | None = None
-    k_exp: float | None = None
-    k_sig: float | None = None
-    threshold: float | None = None
-
     # Debug mode for PyBullet visualization
     debug_mode: str | None = None
 
@@ -196,60 +176,6 @@ def launch_robot_server(args: Args):
            camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper,
            image_width=96, image_height=96,
            debug_mode=args.debug_mode
-        )
-
-    elif args.robot == "sim_ur_pybullet_small_engine_new_traj_gen":
-        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEngineNewPybulletRobotServer
-
-        # Build trajectory generation config from command-line args (only non-None values)
-        traj_gen_config = {}
-        if args.num_base_trajectories is not None:
-            traj_gen_config["num_base_trajectories"] = args.num_base_trajectories
-        if args.obstacles_per_base_trajectory is not None:
-            traj_gen_config["obstacles_per_base_trajectory"] = args.obstacles_per_base_trajectory
-        if args.paths_per_obstacle is not None:
-            traj_gen_config["paths_per_obstacle"] = args.paths_per_obstacle
-        if args.min_obstacles is not None:
-            traj_gen_config["min_obstacles"] = args.min_obstacles
-        if args.max_obstacles is not None:
-            traj_gen_config["max_obstacles"] = args.max_obstacles
-        if args.cuboids_fn is not None:
-            traj_gen_config["cuboids_fn"] = args.cuboids_fn
-        if args.q_start is not None:
-            traj_gen_config["q_start"] = args.q_start
-        if args.q_goal is not None:
-            traj_gen_config["q_goal"] = args.q_goal
-        if args.render_images:
-            traj_gen_config["render_images"] = True
-        if args.experiment_name is not None:
-            traj_gen_config["experiment_name"] = args.experiment_name
-
-        # Camera-aware path scoring parameters
-        if args.disable_camera_scoring_for_rrt:
-            traj_gen_config["disable_camera_scoring_for_rrt"] = True
-        if args.num_path_candidates is not None:
-            traj_gen_config["num_path_candidates"] = args.num_path_candidates
-        if args.max_path_attempts is not None:
-            traj_gen_config["max_path_attempts"] = args.max_path_attempts
-        if args.k_exp is not None:
-            traj_gen_config["k_exp"] = args.k_exp
-        if args.k_sig is not None:
-            traj_gen_config["k_sig"] = args.k_sig
-        if args.threshold is not None:
-            traj_gen_config["threshold"] = args.threshold
-
-        # Determine camera names based on rendering config
-        camera_names_to_use = camera_names if traj_gen_config.get("render_images", False) else []
-
-        server = UprightRobotSmallEngineNewPybulletRobotServer(
-            port=port,
-            host=args.hostname,
-            serve_mode=UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.GENERATE_TRAJECTORIES,
-            camera_names=camera_names_to_use,
-            robot_name=args.robot_name,
-            use_gripper=use_gripper,
-            trajectory_gen_config=traj_gen_config,
-            debug_mode=args.debug_mode,
         )
 
     elif args.robot == "sim_ur_pybullet_open_bwa_interactive":
