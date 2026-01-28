@@ -226,8 +226,11 @@ def transform_from_pos_quat(pos, quat, device='cuda'):
     # quaternion_to_rot_matrix expects (x, y, z, w) format
     # rot_mat_tensor = torch.tensor(quaternion_to_rot_matrix(quat), device=device).float()
 
+    if not isinstance(quat, torch.Tensor):
+        quat = torch.tensor(quat, device=device, dtype=torch.float32)
+
     # o3.quaternion to matrix takes in (w,x,y,z) format for quaternions
-    rot_mat_tensor = o3.quaternion_to_matrix(torch.tensor(quat, device=device).float())
+    rot_mat_tensor = o3.quaternion_to_matrix(quat)
     
     if not isinstance(pos, torch.Tensor):
         pos = torch.tensor(pos, device=device, dtype=torch.float32)
@@ -316,6 +319,7 @@ def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base
     rot_old_mat = o3.quaternion_to_matrix(rot_old) # (N, 3, 3)
     # (1, 3, 3) @ (N, 3, 3) -> (N, 3, 3)
     rot_new_mat = R_mat.unsqueeze(0) @ rot_old_mat 
+    # import pdb; pdb.set_trace()
     rot_obj = o3.matrix_to_quaternion(rot_new_mat) # (N, 4)
 
     # 3. Scales: Multiply with pure scaling S_vec

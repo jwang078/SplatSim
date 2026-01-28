@@ -1,4 +1,6 @@
+import random
 import time
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import numpy as np
@@ -50,6 +52,54 @@ class BWAPybulletRobotServer(PybulletRobotServerBase):
                 self.set_serve_mode(self.SERVE_MODES.INTERACTIVE)
         else:
             raise ValueError(f"Unknown serve mode {self.serve_mode}. ")
+
+    # =========================================================================
+    # Gym Environment Interface
+    # =========================================================================
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Reset the environment to an initial state.
+
+        Args:
+            seed: Random seed for reproducibility
+            options: Optional configuration dict
+
+        Returns:
+            observation: Initial observation dict
+            info: Dict with initial info
+        """
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+
+        self._step_count = 0
+        self._episode_started = True
+
+        # From GENERATE_DEMOS: randomize_ee_pose()
+        initial_joints = self.randomize_ee_pose()
+        self.teleport_joint_state(self.splatsim_robot, initial_joints)
+        self.open_gripper()
+
+        # Let simulation settle
+        for _ in range(100):
+            self.pybullet_client.stepSimulation()
+
+        return self._get_gym_observation(), {"is_success": False}
+
+    def compute_reward(self) -> float:
+        """Compute sparse reward based on success."""
+        return 1.0 if self.check_success() else 0.0
+
+    def check_success(self) -> bool:
+        """Check if the task goal is achieved.
+
+        TODO: Implement task-specific success criteria for BWA environment.
+        """
+        return False
+
+    def check_terminated(self) -> bool:
+        """Check if episode should terminate."""
+        return self.check_success()
 
 
 class OpenSpaceBWAPybulletRobotServer(BWAPybulletRobotServer):

@@ -1,4 +1,5 @@
 import time
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import numpy as np
@@ -25,6 +26,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
     ENV_CONFIG_NAME = None
     ENV_CONFIG = None
     background_splat_name = "robot_iphone"
+    TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
 
 
     def __init__(self, **kwargs):
@@ -310,6 +312,81 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
                 self.set_serve_mode(self.SERVE_MODES.INTERACTIVE)
         else:
             raise ValueError(f"Unknown serve mode {self.serve_mode}. ")
+
+    # =========================================================================
+    # Gym Environment Interface
+    # =========================================================================
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Reset the environment to an initial state.
+
+        Args:
+            seed: Random seed for reproducibility
+            options: Optional configuration dict
+
+        Returns:
+            observation: Initial observation dict
+            info: Dict with initial info
+        """
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+
+        self._step_count = 0
+        self._episode_started = True
+
+        # From GENERATE_DEMOS (serve_loop)
+        self.randomize_object_pose()
+        self.randomize_plate_and_drop_pose()
+
+        # Get initial joint state and joint signs
+        initial_joints = self.splatsim_robot.articulation_config.initial_joint_positions
+        joint_signs = self.splatsim_robot.articulation_config.joint_signs
+
+        # Let simulation settle with robot in initial position
+        for _ in range(10000):
+            self.pybullet_client.stepSimulation()
+            self.open_gripper()
+            for k in range(1, self.num_dofs()):
+                self.pybullet_client.resetJointState(
+                    self.splatsim_robot.sim_id,
+                    k,
+                    initial_joints[k - 1] * joint_signs[k - 1],
+                )
+
+        return self._get_gym_observation(), {"is_success": False}
+
+    def compute_reward(self) -> float:
+        """Compute sparse reward based on success."""
+        return 1.0 if self.check_success() else 0.0
+
+    def check_success(self) -> bool:
+        """Check if objects are placed on the plate.
+
+        Refactored from eval_trajectory_success().
+        """
+        # Check the MSE of XY position of objects with the drop location
+        for i in range(len(self.splatsim_objects) - 1):
+            splatsim_obj = self.splatsim_objects[i]
+            if splatsim_obj == self.splatsim_robot or splatsim_obj == self.splatsim_background:
+                continue
+            if splatsim_obj.sim_id is None:
+                continue
+
+            object_pos, _ = self.pybullet_client.getBasePositionAndOrientation(
+                splatsim_obj.sim_id
+            )
+            mse = (object_pos[0] - self.drop_ee_pos[0]) ** 2 + (
+                object_pos[1] - self.drop_ee_pos[1]
+            ) ** 2
+
+            if mse > 0.03:
+                return False
+        return True
+
+    def check_terminated(self) -> bool:
+        """Check if episode should terminate."""
+        return self.check_success()
 
 
 class AppleOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):

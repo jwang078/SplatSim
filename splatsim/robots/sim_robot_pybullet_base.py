@@ -1,7 +1,9 @@
 import pickle
 import threading
 import time
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
+import gymnasium
+from gymnasium import spaces
 import enum
 import random
 from collections import namedtuple
@@ -35,7 +37,7 @@ from gaussian_renderer import render
 
 # import urdf_models.models_data as md
 import pybullet as p
-from pybullet_planning.interfaces.robots.collision import pairwise_collision
+from pybullet_planning.interfaces.robots.collision import pairwise_collision, pairwise_link_collision
 
 from pybullet_planning import RED, BLUE, GREEN
 from pybullet_planning import Pose
@@ -58,6 +60,23 @@ from gaussian_splatting.arguments import ModelParams, PipelineParams, Namespace
 from gaussian_splatting.scene import Scene
 
 from splatsim.utils.transform_utils import rotation_matrix_to_euler_angles
+from splatsim.utils.image_utils import letterbox
+
+from pathlib import Path
+# Get the splatsim package root directory
+SPLATSIM_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def resolve_splatsim_path(path: str) -> str:
+    """Resolve a path, making relative paths relative to SPLATSIM_ROOT.
+
+    This allows configs to use relative paths like './splatsim/...' that work
+    regardless of the current working directory.
+    """
+    if os.path.isabs(path):
+        return path
+    resolved = SPLATSIM_ROOT / path
+    return str(resolved)
 
 
 class ZMQServerThread(threading.Thread):
@@ -183,7 +202,11 @@ class SplatSimCamera:
 class PybulletRobotServerBase:
     MAX_TRAJECTORY_COUNT = 500
 
-    TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
+    TABLE_LIMITS = None # To be set in a child class
+
+    # Gym environment constants
+    DEFAULT_MAX_EPISODE_STEPS = 500
+    DEFAULT_PHYSICS_STEPS_PER_ACTION = 12  # 240Hz physics / 20Hz control
 
     # This is the default splat name. Overwrite it in a child class of PybulletRobotServerBase
     background_splat_name = "robot_iphone"
@@ -286,6 +309,9 @@ class PybulletRobotServerBase:
 
     # TODO is there a plastic strawberry env?
 
+    lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
+    upper_limits = [np.pi, 0, np.pi, np.pi, np.pi, np.pi]
+
     ENV_CONFIG = None  # To be set in a subclass
 
     def __init__(
@@ -300,7 +326,6 @@ class PybulletRobotServerBase:
         cam_i: int = 254,
         image_width: int = 640,
         image_height: Optional[int] = None,
-        object_config_path: str = "./configs/object_configs/objects.yaml",
         debug_mode: Optional[str] = None,
         trajectory_gen_config: dict = None,
     ):
@@ -315,18 +340,18 @@ class PybulletRobotServerBase:
 
         # load labels.npy
         self.robot_labels = np.load(
-            "./data/labels_path/" + self.robot_name + "_labels.npy"
+            str(SPLATSIM_ROOT / "data" / "labels_path" / f"{self.robot_name}_labels.npy")
         )
         self.robot_labels = torch.from_numpy(self.robot_labels).to(device="cuda").long()
 
         self._zmq_server = ZMQRobotServer(robot=self, host=host, port=port)
         self._zmq_server_thread = ZMQServerThread(self._zmq_server)
         self.pybullet_client = p
-        self.object_config_path = object_config_path
+        self.object_config_path = str(SPLATSIM_ROOT / "configs" / "object_configs" / "objects.yaml")
         self.grasp_poses = {}
         self.pybullet_client.connect(p.GUI)
         self.pybullet_client.setAdditionalSearchPath(
-            "./submodules/pybullet-playground-wrapper/pybullet_playground/urdf/pybullet_ur5_gripper/urdf"
+            str(SPLATSIM_ROOT.parent / "submodules" / "pybullet-playground-wrapper" / "pybullet_playground" / "urdf" / "pybullet_ur5_gripper" / "urdf")
         )
         self.pybullet_client.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
 
@@ -471,8 +496,6 @@ class PybulletRobotServerBase:
             )
 
         # limits are +-pi of the initial joint positions
-        lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
-        upper_limits = [np.pi, 0, np.pi, np.pi, np.pi, np.pi]
         self.drop_ee_joint = self.pybullet_client.calculateInverseKinematics(
             self.splatsim_robot.sim_id,
             6,
@@ -480,8 +503,8 @@ class PybulletRobotServerBase:
             self.drop_ee_quat,
             maxNumIterations=100000,
             residualThreshold=1e-10,
-            lowerLimits=lower_limits,
-            upperLimits=upper_limits,
+            lowerLimits=self.lower_limits,
+            upperLimits=self.upper_limits,
         )
 
         print("drop_ee_joint", self.drop_ee_joint)
@@ -523,7 +546,7 @@ class PybulletRobotServerBase:
         self.current_gripper_action = GripperState.OPEN
 
         # trajectory path
-        with open("configs/folder_configs.yaml", "r") as f:
+        with open(resolve_splatsim_path("configs/folder_configs.yaml"), "r") as f:
             folder_config = yaml.safe_load(f)
         self.path = folder_config["traj_folder"]
         # get no of folders in the path
@@ -540,12 +563,10 @@ class PybulletRobotServerBase:
         # Placeholder object for rendering purposes
         self.scene_gaussian = GaussianModel(3)
 
-        if "base_rgb" in self.camera_names:
-            self.base_camera = self.setup_camera_from_dataset(
-                self.splatsim_background.object_config, cam_i=self.cam_i, use_train=True
-            )
-        else:
-            self.base_camera = None
+        # Always set up the base camera because wrist_rgb is initialized from it
+        self.base_camera = self.setup_camera_from_dataset(
+            self.splatsim_background.object_config, cam_i=self.cam_i, use_train=True
+        )
 
         if "wrist_rgb" in self.camera_names:
             # Hardcoding a splat dataset / recovered camera from a GoPro
@@ -637,6 +658,12 @@ class PybulletRobotServerBase:
                 )
             self.pybullet_client.stepSimulation()
 
+        # Gym-related state
+        self._step_count = 0
+        self._max_episode_steps = self.DEFAULT_MAX_EPISODE_STEPS
+        self._physics_steps_per_action = self.DEFAULT_PHYSICS_STEPS_PER_ACTION
+        self._episode_started = False
+
     def num_dofs(self) -> int:
         return 7
 
@@ -682,7 +709,7 @@ class PybulletRobotServerBase:
         if splatsim_obj.name in self.models_lib.model_name_list:
             urdf_path = self.models_lib[splatsim_obj.splat_name]
         elif "urdf_path" in splatsim_obj.object_config:
-            urdf_path = splatsim_obj.object_config["urdf_path"][0]
+            urdf_path = resolve_splatsim_path(splatsim_obj.object_config["urdf_path"][0])
             if not os.path.exists(urdf_path):
                 raise FileNotFoundError(f"URDF file not found: {urdf_path}")
         else:
@@ -801,11 +828,11 @@ class PybulletRobotServerBase:
             "source_path" in splatsim_obj.object_config
             and "model_path" in splatsim_obj.object_config
         ):
-            source_path = splatsim_obj.object_config["source_path"]
+            source_path = resolve_splatsim_path(splatsim_obj.object_config["source_path"])
             if not os.path.exists(source_path):
                 raise FileNotFoundError(f"Source path not found: {source_path}")
 
-            model_path = splatsim_obj.object_config["model_path"]
+            model_path = resolve_splatsim_path(splatsim_obj.object_config["model_path"])
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Model path not found: {model_path}")
 
@@ -972,7 +999,7 @@ class PybulletRobotServerBase:
                 initial_joint_positions = initial_joint_positions[:num_joints]
 
             segmentation_labels = np.load(
-                "./data/labels_path/" + splatsim_obj.splat_name + "_labels.npy"
+                resolve_splatsim_path("./data/labels_path/" + splatsim_obj.splat_name + "_labels.npy")
             )
             segmentation_labels = (
                 torch.from_numpy(segmentation_labels)
@@ -1046,7 +1073,7 @@ class PybulletRobotServerBase:
     def teleport_joint_state(
         self, splatsim_obj: SplatSimObject, joint_state: List[float]
     ) -> None:
-        """Set the joint states of an articulated object in the simulation."""
+        """Set the joint states of an articulated object in the simulation and hold position."""
         if not splatsim_obj.is_articulated:
             raise ValueError(f"Object {splatsim_obj.name} is not articulated.")
 
@@ -1062,11 +1089,23 @@ class PybulletRobotServerBase:
             )
 
         for i in range(1, min(len(joint_state), num_joints)):
+            target_position = (
+                joint_state[i - 1]
+                * splatsim_obj.articulation_config.joint_signs[i - 1]
+            )
+            # Teleport joint to target position
             self.pybullet_client.resetJointState(
                 splatsim_obj.sim_id,
                 i,
-                joint_state[i - 1]
-                * splatsim_obj.articulation_config.joint_signs[i - 1],
+                target_position,
+            )
+            # Set position control to hold the joint at target position
+            self.pybullet_client.setJointMotorControl2(
+                splatsim_obj.sim_id,
+                i,
+                p.POSITION_CONTROL,
+                targetPosition=target_position,
+                force=500,
             )
 
     def command_joint_state(self, joint_state: np.ndarray) -> None:
@@ -1448,11 +1487,11 @@ class PybulletRobotServerBase:
         ###################################################################
         # Load the gaussian splat dataset to get camera parameters
         ###################################################################
-        source_path = splatsim_obj_object_config["source_path"]
+        source_path = resolve_splatsim_path(splatsim_obj_object_config["source_path"])
         if not os.path.exists(source_path):
             raise FileNotFoundError(f"Source path not found: {source_path}")
 
-        model_path = splatsim_obj_object_config["model_path"]
+        model_path = resolve_splatsim_path(splatsim_obj_object_config["model_path"])
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model path not found: {model_path}")
 
@@ -1644,6 +1683,10 @@ class PybulletRobotServerBase:
         pos, quat = self.pybullet_client.getBasePositionAndOrientation(body_id)
         return pos, quat
 
+    def get_task_description(self) -> str:
+        # TODO make this better
+        return self.ENV_CONFIG.get("task_description", "")
+
     def get_observations(self) -> Dict[str, np.ndarray]:
         joint_positions = self.get_joint_state()
         joint_positions_dummy = self.get_joint_state_dummy()
@@ -1828,61 +1871,94 @@ class PybulletRobotServerBase:
                             collison_between_objects = True
                             break
 
-    def randomize_ee_pose(self):
+    def randomize_ee_pose(self, max_attempts=100):
         # generating random initial joint state using random end effector position and orientation
-        random_ee_pos, random_ee_quat = self.get_random_ee_pose()
+        for attempt in range(max_attempts):
+            random_ee_pos, random_ee_quat = self.get_random_ee_pose()
 
-        # joint angles using inverse kinematics
-        initial_joint_positions = self.pybullet_client.calculateInverseKinematics(
-            self.splatsim_robot.sim_id,
-            6,
-            random_ee_pos,
-            random_ee_quat,
-            maxNumIterations=100000,
-            residualThreshold=1e-10,
-        )
-
-        # reset the joint positions to the initial joint positions
-        for i in range(1, self.num_dofs()):
-            self.pybullet_client.resetJointState(
-                self.splatsim_robot.sim_id, i, initial_joint_positions[i - 1]
+            # joint angles using inverse kinematics
+            initial_joint_positions = self.pybullet_client.calculateInverseKinematics(
+                self.splatsim_robot.sim_id,
+                6,
+                random_ee_pos,
+                random_ee_quat,
+                maxNumIterations=100000,
+                residualThreshold=1e-10,
+                lowerLimits=self.lower_limits,
+                upperLimits=self.upper_limits,
             )
-        # TODO possibly randomize gripper state here, too
-        # Though that might have to edit initial_joint_positions
+
+            # Wrap joint angles to [-pi, pi]
+            initial_joint_positions = tuple(
+                ((angle + np.pi) % (2 * np.pi)) - np.pi
+                for angle in initial_joint_positions
+            )
+
+            # reset the joint positions to the initial joint positions
+            for i in range(1, self.num_dofs()):
+                self.pybullet_client.resetJointState(
+                    self.splatsim_robot.sim_id, i, initial_joint_positions[i - 1]
+                )
+
+            # Check for collisions between robot and scene objects
+            # Only detect actual penetration (negative contact distance), not just proximity
+            collision_detected = False
+            for splatsim_obj in self.splatsim_objects:
+                if splatsim_obj.sim_id is not None and splatsim_obj != self.splatsim_robot:
+                    contacts = self.pybullet_client.getClosestPoints(
+                        self.splatsim_robot.sim_id, splatsim_obj.sim_id, distance=0.0
+                    )
+                    # Check if any contact has negative distance (actual penetration)
+                    for contact in contacts:
+                        contact_distance = contact[8]  # contactDistance is at index 8
+                        if contact_distance < -0.001:  # Small tolerance for numerical stability
+                            collision_detected = True
+                            break
+                    if collision_detected:
+                        break
+
+            if not collision_detected:
+                # TODO possibly randomize gripper state here, too
+                # Though that might have to edit initial_joint_positions
+                return initial_joint_positions
+
+        # If we exhausted all attempts, return the last configuration with a warning
+        print(f"Warning: Could not find collision-free EE pose after {max_attempts} attempts")
         return initial_joint_positions
 
     def get_random_ee_pose(self):
         # random end effector position
-        if random.uniform(0, 1) > 0.2:
-            random_ee_pos = np.array(
-                [
-                    random.uniform(
-                        self.TABLE_LIMITS[0][0], self.TABLE_LIMITS[0][1] + 0.1
-                    ),
-                    random.uniform(
-                        self.TABLE_LIMITS[1][0] - 0.1, self.TABLE_LIMITS[1][1] + 0.1
-                    ),
-                    random.uniform(0.25, 0.65),
-                ]
-            )
-        else:
-            # get object position
-            (
-                object_pos,
-                object_quat,
-            ) = self.pybullet_client.getBasePositionAndOrientation(
-                self.splatsim_objects[0].sim_id
-            )
-            random_x = random.uniform(-0.105, 0.105)
-            random_y = random.uniform(-0.105, 0.105)
-            random_z = random.uniform(0.25, 0.3)
-            random_ee_pos = np.array(
-                [
-                    object_pos[0] + random_x,
-                    object_pos[1] + random_y,
-                    object_pos[2] + random_z,
-                ]
-            )
+        # if random.uniform(0, 1) > 0.2:
+        random_ee_pos = np.array(
+            [
+                random.uniform(
+                    self.TABLE_LIMITS[0][0], self.TABLE_LIMITS[0][1] + 0.1
+                ),
+                random.uniform(
+                    self.TABLE_LIMITS[1][0] - 0.1, self.TABLE_LIMITS[1][1] + 0.1
+                ),
+                random.uniform(0.25, 0.65),
+            ]
+        )
+        # TODO move this logic to the object_on_plate environment
+        # else:
+        #     # get object position
+        #     (
+        #         object_pos,
+        #         object_quat,
+        #     ) = self.pybullet_client.getBasePositionAndOrientation(
+        #         self.splatsim_objects[0].sim_id
+        #     )
+        #     random_x = random.uniform(-0.105, 0.105)
+        #     random_y = random.uniform(-0.105, 0.105)
+        #     random_z = random.uniform(0.25, 0.3)
+        #     random_ee_pos = np.array(
+        #         [
+        #             object_pos[0] + random_x,
+        #             object_pos[1] + random_y,
+        #             object_pos[2] + random_z,
+        #         ]
+        #     )
         # random_ee_pos = np.array([random.uniform(0.2, 0.5), random.uniform(-0.6, 0.6), random.uniform(0.2, 0.65)])
 
         # get the euler angles from the quaternion
@@ -2386,6 +2462,198 @@ class PybulletRobotServerBase:
                 "wb",
             ) as f:
                 pickle.dump(observations, f)
+
+    # =========================================================================
+    # Gym Environment Interface
+    # =========================================================================
+
+    @property
+    def action_space(self) -> spaces.Box:
+        """Define the action space.
+
+        Returns:
+            Box space for 7 DOF actions (6 joints + gripper)
+        """
+        # Joint limits - can be refined from URDF if needed
+        low = np.array([-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi, 0.0], dtype=np.float32)
+        high = np.array([np.pi, np.pi, np.pi, np.pi, np.pi, np.pi, 1.0], dtype=np.float32)
+        return spaces.Box(low=low, high=high, dtype=np.float32)
+
+    @property
+    def observation_space(self) -> spaces.Dict:
+        """Define the observation space.
+
+        Returns:
+            Dict space with agent_pos (state) and pixels dict (images)
+            in LeRobot-compatible format.
+        """
+        # Build pixels dict space for each camera
+        pixels_dict = {}
+        for camera_name in self.camera_names:
+            pixels_dict[camera_name] = spaces.Box(
+                low=0, high=255,
+                shape=(224, 224, 3), dtype=np.uint8
+            )
+
+        obs_dict = {
+            "agent_pos": spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(7,), dtype=np.float32
+            ),
+            "pixels": spaces.Dict(pixels_dict)
+        }
+        return spaces.Dict(obs_dict)
+
+    def step(self, action: np.ndarray) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
+        """Execute one control step in the environment.
+
+        Args:
+            action: Joint positions array of shape (7,) - 6 joints + gripper
+
+        Returns:
+            observation: Dict with state and images
+            reward: Float reward signal
+            terminated: True if episode ended due to success/failure condition
+            truncated: True if episode ended due to time limit
+            info: Dict with 'is_success' key
+        """
+        assert self._episode_started, "Must call reset() before step()"
+
+        # Apply action via existing method
+        self.command_joint_state(action)
+
+        # Step physics simulation (multiple substeps for stability)
+        for _ in range(self._physics_steps_per_action):
+            self.pybullet_client.stepSimulation()
+
+        self._step_count += 1
+
+        # Get new observation
+        observation = self._get_gym_observation()
+
+        # Compute reward, termination, success
+        reward = self.compute_reward()
+        is_success = self.check_success()
+        terminated = self.check_terminated()
+        truncated = self._step_count >= self._max_episode_steps
+
+        info = {
+            "is_success": is_success,
+            "step_count": self._step_count,
+        }
+
+        return observation, reward, terminated, truncated, info
+
+    def _get_gym_observation(self) -> Dict[str, Any]:
+        """Get observation in Gym-compatible format.
+
+        Returns:
+            Dict with:
+                - 'state': np.ndarray of joint positions + gripper (7,)
+                - camera images by name (e.g., 'base_rgb', 'wrist_rgb')
+        """
+        raw_obs = self.get_observations()
+
+        # Joint state (6 joints + gripper)
+        joint_positions = raw_obs["joint_positions"][:6]
+        gripper_state = raw_obs.get("gripper_position", [0.0])
+        if isinstance(gripper_state, (list, np.ndarray)):
+            gripper_state = gripper_state[0] if len(gripper_state) > 0 else 0.0
+
+        # Use "agent_pos" key for LeRobot compatibility
+        gym_obs = {
+            "agent_pos": np.concatenate([joint_positions, [gripper_state]]).astype(np.float32)
+        }
+
+        # Images - use "pixels" dict format for LeRobot compatibility
+        # LeRobot expects: {"pixels": {"base_rgb": img, "wrist_rgb": img}} for multi-camera
+        # or {"pixels": img} for single camera
+        pixels = {}
+        for camera_name in self.camera_names:
+            img = raw_obs.get(camera_name)
+            if img is not None:
+                if hasattr(img, 'cpu'):
+                    img = img.cpu().numpy()
+                # Resize to 224x224 using letterbox
+                img = letterbox(img, (224, 224))
+                # Convert from (C, H, W) float32 to (H, W, C) uint8 for LeRobot
+                if img.shape[0] == 3:  # (C, H, W) format
+                    img = np.transpose(img, (1, 2, 0))  # -> (H, W, C)
+                img = (img * 255).clip(0, 255).astype(np.uint8)
+                pixels[camera_name] = img
+            else:
+                # Provide placeholder if camera not available
+                pixels[camera_name] = np.zeros((224, 224, 3), dtype=np.uint8)
+
+        # Use dict format for pixels (LeRobot expects this for multi-camera)
+        gym_obs["pixels"] = pixels
+
+        return gym_obs
+
+    def check_truncated(self) -> bool:
+        """Check if episode should be truncated due to time limit.
+
+        Returns:
+            True if step limit exceeded
+        """
+        return self._step_count >= self._max_episode_steps
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Reset the environment to an initial state.
+
+        Subclasses must implement this method with task-specific reset logic.
+
+        Args:
+            seed: Random seed for reproducibility
+            options: Optional configuration dict
+
+        Returns:
+            observation: Initial observation dict
+            info: Dict with initial info
+
+        Raises:
+            NotImplementedError: Subclasses must implement this method
+        """
+        raise NotImplementedError("Subclasses must implement reset()")
+
+    def compute_reward(self) -> float:
+        """Compute the reward for the current state.
+
+        Subclasses must implement this method with task-specific reward logic.
+
+        Returns:
+            Float reward value
+
+        Raises:
+            NotImplementedError: Subclasses must implement this method
+        """
+        raise NotImplementedError("Subclasses must implement compute_reward()")
+
+    def check_success(self) -> bool:
+        """Check if the current episode achieved success.
+
+        Subclasses must implement this method with task-specific success criteria.
+
+        Returns:
+            True if success condition is met
+
+        Raises:
+            NotImplementedError: Subclasses must implement this method
+        """
+        raise NotImplementedError("Subclasses must implement check_success()")
+
+    def check_terminated(self) -> bool:
+        """Check if episode should terminate due to success or failure.
+
+        Subclasses must implement this method with task-specific termination conditions.
+
+        Returns:
+            True if episode should terminate
+
+        Raises:
+            NotImplementedError: Subclasses must implement this method
+        """
+        raise NotImplementedError("Subclasses must implement check_terminated()")
 
     def shutdown(self):
         # Say to shut down

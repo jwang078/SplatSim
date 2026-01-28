@@ -246,6 +246,7 @@ def main(args):
             # traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_trajectories.zarr"
             # traj_folder = "output/upright_robot_small_engine_new_trajectories_sapi05.zarr"
             traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_1strrtpath_trajectories.zarr"
+            # traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_5thrrtpath_trajectories.zarr"
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
             startup_steps = 2
             query_new_joints_per_startup_step = False
@@ -503,7 +504,7 @@ def main(args):
                     **{f"observation.images.{key}": letterbox(obs[key].detach().cpu().numpy(), (224, 224)) for key in image_keys},
                     "observation.state": obs["joint_positions"].astype(np.float32),
                     "action": action.astype(np.float32),
-                    "task": "test", # TODO this is probably more necessary if there are multiple tasks
+                    "task": "", # TODO this is probably more necessary if there are multiple tasks
                 })
 
             if getattr(agent, 'state', AGENT_STATE.UNKNOWN) == AGENT_STATE.SETTLING and started_executing_traj:

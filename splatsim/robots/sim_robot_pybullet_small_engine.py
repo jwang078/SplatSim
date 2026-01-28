@@ -1,4 +1,6 @@
+import random
 import time
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import numpy as np
@@ -12,6 +14,18 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
     ENV_CONFIG_NAME = None
     ENV_CONFIG = None
+
+    # Success criteria: target end effector pose
+    TARGET_EE_POS = (-0.003126271918487248, 0.4626016957140267, 0.31067939915838083)
+    TARGET_EE_QUAT = (-0.5883302720488017, 0.318663764807395, 0.472865116611213, 0.5733406295406109)
+
+    # Tolerance for success check
+    POS_TOLERANCE_M = 0.03  # 3 centimeters
+    QUAT_TOLERANCE_DEG = 10.0  # 10 degrees
+
+    # TODO reformat this to have a "task"-like variable that sets the task
+    # That then informs self.TRAJECTORY_GEN_CONFIG["q_goal"], etc
+    # Also sets the success and reward criteria
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -49,9 +63,93 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         else:
             raise ValueError(f"Unknown serve mode {self.serve_mode}. ")
 
+    # =========================================================================
+    # Gym Environment Interface
+    # =========================================================================
+
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Reset the environment to an initial state.
+
+        Args:
+            seed: Random seed for reproducibility
+            options: Optional configuration dict
+
+        Returns:
+            observation: Initial observation dict
+            info: Dict with initial info
+        """
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+
+        self._step_count = 0
+        self._episode_started = True
+
+        # From GENERATE_DEMOS: randomize_ee_pose()
+        initial_joints = self.randomize_ee_pose()
+        self.teleport_joint_state(self.splatsim_robot, initial_joints)
+        self.open_gripper()
+
+        # TODO why is the robot not holding its position during this step simulation settle period?
+        # Let simulation settle
+        for _ in range(100):
+            self.pybullet_client.stepSimulation()
+
+        is_success, info = self.check_success_metrics()
+
+        info = {"is_success": is_success, **info}
+
+        return self._get_gym_observation(), info
+
+    # def compute_reward(self) -> float:
+    #     """Compute sparse reward based on success."""
+
+    #     return 1.0 if self.check_success() else 0.0
+
+    def check_success_metrics(self) -> tuple[bool, dict]:
+        """Check if the task goal is achieved.
+
+        Returns True if the end effector is within POS_TOLERANCE_M (meters) and
+        QUAT_TOLERANCE_DEG (degrees) of the target pose.
+        """
+        success = True
+
+        pos, quat = self.get_current_ee_pose()
+
+        # Check position distance
+        pos_diff = np.linalg.norm(np.array(pos) - np.array(self.TARGET_EE_POS))
+        if pos_diff > self.POS_TOLERANCE_M:
+            success = False
+
+        # Check quaternion distance (angle between orientations)
+        # Quaternion dot product gives cos(theta/2) where theta is the rotation angle
+        q1 = np.array(quat)
+        q2 = np.array(self.TARGET_EE_QUAT)
+        dot = np.abs(np.dot(q1, q2))  # abs handles q and -q representing same rotation
+        dot = np.clip(dot, -1.0, 1.0)  # Numerical stability
+        angle_rad = 2 * np.arccos(dot)
+        angle_deg = np.degrees(angle_rad)
+
+        if angle_deg <= self.QUAT_TOLERANCE_DEG:
+            success = False
+
+        info = {
+            "position_error_m": pos_diff,
+            "orientation_error_deg": angle_deg,
+        }
+
+        return success, info
+
+    def check_terminated(self) -> bool:
+        """Check if episode should terminate."""
+        success, info = self.check_success_metrics()
+        return success
+
 
 class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer):
     ENV_CONFIG_NAME = "upright_robot_small_engine"
+
+    TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
 
     ENV_CONFIG = {
         "objects": [
@@ -74,26 +172,6 @@ class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer)
         ]
     }
 
-    # Environment-specific trajectory generation defaults
-    TRAJECTORY_GEN_CONFIG = {
-        "num_base_trajectories": 10_000,
-        "obstacles_per_base_trajectory": 3,
-        "paths_per_obstacle": 2,
-        "min_obstacles": 1,
-        "max_obstacles": 3,
-        "max_fails": 2,
-        "max_obstacle_fails_per_base_traj": 20,
-        "time_per_traj": 6.0,
-        "robot_update_rate": 20,
-        "rrt_vis_fps": 10,
-        "use_obstacles": False,  # No extra obstacles for small engine by default
-        "q_start": None,
-        "q_goal": None,
-        "cuboids_fn": None,
-        "render_images": False,
-        "save_base_trajectory": True,
-    }
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         # add plane
@@ -113,6 +191,8 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
     # This new lab bench scene has the robot rotated 90 degrees because it was installed rotated D:
     ENV_CONFIG_NAME = "upright_robot_small_engine_new"
     background_splat_name = "robot_iphone_w_engine_new"
+
+    TABLE_LIMITS = ((-0.5, 0.5), (0.2, 0.6))
 
     ENV_CONFIG = {
         "objects": [
