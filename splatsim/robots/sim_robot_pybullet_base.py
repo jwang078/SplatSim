@@ -212,7 +212,7 @@ class PybulletRobotServerBase:
     DEFAULT_PHYSICS_STEPS_PER_ACTION = 12  # 240Hz physics / 20Hz control
 
     # This is the default splat name. Overwrite it in a child class of PybulletRobotServerBase
-    background_splat_name = "robot_iphone"
+    background_splat_name = None
 
     # Enum for serve modes
     class SERVE_MODES(enum.Enum):
@@ -222,71 +222,6 @@ class PybulletRobotServerBase:
 
         GENERATE_TRAJECTORIES = "generate_trajectories"
         GENERATE_TRAJECTORIES_IDLE = "generate_trajectories_idle"
-
-    # object_rot is only x and y. Since it's a tabletop, z is randomized
-    GRASP_CONFIGS = {
-        "orange": {
-            "grasp_pose": np.array(
-                [
-                    [0.03420832, 0.29551898, 0.95472421, -0.08157158],
-                    [-0.82904722, 0.54187654, -0.13802362, -0.14110232],
-                    [-0.55813126, -0.7867899, 0.26353588, 0.20728098],
-                    [0.0, 0.0, 0.0, 1.0],
-                ]
-            ),
-            "object_rot": [0, 0],
-        },
-        "banana1": {
-            "grasp_pose": np.array(
-                [
-                    [-0.13784676, -0.14873802, 0.97922177, 0.01055928],
-                    [-0.98239786, 0.14637033, -0.11606107, -0.06527538],
-                    [-0.12606632, -0.97798401, -0.16629659, 0.23013977],
-                    [0.0, 0.0, 0.0, 1.0],
-                ]
-            ),
-            "object_rot": [0, 0],
-        },
-        "banana2": {
-            "grasp_pose": np.array(
-                [
-                    [0.12773567, 0.02665088, -0.99145011, 0.00692899],
-                    [-0.87105321, 0.481048, -0.09929316, -0.14203231],
-                    [0.47428884, 0.87628908, 0.08466133, -0.20627994],
-                    [0.0, 0.0, 0.0, 1.0],
-                ]
-            ),
-            "object_rot": [0, np.pi],
-        },
-        "apple": {
-            "grasp_pose": np.array(
-                [
-                    [-0.12515046, -0.0412762, 0.99127879, 0.00471373],
-                    [-0.98896543, -0.07464537, -0.12796658, 0.01413896],
-                    [0.07927635, -0.99635553, -0.03147883, 0.27105228],
-                    [0.0, 0.0, 0.0, 1.0],
-                ]
-            ),
-            "object_rot": [0, 0],
-        },
-        # self.strawberry_grasp_pose = np.array([[-0.19612399,  0.06661985,  0.97831344 ,-0.03194745],
-        #                                 [-0.90997152, -0.38409934, -0.15626751,  0.10821076],
-        #                                 [ 0.36535902, -0.92088517,  0.13595326,  0.23474673],
-        #                                 [ 0.,          0. ,         0. ,         1.        ]])
-        "strawberry": {
-            "grasp_pose": np.array(
-                [
-                    [6.03600159e-04, 4.74883933e-01, 8.80048229e-01, -1.17034260e-01],
-                    [-7.31850150e-01, -5.99512796e-01, 3.24005810e-01, 1.57542460e-01],
-                    [6.81465328e-01, -6.44258999e-01, 3.47182012e-01, 1.72402069e-01],
-                    [0.00000000e00, 0.00000000e00, 0.00000000e00, 1.00000000e00],
-                ]
-            ),
-            "object_rot": [0, 0],
-        },
-    }
-
-    # TODO is there a plastic strawberry env?
 
     lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
     upper_limits = [np.pi, 0, np.pi, np.pi, np.pi, np.pi]
@@ -325,6 +260,8 @@ class PybulletRobotServerBase:
 
         self._zmq_server = ZMQRobotServer(robot=self, host=host, port=port)
         self._zmq_server_thread = ZMQServerThread(self._zmq_server)
+        print(f"Listening on {host}:{port}")
+
         self.pybullet_client = p
         self.object_config_path = str(SPLATSIM_ROOT / "configs" / "object_configs" / "objects.yaml")
         self.grasp_poses = {}
@@ -830,10 +767,12 @@ class PybulletRobotServerBase:
             del scene
         elif splatsim_obj.object_config.get("object_type", None) == "cuboid":
             lx, ly, lz = splatsim_obj.object_config["size"]
+            # Default to brown color for rendering
+            color_rgb = splatsim_obj.object_config.get("color_rgb", (87, 51, 33)) 
             cuboid_params = create_cuboid_gaussians(
                 side_lengths=(lx, ly, lz),
                 spacing=0.005,
-                color_rgb=(87, 51, 33),  # Darker brown
+                color_rgb=color_rgb,
             )
             splatsim_obj.gaussians._xyz = cuboid_params["_xyz"]
             splatsim_obj.gaussians._rotation = cuboid_params["_rotation"]
@@ -909,6 +848,7 @@ class PybulletRobotServerBase:
         load_urdf=True,
         can_articulate=True,
     ):
+        load_splat = object_config.get("load_splat", True)
         if len(object_config) == 0 and splat_object_name is None:
             splat_object_name = object_name  # TODO when is this wrong?
 
@@ -932,7 +872,10 @@ class PybulletRobotServerBase:
             object_config=object_config,
         )
 
-        self.load_gaussian_splat(splatsim_obj)
+        if load_splat:
+            self.load_gaussian_splat(splatsim_obj)
+        else:
+            splatsim_obj.gaussians = None
 
         if load_urdf:
             self.load_urdf(splatsim_obj)
@@ -1198,6 +1141,9 @@ class PybulletRobotServerBase:
         features_rest_obj_list = []
         for i in range(len(self.splatsim_objects)):
             splatsim_obj = self.splatsim_objects[i]
+            if splatsim_obj.gaussians is None:
+                continue
+            
             if splatsim_obj.is_articulated:
                 assert (
                     splatsim_obj == self.splatsim_robot
@@ -2068,7 +2014,7 @@ class PybulletRobotServerBase:
                 targetPosition=current_pos,
                 force=500,  # Enough force to hold against gravity
             )
-
+        
         while True:
             # for splatsim_obj in self.splatsim_objects:
             #     use_gravity = splatsim_obj.object_config.get("use_gravity", True)

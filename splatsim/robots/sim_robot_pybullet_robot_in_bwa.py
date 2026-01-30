@@ -20,7 +20,6 @@ from splatsim.utils.robot_splat_render_utils import transform_object, get_curr_l
 
 class BWAPybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
-    ENV_CONFIG_NAME = None
     ENV_CONFIG = None
     background_splat_name = "bwa_open_space"
 
@@ -116,9 +115,8 @@ class BWAPybulletRobotServer(PybulletRobotServerBase):
 
 
 class OpenSpaceBWAPybulletRobotServer(BWAPybulletRobotServer):
-    ENV_CONFIG_NAME = "open_space_bwa"
-
     ENV_CONFIG = {
+        "name": "open_space_bwa",
         "objects": [
             # {
             #     "object_name": "small_engine",

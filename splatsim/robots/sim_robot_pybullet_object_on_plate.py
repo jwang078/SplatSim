@@ -23,10 +23,74 @@ from splatsim.utils.transform_utils import rotation_matrix_to_euler_angles
 
 class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
-    ENV_CONFIG_NAME = None
     ENV_CONFIG = None
     background_splat_name = "robot_iphone"
     TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
+
+    # object_rot is only x and y. Since it's a tabletop, z is randomized
+    GRASP_CONFIGS = {
+        "orange": {
+            "grasp_pose": np.array(
+                [
+                    [0.03420832, 0.29551898, 0.95472421, -0.08157158],
+                    [-0.82904722, 0.54187654, -0.13802362, -0.14110232],
+                    [-0.55813126, -0.7867899, 0.26353588, 0.20728098],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ),
+            "object_rot": [0, 0],
+        },
+        "banana1": {
+            "grasp_pose": np.array(
+                [
+                    [-0.13784676, -0.14873802, 0.97922177, 0.01055928],
+                    [-0.98239786, 0.14637033, -0.11606107, -0.06527538],
+                    [-0.12606632, -0.97798401, -0.16629659, 0.23013977],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ),
+            "object_rot": [0, 0],
+        },
+        "banana2": {
+            "grasp_pose": np.array(
+                [
+                    [0.12773567, 0.02665088, -0.99145011, 0.00692899],
+                    [-0.87105321, 0.481048, -0.09929316, -0.14203231],
+                    [0.47428884, 0.87628908, 0.08466133, -0.20627994],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ),
+            "object_rot": [0, np.pi],
+        },
+        "apple": {
+            "grasp_pose": np.array(
+                [
+                    [-0.12515046, -0.0412762, 0.99127879, 0.00471373],
+                    [-0.98896543, -0.07464537, -0.12796658, 0.01413896],
+                    [0.07927635, -0.99635553, -0.03147883, 0.27105228],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ),
+            "object_rot": [0, 0],
+        },
+        # self.strawberry_grasp_pose = np.array([[-0.19612399,  0.06661985,  0.97831344 ,-0.03194745],
+        #                                 [-0.90997152, -0.38409934, -0.15626751,  0.10821076],
+        #                                 [ 0.36535902, -0.92088517,  0.13595326,  0.23474673],
+        #                                 [ 0.,          0. ,         0. ,         1.        ]])
+        "strawberry": {
+            "grasp_pose": np.array(
+                [
+                    [6.03600159e-04, 4.74883933e-01, 8.80048229e-01, -1.17034260e-01],
+                    [-7.31850150e-01, -5.99512796e-01, 3.24005810e-01, 1.57542460e-01],
+                    [6.81465328e-01, -6.44258999e-01, 3.47182012e-01, 1.72402069e-01],
+                    [0.00000000e00, 0.00000000e00, 0.00000000e00, 1.00000000e00],
+                ]
+            ),
+            "object_rot": [0, 0],
+        },
+    }
+
+    # TODO is there a plastic strawberry env?
 
 
     def __init__(self, **kwargs):
@@ -409,7 +473,7 @@ class AppleOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
             {
                 "object_name": "plastic_apple",
                 "splat_object_name": "plastic_apple",
-                "grasp_config": [PybulletRobotServerBase.GRASP_CONFIGS["apple"]],
+                "grasp_config": [ObjectOnPlatePybulletRobotServer.GRASP_CONFIGS["apple"]],
                 "rotation_range_z": [0, 0],
             },
             {
@@ -423,16 +487,15 @@ class AppleOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
 
 
 class BananaOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
-    ENV_CONFIG_NAME = "banana_on_plate"
-
     ENV_CONFIG = {
+        "name": "banana_on_plate",
         "objects": [
             {
                 "object_name": "plastic_banana",
                 "splat_object_name": "plastic_banana",
                 "grasp_config": [
-                    PybulletRobotServerBase.GRASP_CONFIGS["banana1"],
-                    PybulletRobotServerBase.GRASP_CONFIGS["banana2"],
+                    ObjectOnPlatePybulletRobotServer.GRASP_CONFIGS["banana1"],
+                    ObjectOnPlatePybulletRobotServer.GRASP_CONFIGS["banana2"],
                 ],
                 "rotation_range_z": [0, 0],
             },
@@ -447,14 +510,13 @@ class BananaOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
 
 
 class OrangeOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
-    ENV_CONFIG_NAME = "orange_on_plate"
-
     ENV_CONFIG = {
+        "name": "orange_on_plate",
         "objects": [
             {
                 "object_name": "plastic_orange",
                 "splat_object_name": "plastic_orange",
-                "grasp_config": [PybulletRobotServerBase.GRASP_CONFIGS["orange"]],
+                "grasp_config": [ObjectOnPlatePybulletRobotServer.GRASP_CONFIGS["orange"]],
                 "rotation_range_z": [0, 0],
             },
             {

@@ -12,7 +12,6 @@ from splatsim.robots.sim_robot_pybullet_base import (
 
 class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
-    ENV_CONFIG_NAME = None
     ENV_CONFIG = None
 
     # Success criteria: target end effector pose
@@ -180,50 +179,51 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         return success
 
 
-class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer):
-    TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
+# deprecated
+# class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer):
+#     TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
 
-    ENV_CONFIG = {
-        "name": "upright_robot_small_engine",
-        "objects": [
-            {
-                "object_name": "small_engine",
-                "splat_object_name": "small_engine",
-                "grasp_config": [],
-                "randomize_pose": False,
-                "table_pos": [0.3, 0.55],
-                "table_quat": [0, 0, 1, 0],
-                "rotation_range_z": [0, 0],
-            },
-            {
-                "object_name": "plastic_apple",
-                "splat_object_name": "plastic_apple",
-                "grasp_config": [],
-                "randomize_pose": True,
-                "rotation_range_z": [0, 0],
-            },
-        ]
-    }
+#     ENV_CONFIG = {
+#         "name": "upright_robot_small_engine",
+#         "objects": [
+#             {
+#                 "object_name": "small_engine",
+#                 "splat_object_name": "small_engine",
+#                 "grasp_config": [],
+#                 "randomize_pose": False,
+#                 "table_pos": [0.3, 0.55],
+#                 "table_quat": [0, 0, 1, 0],
+#                 "rotation_range_z": [0, 0],
+#             },
+#             {
+#                 "object_name": "plastic_apple",
+#                 "splat_object_name": "plastic_apple",
+#                 "grasp_config": [],
+#                 "randomize_pose": True,
+#                 "rotation_range_z": [0, 0],
+#             },
+#         ]
+#     }
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # add plane
-        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
+#     def __init__(self, **kwargs):
+#         super().__init__(**kwargs)
+#         # add plane
+#         self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
 
-        # place a wall in -0.4 at x axis using plane.urdf
-        # wall is perpendicular to the plane
-        quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
-        self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
+#         # place a wall in -0.4 at x axis using plane.urdf
+#         # wall is perpendicular to the plane
+#         quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
+#         self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
 
-        # Register obstacles if trajectory generator was initialized via CLI
-        if self.trajectory_generator is not None:
-            self._register_trajectory_obstacles()
+#         # Register obstacles if trajectory generator was initialized via CLI
+#         if self.trajectory_generator is not None:
+#             self._register_trajectory_obstacles()
 
-    def _register_trajectory_obstacles(self):
-        """Register wall and plane as obstacles for trajectory generation."""
-        if self.trajectory_generator is not None:
-            self.trajectory_generator.register_obstacle(self.wall)
-            self.trajectory_generator.register_obstacle(self.plane)
+#     def _register_trajectory_obstacles(self):
+#         """Register wall and plane as obstacles for trajectory generation."""
+#         if self.trajectory_generator is not None:
+#             self.trajectory_generator.register_obstacle(self.wall)
+#             self.trajectory_generator.register_obstacle(self.plane)
 
 class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServer):
     # This new lab bench scene has the robot rotated 90 degrees because it was installed rotated D:
@@ -245,20 +245,18 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 # "table_pos": [-0.565, 0.35],
                 "table_quat": [0, 0, -0.7071068, 0.7071068],
             },
+
+
+            # table has a plane for objects to sit on at z = 0
+            {"object_name": "table", "object_type": "cuboid", "randomize_pose": False, "rotation_range_z": [0, 0], "size": [1.5, 0.90, 0.05], "position": [0, 0.25, -0.025], "mass": 0, "color_rgb": (223, 205, 192), "load_splat": False},
+            
+            # wall is at -0.2 on y axis
+            {"object_name": "wall", "object_type": "cuboid", "randomize_pose": False, "rotation_range_z": [0, 0], "size": [1.5, 0.05, 1.5], "position": [0, -0.225, 0.75], "mass": 0, "color_rgb": (223, 205, 192), "load_splat": False},
         ]
     }
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # add plane
-        self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, 0])
-
-        # place a wall in -0.6 at x axis using plane.urdf
-        # wall is perpendicular to the plane
-        quat = self.pybullet_client.getQuaternionFromEuler([-np.pi/2, np.pi / 2, 0])
-        self.wall = self.pybullet_client.loadURDF("plane.urdf", [0.0, -0.2, 0.0], quat)
-        # self.wall = self.pybullet_client.loadURDF("plane.urdf", [0.0, -0.16, 0.0], quat)
-
         # Set initial camera position on the opposite side of the wall (positive y side)
         # Camera looks at the origin from the positive y side, above the floor
         self.pybullet_client.resetDebugVisualizerCamera(
@@ -267,13 +265,3 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
             cameraPitch=-30,         # -30 degrees = looking down at ~30 degree angle
             cameraTargetPosition=[0, 0, 0.3]  # Look at point above the floor
         )
-
-        # Register obstacles if trajectory generator was initialized via CLI
-        if self.trajectory_generator is not None:
-            self._register_trajectory_obstacles()
-
-    def _register_trajectory_obstacles(self):
-        """Register wall and plane as obstacles for trajectory generation."""
-        if self.trajectory_generator is not None:
-            self.trajectory_generator.register_obstacle(self.wall)
-            self.trajectory_generator.register_obstacle(self.plane)
