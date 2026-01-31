@@ -134,10 +134,14 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
         return self._get_gym_observation(), info
 
-    # def compute_reward(self) -> float:
-    #     """Compute sparse reward based on success."""
+    def compute_reward(self) -> float:
+        """Compute sparse reward based on success."""
 
-    #     return 1.0 if self.check_success() else 0.0
+        return 1.0 if self.check_success() else 0.0
+    
+    def check_success(self) -> bool:
+        success, info = self.check_success_metrics()
+        return success
 
     def check_success_metrics(self) -> tuple[bool, dict]:
         """Check if the task goal is achieved.
@@ -251,7 +255,7 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
             {"object_name": "table", "object_type": "cuboid", "randomize_pose": False, "rotation_range_z": [0, 0], "size": [1.5, 0.90, 0.05], "position": [0, 0.25, -0.025], "mass": 0, "color_rgb": (223, 205, 192), "load_splat": False},
             
             # wall is at -0.2 on y axis
-            {"object_name": "wall", "object_type": "cuboid", "randomize_pose": False, "rotation_range_z": [0, 0], "size": [1.5, 0.05, 1.5], "position": [0, -0.225, 0.75], "mass": 0, "color_rgb": (223, 205, 192), "load_splat": False},
+            {"object_name": "wall", "object_type": "cuboid", "randomize_pose": False, "rotation_range_z": [0, 0], "size": [3.0, 0.05, 1.5], "position": [0, -0.225, 0.75], "mass": 0, "color_rgb": (223, 205, 192), "load_splat": False},
         ]
     }
 

@@ -643,6 +643,7 @@ class PybulletRobotServerBase:
                 # TODO orientation
                 lx, ly, lz = splatsim_obj.object_config["size"]
                 position = splatsim_obj.object_config["position"]
+                color_rgb = splatsim_obj.object_config.get("color_rgb", BLUE)
 
                 # Apply global scaling
                 lx, ly, lz = (
@@ -657,7 +658,7 @@ class PybulletRobotServerBase:
                 ]
 
                 # TODO check if this box is created with (0,0,0) at the center of the box
-                object_loaded = create_box(lx, ly, lz, color=BLUE)
+                object_loaded = create_box(lx, ly, lz, color=color_rgb)
                 set_pose(object_loaded, Pose(point=position))
                 # TODO set orientation
                 mass = (
@@ -1143,7 +1144,7 @@ class PybulletRobotServerBase:
             splatsim_obj = self.splatsim_objects[i]
             if splatsim_obj.gaussians is None:
                 continue
-            
+
             if splatsim_obj.is_articulated:
                 assert (
                     splatsim_obj == self.splatsim_robot

@@ -106,7 +106,6 @@ def _populate_registry():
     """Populate registry with supported environments."""
     from splatsim.robots.sim_robot_pybullet_small_engine import (
         SmallEnginePybulletRobotServer,
-        UprightRobotSmallEnginePybulletRobotServer,
         UprightRobotSmallEngineNewPybulletRobotServer,
     )
     from splatsim.robots.sim_robot_pybullet_object_on_plate import (
@@ -121,7 +120,7 @@ def _populate_registry():
     )
 
     register_env("small_engine", SmallEnginePybulletRobotServer)
-    register_env("upright_small_engine", UprightRobotSmallEnginePybulletRobotServer)
+    # register_env("upright_small_engine", UprightRobotSmallEnginePybulletRobotServer)
     register_env("upright_small_engine_new", UprightRobotSmallEngineNewPybulletRobotServer)
     register_env("object_on_plate", ObjectOnPlatePybulletRobotServer)
     register_env("apple_on_plate", AppleOnPlatePybulletRobotServer)

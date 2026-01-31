@@ -10,7 +10,7 @@ from collections import defaultdict
 from splatsim.utils.agent_state_utils import AGENT_STATE
 
 class ReplayZarrTrajectoryAgent(Agent): 
-    NUM_STEPS_TO_SETTLE_BETWEEN_TRAJS = 100
+    NUM_STEPS_TO_SETTLE_BETWEEN_TRAJS = 50
 
     def __init__(self, traj_folder: str, env: RobotEnv, save_images: bool = False, step_size=1):
         # TODO later put the step size to 1 when using a better machine
@@ -143,12 +143,7 @@ class ReplayZarrTrajectoryAgent(Agent):
             if self.traj_index >= len(self.trajectories):
                 return None
 
-            # if self.t == 1:
-            #     import pdb; pdb.set_trace()
-            
-            traj = np.array(self.trajectories[self.traj_index]['qs'])
-
-            if self.t >= len(traj):
+            if self.t >= len(self.trajectories[self.traj_index]['qs']):
                 self.load_next_recorded_trajectory()
                 if self.traj_index >= len(self.trajectories):
                     return None  # No more trajectory steps available
@@ -159,7 +154,7 @@ class ReplayZarrTrajectoryAgent(Agent):
                 print("Shifting from executing to settling")
                 
             # TODO save it corrrectly so it doesn't need this :7
-            cur_joint = traj[self.t, :7]
+            cur_joint = self.trajectories[self.traj_index]['qs'][self.t, :7]
             cur_joint = cur_joint.tolist()
             cur_joint = np.array(cur_joint)
             self.t += 1

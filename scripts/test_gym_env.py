@@ -23,7 +23,7 @@ def main():
                         help="Name of robot splat to use")
     parser.add_argument("--cam_i", type=int, default=3,
                         help="Camera index for base_rgb")
-    parser.add_argument("--camera_names", type=str, default='["base_rgb"]',
+    parser.add_argument("--camera_names", type=str, default='["base_rgb", "wrist_rgb"]',
                         help='JSON list of camera names (e.g., \'["wrist_rgb"]\' or \'["base_rgb", "wrist_rgb"]\')')
     parser.add_argument("--no_gripper", action="store_true",
                         help="Disable gripper")
@@ -57,11 +57,13 @@ def main():
     # Reset the environment
     obs, info = env.reset(seed=42)
     print(f"\nInitial observation keys: {obs.keys()}")
-    print(f"State shape: {obs['state'].shape}")
+    print(f"agent_pos shape: {obs['agent_pos'].shape}")
     for cam_name in camera_names:
         if cam_name in obs:
             print(f"{cam_name} shape: {obs[cam_name].shape}")
     print(f"Initial info: {info}")
+
+    import pdb; pdb.set_trace()
 
     # Run a few random steps
     print("\nRunning 10 random steps...")
