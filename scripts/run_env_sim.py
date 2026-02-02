@@ -245,8 +245,9 @@ def main(args):
             # traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_test_trajectories.zarr"
             # traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_trajectories.zarr"
             # traj_folder = "output/upright_robot_small_engine_new_trajectories_sapi05.zarr"
-            traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_1strrtpath_trajectories.zarr"
+            # traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_1strrtpath_trajectories.zarr"
             # traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_5thrrtpath_trajectories.zarr"
+            traj_folder = "/home/jennyw2/code/SplatSim/output/upright_robot_small_engine_new_5path_trajectories.zarr"
             agent = ReplayZarrTrajectoryAgent(traj_folder=traj_folder, env=env, save_images=False)
             startup_steps = 2
             query_new_joints_per_startup_step = False
@@ -395,7 +396,7 @@ def main(args):
         image_keys = [key for key in obs.keys() if key.endswith("_rgb")]
         print(f"Saving {len(image_keys)} image keys in observation to lerobot dataset:", image_keys)
 
-        dataset_repo_id = f"{args.lerobot_dataset_repo_id_base}_{'_'.join(image_keys)}"
+        dataset_repo_id = f"{args.lerobot_dataset_repo_id_base}"
         print(f"Saving to LeRobot dataset with repo ID: {dataset_repo_id}")
 
         # Standard LeRobot cache path
@@ -501,7 +502,7 @@ def main(args):
                 # We save the obs and the action that was generated from it
                 lerobot_saver.add_frame({
                     # images are (c, h, w) format
-                    **{f"observation.images.{key}": letterbox(obs[key].detach().cpu().numpy(), (224, 224)) for key in image_keys},
+                    **{f"observation.images.{key}": letterbox(obs[key], (224, 224)) for key in image_keys},
                     "observation.state": obs["joint_positions"].astype(np.float32),
                     "action": action.astype(np.float32),
                     "task": "", # TODO this is probably more necessary if there are multiple tasks

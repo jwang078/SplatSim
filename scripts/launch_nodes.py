@@ -125,34 +125,6 @@ def launch_robot_server(args: Args):
            debug_mode=args.debug_mode
         )
 
-    elif args.robot == "sim_ur_pybullet_small_engine_interactive":
-        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEnginePybulletRobotServer
-
-        server = UprightRobotSmallEnginePybulletRobotServer(
-           port=port, host=args.hostname, serve_mode=UprightRobotSmallEnginePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-        #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper,
-
-        #    camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
-
-           camera_names=["base_rgb", "wrist_rgb"],
-           robot_name=args.robot_name, cam_i=5, use_gripper=use_gripper,
-        #    image_width=224, image_height=224
-
-           # with the actual engine on table
-        #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper
-           debug_mode=args.debug_mode
-        )
-
-    elif args.robot == "sim_ur_pybullet_small_engine_interactive_norender":
-        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEnginePybulletRobotServer
-
-        server = UprightRobotSmallEnginePybulletRobotServer(
-           port=port, host=args.hostname, serve_mode=UprightRobotSmallEnginePybulletRobotServer.SERVE_MODES.INTERACTIVE,
-           camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper,
-           image_width=96, image_height=96,
-           debug_mode=args.debug_mode
-        )
-
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive":
         from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEngineNewPybulletRobotServer
 
@@ -163,6 +135,23 @@ def launch_robot_server(args: Args):
         #    camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
 
            camera_names=["base_rgb", "wrist_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+           image_resize_mode='letterbox',
+        #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+        #    image_width=224, image_height=224
+           debug_mode=args.debug_mode
+        )
+
+    elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_stretchimg":
+        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEngineNewPybulletRobotServer
+
+        server = UprightRobotSmallEngineNewPybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.INTERACTIVE,
+        #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper,
+
+        #    camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+
+           camera_names=["base_rgb", "wrist_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+           image_resize_mode='stretch',
         #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
         #    image_width=224, image_height=224
            debug_mode=args.debug_mode

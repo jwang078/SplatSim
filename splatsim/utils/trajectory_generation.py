@@ -248,6 +248,12 @@ class TrajectoryGenerator:
             if base_traj is None:
                 return  # Failed, will retry next iteration
 
+        # 2b. Extend the path so that it stays at the last position for a second
+        num_extra_steps = int(1 * self.config["robot_update_rate"])
+        last_q = base_traj[-1]
+        extra_steps = np.tile(last_q, (num_extra_steps, 1))
+        base_traj = np.vstack((base_traj, extra_steps))
+
         # 3. Get EE trajectory for obstacle placement
         base_ee_traj = self._get_ee_trajectory(base_traj)
 
@@ -274,6 +280,12 @@ class TrajectoryGenerator:
                     )
 
                     if modified_traj is not None:
+                        # Extend the path so that it stays at the last position for a second
+                        num_extra_steps = int(1 * self.config["robot_update_rate"])
+                        last_q = modified_traj[-1]
+                        extra_steps = np.tile(last_q, (num_extra_steps, 1))
+                        modified_traj = np.vstack((modified_traj, extra_steps))
+
                         self._save_trajectory_zarr(
                             modified_traj,
                             self.trajectory_count,
@@ -480,12 +492,6 @@ class TrajectoryGenerator:
             path = self._plan_rrt_path(plan_start, plan_goal, additional_obstacles)
 
             if path is not None:
-                # Extend the path so that it stays at the last position for half a second
-                num_extra_steps = int(0.5 * self.config["robot_update_rate"])
-                last_q = path[-1]
-                extra_steps = np.tile(last_q, (num_extra_steps, 1))
-                path = np.vstack((path, extra_steps))
-                
                 paths.append(path)
 
                 if self.config.get("verbose", False):

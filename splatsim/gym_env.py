@@ -60,18 +60,35 @@ class SplatSimGymEnv(gym.Env):
         """Render the environment.
 
         Returns:
-            RGB array if render_mode='rgb_array', None otherwise
+            RGB array if render_mode='rgb_array', None otherwise.
+            If multiple *_rgb observations exist, they are stacked horizontally.
         """
-        # TODO is this used?
         if self.render_mode == "rgb_array":
             obs = self.robot_server.get_observations()
-            # Return base_rgb as the render output
-            if "base_rgb" in obs and obs["base_rgb"] is not None:
-                img = obs["base_rgb"]
-                if hasattr(img, 'cpu'):
-                    img = img.cpu().numpy()
-                # Convert from (C, H, W) -> (H, W, C) for rendering
-                return (np.transpose(img, (1, 2, 0)) * 255).astype(np.uint8)
+
+            # Collect all RGB observations
+            rgb_images = []
+            for key in sorted(obs.keys()):
+                if key.endswith("_rgb") and obs[key] is not None:
+                    img = obs[key]
+                    if hasattr(img, 'cpu'):
+                        img = img.cpu().numpy()
+                    # Convert from (C, H, W) -> (H, W, C) for rendering
+                    img = (np.transpose(img, (1, 2, 0)) * 255).astype(np.uint8)
+                    rgb_images.append(img)
+
+            if rgb_images:
+                # Pad images to the same height if needed
+                max_height = max(img.shape[0] for img in rgb_images)
+                padded_images = []
+                for img in rgb_images:
+                    if img.shape[0] < max_height:
+                        pad_height = max_height - img.shape[0]
+                        padding = np.zeros((pad_height, img.shape[1], img.shape[2]), dtype=img.dtype)
+                        img = np.concatenate([img, padding], axis=0)
+                    padded_images.append(img)
+                # Stack all RGB images horizontally
+                return np.concatenate(padded_images, axis=1)
         return None
 
     def close(self):

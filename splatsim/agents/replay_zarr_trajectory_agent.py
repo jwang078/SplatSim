@@ -103,6 +103,8 @@ class ReplayZarrTrajectoryAgent(Agent):
         self.traj_index += 1
         self.t = 0
 
+        print(f"Loading trajectory {self.traj_index} / {len(self.trajectories)}")
+
         # Load new trajectory
 
         # Load new static obstacles

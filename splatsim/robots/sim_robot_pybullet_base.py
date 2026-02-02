@@ -70,6 +70,30 @@ from pathlib import Path
 SPLATSIM_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def resize_image(img: np.ndarray, output_size: Tuple[int, int], mode: str = "letterbox") -> np.ndarray:
+    """Resize image to output_size using the specified mode.
+
+    Args:
+        img: Input image in CHW format (channels, height, width), float32 in [0, 1]
+        output_size: Target (height, width)
+        mode: Resize mode - "letterbox" or "stretch"
+
+    Returns:
+        Resized image in CHW format, float32 in [0, 1]
+    """
+    if mode == "letterbox":
+        return letterbox(img, output_size=output_size)
+    elif mode == "stretch":
+        # Convert from CHW to HWC for cv2
+        img_hwc = np.transpose(img, (1, 2, 0))
+        # Resize using cv2 (stretches to fill, ignoring aspect ratio)
+        img_resized = cv2.resize(img_hwc, (output_size[1], output_size[0]), interpolation=cv2.INTER_LINEAR)
+        # Convert back to CHW
+        return np.transpose(img_resized, (2, 0, 1))
+    else:
+        raise ValueError(f"Unknown image resize mode: {mode}. Use 'letterbox' or 'stretch'.")
+
+
 def resolve_splatsim_path(path: str) -> str:
     """Resolve a path, making relative paths relative to SPLATSIM_ROOT.
 
@@ -242,6 +266,7 @@ class PybulletRobotServerBase:
         image_height: Optional[int] = None,
         debug_mode: Optional[str] = None,
         trajectory_gen_config: Optional[dict] = None,
+        image_resize_mode: str = "letterbox",
     ):
         self.serve_mode = serve_mode
         self.robot_name = robot_name
@@ -251,6 +276,8 @@ class PybulletRobotServerBase:
         self.image_height = image_height
         self.use_gripper = use_gripper
         self.debug_mode = debug_mode
+        # Image resize mode: "letterbox" (preserve aspect ratio, pad) or "stretch" (fill entire area)
+        self.image_resize_mode = image_resize_mode
 
         # load labels.npy
         self.robot_labels = np.load(
@@ -1616,6 +1643,11 @@ class PybulletRobotServerBase:
         # print the euler angles and the reconstructed quaternion
         if self.use_gripper:
             self.current_gripper_state = self.get_current_gripper_state() / 0.8
+            # Snap the gripper state to 0 or 1 if they're very close
+            if self.current_gripper_state > 0.95:
+                self.current_gripper_state = 1.0
+            elif self.current_gripper_state < 0.05:
+                self.current_gripper_state = 0.0
         else:
             self.current_gripper_state = 0.0
 
@@ -1661,6 +1693,10 @@ class PybulletRobotServerBase:
                     observations[camera_name] = self.render_image(
                         camera_name=camera_name
                     )
+                    # Resize to 224x224 using configured mode (letterbox or stretch)
+                    if hasattr(observations[camera_name], 'cpu'):
+                        observations[camera_name] = observations[camera_name].cpu().numpy()
+                    observations[camera_name] = resize_image(observations[camera_name], (224, 224), mode=self.image_resize_mode)
 
             # Display the rendered observations
             self.display_observations(observations)
@@ -2155,9 +2191,11 @@ class PybulletRobotServerBase:
         )
 
     def get_current_gripper_state(self):
-        return self.pybullet_client.getJointState(
+        # Snap the gripper state to 0 or 1 if they're very close
+        gripper_state = self.pybullet_client.getJointState(
             self.splatsim_robot.sim_id, self.mimic_parent_id
         )[0]
+        return gripper_state
 
     def get_camera_image_from_end_effector(self):
 
@@ -2500,8 +2538,6 @@ class PybulletRobotServerBase:
             if img is not None:
                 if hasattr(img, 'cpu'):
                     img = img.cpu().numpy()
-                # Resize to 224x224 using letterbox
-                img = letterbox(img, (224, 224))
                 # Convert from (C, H, W) float32 to (H, W, C) uint8 for LeRobot
                 if img.shape[0] == 3:  # (C, H, W) format
                     img = np.transpose(img, (1, 2, 0))  # -> (H, W, C)
