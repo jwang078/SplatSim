@@ -424,21 +424,10 @@ class TrajectoryGenerator:
             # Camera forward direction (assumes +Z axis in local frame)
             cam_forward = cam_rotation[:, 2]
 
-            # Direction from camera to target
-            target_direction = target_position - cam_position
-            target_distance = np.linalg.norm(target_direction)
-
-            if target_distance < 1e-6:
-                alignment = 0.0  # Camera at target
-            else:
-                target_direction_normalized = target_direction / target_distance
-                alignment = np.dot(cam_forward, target_direction_normalized)
-
-            # Scoring function components
-            exp_reward = np.exp(k_exp * alignment)
-            sigmoid_gate = 1.0 / (1.0 + np.exp(-k_sig * (alignment - threshold)))
-
-            waypoint_score = exp_reward * sigmoid_gate
+            # Use utility function for single-timestep score
+            waypoint_score = rrt_path_utils.compute_camera_alignment_score(
+                cam_position, cam_forward, target_position, k_exp, k_sig, threshold
+            )
             scores.append(waypoint_score)
 
         return float(np.mean(scores))

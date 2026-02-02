@@ -513,3 +513,45 @@ def show_joint_config_in_gui(robot_id, joint_indices, q):
     for _ in range(240):
         p.stepSimulation()
         time.sleep(1.0 / 240.0)
+
+
+def compute_camera_alignment_score(
+    cam_position: np.ndarray,
+    cam_forward: np.ndarray,
+    target_position: np.ndarray,
+    k_exp: float = 5.0,
+    k_sig: float = 15.0,
+    threshold: float = 0.4,
+) -> float:
+    """
+    Compute camera alignment score for a single timestep.
+
+    Higher score = camera better aligned with target.
+    Combines exponential reward with sigmoid gating.
+
+    Args:
+        cam_position: Camera position in world frame (3,)
+        cam_forward: Camera forward direction unit vector (3,)
+        target_position: Target position in world frame (3,)
+        k_exp: Exponential sharpness (default: 5.0)
+        k_sig: Sigmoid sharpness (default: 15.0)
+        threshold: Alignment threshold (default: 0.4)
+
+    Returns:
+        Score for this single timestep
+    """
+    # Direction from camera to target
+    target_direction = target_position - cam_position
+    target_distance = np.linalg.norm(target_direction)
+
+    if target_distance < 1e-6:
+        alignment = 0.0  # Camera at target
+    else:
+        target_direction_normalized = target_direction / target_distance
+        alignment = np.dot(cam_forward, target_direction_normalized)
+
+    # Scoring function components
+    exp_reward = np.exp(k_exp * alignment)
+    sigmoid_gate = 1.0 / (1.0 + np.exp(-k_sig * (alignment - threshold)))
+
+    return float(exp_reward * sigmoid_gate)

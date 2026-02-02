@@ -10,10 +10,13 @@ from splatsim.robots.sim_robot_pybullet_base import (
     PybulletRobotServerBase,
 )
 
+from splatsim.utils.rrt_path_utils import compute_camera_alignment_score
+
 class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
     ENV_CONFIG = None
 
+    # TODO allow other tasks to be done on the small engine setup
     # Success criteria: target end effector pose
     TARGET_EE_POS = (-0.003126271918487248, 0.4626016957140267, 0.31067939915838083)
     TARGET_EE_QUAT = (-0.5883302720488017, 0.318663764807395, 0.472865116611213, 0.5733406295406109)
@@ -128,9 +131,9 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         for _ in range(100):
             self.pybullet_client.stepSimulation()
 
-        is_success, info = self.check_success_metrics()
+        metrics = self.check_metrics()
 
-        info = {"is_success": is_success, **info}
+        info = {"is_success": metrics['is_success'], **metrics}
 
         return self._get_gym_observation(), info
 
@@ -140,10 +143,10 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         return 1.0 if self.check_success() else 0.0
     
     def check_success(self) -> bool:
-        success, info = self.check_success_metrics()
-        return success
+        metrics = self.check_metrics()
+        return metrics['is_success']
 
-    def check_success_metrics(self) -> tuple[bool, dict]:
+    def check_metrics(self) -> dict:
         """Check if the task goal is achieved.
 
         Returns True if the end effector is within POS_TOLERANCE_M (meters) and
@@ -170,17 +173,24 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         if angle_deg <= self.QUAT_TOLERANCE_DEG:
             success = False
 
-        info = {
+        cam_position, cam_rotation = self.get_wrist_camera_transform()
+        # Camera forward direction (assumes +Z axis in local frame)
+        cam_forward = cam_rotation[:, 2]
+        cam_looks_at_goal_score = compute_camera_alignment_score(cam_position, cam_forward, self.TARGET_EE_POS)
+
+        metrics = {
+            "is_success": success,
             "position_error_m": pos_diff,
             "orientation_error_deg": angle_deg,
+            "cam_looks_at_goal_score": cam_looks_at_goal_score,
         }
 
-        return success, info
+        return metrics
 
     def check_terminated(self) -> bool:
         """Check if episode should terminate."""
-        success, info = self.check_success_metrics()
-        return success
+        metrics = self.check_metrics()
+        return metrics['is_success']
 
 
 # deprecated

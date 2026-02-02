@@ -220,9 +220,9 @@ class GripperPathSegment(PathSegment):
 
 @dataclass
 class SplatSimCamera:
-    camera: Camera
-    pipeline: PipelineParams
-    background: torch.tensor
+    camera: Optional[Camera]
+    pipeline: Optional[PipelineParams]
+    background: Optional[torch.tensor]
     tracked_link_index: Optional[str] = None
 
 
@@ -515,25 +515,33 @@ class PybulletRobotServerBase:
             self.wrist_camera = self.setup_camera_from_dataset(
                 self.object_config["bwa_open_space"], cam_i=3, use_train=True
             )
-            # Get the index of the wrist_camera_link
-            if "wrist_camera_link_name" in self.splatsim_robot.object_config:
-                wrist_camera_link_name = self.splatsim_robot.object_config[
-                    "wrist_camera_link_name"
-                ]
-                num_joints = p.getNumJoints(self.splatsim_robot.sim_id)
-                for i in range(num_joints):
-                    info = p.getJointInfo(self.splatsim_robot.sim_id, i)
-                    if info[12].decode("utf-8") == wrist_camera_link_name:
-                        self.wrist_camera.tracked_link_index = i
-                        break
-                if self.wrist_camera.tracked_link_index is None:
-                    raise ValueError(
-                        f"Cannot find wrist camera link name {wrist_camera_link_name}"
-                    )
-            else:
+        else:
+            # Make a dummy camera
+            self.wrist_camera = SplatSimCamera(
+                camera=None,
+                pipeline=None,
+                background=None,
+            )
+
+        # Add the index of the wrist_camera_link to the wrist camera if it's available
+        if "wrist_camera_link_name" in self.splatsim_robot.object_config:
+            wrist_camera_link_name = self.splatsim_robot.object_config[
+                "wrist_camera_link_name"
+            ]
+            num_joints = p.getNumJoints(self.splatsim_robot.sim_id)
+            for i in range(num_joints):
+                info = p.getJointInfo(self.splatsim_robot.sim_id, i)
+                if info[12].decode("utf-8") == wrist_camera_link_name:
+                    self.wrist_camera.tracked_link_index = i
+                    break
+            if self.wrist_camera.tracked_link_index is None:
                 raise ValueError(
-                    f"wrist_camera_link_name attribute not defined in object config of robot {self.robot_name}, yet wrist camera was requested"
+                    f"Cannot find wrist camera link name {wrist_camera_link_name}"
                 )
+        else:
+            raise ValueError(
+                f"wrist_camera_link_name attribute not defined in object config of robot {self.robot_name}, yet wrist camera was requested"
+            )
 
         # Prepare for teleport by removing forces
         for i in range(
@@ -1076,13 +1084,10 @@ class PybulletRobotServerBase:
     def enable_rendering(self):
         self.do_render_from_splat = True
 
-    def get_wrist_camera(self):
+    def get_wrist_camera_transform(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         if self.wrist_camera.tracked_link_index is None:
             print("WARNING: No wrist camera index found")
             return None
-
-        uid = 0
-        colmap_id = 1
 
         # Get the pose of the wrist_camera_link
         link_state = p.getLinkState(
@@ -1098,6 +1103,14 @@ class PybulletRobotServerBase:
         R_cw = (
             np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3).astype(np.float32)
         )
+
+        return T_cw, R_cw
+
+    def get_wrist_camera(self):
+        transform_pair = self.get_wrist_camera_transform()
+        if transform_pair is None:
+            return None
+        T_cw, R_cw = transform_pair
 
         T_wc = -R_cw.T @ T_cw
 
@@ -2501,9 +2514,12 @@ class PybulletRobotServerBase:
         terminated = self.check_terminated()
         truncated = self._step_count >= self._max_episode_steps
 
+        metrics = self.check_metrics()
+
         info = {
             "is_success": is_success,
             "step_count": self._step_count,
+            **metrics
         }
 
         return observation, reward, terminated, truncated, info
@@ -2603,6 +2619,16 @@ class PybulletRobotServerBase:
             NotImplementedError: Subclasses must implement this method
         """
         raise NotImplementedError("Subclasses must implement check_success()")
+    
+    def check_metrics(self) -> Dict[str, Any]:
+        """Check additional metrics for the current episode.
+
+        Subclasses can implement this method to return task-specific metrics.
+
+        Returns:
+            Dict of metric names to values
+        """
+        return {}
 
     def check_terminated(self) -> bool:
         """Check if episode should terminate due to success or failure.
