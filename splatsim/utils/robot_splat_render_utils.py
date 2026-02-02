@@ -8,6 +8,7 @@ import pybullet as p
 
 from typing import Any, Dict, Optional, List, Tuple
 from dataclasses import dataclass, field
+from functools import wraps
 
 from splatsim.utils.utils_fk import *
 
@@ -31,6 +32,27 @@ class SplatSimObject:
     transformations_cache: dict[Any] = None
     is_articulated: bool = False # For example, the robot has is_articulated=True. An object with is_articulated should have articulation_config
     articulation_config: Optional[ArticulationConfig] = None
+
+def high_precision_mode(func):
+    """
+    Some PyTorch operations use TensorFloat-32 (TF32) on NVIDIA GPUs by default for better performance.
+    This can lead to reduced numerical precision in certain computations.
+    The rotation matrix math and quaternion conversions are sensitive to precision errors,
+    and may throw assertion errors if TF32 is used.
+    """
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Store original state
+        old_tf32 = torch.backends.cuda.matmul.allow_tf32
+        # Disable TF32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            return func(*args, **kwargs)
+        finally:
+            # Always restore state
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
+    return wrapper
 
 def get_curr_link_states(robot_uid, use_link_centers=True):
     link_states = []
@@ -96,7 +118,8 @@ def crop_splat(splatsim_obj: SplatSimObject, keep_within_aabb=True):
         splatsim_obj.gaussians._features_rest = pc._features_rest[segmented_indices]
         splatsim_obj.gaussians._features_dc = pc._features_dc[segmented_indices]
         splatsim_obj.gaussians._scaling = pc._scaling[segmented_indices]
-    
+
+@high_precision_mode
 def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base_position=True, inplace=False):
     # xyz is in global frame. pc is in splat frame
     pc = splatsim_obj.gaussians
@@ -252,6 +275,7 @@ def build_matrix_from_r_t(r, t, device='cuda'):
     transform[:3, 3] = t.to(device, torch.float32)
     return transform
 
+@high_precision_mode
 def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base_position=True, inplace=False):
     """
     Transforms all properties of a Gaussian splat object (splatsim_obj)
@@ -345,7 +369,7 @@ def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base
 
     return xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
 
-
+@high_precision_mode
 def transform_shs(shs_feat, rotation_matrix):
     ## rotate shs
     P = torch.tensor([[0, 0, 1], [1, 0, 0], [0, 1, 0]], device=rotation_matrix.device).float() # switch axes: yzx -> xyz
