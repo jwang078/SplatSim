@@ -122,6 +122,10 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         self._step_count = 0
         self._episode_started = True
 
+        # Smoothness tracking
+        self._prev_action = None
+        self._action_delta = 0.0
+
         # From GENERATE_DEMOS: randomize_ee_pose()
         initial_joints = self.randomize_ee_pose()
         self.teleport_joint_state(self.splatsim_robot, initial_joints)
@@ -136,6 +140,17 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         info = {"is_success": metrics['is_success'], **metrics}
 
         return self._get_gym_observation(), info
+
+    def step(self, action: np.ndarray) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
+        """Execute one control step, tracking action smoothness."""
+        # Track action delta for smoothness metric
+        if self._prev_action is not None:
+            self._action_delta = np.linalg.norm(np.array(action) - self._prev_action)
+        else:
+            self._action_delta = 0.0
+        self._prev_action = np.array(action)
+
+        return super().step(action)
 
     def compute_reward(self) -> float:
         """Compute sparse reward based on success."""
@@ -183,6 +198,7 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
             "position_error_m": pos_diff,
             "orientation_error_deg": angle_deg,
             "cam_looks_at_goal_score": cam_looks_at_goal_score,
+            "action_delta": self._action_delta,
         }
 
         return metrics
@@ -247,6 +263,7 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
 
     ENV_CONFIG = {
         "name": "upright_robot_small_engine_new",
+        "task_description": "<control_mode> joint <control_mode>",
         "objects": [
             {
                 "object_name": "small_engine_new",

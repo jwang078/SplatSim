@@ -1636,7 +1636,6 @@ class PybulletRobotServerBase:
         return pos, quat
 
     def get_task_description(self) -> str:
-        # TODO make this better
         return self.ENV_CONFIG.get("task_description", "")
 
     def get_observations(self) -> Dict[str, np.ndarray]:
