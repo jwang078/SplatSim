@@ -6,6 +6,12 @@ import torch
 import numpy as np
 import zmq
 
+from splatsim.configs import (
+    EnvConfig,
+    TaskConfig,
+    CuboidObjectConfig,
+    SplatObjectConfig,
+)
 from splatsim.robots.sim_robot_pybullet_base import (
     PybulletRobotServerBase,
 )
@@ -14,27 +20,10 @@ from splatsim.utils.rrt_path_utils import compute_camera_alignment_score
 
 class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
-    ENV_CONFIG = None
-
-    # TODO allow other tasks to be done on the small engine setup
-    # Success criteria: target end effector pose
-    TARGET_EE_POS = (-0.003126271918487248, 0.4626016957140267, 0.31067939915838083)
-    TARGET_EE_QUAT = (-0.5883302720488017, 0.318663764807395, 0.472865116611213, 0.5733406295406109)
-
-    # Tolerance for success check
-    POS_TOLERANCE_M = 0.03  # 3 centimeters
-    QUAT_TOLERANCE_DEG = 10.0  # 10 degrees
-
-    # TODO reformat this to have a "task"-like variable that sets the task
-    # That then informs self.TRAJECTORY_GEN_CONFIG["q_goal"], etc
-    # Also sets the success and reward criteria
+    ENV_CONFIG: EnvConfig
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-
-    def _register_trajectory_obstacles(self):
-        """Register static obstacles with the trajectory generator. Override in subclasses."""
-        pass
 
     def plan_given_this_state(self, initial_joint_positions):
         all_paths = []
@@ -42,31 +31,6 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
     def serve_loop(self) -> None:
         # To be called in the parent's serve()
-
-        # Check mode dropdown for mode changes
-        new_mode = self._check_mode_buttons()
-        if new_mode is not None:
-            self._handle_mode_transition(new_mode)
-
-        # Check GUI buttons for trajectory generation control (start/stop)
-        start_pressed, stop_pressed = self._splatsim_gui.check_traj_buttons()
-
-        if start_pressed and self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
-            # Sync GUI values to config before starting
-            self._splatsim_gui.save_to_config(self.trajectory_generator.config)
-            # Register static obstacles with the trajectory generator
-            self._register_trajectory_obstacles()
-            # Switch to active trajectory generation
-            self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES)
-            print(f"[GUI] Started trajectory generation with config: {self.trajectory_generator.config}")
-
-        if stop_pressed:
-            if self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-                # Stop active generation, go back to idle
-                self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE)
-            elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
-                # From idle, go back to interactive
-                self._handle_mode_transition(self.SERVE_MODES.INTERACTIVE)
 
         if self.serve_mode == self.SERVE_MODES.INTERACTIVE:
             self.pybullet_client.stepSimulation()
@@ -164,34 +128,41 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     def check_metrics(self) -> dict:
         """Check if the task goal is achieved.
 
-        Returns True if the end effector is within POS_TOLERANCE_M (meters) and
-        QUAT_TOLERANCE_DEG (degrees) of the target pose.
+        Returns True if the end effector is within pos_tolerance_m (meters) and
+        quat_tolerance_deg (degrees) of the target pose.
         """
+        assert self.ENV_CONFIG.task is not None, "SmallEngine env requires a task config"
+        task_config = self.ENV_CONFIG.task
+        target_ee_pos = task_config.target_ee_pos
+        target_ee_quat = task_config.target_ee_quat
+        pos_tolerance_m = task_config.pos_tolerance_m
+        quat_tolerance_deg = task_config.quat_tolerance_deg
+
         success = True
 
         pos, quat = self.get_current_ee_pose()
 
         # Check position distance
-        pos_diff = np.linalg.norm(np.array(pos) - np.array(self.TARGET_EE_POS))
-        if pos_diff > self.POS_TOLERANCE_M:
+        pos_diff = np.linalg.norm(np.array(pos) - np.array(target_ee_pos))
+        if pos_diff > pos_tolerance_m:
             success = False
 
         # Check quaternion distance (angle between orientations)
         # Quaternion dot product gives cos(theta/2) where theta is the rotation angle
         q1 = np.array(quat)
-        q2 = np.array(self.TARGET_EE_QUAT)
+        q2 = np.array(target_ee_quat)
         dot = np.abs(np.dot(q1, q2))  # abs handles q and -q representing same rotation
         dot = np.clip(dot, -1.0, 1.0)  # Numerical stability
         angle_rad = 2 * np.arccos(dot)
         angle_deg = np.degrees(angle_rad)
 
-        if angle_deg <= self.QUAT_TOLERANCE_DEG:
+        if angle_deg <= quat_tolerance_deg:
             success = False
 
         cam_position, cam_rotation = self.get_wrist_camera_transform()
         # Camera forward direction (assumes +Z axis in local frame)
         cam_forward = cam_rotation[:, 2]
-        cam_looks_at_goal_score = compute_camera_alignment_score(cam_position, cam_forward, self.TARGET_EE_POS)
+        cam_looks_at_goal_score = compute_camera_alignment_score(cam_position, cam_forward, target_ee_pos)
 
         metrics = {
             "is_success": success,
@@ -208,83 +179,48 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         metrics = self.check_metrics()
         return metrics['is_success']
 
-
-# deprecated
-# class UprightRobotSmallEnginePybulletRobotServer(SmallEnginePybulletRobotServer):
-#     TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
-
-#     ENV_CONFIG = {
-#         "name": "upright_robot_small_engine",
-#         "objects": [
-#             {
-#                 "object_name": "small_engine",
-#                 "splat_object_name": "small_engine",
-#                 "grasp_config": [],
-#                 "randomize_pose": False,
-#                 "table_pos": [0.3, 0.55],
-#                 "table_quat": [0, 0, 1, 0],
-#                 "rotation_range_z": [0, 0],
-#             },
-#             {
-#                 "object_name": "plastic_apple",
-#                 "splat_object_name": "plastic_apple",
-#                 "grasp_config": [],
-#                 "randomize_pose": True,
-#                 "rotation_range_z": [0, 0],
-#             },
-#         ]
-#     }
-
-#     def __init__(self, **kwargs):
-#         super().__init__(**kwargs)
-#         # add plane
-#         self.plane = self.pybullet_client.loadURDF("plane.urdf", [0, 0, -0.022])
-
-#         # place a wall in -0.4 at x axis using plane.urdf
-#         # wall is perpendicular to the plane
-#         quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
-#         self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
-
-#         # Register obstacles if trajectory generator was initialized via CLI
-#         if self.trajectory_generator is not None:
-#             self._register_trajectory_obstacles()
-
-#     def _register_trajectory_obstacles(self):
-#         """Register wall and plane as obstacles for trajectory generation."""
-#         if self.trajectory_generator is not None:
-#             self.trajectory_generator.register_obstacle(self.wall)
-#             self.trajectory_generator.register_obstacle(self.plane)
-
 class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServer):
     # This new lab bench scene has the robot rotated 90 degrees because it was installed rotated D:
     background_splat_name = "robot_iphone_w_engine_new"
 
-    TABLE_LIMITS = ((-0.5, 0.5), (0.2, 0.6))
-
-    ENV_CONFIG = {
-        "name": "upright_robot_small_engine_new",
-        "task_description": "<control_mode> joint <control_mode>",
-        "objects": [
-            {
-                "object_name": "small_engine_new",
-                "splat_object_name": "small_engine_new",
-                "grasp_config": [],
-                "randomize_pose": False,
-                "rotation_range_z": [0, 0],
-                "is_in_scene_splat": True,
-                "table_pos": [-0.48, 0.36],
-                # "table_pos": [-0.565, 0.35],
-                "table_quat": [0, 0, -0.7071068, 0.7071068],
-            },
-
-
+    ENV_CONFIG = EnvConfig(
+        name="upright_robot_small_engine_new",
+        task=TaskConfig(
+            task_description="<control_mode> joint <control_mode>",
+            target_ee_pos=(-0.003126271918487248, 0.4626016957140267, 0.31067939915838083),
+            target_ee_quat=(-0.5883302720488017, 0.318663764807395, 0.472865116611213, 0.5733406295406109),
+            pos_tolerance_m=0.03,  # 3 centimeters
+            quat_tolerance_deg=10.0,  # 10 degrees
+        ),
+        objects=[
+            SplatObjectConfig(
+                object_name="small_engine_new",
+                splat_object_name="small_engine_new",
+                grasp_config=[],
+                randomize_pose=False,
+                rotation_range_z=(0, 0),
+                is_in_scene_splat=True,
+                table_pos=(-0.48, 0.36),
+                table_quat=(0, 0, -0.7071068, 0.7071068),
+            ),
             # table has a plane for objects to sit on at z = 0
-            {"object_name": "table", "object_type": "cuboid", "randomize_pose": False, "rotation_range_z": [0, 0], "size": [1.5, 0.90, 0.05], "position": [0, 0.25, -0.025], "mass": 0, "color_rgb": (223, 205, 192), "load_splat": False},
-            
+            CuboidObjectConfig(
+                object_name="table",
+                size=(1.5, 0.90, 0.05),
+                position=(0, 0.25, -0.025),
+                mass=0,
+                color_rgb=(223, 205, 192),
+            ),
             # wall is at -0.2 on y axis
-            {"object_name": "wall", "object_type": "cuboid", "randomize_pose": False, "rotation_range_z": [0, 0], "size": [3.0, 0.05, 1.5], "position": [0, -0.225, 0.75], "mass": 0, "color_rgb": (223, 205, 192), "load_splat": False},
-        ]
-    }
+            CuboidObjectConfig(
+                object_name="wall",
+                size=(3.0, 0.05, 1.5),
+                position=(0, -0.225, 0.75),
+                mass=0,
+                color_rgb=(223, 205, 192),
+            ),
+        ],
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

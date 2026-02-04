@@ -63,6 +63,12 @@ from splatsim.utils.transform_utils import rotation_matrix_to_euler_angles
 from splatsim.utils.image_utils import letterbox
 from splatsim.utils.trajectory_generation import TrajectoryGenerator
 from splatsim.utils.splatsim_gui import SplatSimGui
+from splatsim.configs import (
+    DebugModes,
+    EnvConfig,
+    CuboidObjectConfig,
+    SplatObjectConfig,
+)
 
 from pathlib import Path
 
@@ -229,7 +235,24 @@ class SplatSimCamera:
 class PybulletRobotServerBase:
     MAX_TRAJECTORY_COUNT = 500
 
-    TABLE_LIMITS = None # To be set in a child class
+    @property
+    def TABLE_LIMITS(self):
+        """Compute table limits from ENV_CONFIG.
+
+        Returns:
+            Tuple of ((x_min, x_max), (y_min, y_max)) computed from the table object in ENV_CONFIG.
+
+        Raises:
+            ValueError: If no table object is defined in ENV_CONFIG.
+        """
+        for obj in self.ENV_CONFIG.objects:
+            if obj.object_name == "table" and isinstance(obj, CuboidObjectConfig):
+                position = obj.position
+                size = obj.size
+                x_center, y_center = position[0], position[1]
+                x_half, y_half = size[0] / 2, size[1] / 2
+                return ((x_center - x_half, x_center + x_half), (y_center - y_half, y_center + y_half))
+        raise ValueError("TABLE_LIMITS requested but no 'table' object is defined in ENV_CONFIG['objects'].")
 
     # Gym environment constants
     DEFAULT_MAX_EPISODE_STEPS = 500
@@ -247,10 +270,13 @@ class PybulletRobotServerBase:
         GENERATE_TRAJECTORIES = "generate_trajectories"
         GENERATE_TRAJECTORIES_IDLE = "generate_trajectories_idle"
 
+    # Alias to the shared DebugModes enum for backwards compatibility
+    DEBUG_MODES = DebugModes
+
     lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
     upper_limits = [np.pi, 0, np.pi, np.pi, np.pi, np.pi]
 
-    ENV_CONFIG = {} # To be set in a subclass
+    ENV_CONFIG: EnvConfig # To be set in a subclass
 
     def __init__(
         self,
@@ -264,7 +290,7 @@ class PybulletRobotServerBase:
         cam_i: int = 254,
         image_width: int = 640,
         image_height: Optional[int] = None,
-        debug_mode: Optional[str] = None,
+        debug_mode: DEBUG_MODES = DEBUG_MODES.OFF,
         trajectory_gen_config: Optional[dict] = None,
         image_resize_mode: str = "letterbox",
     ):
@@ -275,6 +301,7 @@ class PybulletRobotServerBase:
         self.image_width = image_width
         self.image_height = image_height
         self.use_gripper = use_gripper
+        assert debug_mode in self.DEBUG_MODES, f"debug_mode must be one of {list(self.DEBUG_MODES)}, got {debug_mode}"
         self.debug_mode = debug_mode
         # Image resize mode: "letterbox" (preserve aspect ratio, pad) or "stretch" (fill entire area)
         self.image_resize_mode = image_resize_mode
@@ -288,6 +315,10 @@ class PybulletRobotServerBase:
         self._zmq_server = ZMQRobotServer(robot=self, host=host, port=port)
         self._zmq_server_thread = ZMQServerThread(self._zmq_server)
         print(f"Listening on {host}:{port}")
+
+        # Queue for passing display requests from ZMQ thread to main thread
+        self._display_queue: queue.Queue = queue.Queue()
+        self._main_thread_id = threading.current_thread().ident
 
         self.pybullet_client = p
         self.object_config_path = str(SPLATSIM_ROOT / "configs" / "object_configs" / "objects.yaml")
@@ -340,7 +371,7 @@ class PybulletRobotServerBase:
             pybullet_client=self.pybullet_client,
             robot_id=self.splatsim_robot.sim_id,
             joint_indices=movable_joints,
-            env_config_name=self.ENV_CONFIG.get("name", "default"),
+            env_config_name=self.ENV_CONFIG.name,
             get_ee_link_fn=get_ee_link,
             splatsim_objects=self.splatsim_objects,
             wrist_camera_link_name=wrist_camera_link_name,
@@ -349,7 +380,7 @@ class PybulletRobotServerBase:
 
         self._setup_interactive_gui()
 
-        if self.debug_mode == "no_background":
+        if self.debug_mode == self.DEBUG_MODES.NO_BACKGROUND:
             print("[Debug mode] no_background, using robot as background")
             self.background_splat_name = self.robot_name
             self.splatsim_background = self.splatsim_robot
@@ -362,7 +393,7 @@ class PybulletRobotServerBase:
                 load_urdf=False,
                 can_articulate=False,
             )
-        if self.debug_mode is not None:
+        if self.debug_mode == self.DEBUG_MODES.ROTATE_BASE_CAM:
             print(
                 "[Debug Mode] Setting base_rgb camera to be adjustable using pybullet GUI debug camera"
             )
@@ -386,15 +417,16 @@ class PybulletRobotServerBase:
         # model_lib = md.model_lib()
         # objectid = self.pybullet_client.loadURDF(model_lib['potato_chip_1'], [0.5, 0.15, 0])
 
-        for object_cfg in self.ENV_CONFIG["objects"]:
-            object_name = object_cfg["object_name"]
-            splat_object_name = object_cfg.get("splat_object_name", None)
+        for object_cfg in self.ENV_CONFIG.objects:
+            object_name = object_cfg.object_name
+            splat_object_name = getattr(object_cfg, "splat_object_name", None)
+            nested_object_config = getattr(object_cfg, "object_config", None) or {}
             object_config = {
                 **self.object_config.get(object_name, {}),
-                **object_cfg.get("object_config", {}),
-                **object_cfg,
+                **nested_object_config,
+                **object_cfg.to_dict(),
             }
-            grasp_config = object_cfg.get("grasp_config", None)
+            grasp_config = getattr(object_cfg, "grasp_config", []) or []
 
             # Already adds the splatsim_object to self.splatsim_objects
             splatsim_object = self.create_object(
@@ -589,20 +621,7 @@ class PybulletRobotServerBase:
                 self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
             )
 
-        # set to initial joint state
-        for i in range(10000):
-            for i in range(
-                1, len(self.splatsim_robot.articulation_config.initial_joint_positions)
-            ):
-                self.pybullet_client.resetJointState(
-                    self.splatsim_robot.sim_id,
-                    i,
-                    self.splatsim_robot.articulation_config.initial_joint_positions[
-                        i - 1
-                    ]
-                    * self.splatsim_robot.articulation_config.joint_signs[i - 1],
-                )
-            self.pybullet_client.stepSimulation()
+        self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.articulation_config.initial_joint_positions)
 
         # Gym-related state
         self._step_count = 0
@@ -640,7 +659,6 @@ class PybulletRobotServerBase:
         global_scaling = splatsim_obj.object_config.get("global_scaling", 1)
         is_articulated = splatsim_obj.object_config.get("is_articulated", False)
         base_position = splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0]
-        use_gravity = splatsim_obj.object_config.get("use_gravity", True)
 
         # Find possible URDF config
         if splatsim_obj.name in self.models_lib.model_name_list:
@@ -745,12 +763,6 @@ class PybulletRobotServerBase:
             raise ValueError(
                 f"Could not parse object config for object name {splatsim_obj.name}"
             )
-
-        # import pdb; pdb.set_trace()
-        # if not use_gravity:
-        #     import pdb; pdb.set_trace()
-
-        # p.setGravity(0, 0, 0, body=object_loaded) # Override world gravity for this body
 
         splatsim_obj.sim_id = object_loaded
         splatsim_obj.mass = mass
@@ -866,7 +878,7 @@ class PybulletRobotServerBase:
         non_temp_object_names = [
             self.splatsim_robot.name,
             self.splatsim_background.name,
-        ] + [obj_cfg["object_name"] for obj_cfg in self.ENV_CONFIG["objects"]]
+        ] + [obj_cfg.object_name for obj_cfg in self.ENV_CONFIG.objects]
         all_object_names = [splatsim_obj.name for splatsim_obj in self.splatsim_objects]
         deleted_obj_names = []
         for obj_name in all_object_names:
@@ -1213,11 +1225,13 @@ class PybulletRobotServerBase:
 
             else:
                 if (
-                    self.debug_mode != "no_background"
-                    and splatsim_obj.object_config.get("is_in_scene_splat", False)
+                    splatsim_obj.object_config.get("is_in_scene_splat", False)
                     and not splatsim_obj.object_config.get("randomize_pose", True)
                 ):
                     # Don't render this object because it's already in the scene splat. That calibration is the most accurate
+                    continue
+                if self.debug_mode == DebugModes.NO_BACKGROUND \
+                    and splatsim_obj == self.splatsim_background:
                     continue
                 if splatsim_obj.sim_id is not None:
                     cur_object_position = torch.tensor(
@@ -1414,10 +1428,10 @@ class PybulletRobotServerBase:
         # TODO make this into a config
 
         if camera_name == "base_rgb":
-            if self.debug_mode is None:
-                camera = self.base_camera
-            else:
+            if self.debug_mode != DebugModes.OFF:
                 camera = self.get_pybullet_debug_camera_as_splat_camera()
+            else:
+                camera = self.base_camera
         elif camera_name == "wrist_rgb":
             camera = self.get_wrist_camera()
             if camera is None:
@@ -1636,7 +1650,7 @@ class PybulletRobotServerBase:
         return pos, quat
 
     def get_task_description(self) -> str:
-        return self.ENV_CONFIG.get("task_description", "")
+        return self.ENV_CONFIG.task_description
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         joint_positions = self.get_joint_state()
@@ -1726,6 +1740,7 @@ class PybulletRobotServerBase:
         Args:
             observations: Dictionary containing rendered images as torch tensors (C, H, W)
         """
+        frames_to_display = {}
         for img_obs_name in ["wrist_rgb", "base_rgb"]:
             if img_obs_name not in observations or observations[img_obs_name] is None:
                 continue
@@ -1741,9 +1756,29 @@ class PybulletRobotServerBase:
             # Convert from [0, 1] float to [0, 255] uint8
             frame = (frame * 255).astype(np.uint8)
 
-            # Display (OpenCV uses BGR, our tensors are RGB, so convert)
-            cv2.imshow(img_obs_name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            cv2.waitKey(1)
+            # Convert RGB to BGR for OpenCV
+            frames_to_display[img_obs_name] = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        # If on main thread, display directly; otherwise queue for main thread
+        if threading.current_thread().ident == self._main_thread_id:
+            self._do_display(frames_to_display)
+        else:
+            self._display_queue.put(frames_to_display)
+
+    def _do_display(self, frames: Dict[str, np.ndarray]) -> None:
+        """Actually display frames using cv2.imshow. Must be called from main thread."""
+        for img_obs_name, frame in frames.items():
+            cv2.imshow(img_obs_name, frame)
+        cv2.waitKey(1)
+
+    def _process_display_queue(self) -> None:
+        """Process any pending display requests from the queue. Call from main thread."""
+        while not self._display_queue.empty():
+            try:
+                frames = self._display_queue.get_nowait()
+                self._do_display(frames)
+            except queue.Empty:
+                break
 
     def randomize_object_pose(self):
         collison_between_objects = True
@@ -1757,13 +1792,13 @@ class PybulletRobotServerBase:
                     continue  # only randomize the objects, not the robot
                 my_object_env_config = [
                     conf
-                    for conf in self.ENV_CONFIG["objects"]
-                    if conf["object_name"] == self.splatsim_objects[i].name
+                    for conf in self.ENV_CONFIG.objects
+                    if conf.object_name == self.splatsim_objects[i].name
                 ][0]
                 my_object_config = self.splatsim_objects[i].object_config
-                if my_object_env_config.get("table_pos", None) is not None:
-                    table_pos = my_object_env_config["table_pos"]
-                    table_quat = my_object_env_config.get("table_quat", [0, 0, 0, 1])
+                table_pos = getattr(my_object_env_config, "table_pos", None)
+                if table_pos is not None:
+                    table_quat = getattr(my_object_env_config, "table_quat", (0, 0, 0, 1))
                     base_position = my_object_config.get("base_position", [[0, 0, 0]])[
                         0
                     ]
@@ -1781,7 +1816,7 @@ class PybulletRobotServerBase:
                         pos,
                         table_quat,
                     )
-                elif my_object_env_config.get("randomize_pose", True):
+                elif my_object_env_config.randomize_pose:
                     # randomly reset the object position and orientation
                     # TODO remove hardcoding
                     x = random.uniform(self.TABLE_LIMITS[0][0], self.TABLE_LIMITS[0][1])
@@ -1796,8 +1831,8 @@ class PybulletRobotServerBase:
                     ]
                     # random euler angles for the orientation of the object
                     euler_z = random.uniform(
-                        my_object_env_config["rotation_range_z"][0],
-                        my_object_env_config["rotation_range_z"][1],
+                        my_object_env_config.rotation_range_z[0],
+                        my_object_env_config.rotation_range_z[1],
                     )
                     # random quaternion for the orientation of the object
                     # get object name from the object id
@@ -2026,26 +2061,8 @@ class PybulletRobotServerBase:
             return False
 
     def serve(self) -> None:
-        # Put all the articulated objects into their original states
-        for i in range(100):
-            for splatsim_obj in self.splatsim_objects:
-                if (
-                    splatsim_obj.articulation_config is not None
-                    and splatsim_obj.articulation_config.initial_joint_positions
-                    is not None
-                ):
-                    self.teleport_joint_state(
-                        splatsim_obj=splatsim_obj,
-                        joint_state=splatsim_obj.articulation_config.initial_joint_positions,
-                    )
-                elif not splatsim_obj.object_config.get("use_gravity", True):
-                    self.set_object_pose(
-                        splatsim_obj.name,
-                        splatsim_obj.object_config.get("position"),
-                        splatsim_obj.object_config.get("orn"),
-                        use_gravity=True,
-                    )
-            self.pybullet_client.stepSimulation()
+        self.reset()
+
         # start the zmq server
         self._zmq_server_thread.start()
 
@@ -2065,13 +2082,38 @@ class PybulletRobotServerBase:
             )
         
         while True:
-            # for splatsim_obj in self.splatsim_objects:
-            #     use_gravity = splatsim_obj.object_config.get("use_gravity", True)
-            #     if not use_gravity:
-            #         self.pybullet_client.applyExternalForce(splatsim_obj.sim_id, -1, [0, 0, splatsim_obj.mass], [0, 0, 0], p.WORLD_FRAME)
+            # Process any pending display requests from ZMQ thread
+            self._process_display_queue()
+
+            # Check mode dropdown for mode changes
+            new_mode = self._check_mode_buttons()
+            if new_mode is not None:
+                self._handle_mode_transition(new_mode)
+
+            # Check debug mode dropdown for changes
+            self._check_debug_mode()
+
+            # Check GUI buttons for trajectory generation control (start/stop)
+            start_pressed, stop_pressed = self._splatsim_gui.check_traj_buttons()
+
+            if start_pressed and self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
+                # Sync GUI values to config before starting
+                self._splatsim_gui.save_to_config(self.trajectory_generator.config)
+                # Switch to active trajectory generation
+                self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES)
+                print(f"[GUI] Started trajectory generation with config: {self.trajectory_generator.config}")
+
+            if stop_pressed:
+                if self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+                    # Stop active generation, go back to idle
+                    self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE)
+                elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
+                    # From idle, go back to interactive
+                    self._handle_mode_transition(self.SERVE_MODES.INTERACTIVE)
+
             self.serve_loop()
 
-    def serve_loop():
+    def serve_loop(self):
         raise NotImplementedError()
 
     def plan_given_this_state(self, initial_joint_positions):
@@ -2651,13 +2693,19 @@ class PybulletRobotServerBase:
 
         This launches the SplatSimGui window which includes:
         - Mode switching buttons (Interactive / Trajectory Gen)
+        - Debug mode dropdown
         - Trajectory generation parameters
         - Start/Stop trajectory generation buttons
         """
         # Initialize the Tkinter GUI (runs in separate thread)
         config = self.trajectory_generator.config
         initial_mode = self.serve_mode.value  # Use the enum's string value
-        self._splatsim_gui: SplatSimGui = SplatSimGui(config, initial_mode)
+        self._splatsim_gui: SplatSimGui = SplatSimGui(
+            config,
+            initial_mode,
+            debug_mode_enum=self.DEBUG_MODES,
+            initial_debug_mode=self.debug_mode,
+        )
         self._splatsim_gui.start()
 
     def _check_mode_buttons(self) -> Optional['PybulletRobotServerBase.SERVE_MODES']:
@@ -2679,6 +2727,15 @@ class PybulletRobotServerBase:
             return self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
 
         return None
+
+    def _check_debug_mode(self):
+        """Check if debug mode has changed in the GUI and update self.debug_mode."""
+        new_debug_mode = self._splatsim_gui.get_debug_mode()
+        if new_debug_mode is None:
+            return  # GUI not yet initialized
+        if new_debug_mode != self.debug_mode:
+            print(f"[GUI] Debug mode changed: {self.debug_mode.value} -> {new_debug_mode.value}")
+            self.debug_mode = new_debug_mode
 
     def _handle_mode_transition(self, new_mode: 'PybulletRobotServerBase.SERVE_MODES'):
         """Handle mode transition.

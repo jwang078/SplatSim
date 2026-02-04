@@ -6,6 +6,7 @@ import types
 import yaml
 
 from splatsim.robots.robot import BimanualRobot, PrintRobot
+from splatsim.configs import DebugModes
 from gello.zmq_core.robot_node import ZMQServerRobot
 
 
@@ -19,7 +20,7 @@ class Args:
     robot_name: str = "robot_iphone"
 
     # Debug mode for PyBullet visualization
-    debug_mode: str | None = None
+    debug_mode: DebugModes = DebugModes.OFF
 
 
 def launch_robot_server(args: Args):

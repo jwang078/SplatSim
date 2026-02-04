@@ -65,6 +65,15 @@ class StrParam:
 
 
 @dataclass
+class EnumParam:
+    """Configuration for an enum dropdown parameter."""
+    key: str
+    label: str
+    enum_class: type  # The enum class to use
+    default: Any = None  # Default enum member (uses first if None)
+
+
+@dataclass
 class ButtonConfig:
     """Configuration for a button."""
     text: str
@@ -112,6 +121,7 @@ class ThreadedTkinterGui(ABC):
         # Thread-safe storage
         self._values: Dict[str, tk.Variable] = {}
         self._button_flags: Dict[str, bool] = {}
+        self._enum_classes: Dict[str, type] = {}  # Maps param key -> enum class
         self._lock = threading.Lock()
 
         # GUI state
@@ -253,6 +263,28 @@ class ThreadedTkinterGui(ABC):
             return None
         try:
             return self._values[key].get()
+        except tk.TclError:
+            return None
+
+    def get_enum_value(self, key: str) -> Any:
+        """Get an enum value from the GUI.
+
+        Args:
+            key: The parameter key for an enum dropdown
+
+        Returns:
+            The enum member corresponding to the current selection, or None
+        """
+        if key not in self._values or key not in self._enum_classes:
+            return None
+        try:
+            str_value = self._values[key].get()
+            enum_class = self._enum_classes[key]
+            # Find the enum member with matching value
+            for member in enum_class:
+                if member.value == str_value:
+                    return member
+            return None
         except tk.TclError:
             return None
 
@@ -450,6 +482,44 @@ class GuiBuilder:
         self._row += 1
         return self._row - 1
 
+    def add_enum_param(self, param: 'EnumParam', initial_value: Any = None) -> int:
+        """Add an enum dropdown parameter.
+
+        Args:
+            param: Parameter configuration with enum_class
+            initial_value: Initial enum member (overrides param.default)
+
+        Returns:
+            Row index
+        """
+        # Determine the initial value
+        if initial_value is not None:
+            value = initial_value
+        elif param.default is not None:
+            value = param.default
+        else:
+            # Use first enum member as default
+            value = list(param.enum_class)[0]
+
+        ttk.Label(self._parent, text=param.label).grid(
+            row=self._row, column=0, sticky="w", pady=3
+        )
+
+        # Create a StringVar that stores the enum's value (not name)
+        var = tk.StringVar(value=value.value)
+        self._gui._values[param.key] = var
+
+        # Store enum class for later lookup
+        self._gui._enum_classes[param.key] = param.enum_class
+
+        # Create dropdown with enum values
+        values = [member.value for member in param.enum_class]
+        combo = ttk.Combobox(self._parent, textvariable=var, values=values, state="readonly", width=18)
+        combo.grid(row=self._row, column=1, sticky="e", pady=3)
+
+        self._row += 1
+        return self._row - 1
+
     def add_button_row(self, buttons: List[ButtonConfig], colspan: int = 2) -> int:
         """Add a row of buttons.
 
@@ -492,17 +562,30 @@ class SplatSimGui(ThreadedTkinterGui):
     BTN_START_TRAJ = "start_traj"
     BTN_STOP_TRAJ = "stop_traj"
 
-    def __init__(self, config: Dict[str, Any], initial_mode: str = "interactive"):
+    # Key for debug mode dropdown
+    DEBUG_MODE_KEY = "debug_mode"
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        initial_mode: str = "interactive",
+        debug_mode_enum: Optional[type] = None,
+        initial_debug_mode: Any = None,
+    ):
         """Initialize the GUI.
 
         Args:
             config: Dictionary of trajectory generation config values
             initial_mode: Initial mode string (e.g., "interactive", "generate_trajectories")
+            debug_mode_enum: The DEBUG_MODES enum class from PybulletRobotServerBase
+            initial_debug_mode: Initial debug mode enum member
         """
         super().__init__(title="SplatSim Controls")
         self._config = config
         self._initial_mode = initial_mode
         self._mode_var: Optional[tk.StringVar] = None
+        self._debug_mode_enum = debug_mode_enum
+        self._initial_debug_mode = initial_debug_mode
 
     def _build_ui(self):
         """Build the SplatSim UI."""
@@ -522,6 +605,15 @@ class SplatSimGui(ThreadedTkinterGui):
             ButtonConfig("Interactive Mode", self.BTN_INTERACTIVE_MODE, "Mode.TButton"),
             ButtonConfig("Trajectory Gen Mode", self.BTN_TRAJ_GEN_MODE, "Mode.TButton"),
         ])
+
+        # Debug mode dropdown (if enum provided)
+        if self._debug_mode_enum is not None:
+            builder.add_separator()
+            builder.add_header("Debug Settings")
+            builder.add_enum_param(
+                EnumParam(self.DEBUG_MODE_KEY, "Debug Mode", self._debug_mode_enum),
+                self._initial_debug_mode
+            )
 
         builder.add_separator()
 
@@ -598,3 +690,11 @@ class SplatSimGui(ThreadedTkinterGui):
                 self._mode_var.set(f"Mode: {mode}")
             except tk.TclError:
                 pass  # Window destroyed
+
+    def get_debug_mode(self) -> Any:
+        """Get the current debug mode selection.
+
+        Returns:
+            The DEBUG_MODES enum member, or None if not available.
+        """
+        return self.get_enum_value(self.DEBUG_MODE_KEY)

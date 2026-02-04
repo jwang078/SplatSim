@@ -300,11 +300,13 @@ def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base
         # Decompose A = U @ S_diag @ Vh
         # U and Vh are rotation matrices. S_vec is a vector of singular values.
         U, S_vec, Vh = torch.linalg.svd(A)
-    except torch._C._LinAlgError:
-        # Fallback if SVD fails (e.g., matrix is all zeros)
-        U = torch.eye(3, device=device)
-        S_vec = torch.ones(3, device=device)
-        Vh = torch.eye(3, device=device)
+    except (torch._C._LinAlgError, RuntimeError):
+        # Fallback if SVD fails on GPU (e.g., cusolver error) - try on CPU
+        try:
+            U, S_vec, Vh = torch.linalg.svd(A.cpu())
+            U, S_vec, Vh = U.to(device), S_vec.to(device), Vh.to(device)
+        except (torch._C._LinAlgError, RuntimeError) as e:
+            raise RuntimeError(f"SVD failed on both GPU and CPU for matrix:\n{A}") from e
 
     # --- 3. Find pure rotation R (and fix reflections) ---
     # R = U @ Vh. (Vh is V.T)

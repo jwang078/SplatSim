@@ -25,7 +25,8 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
     ENV_CONFIG = None
     background_splat_name = "robot_iphone"
-    TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
+    # TODO: Add table object to ENV_CONFIG and remove this hardcoded TABLE_LIMITS
+    # TABLE_LIMITS = ((0.2, 0.6), (-0.5, 0.5))
 
     # object_rot is only x and y. Since it's a tabletop, z is randomized
     GRASP_CONFIGS = {
@@ -342,11 +343,6 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
     def serve_loop(self) -> None:
         # To be called in the parent's serve()
 
-        # Check mode dropdown for mode changes
-        new_mode = self._check_mode_buttons()
-        if new_mode is not None:
-            self._handle_mode_transition(new_mode)
-
         if self.serve_mode == self.SERVE_MODES.INTERACTIVE:
             self.pybullet_client.stepSimulation()
             time.sleep(1 / 240)
@@ -355,22 +351,15 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
             self.randomize_object_pose()
             self.randomize_plate_and_drop_pose()
 
-            # Let the simulation settle
-            for i in range(10000):
-                self.pybullet_client.stepSimulation()
-                self.open_gripper()
-                for k in range(1, self.num_dofs()):
-                    self.pybullet_client.resetJointState(
-                        self.splatsim_robot.sim_id,
-                        k,
-                        self.initial_joint_state[k - 1] * self.joint_signs[k - 1],
-                    )
+            self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.articulation_config.initial_joint_positions)
+
             self.pybullet_client.stepSimulation()
 
             initial_joint_positions = self.randomize_ee_pose()
 
             success = self.plan_execute_record_trajectory(
-                initial_joint_positions, self.joint_signs
+                initial_joint_positions, 
+                self.splatsim_robot.articulation_config.joint_signs
             )
             if success:
                 self.trajectory_count += 1
@@ -418,18 +407,9 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
 
         # Get initial joint state and joint signs
         initial_joints = self.splatsim_robot.articulation_config.initial_joint_positions
-        joint_signs = self.splatsim_robot.articulation_config.joint_signs
 
         # Let simulation settle with robot in initial position
-        for _ in range(10000):
-            self.pybullet_client.stepSimulation()
-            self.open_gripper()
-            for k in range(1, self.num_dofs()):
-                self.pybullet_client.resetJointState(
-                    self.splatsim_robot.sim_id,
-                    k,
-                    initial_joints[k - 1] * joint_signs[k - 1],
-                )
+        self.teleport_joint_state(self.splatsim_robot, initial_joints)
 
         return self._get_gym_observation(), {"is_success": False}
 
