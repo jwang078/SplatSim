@@ -31,7 +31,7 @@ class SplatSimGymEnv(gym.Env):
         self,
         robot_server: PybulletRobotServerBase,
         render_mode: Optional[str] = None,
-        max_episode_steps: int = 200,
+        max_episode_steps: int = 300,
     ):
         """Initialize the Gym environment.
 
