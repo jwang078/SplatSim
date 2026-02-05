@@ -47,7 +47,7 @@ import pybullet_data
 from splatsim.utils.robot_splat_render_utils import (
     get_segmented_indices,
     transform_means,
-    get_transfomration_list,
+    get_transformation_list,
     transform_object,
     get_curr_link_states,
     crop_splat,
@@ -874,6 +874,9 @@ class PybulletRobotServerBase:
         if splatsim_obj.sim_id is not None:
             p.removeBody(splatsim_obj.sim_id)
 
+        # Invalidate scene gaussian buffers so they get reinitialized without the deleted object
+        self._invalidate_scene_gaussian_buffers()
+
     def clear_temp_objects(self):
         non_temp_object_names = [
             self.splatsim_robot.name,
@@ -986,6 +989,10 @@ class PybulletRobotServerBase:
             splatsim_obj.articulation_config.initial_link_poses = initial_link_poses
 
         self.splatsim_objects.append(splatsim_obj)
+
+        # Invalidate scene gaussian buffers so they get reinitialized with the new object
+        self._invalidate_scene_gaussian_buffers()
+
         return splatsim_obj
 
     def set_object_pose(
@@ -1177,129 +1184,122 @@ class PybulletRobotServerBase:
 
         return splatsim_camera
 
-    def prep_image_rendering(self, data) -> Dict[str, np.ndarray]:
-        # Transform each object splat to be in the right pose
-        del self.scene_gaussian._xyz
-        del self.scene_gaussian._rotation
-        del self.scene_gaussian._opacity
-        del self.scene_gaussian._features_rest
-        del self.scene_gaussian._features_dc
-        del self.scene_gaussian._scaling
+    def _init_scene_gaussian_buffers(self):
+        """Initialize pre-allocated buffers for scene_gaussian to avoid fragmentation.
 
-        xyz_obj_list = []
-        rot_obj_list = []
-        opacity_obj_list = []
-        scales_obj_list = []
-        features_dc_obj_list = []
-        features_rest_obj_list = []
-        for i in range(len(self.splatsim_objects)):
-            splatsim_obj = self.splatsim_objects[i]
+        Called automatically on first render and after objects are created/deleted.
+        """
+        # Calculate total number of gaussians across all rendered objects
+        total_gaussians = 0
+        self._scene_gaussian_offsets = {}  # Map object name to (start, end) indices
+
+        for splatsim_obj in self.splatsim_objects:
             if splatsim_obj.gaussians is None:
                 continue
+            if (splatsim_obj.object_config.get("is_in_scene_splat", False)
+                and not splatsim_obj.object_config.get("randomize_pose", True)):
+                continue
+            if self.debug_mode == DebugModes.NO_BACKGROUND and splatsim_obj == self.splatsim_background:
+                continue
 
-            if splatsim_obj.is_articulated:
-                assert (
-                    splatsim_obj == self.splatsim_robot
-                ), "Other articulated objects are not implemented yet"
+            n_gaussians = splatsim_obj.gaussians.get_xyz.shape[0]
+            self._scene_gaussian_offsets[splatsim_obj.name] = (total_gaussians, total_gaussians + n_gaussians)
+            total_gaussians += n_gaussians
 
-                # Gets transformations for all links of the robot based on the current simulation
-                transformations_list = get_transfomration_list(
-                    splatsim_obj.sim_id,
-                    splatsim_obj.articulation_config.initial_link_poses,
-                )
+        # Pre-allocate scene gaussian buffers
+        device = 'cuda'
+        self._scene_gaussian_buffers_initialized = True
+        self.scene_gaussian._xyz = torch.zeros(total_gaussians, 3, device=device, dtype=torch.float32)
+        self.scene_gaussian._rotation = torch.zeros(total_gaussians, 4, device=device, dtype=torch.float32)
+        self.scene_gaussian._opacity = torch.zeros(total_gaussians, 1, device=device, dtype=torch.float32)
+        self.scene_gaussian._scaling = torch.zeros(total_gaussians, 3, device=device, dtype=torch.float32)
+        self.scene_gaussian._features_dc = torch.zeros(total_gaussians, 1, 3, device=device, dtype=torch.float32)
+        self.scene_gaussian._features_rest = torch.zeros(total_gaussians, 15, 3, device=device, dtype=torch.float32)
 
-                # TODO generalize this to "every articulated object" instead of just the robot
-                (
-                    xyz_obj,
-                    rot_obj,
-                    opacity_obj,
-                    scales_obj,
-                    features_rest_obj,
-                    features_dc_obj,
-                ) = transform_means(
-                    splatsim_obj=splatsim_obj,
-                    transformations_list=transformations_list,
-                    use_base_position=True,
-                    inplace=False,
-                )
+    def _invalidate_scene_gaussian_buffers(self):
+        """Mark scene gaussian buffers as needing reinitialization.
 
-            else:
-                if (
-                    splatsim_obj.object_config.get("is_in_scene_splat", False)
-                    and not splatsim_obj.object_config.get("randomize_pose", True)
-                ):
-                    # Don't render this object because it's already in the scene splat. That calibration is the most accurate
-                    continue
-                if self.debug_mode == DebugModes.NO_BACKGROUND \
-                    and splatsim_obj == self.splatsim_background:
-                    continue
-                if splatsim_obj.sim_id is not None:
-                    cur_object_position = torch.tensor(
-                        data[splatsim_obj.name + "_position"], device="cuda"
-                    ).float()
-                    cur_object_rotation = torch.tensor(
-                        data[splatsim_obj.name + "_orientation"], device="cuda"
-                    ).float()
-                else:
-                    # TODO currently, objects that aren't urdfs in sim don't ever move
-                    cur_object_position = torch.tensor([0, 0, 0], device="cuda").float()
-                    cur_object_rotation = torch.tensor(
-                        [0, 0, 0, 1], device="cuda"
-                    ).float()
-                cur_object_rotation = torch.roll(
-                    cur_object_rotation,
-                    1,
-                )
+        Call this when objects are created or deleted.
+        """
+        self._scene_gaussian_buffers_initialized = False
 
-                (
-                    xyz_obj,
-                    rot_obj,
-                    opacity_obj,
-                    scales_obj,
-                    features_dc_obj,
-                    features_rest_obj,
-                ) = transform_object(
-                    splatsim_obj=splatsim_obj,
-                    pos=cur_object_position,
-                    quat=cur_object_rotation,
-                    use_base_position=True,
-                    inplace=False,
-                )
+    def prep_image_rendering(self, data) -> Dict[str, np.ndarray]:
+        # Initialize buffers on first call
+        if not getattr(self, '_scene_gaussian_buffers_initialized', False):
+            self._init_scene_gaussian_buffers()
 
-            xyz_obj_list.append(xyz_obj)
-            rot_obj_list.append(rot_obj)
-            opacity_obj_list.append(opacity_obj)
-            scales_obj_list.append(scales_obj)
-            features_dc_obj_list.append(features_dc_obj)
-            features_rest_obj_list.append(features_rest_obj)
-
-        # Combine splats of robot and of objects
+        # Transform each object splat to be in the right pose and copy into pre-allocated buffers
         with torch.no_grad():
-            # gaussians.active_sh_degree = 0
-            self.scene_gaussian._xyz = torch.cat(
-                xyz_obj_list,
-                dim=0,
-            )
-            self.scene_gaussian._rotation = torch.cat(
-                rot_obj_list,
-                dim=0,
-            )
-            self.scene_gaussian._opacity = torch.cat(
-                opacity_obj_list,
-                dim=0,
-            )
-            self.scene_gaussian._features_rest = torch.cat(
-                features_rest_obj_list,
-                dim=0,
-            )
-            self.scene_gaussian._features_dc = torch.cat(
-                features_dc_obj_list,
-                dim=0,
-            )
-            self.scene_gaussian._scaling = torch.cat(
-                scales_obj_list,
-                dim=0,
-            )
+            for i in range(len(self.splatsim_objects)):
+                splatsim_obj = self.splatsim_objects[i]
+                if splatsim_obj.gaussians is None:
+                    continue
+
+                # Skip objects not in the offset map (filtered during init)
+                if splatsim_obj.name not in self._scene_gaussian_offsets:
+                    continue
+
+                start_idx, end_idx = self._scene_gaussian_offsets[splatsim_obj.name]
+
+                # Build output_slices dict for zero-copy writes directly into scene_gaussian buffers
+                output_slices = {
+                    '_xyz': self.scene_gaussian._xyz[start_idx:end_idx],
+                    '_rotation': self.scene_gaussian._rotation[start_idx:end_idx],
+                    '_opacity': self.scene_gaussian._opacity[start_idx:end_idx],
+                    '_scaling': self.scene_gaussian._scaling[start_idx:end_idx],
+                    '_features_dc': self.scene_gaussian._features_dc[start_idx:end_idx],
+                    '_features_rest': self.scene_gaussian._features_rest[start_idx:end_idx],
+                }
+
+                if splatsim_obj.is_articulated:
+                    assert (
+                        splatsim_obj == self.splatsim_robot
+                    ), "Other articulated objects are not implemented yet"
+
+                    # Gets transformations for all links of the robot based on the current simulation
+                    transformations_list = get_transformation_list(splatsim_obj)
+
+                    # TODO generalize this to "every articulated object" instead of just the robot
+                    transform_means(
+                        splatsim_obj=splatsim_obj,
+                        transformations_list=transformations_list,
+                        use_base_position=True,
+                        inplace=False,
+                        output_slices=output_slices,
+                    )
+
+                else:
+                    if splatsim_obj.sim_id is not None:
+                        # Reuse cached tensors and copy data to avoid allocating new GPU memory each step
+                        if 'position_tensor' not in splatsim_obj._cache:
+                            splatsim_obj._cache['position_tensor'] = torch.zeros(3, device="cuda", dtype=torch.float32)
+                            splatsim_obj._cache['rotation_tensor'] = torch.zeros(4, device="cuda", dtype=torch.float32)
+                            splatsim_obj._cache['rotation_rolled'] = torch.zeros(4, device="cuda", dtype=torch.float32)
+                        cur_object_position = splatsim_obj._cache['position_tensor']
+                        cur_object_position.copy_(torch.as_tensor(data[splatsim_obj.name + "_position"], device="cuda"))
+                        rot_raw = splatsim_obj._cache['rotation_tensor']
+                        rot_raw.copy_(torch.as_tensor(data[splatsim_obj.name + "_orientation"], device="cuda"))
+                        # Roll quaternion from xyzw to wxyz format using pre-allocated tensor
+                        cur_object_rotation = splatsim_obj._cache['rotation_rolled']
+                        cur_object_rotation[0] = rot_raw[3]  # w
+                        cur_object_rotation[1:4] = rot_raw[0:3]  # xyz
+                    else:
+                        # Static objects: cache a zero position and identity rotation (already in wxyz format)
+                        if 'static_position' not in splatsim_obj._cache:
+                            splatsim_obj._cache['static_position'] = torch.tensor([0, 0, 0], device="cuda").float()
+                            # Identity quaternion in wxyz format: (1, 0, 0, 0)
+                            splatsim_obj._cache['static_rotation'] = torch.tensor([1, 0, 0, 0], device="cuda").float()
+                        cur_object_position = splatsim_obj._cache['static_position']
+                        cur_object_rotation = splatsim_obj._cache['static_rotation']
+
+                    transform_object(
+                        splatsim_obj=splatsim_obj,
+                        pos=cur_object_position,
+                        quat=cur_object_rotation,
+                        use_base_position=True,
+                        inplace=False,
+                        output_slices=output_slices,
+                    )
 
     def get_pybullet_debug_camera_as_splat_camera(self) -> SplatSimCamera:
         """Convert PyBullet's debug camera to a Camera object for Gaussian splatting."""
@@ -1441,10 +1441,10 @@ class PybulletRobotServerBase:
 
         rendering = render(
             camera.camera, self.scene_gaussian, camera.pipeline, camera.background
-        )["render"].cpu()
+        )["render"].cpu().numpy()
         # If you index "depth" instead of "render", you get the depth image
 
-        # save the image
+        # save the image (always as numpy array)
         return rendering
 
     def setup_camera_from_dataset(
@@ -1506,6 +1506,10 @@ class PybulletRobotServerBase:
             camera = scene.getTrainCameras(scale=cam_scale)[0]
         else:
             camera = scene.getTestCameras(scale=cam_scale)[0]
+
+        del scene
+        del temp_gaussian_model
+        del dataset
 
         ###################################################################
         # Transform the camera to be in the simulator frame instead of the splatsim background object's splat frame
@@ -1716,13 +1720,13 @@ class PybulletRobotServerBase:
             self.prep_image_rendering(data=observations)
             with torch.no_grad():
                 for camera_name in self.camera_names:
+                    # render_image returns numpy array directly
                     observations[camera_name] = self.render_image(
                         camera_name=camera_name
                     )
                     # Resize to 224x224 using configured mode (letterbox or stretch)
-                    if hasattr(observations[camera_name], 'cpu'):
-                        observations[camera_name] = observations[camera_name].cpu().numpy()
-                    observations[camera_name] = resize_image(observations[camera_name], (224, 224), mode=self.image_resize_mode)
+                    if observations[camera_name] is not None:
+                        observations[camera_name] = resize_image(observations[camera_name], (224, 224), mode=self.image_resize_mode)
 
             # Display the rendered observations
             self.display_observations(observations)

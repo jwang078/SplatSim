@@ -26,12 +26,13 @@ class SplatSimObject:
     splat_name: str
     sim_id: int = None
     mass: float = 0.0 # Default to static object
-    gaussians: Any = None 
+    gaussians: Any = None
     grasp_configs: List[dict] = field(default_factory=list)
     object_config: dict[Any] = None # The format in configs/object_configs/objects.yaml
     transformations_cache: dict[Any] = None
     is_articulated: bool = False # For example, the robot has is_articulated=True. An object with is_articulated should have articulation_config
     articulation_config: Optional[ArticulationConfig] = None
+    _cache: dict = field(default_factory=dict)  # Cache for GPU tensors to avoid recreating each step
 
 def high_precision_mode(func):
     """
@@ -74,7 +75,59 @@ def get_curr_link_states(robot_uid, use_link_centers=True):
     return link_states
 
 
+def get_transformation_list(splatsim_obj: SplatSimObject, use_link_centers=True):
+    """Get transformation matrices for each joint, using cached tensors to avoid GPU fragmentation.
+
+    Args:
+        splatsim_obj: The articulated SplatSimObject (must have articulation_config)
+        use_link_centers: Whether to use link center positions
+
+    Returns:
+        List of (r_rel, t) tuples for each joint
+    """
+    assert splatsim_obj.articulation_config is not None, "splatsim_obj must have articulation_config"
+    assert splatsim_obj.articulation_config.initial_link_poses is not None, "articulation_config must have initial_link_poses"
+
+    robot_uid = splatsim_obj.sim_id
+    initial_link_states = splatsim_obj.articulation_config.initial_link_poses
+    num_joints = p.getNumJoints(robot_uid)
+
+    new_joints = get_curr_link_states(robot_uid, use_link_centers=use_link_centers)
+
+    if len(initial_link_states) != num_joints or len(new_joints) != num_joints:
+        print(f"Error: Number of joints mismatch. Initial: {len(initial_link_states)}, New: {len(new_joints)}, Expected: {num_joints}")
+
+    # Initialize transform cache if needed
+    if 'transform_r_rel' not in splatsim_obj._cache:
+        splatsim_obj._cache['transform_r_rel'] = [
+            torch.zeros(3, 3, device='cuda', dtype=torch.float32) for _ in range(num_joints)
+        ]
+        splatsim_obj._cache['transform_t'] = [
+            torch.zeros(3, device='cuda', dtype=torch.float32) for _ in range(num_joints)
+        ]
+
+    transformations_list = []
+    for joint_index in range(num_joints):
+        # x, y, z, q
+        input_1 = (initial_link_states[joint_index]["pos"][0], initial_link_states[joint_index]["pos"][1], initial_link_states[joint_index]["pos"][2], np.array(initial_link_states[joint_index]["q"]))
+        input_2 = (new_joints[joint_index]["pos"][0], new_joints[joint_index]["pos"][1], new_joints[joint_index]["pos"][2], np.array(new_joints[joint_index]["q"]))
+        # this takes in q = (x,y,z,w) format for quaternions
+        r_rel_np, t_np = compute_transformation(input_1, input_2)
+        # Reuse cached tensors - copy data instead of creating new GPU tensors
+        splatsim_obj._cache['transform_r_rel'][joint_index].copy_(torch.from_numpy(r_rel_np))
+        splatsim_obj._cache['transform_t'][joint_index].copy_(torch.from_numpy(t_np))
+
+        transformations_list.append((
+            splatsim_obj._cache['transform_r_rel'][joint_index],
+            splatsim_obj._cache['transform_t'][joint_index]
+        ))
+
+    return transformations_list
+
+
+# Keep old function name for backwards compatibility with other files
 def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=True):
+    """Deprecated: Use get_transformation_list(splatsim_obj) instead for better memory efficiency."""
     num_joints = p.getNumJoints(robot_uid)
 
     new_joints = get_curr_link_states(robot_uid, use_link_centers=use_link_centers)
@@ -91,7 +144,7 @@ def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=Tru
         r_rel, t = compute_transformation(input_1, input_2)
         r_rel = torch.from_numpy(r_rel).to(device='cuda').float()
         t = torch.from_numpy(t).to(device='cuda').float()
-        
+
         transformations_list.append((r_rel, t))
 
     return transformations_list
@@ -120,25 +173,60 @@ def crop_splat(splatsim_obj: SplatSimObject, keep_within_aabb=True):
         splatsim_obj.gaussians._scaling = pc._scaling[segmented_indices]
 
 @high_precision_mode
-def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base_position=True, inplace=False):
+def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base_position=True, inplace=False, output_slices=None):
+    """Transform articulated object gaussians (e.g., robot with multiple joints).
+
+    Args:
+        splatsim_obj: The articulated SplatSimObject
+        transformations_list: List of (r_rel, t) tuples for each joint
+        use_base_position: Whether to apply base position offset
+        inplace: If True, save outputs directly into splatsim_obj.gaussians
+        output_slices: If provided, a dict of pre-sliced tensor views to write into directly.
+            Expected keys: '_xyz', '_rotation', '_opacity', '_scaling', '_features_dc', '_features_rest'
+            This avoids creating intermediate tensors and improves memory efficiency.
+
+    Returns:
+        If output_slices is None: tuple of (xyz, rot, opacity, scales, features_rest, features_dc)
+        If output_slices is provided: None (data written directly to slices)
+    """
     # xyz is in global frame. pc is in splat frame
     pc = splatsim_obj.gaussians
     robot_uid = splatsim_obj.sim_id
-    xyz = copy.deepcopy(splatsim_obj.gaussians.get_xyz)
     segmented_list = splatsim_obj.articulation_config.segmented_list
 
-    # Note: this function does NOT handle transformation matrices with scaling factors in the rotation matrix area
-    # Assume that it was handled already in object creation. The objects do not change size during runtime
-    scales_obj = pc._scaling # pc.get_scaling is exp(pc._scaling)
+    # If writing to output_slices, use them as our working buffers
+    if output_slices is not None:
+        xyz = output_slices['_xyz']
+        xyz.copy_(pc.get_xyz)
+        rot = output_slices['_rotation']
+        rot.copy_(pc.get_rotation)
+        shs_featrest = output_slices['_features_rest']
+        shs_featrest.copy_(pc._features_rest)
+        # These don't need transformation per-segment, just copy once at the end
+        scales_obj = pc._scaling
+        opacity = pc.get_opacity_raw
+        shs_dc = pc._features_dc
+    else:
+        # Use .clone() instead of copy.deepcopy - much more efficient for GPU tensors
+        xyz = pc.get_xyz.clone()
+        # Clone rotation since we modify it in-place per segment
+        rot = pc.get_rotation.clone()
+        # Clone features_rest since transform_shs modifies it in-place
+        # features_dc is not modified, so we can reference it directly
+        with torch.no_grad():
+            shs_dc = pc._features_dc
+            shs_featrest = pc._features_rest.clone()
+        scales_obj = pc._scaling
+        opacity = pc.get_opacity_raw
 
-    rot = pc.get_rotation
-    opacity = pc.get_opacity_raw
-    with torch.no_grad():
-        shs_dc = pc._features_dc.clone()
-        shs_featrest = pc._features_rest.clone()
-
+    # Cache base_position on the splatsim_obj to avoid recreating tensor each step
     if use_base_position:
-        base_position = torch.tensor(splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0], device='cuda').float()
+        if 'base_position' not in splatsim_obj._cache:
+            splatsim_obj._cache['base_position'] = torch.tensor(
+                splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0],
+                device='cuda'
+            ).float()
+        base_position = splatsim_obj._cache['base_position']
 
     for joint_index in range(p.getNumJoints(robot_uid)):
         r_rel, t = transformations_list[joint_index] # T between initial link and current link
@@ -160,7 +248,16 @@ def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base
         shs_feat = transform_shs(shs_feat, rot_rotation_matrix)
         with torch.no_grad():
             shs_featrest[segment] = shs_feat
-           
+
+    # If output_slices provided, copy the non-transformed data into the slices
+    if output_slices is not None:
+        output_slices['_opacity'].copy_(opacity)
+        output_slices['_scaling'].copy_(scales_obj)
+        output_slices['_features_dc'].copy_(shs_dc)
+        # xyz, rot, features_rest were already written in-place above
+        # Return the slices (which are views into the scene_gaussian buffers)
+        return xyz, rot, opacity, scales_obj, shs_featrest, shs_dc
+
     return xyz, rot, opacity, scales_obj, shs_featrest, shs_dc
 
 def create_cuboid_gaussians(
@@ -276,105 +373,119 @@ def build_matrix_from_r_t(r, t, device='cuda'):
     return transform
 
 @high_precision_mode
-def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base_position=True, inplace=False):
+def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base_position=True, inplace=False, output_slices=None):
     """
-    Transforms all properties of a Gaussian splat object (splatsim_obj)
-    using a 4x4 transformation matrix.
-    
-    This function correctly handles non-uniform scaling by using SVD
-    to decompose the transformation into its rotation and scaling components.
+    Transforms all properties of a Gaussian splat object using a 4x4 transformation matrix.
+    Memory-efficient: writes directly to output_slices if provided.
     """
-    assert (pos is not None and quat is not None) + (transform is not None) == 1, "Provide either (a pos and a quat) or (a 4x4 transform matrix)"
+    assert (pos is not None and quat is not None) + (transform is not None) == 1, \
+        "Provide either (a pos and a quat) or (a 4x4 transform matrix)"
 
     pc = splatsim_obj.gaussians
     device = pc.get_xyz.device
 
-    # Unify the representation to a 4x4 transform matrix
+    # --- 1. Unify Representation (4x4 Matrix) ---
     if transform is None:
-        transform = transform_from_pos_quat(pos, quat, device)
+        if 'transform_matrix' not in splatsim_obj._cache:
+            splatsim_obj._cache['transform_matrix'] = torch.eye(4, device=device, dtype=torch.float32)
+        transform = splatsim_obj._cache['transform_matrix']
 
-    A = transform[:3, :3] # Scaling + Rotation part
-    t = transform[:3, 3] # Translation part
+        if not isinstance(quat, torch.Tensor):
+            quat = torch.as_tensor(quat, device=device, dtype=torch.float32)
+        rot_mat_tensor = o3.quaternion_to_matrix(quat)
 
+        if not isinstance(pos, torch.Tensor):
+            pos = torch.as_tensor(pos, device=device, dtype=torch.float32)
+
+        transform[:3, :3] = rot_mat_tensor.to(device, torch.float32)
+        transform[:3, 3] = pos.to(device, torch.float32)
+        transform[3, :3] = 0
+        transform[3, 3] = 1
+
+    A = transform[:3, :3] 
+    t = transform[:3, 3]
+
+    # --- 2. SVD Decomposition for Scaling/Rotation ---
     try:
-        # Decompose A = U @ S_diag @ Vh
-        # U and Vh are rotation matrices. S_vec is a vector of singular values.
         U, S_vec, Vh = torch.linalg.svd(A)
     except (torch._C._LinAlgError, RuntimeError):
-        # Fallback if SVD fails on GPU (e.g., cusolver error) - try on CPU
         try:
             U, S_vec, Vh = torch.linalg.svd(A.cpu())
             U, S_vec, Vh = U.to(device), S_vec.to(device), Vh.to(device)
-        except (torch._C._LinAlgError, RuntimeError) as e:
-            raise RuntimeError(f"SVD failed on both GPU and CPU for matrix:\n{A}") from e
+        except Exception as e:
+            raise RuntimeError(f"SVD failed for matrix:\n{A}") from e
 
-    # --- 3. Find pure rotation R (and fix reflections) ---
-    # R = U @ Vh. (Vh is V.T)
     R_mat = U @ Vh
-    # SVD can produce a reflection (det(R) = -1) if one scale is negative.
-    # We fix this to get a proper rotation matrix.
     if torch.linalg.det(R_mat) < 0:
-        U[:, -1] *= -1 # Invert the last column of U
-        S_vec[-1] *= -1 # And invert the last scaling factor
+        U[:, -1] *= -1
+        S_vec[-1] *= -1
         R_mat = U @ Vh
 
-    # --- 4. Get all Gaussian properties ---
-    xyz_old = pc.get_xyz
-    rot_old = pc.get_rotation     # (N, 4) quaternions
-    scales_old = pc.get_scaling  # (N, 3) scales (already exp(log_scales))
-    opacity_obj = pc.get_opacity_raw
+    # --- 3. Compute Transformed Values ---
     
-    with torch.no_grad():
-        features_dc_obj = pc._features_dc.clone()
-        features_rest_obj = pc._features_rest.clone()
-
-    # --- 5. Apply transformations to each property ---
-    # 1. Positions: Apply full A matrix and t
-    # (N, 3) @ (3, 3) -> (N, 3). Then add translation.
+    # 3a. Position
+    xyz_old = pc.get_xyz
     if use_base_position:
-        base_position = torch.tensor(splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0], device='cuda').float()
-        rotated_base_position = base_position @ A.T
-        # The transform's t includes the base position offset because it was computed in world frame
-        # xyz is in the object frame, so we need to remove the base position effect
-        xyz_obj = (xyz_old + base_position) @ A.T - rotated_base_position + t
+        if 'base_position' not in splatsim_obj._cache:
+            splatsim_obj._cache['base_position'] = torch.tensor(
+                splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0],
+                device=device
+            ).float()
+        base_pos = splatsim_obj._cache['base_position']
+        rotated_base = base_pos @ A.T
+        xyz_final = (xyz_old + base_pos) @ A.T - rotated_base + t
     else:
-        xyz_obj = xyz_old @ A.T + t
+        xyz_final = xyz_old @ A.T + t
 
-    # 2. Rotations: Compose with pure rotation R_mat
-    # We must convert old rotations to matrices, multiply, then convert back
-    rot_old_mat = o3.quaternion_to_matrix(rot_old) # (N, 3, 3)
-    # (1, 3, 3) @ (N, 3, 3) -> (N, 3, 3)
-    rot_new_mat = R_mat.unsqueeze(0) @ rot_old_mat 
-    # import pdb; pdb.set_trace()
-    rot_obj = o3.matrix_to_quaternion(rot_new_mat) # (N, 4)
+    # 3b. Rotation
+    rot_old_mat = o3.quaternion_to_matrix(pc.get_rotation)
+    rot_new_mat = R_mat.unsqueeze(0) @ rot_old_mat
+    rot_final = o3.matrix_to_quaternion(rot_new_mat)
 
-    # 3. Scales: Multiply with pure scaling S_vec
-    # (N, 3) * (1, 3) -> (N, 3)
-    scales_new = scales_old * S_vec.unsqueeze(0)
-    scales_obj = torch.log(scales_new) # Save back in log space
+    # 3c. Scaling
+    scales_final = torch.log(pc.get_scaling * S_vec.unsqueeze(0))
 
-    # 4. SH Features: Transform with pure rotation R_mat
-    features_rest_obj = transform_shs(features_rest_obj, R_mat)
+    # --- 4. Assign to Final Buffers (Slices or New Tensors) ---
+    if output_slices is not None:
+        xyz_obj = output_slices['_xyz'].copy_(xyz_final)
+        rot_obj = output_slices['_rotation'].copy_(rot_final)
+        scales_obj = output_slices['_scaling'].copy_(scales_final)
+        opacity_obj = output_slices['_opacity'].copy_(pc.get_opacity_raw)
+        features_dc_obj = output_slices['_features_dc'].copy_(pc._features_dc)
+        # Copy features_rest to slice first, then transform in-place (avoids clone allocation)
+        output_slices['_features_rest'].copy_(pc._features_rest)
+        features_rest_obj = transform_shs(output_slices['_features_rest'], R_mat)
+    else:
+        xyz_obj = xyz_final
+        rot_obj = rot_final
+        scales_obj = scales_final
+        opacity_obj = pc.get_opacity_raw.clone()
+        features_dc_obj = pc._features_dc.clone()
+        features_rest_obj = transform_shs(pc._features_rest.clone(), R_mat)
 
+    # --- 5. Finalize ---
     if inplace:
-        splatsim_obj.gaussians._xyz = xyz_obj
-        splatsim_obj.gaussians._rotation = rot_obj
-        splatsim_obj.gaussians._opacity = opacity_obj
-        splatsim_obj.gaussians._features_dc = features_dc_obj
-        splatsim_obj.gaussians._features_rest = features_rest_obj
-        splatsim_obj.gaussians._scaling = scales_obj
+        pc._xyz = xyz_obj
+        pc._rotation = rot_obj
+        pc._opacity = opacity_obj
+        pc._features_dc = features_dc_obj
+        pc._features_rest = features_rest_obj
+        pc._scaling = scales_obj
         if splatsim_obj.articulation_config is not None:
-            # Update the initial link poses after transforming the robot
-            splatsim_obj.articulation_config.initial_link_poses = get_curr_link_states(
-                splatsim_obj.sim_id
-            )
+            splatsim_obj.articulation_config.initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
 
     return xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
+
+# Cached permutation matrix for transform_shs (created once, reused)
+_P_MATRIX_CACHE = {}
 
 @high_precision_mode
 def transform_shs(shs_feat, rotation_matrix):
     ## rotate shs
-    P = torch.tensor([[0, 0, 1], [1, 0, 0], [0, 1, 0]], device=rotation_matrix.device).float() # switch axes: yzx -> xyz
+    device = rotation_matrix.device
+    if device not in _P_MATRIX_CACHE:
+        _P_MATRIX_CACHE[device] = torch.tensor([[0, 0, 1], [1, 0, 0], [0, 1, 0]], device=device).float()
+    P = _P_MATRIX_CACHE[device]
     permuted_rotation_matrix = torch.linalg.inv(P) @ rotation_matrix @ P
     rot_angles = o3._rotation.matrix_to_angles(permuted_rotation_matrix)
     rot_angles = (rot_angles[0].cpu(), rot_angles[1].cpu(), rot_angles[2].cpu())

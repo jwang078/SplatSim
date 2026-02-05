@@ -506,7 +506,11 @@ class GuiBuilder:
         )
 
         # Create a StringVar that stores the enum's value (not name)
-        var = tk.StringVar(value=value.value)
+        # Handle both enum members and string values
+        if isinstance(value, str):
+            var = tk.StringVar(value=value)
+        else:
+            var = tk.StringVar(value=value.value)
         self._gui._values[param.key] = var
 
         # Store enum class for later lookup
