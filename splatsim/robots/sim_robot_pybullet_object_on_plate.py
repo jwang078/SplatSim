@@ -105,6 +105,42 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
         quat = self.pybullet_client.getQuaternionFromEuler([0, np.pi / 2, 0])
         self.wall = self.pybullet_client.loadURDF("plane.urdf", [-0.4, 0, 0.0], quat)
 
+        # TODO add this functionality back:
+        # # reset the box position
+        # for splatsim_obj in self.splatsim_objects:
+        #     if splatsim_obj.name == "plate":
+        #         self.pybullet_client.resetBasePositionAndOrientation(
+        #             splatsim_obj.sim_id,
+        #             [0.3, -0.5, 0.02],
+        #             p.getQuaternionFromEuler([0, 0, np.pi / 2]),
+        #         )
+        #         break
+        # set the drop location for the apple and banana
+        # self.drop_ee_pos = [0.3, -0.5, 0.3]
+        # self.drop_ee_euler = [-np.pi / 2, 0, -np.pi / 2]
+        # self.drop_ee_quat = self.pybullet_client.getQuaternionFromEuler(
+        #     self.drop_ee_euler
+        # )
+        # limits are +-pi of the initial joint positions
+        # self.drop_ee_joint = self.pybullet_client.calculateInverseKinematics(
+        #     self.splatsim_robot.sim_id,
+        #     6,
+        #     self.drop_ee_pos,
+        #     self.drop_ee_quat,
+        #     maxNumIterations=100000,
+        #     residualThreshold=1e-10,
+        #     lowerLimits=self.lower_limits,
+        #     upperLimits=self.upper_limits,
+        # )
+        # print("drop_ee_joint", self.drop_ee_joint)
+        # set the joint positions to the drop location
+        # for i in range(1, self.num_dofs()):
+        #     self.pybullet_client.resetJointState(
+        #         self.splatsim_robot.sim_id, i, self.drop_ee_joint[i - 1]
+        #     )
+        # change the friction of the plane
+        # self.pybullet_client.changeDynamics(self.plane, -1, lateralFriction=random.uniform(0.2, 1.1))
+
     def plan_given_this_state(self, initial_joint_positions):
         all_paths = []
 

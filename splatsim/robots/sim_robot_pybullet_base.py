@@ -262,8 +262,9 @@ class PybulletRobotServerBase:
         raise ValueError("TABLE_LIMITS requested but no 'table' object is defined in ENV_CONFIG['objects'].")
 
     # Gym environment constants
-    DEFAULT_MAX_EPISODE_STEPS = 500
-    DEFAULT_PHYSICS_STEPS_PER_ACTION = 12  # 240Hz physics / 20Hz control
+    _max_episode_steps = 400 # Can overwrite this in a child class
+    # 240Hz physics / 30Hz control
+    _physics_steps_per_action = 8  # Can overwrite this in a child class
 
     # This is the default splat name. Overwrite it in a child class of PybulletRobotServerBase
     background_splat_name = None
@@ -308,6 +309,8 @@ class PybulletRobotServerBase:
         self.image_width = image_width
         self.image_height = image_height
         self.use_gripper = use_gripper
+        if isinstance(debug_mode, str):
+            debug_mode = self.DEBUG_MODES(debug_mode)
         assert debug_mode in self.DEBUG_MODES, f"debug_mode must be one of {list(self.DEBUG_MODES)}, got {debug_mode}"
         self.debug_mode = debug_mode
         # Image resize mode: "letterbox" (preserve aspect ratio, pad) or "stretch" (fill entire area)
@@ -327,15 +330,36 @@ class PybulletRobotServerBase:
         self._display_queue: queue.Queue = queue.Queue()
         self._main_thread_id = threading.current_thread().ident
 
-        self.pybullet_client = p
+        # Populate this on the fly if it's needed
+        self.base_cuboid_gaussians = None
+
+        ## add stage
+        self.stage = 0
+
+        self.do_render_from_splat = True
+
+        # Placeholder object for rendering purposes
+        self.scene_gaussian = GaussianModel(3)
+
         self.object_config_path = str(SPLATSIM_ROOT / "configs" / "object_configs" / "objects.yaml")
         self.grasp_poses = {}
+
+        self.pybullet_client = p
         self.pybullet_client.connect(p.GUI)
         self.pybullet_client.setAdditionalSearchPath(
             str(SPLATSIM_ROOT.parent / "submodules" / "pybullet-playground-wrapper" / "pybullet_playground" / "urdf" / "pybullet_ur5_gripper" / "urdf")
         )
         # Enable GUI for trajectory generation controls (sliders/buttons)
         self.pybullet_client.configureDebugVisualizer(p.COV_ENABLE_GUI, 1)
+
+        # set time step
+        self.pybullet_client.setTimeStep(1 / 240)
+        # add gravity
+        self.pybullet_client.setGravity(0, 0, -9.81)
+
+        # For plane.urdf
+        self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
+
 
         with open(self.object_config_path, "r") as file:
             self.object_config = yaml.safe_load(file)
@@ -346,24 +370,10 @@ class PybulletRobotServerBase:
 
         self.models_lib = MockModelsLib  # md.model_lib()
 
-        # For plane.urdf
-        self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
-
         self.splatsim_objects: List[SplatSimObject] = []
         self.splatsim_robot: SplatSimObject = self.create_object(
             object_name="robot", splat_object_name=self.robot_name
         )
-
-        # Always initialize trajectory generator (for GUI defaults and potential mode switching)
-        # Get EE link index function
-        def get_ee_link():
-            return self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id) - 1
-
-        # Get movable joint indices (first 6 joints, excluding gripper)
-        movable_joints = list(range(1, 7))
-
-        # Get wrist camera link name from robot config
-        wrist_camera_link_name = self.splatsim_robot.object_config.get("wrist_camera_link_name", None)
 
         # Initialize trajectory generation config and generator
         # TrajectoryGenerator has the default values; we only merge subclass and CLI overrides
@@ -373,15 +383,14 @@ class PybulletRobotServerBase:
             **getattr(self, 'TRAJECTORY_GEN_CONFIG', {}),
             **cli_config
         }
-
         self.trajectory_generator = TrajectoryGenerator(
             pybullet_client=self.pybullet_client,
             robot_id=self.splatsim_robot.sim_id,
-            joint_indices=movable_joints,
+            joint_indices=list(range(1, 7)), # excludes gripper
             env_config_name=self.ENV_CONFIG.name,
-            get_ee_link_fn=get_ee_link,
+            get_ee_link_fn=lambda: self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id) - 1,
             splatsim_objects=self.splatsim_objects,
-            wrist_camera_link_name=wrist_camera_link_name,
+            wrist_camera_link_name=self.splatsim_robot.object_config.get("wrist_camera_link_name", None),
             **trajectory_gen_config,
         )
 
@@ -414,16 +423,6 @@ class PybulletRobotServerBase:
             if joint_name == "ee_fixed_joint":
                 self.ur5e_ee_id = joint_id
 
-        # self.offsets = [np.pi / 2, 0, 0, 0, 0, 0, 0]
-        # This has an extra 0 at the beginning for the world joint, and then another 0 for a fixed joint, I think
-        # self.initial_joint_state = self.splatsim_robot.object_config["joint_states"][0]
-        # Remove the extra 0 for the world joint
-        # self.initial_joint_state = self.initial_joint_state[1:]
-        # + 1 joint for the world joint at the beginning which will be skipped
-
-        # model_lib = md.model_lib()
-        # objectid = self.pybullet_client.loadURDF(model_lib['potato_chip_1'], [0.5, 0.15, 0])
-
         for object_cfg in self.ENV_CONFIG.objects:
             object_name = object_cfg.object_name
             splat_object_name = getattr(object_cfg, "splat_object_name", None)
@@ -444,88 +443,9 @@ class PybulletRobotServerBase:
 
             splatsim_object.grasp_configs = grasp_config
 
-        # Populate this on the fly if it's needed
-        self.base_cuboid_gaussians = None
-
         self.randomize_object_pose()
 
-        # reset the box position
-        for splatsim_obj in self.splatsim_objects:
-            if splatsim_obj.name == "plate":
-                self.pybullet_client.resetBasePositionAndOrientation(
-                    splatsim_obj.sim_id,
-                    [0.3, -0.5, 0.02],
-                    p.getQuaternionFromEuler([0, 0, np.pi / 2]),
-                )
-                break
-
-        # set the drop location for the apple and banana
-        self.drop_ee_pos = [0.3, -0.5, 0.3]
-        self.drop_ee_euler = [-np.pi / 2, 0, -np.pi / 2]
-        self.drop_ee_quat = self.pybullet_client.getQuaternionFromEuler(
-            self.drop_ee_euler
-        )
-
-        # set initial joint positions
-        for i in range(
-            1, len(self.splatsim_robot.articulation_config.initial_joint_positions)
-        ):
-            self.pybullet_client.resetJointState(
-                self.splatsim_robot.sim_id,
-                i,
-                self.splatsim_robot.articulation_config.initial_joint_positions[i - 1],
-            )
-
-        # limits are +-pi of the initial joint positions
-        self.drop_ee_joint = self.pybullet_client.calculateInverseKinematics(
-            self.splatsim_robot.sim_id,
-            6,
-            self.drop_ee_pos,
-            self.drop_ee_quat,
-            maxNumIterations=100000,
-            residualThreshold=1e-10,
-            lowerLimits=self.lower_limits,
-            upperLimits=self.upper_limits,
-        )
-
-        print("drop_ee_joint", self.drop_ee_joint)
-
-        # set the joint positions to the drop location
-
-        for i in range(1, self.num_dofs()):
-            self.pybullet_client.resetJointState(
-                self.splatsim_robot.sim_id, i, self.drop_ee_joint[i - 1]
-            )
-
-        # change the friction of the object
-        for splatsim_obj in self.splatsim_objects:
-            if splatsim_obj.sim_id is not None:
-                self.pybullet_client.changeDynamics(
-                    splatsim_obj.sim_id, -1, lateralFriction=1.5
-                )
-                # rolling friction
-                self.pybullet_client.changeDynamics(
-                    splatsim_obj.sim_id, -1, rollingFriction=0
-                )
-                inertia = p.getDynamicsInfo(splatsim_obj.sim_id, -1)[2]
-
-        # add gravity
-        self.pybullet_client.setGravity(0, 0, -9.81)
-
-        ## add stage
-        self.stage = 0
-
-        self.do_render_from_splat = True
-
-        # change the friction of the plane
-        # self.pybullet_client.changeDynamics(self.plane, -1, lateralFriction=random.uniform(0.2, 1.1))
-
-        # set time step
-        self.pybullet_client.setTimeStep(1 / 240)
-
-        # current gripper state
-        self.current_gripper_action = GripperState.OPEN
-
+        # TODO put all trajectory saving into TrajectoryGenerator
         # trajectory path
         with open(resolve_splatsim_path("configs/folder_configs.yaml"), "r") as f:
             folder_config = yaml.safe_load(f)
@@ -536,21 +456,13 @@ class PybulletRobotServerBase:
         else:
             self.trajectory_count = 0
 
-        # step simulation
-        for i in range(100):
-            self.pybullet_client.stepSimulation()
-            # time.sleep(1/240)
-
-        # Placeholder object for rendering purposes
-        self.scene_gaussian = GaussianModel(3)
-
         # Always set up the base camera because wrist_rgb is initialized from it
         self.base_camera = self.setup_camera_from_dataset(
             self.splatsim_background.object_config, cam_i=self.cam_i, use_train=True
         )
 
         if "wrist_rgb" in self.camera_names:
-            # Hardcoding a splat dataset / recovered camera from a GoPro
+            # TODO Hardcoding a splat dataset / recovered camera from a GoPro
             self.wrist_camera = self.setup_camera_from_dataset(
                 self.object_config["bwa_open_space"], cam_i=3, use_train=True
             )
@@ -582,58 +494,12 @@ class PybulletRobotServerBase:
                 f"wrist_camera_link_name attribute not defined in object config of robot {self.robot_name}, yet wrist camera was requested"
             )
 
-        # Prepare for teleport by removing forces
-        for i in range(
-            len(self.splatsim_robot.articulation_config.initial_joint_positions)
-        ):
-            self.pybullet_client.setJointMotorControl2(
-                self.splatsim_robot.sim_id,
-                i,
-                self.pybullet_client.VELOCITY_CONTROL,
-                force=0,
-            )
-        # Reset joint states by teleporting
-        self.teleport_joint_state(
-            self.splatsim_robot,
-            self.splatsim_robot.articulation_config.initial_joint_positions,
-        )
-        # for i in range(1, len(self.initial_joint_state)):
-        #     self.pybullet_client.resetJointState(
-        #         self.splatsim_robot.sim_id,
-        #         i,
-        #         self.initial_joint_state[i - 1] * self.joint_signs[i - 1],
-        #     )
-
-        # get end effector position and orientation
-
-        # TODO re-enable
-        # for i in range(1, self.num_dofs()):
-        #     self.pybullet_client.setJointMotorControl2(
-        #         self.splatsim_robot.sim_id,
-        #         i,
-        #         p.VELOCITY_CONTROL,
-        #         targetPosition=self.splatsim_robot.articulation_config.initial_joint_positions[i - 1]
-        #         * self.splatsim_robot.articulation_config.joint_signs[i - 1],
-        #         force=250,
-        #         maxVelocity=0.2,
-        #     )
-        # self.close_gripper()
-
-        # print joint angles
-        joint_states = []
-        for i in range(
-            1, len(self.splatsim_robot.articulation_config.initial_joint_positions)
-        ):
-            joint_states.append(
-                self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
-            )
-
+        # current gripper state
+        self.current_gripper_action = GripperState.OPEN
         self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.articulation_config.initial_joint_positions)
 
         # Gym-related state
         self._step_count = 0
-        self._max_episode_steps = self.DEFAULT_MAX_EPISODE_STEPS
-        self._physics_steps_per_action = self.DEFAULT_PHYSICS_STEPS_PER_ACTION
         self._episode_started = False
 
     def num_dofs(self) -> int:
@@ -773,6 +639,14 @@ class PybulletRobotServerBase:
 
         splatsim_obj.sim_id = object_loaded
         splatsim_obj.mass = mass
+
+        # Set friction
+        self.pybullet_client.changeDynamics(
+            splatsim_obj.sim_id, -1, lateralFriction=1.5
+        )
+        self.pybullet_client.changeDynamics(
+            splatsim_obj.sim_id, -1, rollingFriction=0
+        )
 
     def load_gaussian_splat(self, splatsim_obj):
         # Most of these representations are in the splat frame, so we need to transform to simulator frame
@@ -1075,7 +949,8 @@ class PybulletRobotServerBase:
                 i,
                 p.POSITION_CONTROL,
                 targetPosition=target_position,
-                force=500,
+                force=150,
+                maxVelocity=3.14,
             )
 
     def command_joint_state(self, joint_state: np.ndarray) -> None:
@@ -1090,8 +965,9 @@ class PybulletRobotServerBase:
                 i,
                 p.POSITION_CONTROL,
                 targetPosition=joint_state[i - 1],
-                force=1000,
-                # force=250,
+                # Set a more realistic force for the robot
+                force=150,
+                maxVelocity=3.14,
             )
 
         if self.use_gripper:
@@ -1432,8 +1308,6 @@ class PybulletRobotServerBase:
         print("PyBullet camera updated!\n")
 
     def render_image(self, camera_name):
-        # TODO make this into a config
-
         if camera_name == "base_rgb":
             if self.debug_mode != DebugModes.OFF:
                 camera = self.get_pybullet_debug_camera_as_splat_camera()
@@ -2079,18 +1953,18 @@ class PybulletRobotServerBase:
 
         print("Ready to serve.")
 
-        # Set motors to hold current position to prevent arm from falling due to gravity
-        for i in range(1, self.num_dofs()):
-            current_pos = self.pybullet_client.getJointState(
-                self.splatsim_robot.sim_id, i
-            )[0]
-            self.pybullet_client.setJointMotorControl2(
-                self.splatsim_robot.sim_id,
-                i,
-                self.pybullet_client.POSITION_CONTROL,
-                targetPosition=current_pos,
-                force=500,  # Enough force to hold against gravity
-            )
+        # # Set motors to hold current position to prevent arm from falling due to gravity
+        # for i in range(1, self.num_dofs()):
+        #     current_pos = self.pybullet_client.getJointState(
+        #         self.splatsim_robot.sim_id, i
+        #     )[0]
+        #     self.pybullet_client.setJointMotorControl2(
+        #         self.splatsim_robot.sim_id,
+        #         i,
+        #         self.pybullet_client.POSITION_CONTROL,
+        #         targetPosition=current_pos,
+        #         force=500,  # Enough force to hold against gravity
+        #     )
         
         while True:
             # Process any pending display requests from ZMQ thread

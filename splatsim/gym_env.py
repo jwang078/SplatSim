@@ -31,21 +31,19 @@ class SplatSimGymEnv(gym.Env):
         self,
         robot_server: PybulletRobotServerBase,
         render_mode: Optional[str] = None,
-        max_episode_steps: int = 200,
     ):
         """Initialize the Gym environment.
 
         Args:
             robot_server: Instance of PybulletRobotServerBase or subclass
             render_mode: 'rgb_array' for pixel observations
-            max_episode_steps: Maximum steps per episode (default 400, matching Aloha at 50fps = 8 seconds)
         """
         super().__init__()
         self.robot_server = robot_server
         self.render_mode = render_mode
         self.action_space = robot_server.action_space
         self.observation_space = robot_server.observation_space
-        self._max_episode_steps = max_episode_steps
+        self._max_episode_steps = robot_server._max_episode_steps
 
     def step(self, action: np.ndarray):
         """Execute one step in the environment."""
