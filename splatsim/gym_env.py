@@ -93,7 +93,9 @@ class SplatSimGymEnv(gym.Env):
 
     def close(self):
         """Clean up resources."""
-        pass
+        if self.robot_server is not None:
+            self.robot_server.stop()
+            self.robot_server = None
 
     @property
     def task_description(self) -> str:

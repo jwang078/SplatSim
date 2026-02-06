@@ -141,7 +141,10 @@ class ThreadedTkinterGui(ABC):
         self._thread.start()
 
     def stop(self):
-        """Stop the GUI and close the window (thread-safe)."""
+        """Stop the GUI and close the window (thread-safe).
+
+        Waits for the GUI thread to finish to ensure proper cleanup.
+        """
         self._shutdown_requested = True
         self._running = False
         if self._root:
@@ -150,10 +153,32 @@ class ThreadedTkinterGui(ABC):
             except tk.TclError:
                 pass
 
+        # Wait for the GUI thread to finish (with timeout to avoid deadlock)
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
     def _destroy_window(self):
-        """Destroy window - must be called from GUI thread."""
+        """Destroy window - must be called from GUI thread.
+
+        Explicitly unregisters tk.Variable objects from the Tcl interpreter
+        before destroying the window, preventing 'main thread is not in main
+        loop' errors when Python's GC later calls Variable.__del__.
+        """
         if self._root:
             try:
+                # Unregister each tk.Variable from the Tcl interpreter while
+                # we're still in the GUI thread, then neuter the _tk reference
+                # so that Variable.__del__ becomes a no-op.
+                with self._lock:
+                    for var in self._values.values():
+                        try:
+                            self._root.tk.globalunsetvar(var._name)
+                        except tk.TclError:
+                            pass
+                        # Prevent __del__ from touching the (soon-dead) Tcl interp
+                        var._tk = None
+                    self._values.clear()
+                    self._enum_classes.clear()
                 self._root.quit()
                 self._root.destroy()
             except tk.TclError:
@@ -174,6 +199,12 @@ class ThreadedTkinterGui(ABC):
             self._root.mainloop()
         except Exception:
             pass
+        finally:
+            # Ensure cleanup runs from this thread after mainloop exits,
+            # regardless of how it exited.  This prevents Tcl_AsyncDelete
+            # from aborting when the Tcl interpreter is torn down by the
+            # wrong thread during process exit.
+            self._destroy_window()
 
     def _configure_styles(self):
         """Configure ttk styles."""
@@ -598,8 +629,9 @@ class SplatSimGui(ThreadedTkinterGui):
 
         builder = GuiBuilder(main_frame, self, self._style)
 
-        # Current mode status display
+        # Current mode status display (stored in _values for proper cleanup)
         self._mode_var = tk.StringVar(value=f"Mode: {self._initial_mode}")
+        self._values["_mode_var"] = self._mode_var
         mode_label = ttk.Label(main_frame, textvariable=self._mode_var, style="Header.TLabel")
         mode_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 10))
         builder._row += 1

@@ -185,13 +185,20 @@ class ZMQRobotServer:
                 self._socket.send(pickle.dumps(result))
             except zmq.error.Again:
                 pass
-                # print("Timeout in ZMQLeaderServer serve")
                 # Timeout occurred, check if the stop event is set
+            except (zmq.error.ContextTerminated, zmq.error.ZMQError):
+                break  # Socket/context was closed during shutdown
 
     def stop(self) -> None:
         self._stop_event.set()
-        self._socket.close()
-        self._context.term()
+        try:
+            self._socket.close()
+        except zmq.error.ZMQError:
+            pass
+        try:
+            self._context.term()
+        except zmq.error.ZMQError:
+            pass
 
 
 class GripperState(str, enum.Enum):
@@ -2127,10 +2134,32 @@ class PybulletRobotServerBase:
         shutil.rmtree(os.path.join(self.path, str(self.trajectory_count).zfill(3)))
 
     def stop(self) -> None:
-        self._zmq_server_thread.join()
+        """Stop the robot server and clean up resources.
+
+        Safe to call whether or not serve() was called (gym mode vs ZMQ server mode).
+        """
+        # Only join the thread if it was actually started
+        if self._zmq_server_thread.is_alive():
+            self._zmq_server.stop()
+            self._zmq_server_thread.join(timeout=2.0)
+
+        # Clean up GUI if it exists
+        if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+            self._splatsim_gui.stop()
+            self._splatsim_gui = None
+
+        # Disconnect pybullet
+        if hasattr(self, 'pybullet_client') and self.pybullet_client is not None:
+            try:
+                self.pybullet_client.disconnect()
+            except Exception:
+                pass  # Already disconnected
 
     def __del__(self) -> None:
-        self.stop()
+        try:
+            self.stop()
+        except Exception:
+            pass  # Ignore errors during garbage collection
 
     def __parse_joint_info__(self):
         numJoints = p.getNumJoints(self.splatsim_robot.sim_id)
@@ -2762,6 +2791,8 @@ class PybulletRobotServerBase:
         self._splatsim_gui.set_mode(new_mode.value)
 
     def shutdown(self):
-        """Clean up resources."""
-        # Stop the GUI if running
-        self._splatsim_gui.stop()
+        """Clean up resources.
+
+        Another name for self.stop(). This is to fit with the gello api
+        """
+        self.stop()
