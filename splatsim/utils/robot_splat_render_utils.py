@@ -75,12 +75,13 @@ def get_curr_link_states(robot_uid, use_link_centers=True):
     return link_states
 
 
-def get_transformation_list(splatsim_obj: SplatSimObject, use_link_centers=True):
+def get_transformation_list(splatsim_obj: SplatSimObject, use_link_centers=True, cached_link_states=None):
     """Get transformation matrices for each joint, using cached tensors to avoid GPU fragmentation.
 
     Args:
         splatsim_obj: The articulated SplatSimObject (must have articulation_config)
         use_link_centers: Whether to use link center positions
+        cached_link_states: Optional pre-fetched link states for synchronization. If None, will query PyBullet directly.
 
     Returns:
         List of (r_rel, t) tuples for each joint
@@ -92,7 +93,10 @@ def get_transformation_list(splatsim_obj: SplatSimObject, use_link_centers=True)
     initial_link_states = splatsim_obj.articulation_config.initial_link_poses
     num_joints = p.getNumJoints(robot_uid)
 
-    new_joints = get_curr_link_states(robot_uid, use_link_centers=use_link_centers)
+    if cached_link_states is not None:
+        new_joints = cached_link_states
+    else:
+        new_joints = get_curr_link_states(robot_uid, use_link_centers=use_link_centers)
 
     if len(initial_link_states) != num_joints or len(new_joints) != num_joints:
         print(f"Error: Number of joints mismatch. Initial: {len(initial_link_states)}, New: {len(new_joints)}, Expected: {num_joints}")

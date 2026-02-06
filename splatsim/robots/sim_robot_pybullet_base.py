@@ -986,30 +986,36 @@ class PybulletRobotServerBase:
     def enable_rendering(self):
         self.do_render_from_splat = True
 
-    def get_wrist_camera_transform(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    def get_wrist_camera_transform(self, cached_link_states=None) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         if self.wrist_camera.tracked_link_index is None:
             print("WARNING: No wrist camera index found")
             return None
 
-        # Get the pose of the wrist_camera_link
-        link_state = p.getLinkState(
-            self.splatsim_robot.sim_id,
-            self.wrist_camera.tracked_link_index,
-            computeForwardKinematics=True,
-        )
+        # Use cached state for synchronization if available
+        link_idx = int(self.wrist_camera.tracked_link_index)
+        if cached_link_states is not None and link_idx < len(cached_link_states):
+            # Use cached state for synchronization
+            cached_state = cached_link_states[link_idx]
+            T_cw = np.array(cached_state["pos"]).astype(np.float32)
+            quat = cached_state["q"]
+        else:
+            # Fall back to direct query (backward compatibility)
+            link_state = p.getLinkState(
+                self.splatsim_robot.sim_id,
+                link_idx,
+                computeForwardKinematics=True,
+            )
+            T_cw = np.array(link_state[0]).astype(np.float32)
+            quat = link_state[1]
 
-        # Original camera-to-world transform
-        T_cw = np.array(link_state[0]).astype(np.float32)  # xyz position in world frame
-
-        quat = link_state[1]
         R_cw = (
             np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3).astype(np.float32)
         )
 
         return T_cw, R_cw
 
-    def get_wrist_camera(self):
-        transform_pair = self.get_wrist_camera_transform()
+    def get_wrist_camera(self, cached_link_states=None):
+        transform_pair = self.get_wrist_camera_transform(cached_link_states=cached_link_states)
         if transform_pair is None:
             return None
         T_cw, R_cw = transform_pair
@@ -1017,21 +1023,10 @@ class PybulletRobotServerBase:
         T_wc = -R_cw.T @ T_cw
 
         # TODO is this needed?
-        # scale = self.base_camera.scale if self.base_camera is not None else 1.0
         resolution = (
             self.base_camera.camera.image_width,
             self.base_camera.camera.image_height,
         )
-
-        # Use actual camera resolution and FOV from COLMAP calibration
-        # COLMAP camera model: OPENCV_FISHEYE
-        # COLMAP params: width=960, height=540, fx=1152, fy=1152, cx=480, cy=270
-        # Distortion k1-k4 = [0,0,0,0] (no distortion, lucky!)
-        # Computed FOV: FoVx=0.789582 rad (45.24°), FoVy=0.460439 rad (26.38°)
-        # resolution = (960, 540)
-        # resolution = (960, 540)
-        # fovx = 0.789582  # radians
-        # fovy = 0.460439  # radians
 
         colmap_id = 0
         uid = 0
@@ -1106,7 +1101,7 @@ class PybulletRobotServerBase:
         """
         self._scene_gaussian_buffers_initialized = False
 
-    def prep_image_rendering(self, data) -> Dict[str, np.ndarray]:
+    def prep_image_rendering(self, data, cached_link_states=None):
         # Initialize buffers on first call
         if not getattr(self, '_scene_gaussian_buffers_initialized', False):
             self._init_scene_gaussian_buffers()
@@ -1140,7 +1135,7 @@ class PybulletRobotServerBase:
                     ), "Other articulated objects are not implemented yet"
 
                     # Gets transformations for all links of the robot based on the current simulation
-                    transformations_list = get_transformation_list(splatsim_obj)
+                    transformations_list = get_transformation_list(splatsim_obj, cached_link_states=cached_link_states)
 
                     # TODO generalize this to "every articulated object" instead of just the robot
                     transform_means(
@@ -1307,14 +1302,14 @@ class PybulletRobotServerBase:
 
         print("PyBullet camera updated!\n")
 
-    def render_image(self, camera_name):
+    def render_image(self, camera_name, cached_link_states=None):
         if camera_name == "base_rgb":
             if self.debug_mode != DebugModes.OFF:
                 camera = self.get_pybullet_debug_camera_as_splat_camera()
             else:
                 camera = self.base_camera
         elif camera_name == "wrist_rgb":
-            camera = self.get_wrist_camera()
+            camera = self.get_wrist_camera(cached_link_states=cached_link_states)
             if camera is None:
                 return None
         else:
@@ -1598,12 +1593,19 @@ class PybulletRobotServerBase:
             observations[self.splatsim_objects[i].name + "_orientation"] = object_quat
 
         if self.do_render_from_splat and len(self.camera_names) > 0:
-            self.prep_image_rendering(data=observations)
+            # Capture link state snapshot for synchronized rendering
+            cached_link_states = get_curr_link_states(
+                self.splatsim_robot.sim_id,
+                use_link_centers=True
+            )
+
+            self.prep_image_rendering(data=observations, cached_link_states=cached_link_states)
             with torch.no_grad():
                 for camera_name in self.camera_names:
                     # render_image returns numpy array directly
                     observations[camera_name] = self.render_image(
-                        camera_name=camera_name
+                        camera_name=camera_name,
+                        cached_link_states=cached_link_states
                     )
                     # Resize to 224x224 using configured mode (letterbox or stretch)
                     if observations[camera_name] is not None:
