@@ -4,8 +4,8 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
-from splatsim.agents.agent import Agent
-from splatsim.robots.dynamixel import DynamixelRobot
+from gello.agents.agent import Agent
+from gello.robots.dynamixel import DynamixelRobot
 
 
 @dataclass
@@ -103,6 +103,7 @@ PORT_CONFIG_MAP: Dict[str, DynamixelRobotConfig] = {
         joint_signs=(1, 1, -1, 1, 1, 1),
         gripper_config=(7, 286, 248),
     ),
+    # paste this into the gello default config
     # Custom UR
     "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT78LMLS-if00-port0": DynamixelRobotConfig(
         joint_ids=(1, 2, 3, 4, 5, 6),

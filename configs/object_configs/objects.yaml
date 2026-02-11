@@ -191,6 +191,54 @@ small_engine_new:
   base_position:
   - [0.0, 0.0, 0.180955]
   use_fixed_base: true
+thinkpad_box:
+  transformation:
+    matrix:
+    - [-0.163842, -0.019906, 0.040555, -0.259844]
+    - [-0.04517, 0.069524, -0.148362, 0.216919]
+    - [0.000787, -0.153803, -0.072313, 0.489712]
+    - [0.0, 0.0, 0.0, 1.0]
+  aabb:
+    bounding_box:
+    - [-0.2541, -0.0381, -0.0008]
+    - [0.2541, 0.0384, 0.3189]
+    urdf_bbox_adjustment:
+    - [-0.01, 0.01]
+    - [-0.01, 0.01]
+    - [-0.01, 0.01]
+  urdf_path:
+  - /home/jennyw2/code/SplatSim/splatsim/robot_definitions/urdf/boxes/thinkpad_box.urdf
+  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/boxes_thinkpadbox_images_500_500match_540height_OPENCVcam/sfm_disk_disk+lightglue/undistorted
+  model_path: /home/jennyw2/code/gaussian-splatting/output/boxes_thinkpadbox_images_500_500match_540height_OPENCVcam
+  joint_states:
+  - [0]
+  base_position:
+  - [0.0, 0.0, 0.0]
+  use_fixed_base: true
+starwars_box:
+  transformation:
+    matrix:
+    - [-0.172723, 0.003905, 0.029289, -0.089052]
+    - [-0.027284, 0.045596, -0.166981, 0.085052]
+    - [-0.011342, -0.169151, -0.044335, 0.40714100000000003]
+    - [0.0, 0.0, 0.0, 1.0]
+  aabb:
+    bounding_box:
+    - [-0.264, -0.0862, -0.0108]
+    - [0.264, 0.0866, 0.3035]
+    urdf_bbox_adjustment:
+    - [-0.01, 0.01]
+    - [-0.01, 0.01]
+    - [-0.01, 0.01]
+  urdf_path:
+  - /home/jennyw2/code/SplatSim/splatsim/robot_definitions/urdf/boxes/starwars_box.urdf
+  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/boxes_starwarsbox_images_500_500match_540height_OPENCVcam/sfm_disk_disk+lightglue/undistorted
+  model_path: /home/jennyw2/code/gaussian-splatting/output/boxes_starwarsbox_images_500_500match_540height_OPENCVcam
+  joint_states:
+  - [0]
+  base_position:
+  - [0.0, 0.0, 0.0]
+  use_fixed_base: true
 plastic_apple:
   transformation:
     matrix:

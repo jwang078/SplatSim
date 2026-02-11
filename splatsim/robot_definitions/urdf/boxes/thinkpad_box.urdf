@@ -1,0 +1,39 @@
+<?xml version="1.0" ?>
+<robot name="thinkpad_box" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <link name="base_link">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <box size="0.508 0.0762 0.3175"/>
+      </geometry>
+      <material name="SlateGrey">
+        <color rgba="0.4 0.4 0.45 1.0"/>
+      </material>
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <box size="0.508 0.0762 0.3175"/>
+      </geometry>
+    </collision>
+
+    <inertial>
+      <mass value="2.0"/>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <inertia 
+        ixx="0.01776" ixy="0.0" ixz="0.0" 
+        iyy="0.05981" iyz="0.0" 
+        izz="0.04398"/>
+    </inertial>
+  </link>
+
+  <link name="world"/>
+  <joint name="world_joint" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+    <origin rpy="0 0 0" xyz="0 0 0.15875"/>
+  </joint>
+
+</robot>

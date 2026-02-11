@@ -9,7 +9,10 @@ import tkinter as tk
 from tkinter import ttk
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+from PIL import Image, ImageTk
 
 
 # =============================================================================
@@ -143,19 +146,26 @@ class ThreadedTkinterGui(ABC):
     def stop(self):
         """Stop the GUI and close the window (thread-safe).
 
-        Waits for the GUI thread to finish to ensure proper cleanup.
+        Signals the GUI thread to shut down via _shutdown_requested flag,
+        which is polled by _check_shutdown every 100ms. Waits for the GUI
+        thread to finish to ensure Tk resources are cleaned up from the
+        correct thread (avoiding Tcl_AsyncDelete crashes).
         """
         self._shutdown_requested = True
         self._running = False
-        if self._root:
-            try:
-                self._root.after(0, self._destroy_window)
-            except tk.TclError:
-                pass
 
-        # Wait for the GUI thread to finish (with timeout to avoid deadlock)
+        # Wait for the GUI thread to finish — _check_shutdown (running on the
+        # Tk event loop) will see _shutdown_requested and call _destroy_window
+        # from the correct thread.  Use a generous timeout so the Tk thread
+        # has time to process the shutdown.
         if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=5.0)
+
+        # If the thread is still alive after the timeout, the Tk mainloop is
+        # stuck.  Null out _root so that __del__ / GC won't touch a live
+        # interpreter from the wrong thread.
+        if self._thread is not None and self._thread.is_alive():
+            self._root = None
 
     def _destroy_window(self):
         """Destroy window - must be called from GUI thread.
@@ -356,7 +366,7 @@ class ThreadedTkinterGui(ABC):
 class GuiBuilder:
     """Helper class for building GUI components."""
 
-    def __init__(self, parent: ttk.Frame, gui: ThreadedTkinterGui, style: GuiStyle):
+    def __init__(self, parent: tk.Widget, gui: ThreadedTkinterGui, style: GuiStyle):
         """Initialize the builder.
 
         Args:
@@ -582,20 +592,128 @@ class GuiBuilder:
 
 
 # =============================================================================
+# Mode Panels
+# =============================================================================
+
+class ModePanel:
+    """Base class for a mode's settings panel in the GUI.
+
+    Subclass to define a new mode. Each panel gets its own LabelFrame that is
+    shown when the mode is active and hidden otherwise.
+
+    To add a new mode:
+        1. Subclass ModePanel
+        2. Set name, mode_values, and button_key as class attributes
+        3. Override build() to add widgets (or leave empty for a placeholder)
+        4. Pass an instance to SplatSimGui via the panels list
+    """
+
+    name: str           # Display name (used for the button and LabelFrame title)
+    mode_values: set    # SERVE_MODES .value strings this panel owns
+    button_key: str     # Unique key for the mode-switch button
+    default_mode: str   # Mode string to transition to when the button is pressed
+
+    def __init__(self):
+        self.frame: Optional[ttk.LabelFrame] = None
+
+    def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
+              style: GuiStyle, config: Dict[str, Any]) -> None:
+        """Build mode-specific widgets inside parent. Override in subclasses."""
+        pass
+
+    def process_buttons(self, gui: 'SplatSimGui') -> None:
+        """Handle panel-specific button presses. Override in subclasses.
+
+        Called once per frame when this panel's mode is active.
+        """
+        pass
+
+
+class InteractiveModePanel(ModePanel):
+    """Interactive mode — no configurable settings yet."""
+
+    name = "Interactive Mode"
+    mode_values = {"interactive"}
+    button_key = "interactive_mode"
+    default_mode = "interactive"
+
+
+class TrajectoryGenModePanel(ModePanel):
+    """Trajectory generation mode with all its parameter controls."""
+
+    name = "Trajectory Gen Mode"
+    mode_values = {"generate_trajectories", "generate_trajectories_idle"}
+    button_key = "traj_gen_mode"
+    default_mode = "generate_trajectories_idle"
+
+    BTN_START = "start_traj"
+    BTN_STOP = "stop_traj"
+
+    def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
+              style: GuiStyle, config: Dict[str, Any]) -> None:
+        builder = GuiBuilder(parent, gui, style)
+
+        builder.add_str_param(
+            StrParam("experiment_name", "Experiment Name", "", width=25),
+            config.get("experiment_name", "")
+        )
+
+        int_params = [
+            IntParam("num_base_trajectories", "Num Trajectories", 1, 1000),
+            IntParam("obstacles_per_base_trajectory", "Obstacles/Traj", 0, 10),
+            IntParam("paths_per_obstacle", "Paths/Obstacle", 1, 5),
+            IntParam("min_obstacles", "Min Obstacles", 0, 5),
+            IntParam("max_obstacles", "Max Obstacles", 1, 10),
+            IntParam("num_path_candidates", "Path Candidates", 1, 20),
+        ]
+        for param in int_params:
+            builder.add_int_param(param, config.get(param.key))
+
+        float_params = [
+            FloatParam("k_exp", "k_exp", 0.1, 20.0),
+            FloatParam("k_sig", "k_sig", 0.1, 30.0),
+            FloatParam("threshold", "threshold", 0.0, 1.0),
+        ]
+        for param in float_params:
+            builder.add_float_param(param, config.get(param.key))
+
+        builder.add_bool_param(
+            BoolParam("disable_camera_scoring_for_rrt", "Disable Cam Score"),
+            config.get("disable_camera_scoring_for_rrt", False)
+        )
+
+        builder.add_button_row([
+            ButtonConfig("Start Traj Gen", self.BTN_START),
+            ButtonConfig("Stop", self.BTN_STOP),
+        ])
+
+    def process_buttons(self, gui: 'SplatSimGui') -> None:
+        start = gui.check_button(self.BTN_START)
+        stop = gui.check_button(self.BTN_STOP)
+
+        if start and gui.mode == "generate_trajectories_idle":
+            gui.save_to_config(gui._config)
+            gui.set_mode("generate_trajectories")
+            print(f"[GUI] Started trajectory generation with config: {gui._config}")
+
+        if stop:
+            if gui.mode == "generate_trajectories":
+                gui.set_mode("generate_trajectories_idle")
+            elif gui.mode == "generate_trajectories_idle":
+                gui.set_mode("interactive")
+
+
+# =============================================================================
 # SplatSim GUI Implementation
 # =============================================================================
 
 class SplatSimGui(ThreadedTkinterGui):
     """Tkinter-based GUI for SplatSim controls.
 
-    Includes mode switching and trajectory generation parameters.
+    Modes are defined as ModePanel subclasses and passed via the panels list.
+    Each panel gets a mode-switch button and a LabelFrame that is shown/hidden
+    automatically when the mode changes.
     """
-
-    # Button callback keys
-    BTN_INTERACTIVE_MODE = "interactive_mode"
-    BTN_TRAJ_GEN_MODE = "traj_gen_mode"
-    BTN_START_TRAJ = "start_traj"
-    BTN_STOP_TRAJ = "stop_traj"
 
     # Key for debug mode dropdown
     DEBUG_MODE_KEY = "debug_mode"
@@ -606,14 +724,17 @@ class SplatSimGui(ThreadedTkinterGui):
         initial_mode: str = "interactive",
         debug_mode_enum: Optional[type] = None,
         initial_debug_mode: Any = None,
+        panels: Optional[List[ModePanel]] = None,
     ):
         """Initialize the GUI.
 
         Args:
-            config: Dictionary of trajectory generation config values
-            initial_mode: Initial mode string (e.g., "interactive", "generate_trajectories")
-            debug_mode_enum: The DEBUG_MODES enum class from PybulletRobotServerBase
-            initial_debug_mode: Initial debug mode enum member
+            config: Dictionary of config values passed to each panel's build()
+            initial_mode: Initial mode string (e.g., "interactive")
+            debug_mode_enum: The DEBUG_MODES enum class (optional)
+            initial_debug_mode: Initial debug mode enum member (optional)
+            panels: List of ModePanel instances. Defaults to
+                     [InteractiveModePanel(), TrajectoryGenModePanel()].
         """
         super().__init__(title="SplatSim Controls")
         self._config = config
@@ -621,6 +742,27 @@ class SplatSimGui(ThreadedTkinterGui):
         self._mode_var: Optional[tk.StringVar] = None
         self._debug_mode_enum = debug_mode_enum
         self._initial_debug_mode = initial_debug_mode
+        self._panels = panels if panels is not None else [
+            InteractiveModePanel(),
+            TrajectoryGenModePanel(),
+        ]
+
+        # Mode state (thread-safe — written by GUI thread, read by main thread)
+        self._current_mode = initial_mode
+        self._mode_lock = threading.Lock()
+
+        # Build lookup: button_key -> panel
+        self._panel_by_button: Dict[str, ModePanel] = {
+            p.button_key: p for p in self._panels
+        }
+
+        # Camera image display state
+        self._camera_frame: Optional[ttk.LabelFrame] = None
+        self._camera_labels: Dict[str, tk.Label] = {}
+        self._camera_name_labels: Dict[str, ttk.Label] = {}
+        self._photo_refs: Dict[str, ImageTk.PhotoImage] = {}
+        self._pending_images: Optional[Dict[str, np.ndarray]] = None
+        self._image_lock = threading.Lock()
 
     def _build_ui(self):
         """Build the SplatSim UI."""
@@ -629,17 +771,29 @@ class SplatSimGui(ThreadedTkinterGui):
 
         builder = GuiBuilder(main_frame, self, self._style)
 
-        # Current mode status display (stored in _values for proper cleanup)
+        # Camera observations display area (at the top)
+        builder.add_header("Camera Observations")
+        self._camera_frame = ttk.LabelFrame(main_frame, text="", padding=5)
+        self._camera_frame.grid(
+            row=builder.current_row, column=0, columnspan=2, sticky="nsew", pady=5
+        )
+        builder._row += 1
+
+        # Start polling for image updates
+        self._poll_camera_images()
+
+        builder.add_separator()
+
+        # Current mode status display
         self._mode_var = tk.StringVar(value=f"Mode: {self._initial_mode}")
         self._values["_mode_var"] = self._mode_var
         mode_label = ttk.Label(main_frame, textvariable=self._mode_var, style="Header.TLabel")
         mode_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 10))
         builder._row += 1
 
-        # Mode selection buttons
+        # Mode selection buttons (one per panel)
         builder.add_button_row([
-            ButtonConfig("Interactive Mode", self.BTN_INTERACTIVE_MODE, "Mode.TButton"),
-            ButtonConfig("Trajectory Gen Mode", self.BTN_TRAJ_GEN_MODE, "Mode.TButton"),
+            ButtonConfig(p.name, p.button_key, "Mode.TButton") for p in self._panels
         ])
 
         # Debug mode dropdown (if enum provided)
@@ -651,81 +805,92 @@ class SplatSimGui(ThreadedTkinterGui):
                 self._initial_debug_mode
             )
 
-        builder.add_separator()
+        # Build each panel's settings frame
+        for panel in self._panels:
+            panel.frame = ttk.LabelFrame(main_frame, text=panel.name, padding=10)
+            panel.frame.grid(
+                row=builder.current_row, column=0, columnspan=2,
+                sticky="nsew", pady=(5, 5)
+            )
+            # Ensure the titled border is visible even if build() adds no widgets
+            panel.frame.configure(height=40)
+            panel.frame.grid_propagate(False)
+            builder._row += 1
+            panel.build(panel.frame, self, self._style, self._config)
+            # Re-enable propagation if build() added widgets, so the frame
+            # grows to fit them. If still empty, the minimum height holds.
+            if panel.frame.winfo_children():
+                panel.frame.grid_propagate(True)
 
-        # Trajectory parameters section
-        builder.add_header("Trajectory Parameters")
+        # Show/hide panels based on initial mode
+        self._update_panel_visibility(self._initial_mode)
 
-        # Experiment name (string field)
-        builder.add_str_param(
-            StrParam("experiment_name", "Experiment Name", "", width=25),
-            self._config.get("experiment_name", "")
-        )
+    # ------------------------------------------------------------------
+    # Mode state & transitions
+    # ------------------------------------------------------------------
 
-        # Integer parameters
-        int_params = [
-            IntParam("num_base_trajectories", "Num Trajectories", 1, 1000),
-            IntParam("obstacles_per_base_trajectory", "Obstacles/Traj", 0, 10),
-            IntParam("paths_per_obstacle", "Paths/Obstacle", 1, 5),
-            IntParam("min_obstacles", "Min Obstacles", 0, 5),
-            IntParam("max_obstacles", "Max Obstacles", 1, 10),
-            IntParam("num_path_candidates", "Path Candidates", 1, 20),
-        ]
-        for param in int_params:
-            builder.add_int_param(param, self._config.get(param.key))
-
-        # Float parameters
-        float_params = [
-            FloatParam("k_exp", "k_exp", 0.1, 20.0),
-            FloatParam("k_sig", "k_sig", 0.1, 30.0),
-            FloatParam("threshold", "threshold", 0.0, 1.0),
-        ]
-        for param in float_params:
-            builder.add_float_param(param, self._config.get(param.key))
-
-        # Boolean parameters
-        builder.add_bool_param(
-            BoolParam("disable_camera_scoring_for_rrt", "Disable Cam Score"),
-            self._config.get("disable_camera_scoring_for_rrt", False)
-        )
-
-        builder.add_separator()
-
-        # Trajectory control buttons
-        builder.add_button_row([
-            ButtonConfig("Start Traj Gen", self.BTN_START_TRAJ),
-            ButtonConfig("Stop", self.BTN_STOP_TRAJ),
-        ])
-
-    def check_mode_buttons(self) -> Tuple[bool, bool]:
-        """Check and clear mode button press flags.
-
-        Returns:
-            Tuple of (interactive_pressed, traj_gen_pressed)
-        """
-        result = self.check_buttons([self.BTN_INTERACTIVE_MODE, self.BTN_TRAJ_GEN_MODE])
-        return result[self.BTN_INTERACTIVE_MODE], result[self.BTN_TRAJ_GEN_MODE]
-
-    def check_traj_buttons(self) -> Tuple[bool, bool]:
-        """Check and clear trajectory control button press flags.
-
-        Returns:
-            Tuple of (start_pressed, stop_pressed)
-        """
-        result = self.check_buttons([self.BTN_START_TRAJ, self.BTN_STOP_TRAJ])
-        return result[self.BTN_START_TRAJ], result[self.BTN_STOP_TRAJ]
+    @property
+    def mode(self) -> str:
+        """Current mode string (thread-safe read)."""
+        with self._mode_lock:
+            return self._current_mode
 
     def set_mode(self, mode: str):
-        """Update the displayed mode status.
+        """Set the current mode, update the display, and show/hide panels.
+
+        Thread-safe — can be called from any thread.
 
         Args:
-            mode: The mode string to display (e.g., "interactive", "generate_trajectories")
+            mode: The mode string (e.g., "interactive", "generate_trajectories")
         """
+        with self._mode_lock:
+            old = self._current_mode
+            self._current_mode = mode
+        if old != mode:
+            print(f"[GUI] Mode: {old} -> {mode}")
         if self._mode_var is not None:
             try:
                 self._mode_var.set(f"Mode: {mode}")
             except tk.TclError:
-                pass  # Window destroyed
+                pass
+        self._update_panel_visibility(mode)
+
+    def process_mode_transitions(self) -> None:
+        """Process mode button presses and panel-specific button logic.
+
+        Call this once per frame from the main loop. It handles:
+        - Mode-switch buttons (one per panel)
+        - Panel-specific buttons (e.g. Start/Stop for TrajectoryGenModePanel)
+        """
+        # Check if any mode-switch button was pressed
+        for panel in self._panels:
+            if not self.check_button(panel.button_key):
+                continue
+            # Ignore if already in this mode group
+            if self.mode in panel.mode_values:
+                break
+            # Transition to the panel's default mode (first in mode_values)
+            target = panel.default_mode
+            self.set_mode(target)
+            break
+
+        # Let each panel handle its own buttons
+        for panel in self._panels:
+            if self.mode in panel.mode_values:
+                panel.process_buttons(self)
+
+    def _update_panel_visibility(self, mode: str) -> None:
+        """Show the panel that owns this mode, hide all others."""
+        for panel in self._panels:
+            if panel.frame is None:
+                continue
+            try:
+                if mode in panel.mode_values:
+                    panel.frame.grid()
+                else:
+                    panel.frame.grid_remove()
+            except tk.TclError:
+                pass
 
     def get_debug_mode(self) -> Any:
         """Get the current debug mode selection.
@@ -734,3 +899,84 @@ class SplatSimGui(ThreadedTkinterGui):
             The DEBUG_MODES enum member, or None if not available.
         """
         return self.get_enum_value(self.DEBUG_MODE_KEY)
+
+    # ------------------------------------------------------------------
+    # Camera image display
+    # ------------------------------------------------------------------
+
+    def update_camera_images(self, frames: Dict[str, np.ndarray]) -> None:
+        """Update camera observation images (thread-safe).
+
+        Can be called from any thread. Images will be displayed on the next
+        Tkinter poll cycle.
+
+        Args:
+            frames: Dict mapping camera name to RGB numpy array (H, W, 3), uint8.
+        """
+        with self._image_lock:
+            self._pending_images = dict(frames)
+
+    def _poll_camera_images(self) -> None:
+        """Poll for pending image updates from other threads."""
+        if not self._root or self._shutdown_requested:
+            return
+
+        with self._image_lock:
+            pending = self._pending_images
+            self._pending_images = None
+
+        if pending is not None:
+            self._render_camera_images(pending)
+
+        self._root.after(33, self._poll_camera_images)  # ~30 fps
+
+    def _render_camera_images(self, frames: Dict[str, np.ndarray]) -> None:
+        """Render camera images into the GUI. Must be called from Tk thread."""
+        if self._camera_frame is None:
+            return
+
+        # Determine grid layout: arrange in rows of up to 2 columns
+        camera_names = sorted(frames.keys())
+        num_cameras = len(camera_names)
+        if num_cameras == 0:
+            return
+        cols = min(num_cameras, 2)
+        max_thumb_width = 224
+
+        # Remove labels for cameras that are no longer present
+        stale = set(self._camera_labels.keys()) - set(camera_names)
+        for name in stale:
+            self._camera_labels[name].destroy()
+            del self._camera_labels[name]
+            self._camera_name_labels[name].destroy()
+            del self._camera_name_labels[name]
+            self._photo_refs.pop(name, None)
+
+        for idx, name in enumerate(camera_names):
+            row = (idx // cols) * 2  # *2 because label + image per camera
+            col = idx % cols
+
+            img_array = frames[name]
+            h, w = img_array.shape[:2]
+            scale = min(max_thumb_width / w, max_thumb_width / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+
+            pil_img = Image.fromarray(img_array).resize(
+                (new_w, new_h), Image.BILINEAR
+            )
+            photo = ImageTk.PhotoImage(pil_img)
+            self._photo_refs[name] = photo
+
+            # Create or update the name label
+            if name not in self._camera_name_labels:
+                lbl = ttk.Label(self._camera_frame, text=name, style="TLabel")
+                lbl.grid(row=row, column=col, padx=5, pady=(5, 0), sticky="n")
+                self._camera_name_labels[name] = lbl
+
+            # Create or update the image label
+            if name not in self._camera_labels:
+                img_lbl = tk.Label(self._camera_frame, bg="black")
+                img_lbl.grid(row=row + 1, column=col, padx=5, pady=(0, 5))
+                self._camera_labels[name] = img_lbl
+
+            self._camera_labels[name].configure(image=photo)

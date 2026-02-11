@@ -33,6 +33,7 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         # To be called in the parent's serve()
 
         if self.serve_mode == self.SERVE_MODES.INTERACTIVE:
+            print("in collision?", self.is_robot_in_collision())
             self.pybullet_client.stepSimulation()
             time.sleep(1 / 240)
         elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
@@ -53,14 +54,14 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
                 print(
                     f"Exiting record_demos mode because max trajectory count of {self.MAX_TRAJECTORY_COUNT} was reached in folder {self.path}"
                 )
-                self._handle_mode_transition(self.SERVE_MODES.INTERACTIVE)
+                self.serve_mode = self.SERVE_MODES.INTERACTIVE
         elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
             # Handle active trajectory generation mode
             self.trajectory_generator.generate_trajectory_batch()
 
             if self.trajectory_generator.is_complete():
                 print(f"[GUI] Completed trajectory generation. Switching to idle mode.")
-                self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE)
+                self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
         else:
             raise ValueError(f"Unknown serve mode {self.serve_mode}. ")
 
@@ -89,6 +90,10 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         # Smoothness tracking
         self._prev_action = None
         self._action_delta = 0.0
+        self._prev_action_delta = 0.0
+        self._action_accel = 0.0
+        self._prev_action_accel = 0.0
+        self._action_jerk = 0.0
 
         # From GENERATE_DEMOS: randomize_ee_pose()
         initial_joints = self.randomize_ee_pose()
@@ -107,12 +112,22 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
     def step(self, action: np.ndarray) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
         """Execute one control step, tracking action smoothness."""
-        # Track action delta for smoothness metric
+        # Track action delta (velocity) for smoothness metric
         if self._prev_action is not None:
             self._action_delta = np.linalg.norm(np.array(action) - self._prev_action)
         else:
             self._action_delta = 0.0
+
+        # Track action acceleration (delta in action_delta)
+        self._action_accel = np.abs(self._action_delta - self._prev_action_delta)
+
+        # Track action jerk (delta in action_accel)
+        self._action_jerk = np.abs(self._action_accel - self._prev_action_accel)
+
+        # Update previous values for next step
         self._prev_action = np.array(action)
+        self._prev_action_delta = self._action_delta
+        self._prev_action_accel = self._action_accel
 
         return super().step(action)
 
@@ -164,12 +179,19 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         cam_forward = cam_rotation[:, 2]
         cam_looks_at_goal_score = compute_camera_alignment_score(cam_position, cam_forward, target_ee_pos)
 
+        in_collision = self.is_robot_in_collision()
+        if in_collision:
+            success = False
+
         metrics = {
             "is_success": success,
             "position_error_m": pos_diff,
             "orientation_error_deg": angle_deg,
             "cam_looks_at_goal_score": cam_looks_at_goal_score,
             "action_delta": self._action_delta,
+            "action_accel": self._action_accel,
+            "action_jerk": self._action_jerk,
+            "in_collision": in_collision,
         }
 
         return metrics
@@ -219,6 +241,27 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 mass=0,
                 color_rgb=(223, 205, 192),
             ),
+
+            # SplatObjectConfig(
+            #     object_name="thinkpad_box",
+            #     splat_object_name="thinkpad_box",
+            #     grasp_config=[],
+            #     randomize_pose=False,
+            #     rotation_range_z=(0, 0),
+            #     is_in_scene_splat=False,
+            #     table_pos=(0.48, 0.20),
+            #     table_quat=(0, 0, 0, 1),
+            # ),
+            # SplatObjectConfig(
+            #     object_name="starwars_box",
+            #     splat_object_name="starwars_box",
+            #     grasp_config=[],
+            #     randomize_pose=False,
+            #     rotation_range_z=(0, 0),
+            #     is_in_scene_splat=False,
+            #     table_pos=(0.48, 0.40),
+            #     table_quat=(0, 0, 0, 1),
+            # ),
         ],
     )
 

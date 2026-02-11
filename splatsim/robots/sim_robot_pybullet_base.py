@@ -17,7 +17,6 @@ from argparse import ArgumentParser
 from dataclasses import dataclass, field
 import numpy as np
 import threading
-import queue
 from e3nn import o3
 
 
@@ -281,6 +280,20 @@ class PybulletRobotServerBase:
     # Alias to the shared DebugModes enum for backwards compatibility
     DEBUG_MODES = DebugModes
 
+    @property
+    def serve_mode(self) -> 'PybulletRobotServerBase.SERVE_MODES':
+        """Current serve mode. Reads from the GUI when available."""
+        if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+            return self.SERVE_MODES(self._splatsim_gui.mode)
+        return self._serve_mode
+
+    @serve_mode.setter
+    def serve_mode(self, value: 'PybulletRobotServerBase.SERVE_MODES'):
+        """Set the serve mode. Updates the GUI when available."""
+        self._serve_mode = value
+        if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+            self._splatsim_gui.set_mode(value.value)
+
     lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
     upper_limits = [np.pi, 0, np.pi, np.pi, np.pi, np.pi]
 
@@ -302,7 +315,7 @@ class PybulletRobotServerBase:
         trajectory_gen_config: Optional[dict] = None,
         image_resize_mode: str = "letterbox",
     ):
-        self.serve_mode = serve_mode
+        self._serve_mode = serve_mode
         self.robot_name = robot_name
         self.camera_names = camera_names
         self.cam_i = cam_i
@@ -325,10 +338,6 @@ class PybulletRobotServerBase:
         self._zmq_server = ZMQRobotServer(robot=self, host=host, port=port)
         self._zmq_server_thread = ZMQServerThread(self._zmq_server)
         print(f"Listening on {host}:{port}")
-
-        # Queue for passing display requests from ZMQ thread to main thread
-        self._display_queue: queue.Queue = queue.Queue()
-        self._main_thread_id = threading.current_thread().ident
 
         # Populate this on the fly if it's needed
         self.base_cuboid_gaussians = None
@@ -655,45 +664,15 @@ class PybulletRobotServerBase:
         if "ply_path" in splatsim_obj.object_config:
             ply_path = splatsim_obj.object_config["ply_path"]
             splatsim_obj.gaussians.load_ply(ply_path)
-        elif (
-            "source_path" in splatsim_obj.object_config
-            and "model_path" in splatsim_obj.object_config
-        ):
-            source_path = resolve_splatsim_path(splatsim_obj.object_config["source_path"])
-            if not os.path.exists(source_path):
-                raise FileNotFoundError(f"Source path not found: {source_path}")
-
+        elif "model_path" in splatsim_obj.object_config:
             model_path = resolve_splatsim_path(splatsim_obj.object_config["model_path"])
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Model path not found: {model_path}")
 
-            parser = ArgumentParser(description="Testing script parameters")
-            model = ModelParams(parser, sentinel=True)
-            dataset = model.extract(
-                Namespace(
-                    sh_degree=3,
-                    source_path=source_path,
-                    model_path=model_path,
-                    images="images",
-                    depths="",
-                    resolution=-1,
-                    white_background=False,
-                    train_test_exp=False,
-                    data_device="cuda",
-                    eval=False,
-                )
-            )
-            # This loads the .ply file into gaussians
-            scene = Scene(
-                dataset,
-                splatsim_obj.gaussians,
-                load_iteration=-1,
-                shuffle=False,
-                resolution_scales=[],
-                train_cam_indices=[],
-                test_cam_indices=[],
-            )
-            del scene
+            pc_dir = os.path.join(model_path, "point_cloud")
+            iteration = max(int(f.split("_")[-1]) for f in os.listdir(pc_dir))
+            ply_path = os.path.join(pc_dir, f"iteration_{iteration}", "point_cloud.ply")
+            splatsim_obj.gaussians.load_ply(ply_path)
         elif splatsim_obj.object_config.get("object_type", None) == "cuboid":
             lx, ly, lz = splatsim_obj.object_config["size"]
             # Default to brown color for rendering
@@ -1622,50 +1601,36 @@ class PybulletRobotServerBase:
         return observations
 
     def display_observations(self, observations: Dict[str, Any]) -> None:
-        """Display rendered RGB observations using cv2.imshow()
+        """Display rendered RGB observations in the SplatSim GUI.
 
         Args:
             observations: Dictionary containing rendered images as torch tensors (C, H, W)
         """
+        if not hasattr(self, '_splatsim_gui') or self._splatsim_gui is None:
+            return
+
         frames_to_display = {}
-        for img_obs_name in ["wrist_rgb", "base_rgb"]:
-            if img_obs_name not in observations or observations[img_obs_name] is None:
+        for camera_name in self.camera_names:
+            if camera_name not in observations or observations[camera_name] is None:
                 continue
-            frame = observations[img_obs_name]
+            frame = observations[camera_name]
 
             # Convert from tensor if needed
             if isinstance(frame, torch.Tensor):
                 frame = frame.detach().cpu().numpy()
 
             # Convert from CxHxW to HxWxC
-            frame = np.transpose(frame, (1, 2, 0))
+            if frame.ndim == 3 and frame.shape[0] in (1, 3, 4):
+                frame = np.transpose(frame, (1, 2, 0))
 
             # Convert from [0, 1] float to [0, 255] uint8
-            frame = (frame * 255).astype(np.uint8)
+            if frame.dtype != np.uint8:
+                frame = (frame * 255).astype(np.uint8)
 
-            # Convert RGB to BGR for OpenCV
-            frames_to_display[img_obs_name] = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            frames_to_display[camera_name] = frame
 
-        # If on main thread, display directly; otherwise queue for main thread
-        if threading.current_thread().ident == self._main_thread_id:
-            self._do_display(frames_to_display)
-        else:
-            self._display_queue.put(frames_to_display)
-
-    def _do_display(self, frames: Dict[str, np.ndarray]) -> None:
-        """Actually display frames using cv2.imshow. Must be called from main thread."""
-        for img_obs_name, frame in frames.items():
-            cv2.imshow(img_obs_name, frame)
-        cv2.waitKey(1)
-
-    def _process_display_queue(self) -> None:
-        """Process any pending display requests from the queue. Call from main thread."""
-        while not self._display_queue.empty():
-            try:
-                frames = self._display_queue.get_nowait()
-                self._do_display(frames)
-            except queue.Empty:
-                break
+        if frames_to_display:
+            self._splatsim_gui.update_camera_images(frames_to_display)
 
     def randomize_object_pose(self):
         collison_between_objects = True
@@ -1744,7 +1709,9 @@ class PybulletRobotServerBase:
                 for j in range(len(self.splatsim_objects)):
                     if self.splatsim_objects[j].sim_id is None:
                         continue
-                    if i != j:
+                    both_not_randomizable = not self.splatsim_objects[i].object_config.get("randomize_pose", True) \
+                        and not self.splatsim_objects[j].object_config.get("randomize_pose", True)
+                    if i != j and not both_not_randomizable:
                         collison_between_objects_1 = pairwise_collision(
                             self.splatsim_objects[i].sim_id,
                             self.splatsim_objects[j].sim_id,
@@ -1782,24 +1749,7 @@ class PybulletRobotServerBase:
                     self.splatsim_robot.sim_id, i, initial_joint_positions[i - 1]
                 )
 
-            # Check for collisions between robot and scene objects
-            # Only detect actual penetration (negative contact distance), not just proximity
-            collision_detected = False
-            for splatsim_obj in self.splatsim_objects:
-                if splatsim_obj.sim_id is not None and splatsim_obj != self.splatsim_robot:
-                    contacts = self.pybullet_client.getClosestPoints(
-                        self.splatsim_robot.sim_id, splatsim_obj.sim_id, distance=0.0
-                    )
-                    # Check if any contact has negative distance (actual penetration)
-                    for contact in contacts:
-                        contact_distance = contact[8]  # contactDistance is at index 8
-                        if contact_distance < -0.001:  # Small tolerance for numerical stability
-                            collision_detected = True
-                            break
-                    if collision_detected:
-                        break
-
-            if not collision_detected:
+            if not self.is_robot_in_collision():
                 # TODO possibly randomize gripper state here, too
                 # Though that might have to edit initial_joint_positions
                 return initial_joint_positions
@@ -1807,6 +1757,21 @@ class PybulletRobotServerBase:
         # If we exhausted all attempts, return the last configuration with a warning
         print(f"Warning: Could not find collision-free EE pose after {max_attempts} attempts")
         return initial_joint_positions
+    
+    def is_robot_in_collision(self):
+        # Check for collisions between robot and scene objects
+        # Only detect actual penetration (negative contact distance), not just proximity
+        for splatsim_obj in self.splatsim_objects:
+            if splatsim_obj.sim_id is not None and splatsim_obj != self.splatsim_robot:
+                contacts = self.pybullet_client.getClosestPoints(
+                    self.splatsim_robot.sim_id, splatsim_obj.sim_id, distance=0.0
+                )
+                # Check if any contact has negative distance (actual penetration)
+                for contact in contacts:
+                    contact_distance = contact[8]  # contactDistance is at index 8
+                    if contact_distance < -0.001:  # Small tolerance for numerical stability
+                        return True
+        return False
 
     def get_random_ee_pose(self):
         if self.TABLE_LIMITS is None:
@@ -1969,34 +1934,11 @@ class PybulletRobotServerBase:
         #     )
         
         while True:
-            # Process any pending display requests from ZMQ thread
-            self._process_display_queue()
-
-            # Check mode dropdown for mode changes
-            new_mode = self._check_mode_buttons()
-            if new_mode is not None:
-                self._handle_mode_transition(new_mode)
+            # Let the GUI handle all mode/button transitions
+            self._splatsim_gui.process_mode_transitions()
 
             # Check debug mode dropdown for changes
             self._check_debug_mode()
-
-            # Check GUI buttons for trajectory generation control (start/stop)
-            start_pressed, stop_pressed = self._splatsim_gui.check_traj_buttons()
-
-            if start_pressed and self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
-                # Sync GUI values to config before starting
-                self._splatsim_gui.save_to_config(self.trajectory_generator.config)
-                # Switch to active trajectory generation
-                self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES)
-                print(f"[GUI] Started trajectory generation with config: {self.trajectory_generator.config}")
-
-            if stop_pressed:
-                if self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-                    # Stop active generation, go back to idle
-                    self._handle_mode_transition(self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE)
-                elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
-                    # From idle, go back to interactive
-                    self._handle_mode_transition(self.SERVE_MODES.INTERACTIVE)
 
             self.serve_loop()
 
@@ -2019,10 +1961,14 @@ class PybulletRobotServerBase:
             self._zmq_server.stop()
             self._zmq_server_thread.join(timeout=2.0)
 
-        # Clean up GUI if it exists
+        # Clean up GUI if it exists — must happen before pybullet disconnect
+        # so the Tk thread can shut down gracefully
         if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
             self._splatsim_gui.stop()
             self._splatsim_gui = None
+
+        # Free GPU memory held by gaussian splat models and CUDA tensors
+        self._cleanup_gpu_resources()
 
         # Disconnect pybullet
         if hasattr(self, 'pybullet_client') and self.pybullet_client is not None:
@@ -2030,6 +1976,58 @@ class PybulletRobotServerBase:
                 self.pybullet_client.disconnect()
             except Exception:
                 pass  # Already disconnected
+
+    def _cleanup_gpu_resources(self) -> None:
+        """Release all CUDA tensors and gaussian splat models."""
+        import gc
+
+        # Clear gaussian splat models from splatsim objects
+        if hasattr(self, 'splatsim_objects'):
+            for obj in self.splatsim_objects:
+                if hasattr(obj, 'gaussians') and obj.gaussians is not None:
+                    del obj.gaussians
+                    obj.gaussians = None
+                if hasattr(obj, '_cache'):
+                    obj._cache.clear()
+            self.splatsim_objects.clear()
+
+        # Clear the background splat
+        if hasattr(self, 'splatsim_background'):
+            if hasattr(self.splatsim_background, 'gaussians'):
+                del self.splatsim_background.gaussians
+            self.splatsim_background = None
+
+        # Clear the robot splat
+        if hasattr(self, 'splatsim_robot'):
+            if hasattr(self.splatsim_robot, 'gaussians'):
+                del self.splatsim_robot.gaussians
+            self.splatsim_robot = None
+
+        # Clear scene gaussian and labels
+        if hasattr(self, 'scene_gaussian'):
+            del self.scene_gaussian
+            self.scene_gaussian = None
+        if hasattr(self, 'robot_labels'):
+            del self.robot_labels
+            self.robot_labels = None
+
+        # Clear camera resources
+        for cam_attr in ('base_camera', 'wrist_camera'):
+            if hasattr(self, cam_attr):
+                cam = getattr(self, cam_attr)
+                if cam is not None:
+                    if hasattr(cam, 'background') and cam.background is not None:
+                        del cam.background
+                    if hasattr(cam, 'camera') and cam.camera is not None:
+                        del cam.camera
+                setattr(self, cam_attr, None)
+
+        # Force garbage collection and release CUDA cache
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def __del__(self) -> None:
         try:
@@ -2617,26 +2615,6 @@ class PybulletRobotServerBase:
         )
         self._splatsim_gui.start()
 
-    def _check_mode_buttons(self) -> Optional['PybulletRobotServerBase.SERVE_MODES']:
-        """Check if a mode button was pressed and return new mode if so.
-
-        Returns:
-            New SERVE_MODES value if a button was pressed, None otherwise.
-        """
-        interactive_pressed, traj_gen_pressed = self._splatsim_gui.check_mode_buttons()
-
-        if interactive_pressed and self.serve_mode != self.SERVE_MODES.INTERACTIVE:
-            return self.SERVE_MODES.INTERACTIVE
-
-        # Trajectory gen button goes to IDLE mode first (user must click Start to begin)
-        if traj_gen_pressed and self.serve_mode not in (
-            self.SERVE_MODES.GENERATE_TRAJECTORIES,
-            self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
-        ):
-            return self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
-
-        return None
-
     def _check_debug_mode(self):
         """Check if debug mode has changed in the GUI and update self.debug_mode."""
         new_debug_mode = self._splatsim_gui.get_debug_mode()
@@ -2645,26 +2623,6 @@ class PybulletRobotServerBase:
         if new_debug_mode != self.debug_mode:
             print(f"[GUI] Debug mode changed: {self.debug_mode.value} -> {new_debug_mode.value}")
             self.debug_mode = new_debug_mode
-
-    def _handle_mode_transition(self, new_mode: 'PybulletRobotServerBase.SERVE_MODES'):
-        """Handle mode transition.
-
-        Args:
-            new_mode: The new SERVE_MODES value to transition to.
-        """
-        if new_mode == self.SERVE_MODES.INTERACTIVE:
-            print(f"[GUI] Switched to Interactive mode")
-
-        elif new_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
-            print(f"[GUI] Switched to Trajectory Generation mode (idle - click Start to begin)")
-
-        elif new_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-            print(f"[GUI] Trajectory generation started")
-
-        self.serve_mode = new_mode
-
-        # Update the GUI mode display
-        self._splatsim_gui.set_mode(new_mode.value)
 
     def shutdown(self):
         """Clean up resources.
