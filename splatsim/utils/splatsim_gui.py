@@ -346,17 +346,29 @@ class ThreadedTkinterGui(ABC):
     def save_to_config(self, config: Dict[str, Any]):
         """Save current GUI values to a config dict.
 
+        Searches both top-level keys and nested sub-dicts for matching keys.
+
         Args:
             config: Config dict to update with current values
         """
         values = self.get_values()
         for key, value in values.items():
+            # Search top-level keys first, then nested sub-dicts
             if key in config:
                 config_type = type(config[key])
                 if config_type == bool:
                     config[key] = bool(value)
                 else:
                     config[key] = config_type(value)
+            else:
+                for _, sub_dict in config.items():
+                    if isinstance(sub_dict, dict) and key in sub_dict:
+                        config_type = type(sub_dict[key])
+                        if config_type == bool:
+                            sub_dict[key] = bool(value)
+                        else:
+                            sub_dict[key] = config_type(value)
+                        break
 
 
 # =============================================================================
@@ -652,10 +664,11 @@ class TrajectoryGenModePanel(ModePanel):
     def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
               style: GuiStyle, config: Dict[str, Any]) -> None:
         builder = GuiBuilder(parent, gui, style)
+        traj_config = config.get("trajectory_generator", {})
 
         builder.add_str_param(
             StrParam("experiment_name", "Experiment Name", "", width=25),
-            config.get("experiment_name", "")
+            traj_config.get("experiment_name", "")
         )
 
         int_params = [
@@ -667,7 +680,7 @@ class TrajectoryGenModePanel(ModePanel):
             IntParam("num_path_candidates", "Path Candidates", 1, 20),
         ]
         for param in int_params:
-            builder.add_int_param(param, config.get(param.key))
+            builder.add_int_param(param, traj_config.get(param.key))
 
         float_params = [
             FloatParam("k_exp", "k_exp", 0.1, 20.0),
@@ -675,11 +688,11 @@ class TrajectoryGenModePanel(ModePanel):
             FloatParam("threshold", "threshold", 0.0, 1.0),
         ]
         for param in float_params:
-            builder.add_float_param(param, config.get(param.key))
+            builder.add_float_param(param, traj_config.get(param.key))
 
         builder.add_bool_param(
             BoolParam("disable_camera_scoring_for_rrt", "Disable Cam Score"),
-            config.get("disable_camera_scoring_for_rrt", False)
+            traj_config.get("disable_camera_scoring_for_rrt", False)
         )
 
         builder.add_button_row([

@@ -4,8 +4,9 @@ import os
 import re
 import json
 from typing import Optional, Tuple, List
+from splatsim.configs import TrajectoryGenModeConfig
 from splatsim.utils import rrt_path_utils
-from splatsim.utils.robot_splat_render_utils import SplatSimObject
+from splatsim.configs.env_config import SplatSimObject
 
 
 class TrajectoryGenerator:
@@ -22,28 +23,7 @@ class TrajectoryGenerator:
         get_ee_link_fn,  # Callback to get EE link index
         splatsim_objects: List[SplatSimObject],
         wrist_camera_link_name: Optional[str] = None,
-        num_base_trajectories: int = 100,
-        obstacles_per_base_trajectory: int = 0,
-        paths_per_obstacle: int = 0,
-        min_obstacles: int = 1,
-        max_obstacles: int = 3,
-        max_fails: int = 2,
-        max_obstacle_fails_per_base_traj: int = 20,
-        time_per_traj: float = 6.0,
-        robot_update_rate: int = 20,
-        rrt_vis_fps: int = 10,
-        use_obstacles: bool = True,
-        q_start: Optional[np.ndarray] = None,
-        q_goal: Optional[np.ndarray] = np.array([1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029]),
-        cuboids_fn: Optional[str] = None,
-        render_images: bool = False,
-        save_base_trajectory: bool = True,
-        disable_camera_scoring_for_rrt: bool = False,
-        num_path_candidates: int = 5,
-        max_path_attempts: int = 20,
-        k_exp: float = 5.0,
-        k_sig: float = 15.0,
-        threshold: float = 0.4,
+        trajectory_gen_config: Optional[TrajectoryGenModeConfig] = None,
     ):
         """
         Initialize trajectory generator.
@@ -56,38 +36,19 @@ class TrajectoryGenerator:
             get_ee_link_fn: Function that returns EE link index
             splatsim_objects: List of SplatSimObject instances
             wrist_camera_link_name: Name of wrist camera link for camera-aware scoring
-            (other kwargs): Trajectory generation configuration parameters
+            trajectory_gen_config: Trajectory generation configuration (uses defaults if None)
         """
         self.pb = pybullet_client
         self.robot_id = robot_id
         self.joint_indices = joint_indices
 
-        # Store all config parameters
+        if trajectory_gen_config is None:
+            trajectory_gen_config = TrajectoryGenModeConfig()
+
         self.config = {
-            "num_base_trajectories": num_base_trajectories,
-            "obstacles_per_base_trajectory": obstacles_per_base_trajectory,
-            "paths_per_obstacle": paths_per_obstacle,
-            "min_obstacles": min_obstacles,
-            "max_obstacles": max_obstacles,
-            "max_fails": max_fails,
-            "max_obstacle_fails_per_base_traj": max_obstacle_fails_per_base_traj,
-            "time_per_traj": time_per_traj,
-            "robot_update_rate": robot_update_rate,
-            "rrt_vis_fps": rrt_vis_fps,
-            "use_obstacles": use_obstacles,
-            "q_start": q_start,
-            "q_goal": q_goal,
-            "cuboids_fn": cuboids_fn,
-            "render_images": render_images,
-            "save_base_trajectory": save_base_trajectory,
-            "disable_camera_scoring_for_rrt": disable_camera_scoring_for_rrt,
-            "num_path_candidates": num_path_candidates,
-            "max_path_attempts": max_path_attempts,
-            "k_exp": k_exp,
-            "k_sig": k_sig,
-            "threshold": threshold,
-            "experiment_name": "",
+            "trajectory_generator": trajectory_gen_config.to_dict(),
         }
+        self._traj_config = self.config["trajectory_generator"]
         self.env_config_name = env_config_name
         self.get_ee_link_fn = get_ee_link_fn
         self.splatsim_objects = splatsim_objects
@@ -117,8 +78,8 @@ class TrajectoryGenerator:
         self.loaded_obstacle_ids = []
 
         # Load cuboid obstacles if specified
-        if self.config.get("use_obstacles") and self.config.get("cuboids_fn"):
-            self.loaded_obstacle_ids = self._load_cuboid_obstacles(self.config["cuboids_fn"])
+        if self._traj_config.get("use_obstacles") and self._traj_config.get("cuboids_fn"):
+            self.loaded_obstacle_ids = self._load_cuboid_obstacles(self._traj_config["cuboids_fn"])
 
         # Zarr storage (initialized lazily when start_generation() is called)
         self.trajectory_count = 0
@@ -127,7 +88,7 @@ class TrajectoryGenerator:
 
     def get_obstacle_ids(self) -> List[int]:
         return self.loaded_obstacle_ids + [
-            obj.sim_id for obj in self.splatsim_objects if obj.sim_id is not None and obj.name != "robot"
+            obj.sim_id for obj in self.splatsim_objects if obj.sim_id is not None and obj.object_config.object_name != "robot"
         ]
 
     def register_obstacle(self, sim_id: int):
@@ -153,7 +114,7 @@ class TrajectoryGenerator:
 
     def _init_zarr_storage(self):
         """Initialize Zarr storage for trajectory data."""
-        experiment_name = self.config.get("experiment_name", "")
+        experiment_name = self._traj_config.get("experiment_name", "")
         if experiment_name:
             output_dir = os.path.join("output", f"{self.env_config_name}_{experiment_name}_trajectories.zarr")
         else:
@@ -177,7 +138,7 @@ class TrajectoryGenerator:
 
     def is_complete(self) -> bool:
         """Check if we've generated all requested trajectories."""
-        return self.trajectory_count >= self.config["num_base_trajectories"]
+        return self.trajectory_count >= self._traj_config["num_base_trajectories"]
 
     def generate_trajectory_batch(self):
         """Generate one base trajectory with multiple obstacle configurations."""
@@ -185,13 +146,13 @@ class TrajectoryGenerator:
         self._init_zarr_storage()
 
         # 1. Get start/goal configurations
-        q_start = self.config.get("q_start")
+        q_start = self._traj_config.get("q_start")
         if q_start is None:
             q_start = self._get_random_collision_free_q()
         else:
             q_start = np.array(q_start)
 
-        q_goal = self.config.get("q_goal")
+        q_goal = self._traj_config.get("q_goal")
         if q_goal is None:
             q_goal = self._get_random_collision_free_q()
         else:
@@ -199,7 +160,7 @@ class TrajectoryGenerator:
 
 
         # 2. Generate base trajectory (with optional camera scoring)
-        if not self.config.get("disable_camera_scoring_for_rrt", False):
+        if not self._traj_config.get("disable_camera_scoring_for_rrt", False):
             # Camera-aware mode: verify camera link is available BEFORE generating paths
             if self.camera_link_index is None:
                 raise ValueError(
@@ -208,8 +169,8 @@ class TrajectoryGenerator:
                 )
 
             # Generate multiple candidates and select best
-            num_candidates = self.config.get("num_path_candidates", 5)
-            max_attempts = self.config.get("max_path_attempts", 20)
+            num_candidates = self._traj_config.get("num_path_candidates", 5)
+            max_attempts = self._traj_config.get("max_path_attempts", 20)
 
             candidate_paths = self._generate_multiple_path_candidates(
                 q_start, q_goal, num_candidates, max_attempts
@@ -222,16 +183,16 @@ class TrajectoryGenerator:
             target_position, _ = self._get_camera_link_pose(q_goal)
 
             # Score all candidates
-            k_exp = self.config.get("k_exp", 5.0)
-            k_sig = self.config.get("k_sig", 15.0)
-            threshold = self.config.get("threshold", 0.4)
+            k_exp = self._traj_config.get("k_exp", 5.0)
+            k_sig = self._traj_config.get("k_sig", 15.0)
+            threshold = self._traj_config.get("threshold", 0.4)
 
             scored_paths = []
             for i, path in enumerate(candidate_paths):
                 score = self._compute_camera_score(path, target_position, k_exp, k_sig, threshold)
                 scored_paths.append((score, i, path))
 
-                if self.config.get("verbose", False):
+                if self._traj_config.get("verbose", False):
                     print(f"Path {i}: score = {score:.4f}")
 
             # Select path with highest score
@@ -239,7 +200,7 @@ class TrajectoryGenerator:
             best_score, best_idx, base_traj = scored_paths[0]
             print("All scores:", [score for score, _, _ in scored_paths])
 
-            if self.config.get("verbose", False):
+            if self._traj_config.get("verbose", False):
                 print(f"Selected path {best_idx} with score {best_score:.4f}")
         else:
             # Standard mode: generate single path
@@ -249,7 +210,7 @@ class TrajectoryGenerator:
                 return  # Failed, will retry next iteration
 
         # 2b. Extend the path so that it stays at the last position for a second
-        num_extra_steps = int(1 * self.config["robot_update_rate"])
+        num_extra_steps = int(1 * self._traj_config["robot_update_rate"])
         last_q = base_traj[-1]
         extra_steps = np.tile(last_q, (num_extra_steps, 1))
         base_traj = np.vstack((base_traj, extra_steps))
@@ -258,15 +219,15 @@ class TrajectoryGenerator:
         base_ee_traj = self._get_ee_trajectory(base_traj)
 
         # 4. Save base trajectory (no obstacles) if configured
-        if self.config.get("save_base_trajectory", True):
+        if self._traj_config.get("save_base_trajectory", True):
             self._save_trajectory_zarr(
                 base_traj, self.trajectory_count, 0, 0, {"obstacles": []}
             )
 
         # 5. Generate trajectories with obstacles
-        if self.config["obstacles_per_base_trajectory"] > 0:
+        if self._traj_config["obstacles_per_base_trajectory"] > 0:
             for obstacle_i in range(
-                1, self.config["obstacles_per_base_trajectory"] + 1
+                1, self._traj_config["obstacles_per_base_trajectory"] + 1
             ):
                 # Add random obstacles
                 obstacle_ids, obstacle_infos = self._add_random_obstacles(
@@ -274,14 +235,14 @@ class TrajectoryGenerator:
                 )
 
                 # Generate multiple paths per obstacle configuration
-                for path_i in range(self.config["paths_per_obstacle"]):
+                for path_i in range(self._traj_config["paths_per_obstacle"]):
                     modified_traj = self._plan_rrt_path(
                         q_start, q_goal, additional_obstacles=obstacle_ids
                     )
 
                     if modified_traj is not None:
                         # Extend the path so that it stays at the last position for a second
-                        num_extra_steps = int(1 * self.config["robot_update_rate"])
+                        num_extra_steps = int(1 * self._traj_config["robot_update_rate"])
                         last_q = modified_traj[-1]
                         extra_steps = np.tile(last_q, (num_extra_steps, 1))
                         modified_traj = np.vstack((modified_traj, extra_steps))
@@ -308,7 +269,7 @@ class TrajectoryGenerator:
             self.lower_limits,
             self.upper_limits,
             max_tries=10000,
-            verbose=self.config.get("verbose", False),
+            verbose=self._traj_config.get("verbose", False),
         )
 
     def _plan_rrt_path(
@@ -330,11 +291,11 @@ class TrajectoryGenerator:
             obstacles,
             self.lower_limits,
             self.upper_limits,
-            self.config["time_per_traj"],
-            self.config["robot_update_rate"],
-            rrt_vis_fps=self.config.get("rrt_vis_fps", 10),
+            self._traj_config["time_per_traj"],
+            self._traj_config["robot_update_rate"],
+            rrt_vis_fps=self._traj_config.get("rrt_vis_fps", 10),
             use_gui=False,
-            verbose=self.config.get("verbose", False),
+            verbose=self._traj_config.get("verbose", False),
         )
 
     def _get_ee_trajectory(self, joint_trajectory: np.ndarray) -> np.ndarray:
@@ -483,11 +444,11 @@ class TrajectoryGenerator:
             if path is not None:
                 paths.append(path)
 
-                if self.config.get("verbose", False):
+                if self._traj_config.get("verbose", False):
                     perturbation_info = "" if len(paths) == 1 else f", perturbed={perturbation_scale:.3f}"
                     print(f"Generated path {len(paths)}/{num_candidates} (attempt {attempts}/{max_attempts}{perturbation_info})")
 
-        if self.config.get("verbose", False) and len(paths) < num_candidates:
+        if self._traj_config.get("verbose", False) and len(paths) < num_candidates:
             print(f"Warning: Only generated {len(paths)}/{num_candidates} valid paths after {max_attempts} attempts")
 
         return paths
@@ -502,7 +463,7 @@ class TrajectoryGenerator:
         new_obj_ids = []
         new_obj_infos = []
         num_obstacles = np.random.randint(
-            self.config["min_obstacles"], self.config["max_obstacles"] + 1
+            self._traj_config["min_obstacles"], self._traj_config["max_obstacles"] + 1
         )
 
         MIN_TIME_PROPORTION = 0.2
@@ -606,6 +567,6 @@ class TrajectoryGenerator:
         )
 
         # TODO: If render_images is True, execute trajectory and save observations
-        if self.config.get("render_images", False):
+        if self._traj_config.get("render_images", False):
             # Call back to base class method to execute and record
             pass

@@ -11,28 +11,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 
 from splatsim.utils.utils_fk import *
-
-@dataclass
-class ArticulationConfig:
-    initial_joint_positions: List[float]
-    joint_signs: List[int] # To handle joint direction conventions
-    segmentation_labels: Optional[List[int]] = None # List of which link each point belongs to
-    segmented_list: Optional[List[List[int]]] = None # List of splat indices per joint
-    initial_link_poses: Optional[List[Tuple[List[float], List[float]]]] = None # List of (pos, quat) per link at initial joint positions]]
-
-@dataclass
-class SplatSimObject:
-    name: str
-    splat_name: str
-    sim_id: int = None
-    mass: float = 0.0 # Default to static object
-    gaussians: Any = None
-    grasp_configs: List[dict] = field(default_factory=list)
-    object_config: dict[Any] = None # The format in configs/object_configs/objects.yaml
-    transformations_cache: dict[Any] = None
-    is_articulated: bool = False # For example, the robot has is_articulated=True. An object with is_articulated should have articulation_config
-    articulation_config: Optional[ArticulationConfig] = None
-    _cache: dict = field(default_factory=dict)  # Cache for GPU tensors to avoid recreating each step
+from splatsim.configs.env_config import SplatSimObject, SplatObjectConfig
 
 def high_precision_mode(func):
     """
@@ -86,11 +65,11 @@ def get_transformation_list(splatsim_obj: SplatSimObject, use_link_centers=True,
     Returns:
         List of (r_rel, t) tuples for each joint
     """
-    assert splatsim_obj.articulation_config is not None, "splatsim_obj must have articulation_config"
-    assert splatsim_obj.articulation_config.initial_link_poses is not None, "articulation_config must have initial_link_poses"
+    assert splatsim_obj.object_config.articulation_config is not None, "splatsim_obj must have articulation_config"
+    assert splatsim_obj.object_config.articulation_config.initial_link_poses is not None, "articulation_config must have initial_link_poses"
 
     robot_uid = splatsim_obj.sim_id
-    initial_link_states = splatsim_obj.articulation_config.initial_link_poses
+    initial_link_states = splatsim_obj.object_config.articulation_config.initial_link_poses
     num_joints = p.getNumJoints(robot_uid)
 
     if cached_link_states is not None:
@@ -154,8 +133,9 @@ def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=Tru
     return transformations_list
 
 def crop_splat(splatsim_obj: SplatSimObject, keep_within_aabb=True):
+    assert type(splatsim_obj.object_config) == SplatObjectConfig
     pc = splatsim_obj.gaussians
-    aabb = splatsim_obj.object_config.get("aabb", {"bounding_box": None})['bounding_box']
+    aabb = splatsim_obj.object_config.aabb.bounding_box
     if aabb is None:
         return
 
@@ -196,7 +176,7 @@ def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base
     # xyz is in global frame. pc is in splat frame
     pc = splatsim_obj.gaussians
     robot_uid = splatsim_obj.sim_id
-    segmented_list = splatsim_obj.articulation_config.segmented_list
+    segmented_list = splatsim_obj.object_config.articulation_config.segmented_list
 
     # If writing to output_slices, use them as our working buffers
     if output_slices is not None:
@@ -227,7 +207,7 @@ def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base
     if use_base_position:
         if 'base_position' not in splatsim_obj._cache:
             splatsim_obj._cache['base_position'] = torch.tensor(
-                splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0],
+                splatsim_obj.object_config.base_position,
                 device='cuda'
             ).float()
         base_position = splatsim_obj._cache['base_position']
@@ -377,7 +357,7 @@ def build_matrix_from_r_t(r, t, device='cuda'):
     return transform
 
 @high_precision_mode
-def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base_position=True, inplace=False, output_slices=None):
+def transform_object(splatsim_obj: SplatSimObject, pos=None, quat=None, transform=None, use_base_position=True, inplace=False, output_slices=None):
     """
     Transforms all properties of a Gaussian splat object using a 4x4 transformation matrix.
     Memory-efficient: writes directly to output_slices if provided.
@@ -432,7 +412,7 @@ def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base
     if use_base_position:
         if 'base_position' not in splatsim_obj._cache:
             splatsim_obj._cache['base_position'] = torch.tensor(
-                splatsim_obj.object_config.get("base_position", [[0, 0, 0]])[0],
+                splatsim_obj.object_config.base_position,
                 device=device
             ).float()
         base_pos = splatsim_obj._cache['base_position']
@@ -475,8 +455,8 @@ def transform_object(splatsim_obj, pos=None, quat=None, transform=None, use_base
         pc._features_dc = features_dc_obj
         pc._features_rest = features_rest_obj
         pc._scaling = scales_obj
-        if splatsim_obj.articulation_config is not None:
-            splatsim_obj.articulation_config.initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
+        if splatsim_obj.object_config.articulation_config is not None and splatsim_obj.sim_id is not None:
+            splatsim_obj.object_config.articulation_config.initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
 
     return xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
 
@@ -535,8 +515,9 @@ def transform_shs(shs_feat, rotation_matrix):
 
 
 def get_segmented_indices(splatsim_obj: SplatSimObject):
+    assert type(splatsim_obj.object_config) == SplatObjectConfig
     pc = splatsim_obj.gaussians
-    aabb = splatsim_obj.object_config["aabb"]["bounding_box"]
+    aabb = splatsim_obj.object_config.aabb.bounding_box
 
     # Defining a cube in Gaussian space to segment out the robot
     xyz = pc.get_xyz # 3D means shape (N, 3)
@@ -547,6 +528,6 @@ def get_segmented_indices(splatsim_obj: SplatSimObject):
     condition = (xyz[:, 0] > aabb[0][0]) & (xyz[:, 0] < aabb[1][0]) & (xyz[:, 1] > aabb[0][1]) & (xyz[:, 1] < aabb[1][1]) & (xyz[:, 2] > aabb[0][2]) & (xyz[:, 2] < aabb[1][2])
     condition = torch.where(condition)[0]
     for i in range(p.getNumJoints(splatsim_obj.sim_id)):
-        segmented_points.append(condition[splatsim_obj.articulation_config.segmentation_labels==i])
+        segmented_points.append(condition[splatsim_obj.segmentation_labels==i])
     
     return segmented_points

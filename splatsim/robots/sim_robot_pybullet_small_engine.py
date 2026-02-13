@@ -11,6 +11,7 @@ from splatsim.configs import (
     TaskConfig,
     CuboidObjectConfig,
     SplatObjectConfig,
+    TrajectoryGenModeConfig,
 )
 from splatsim.robots.sim_robot_pybullet_base import (
     PybulletRobotServerBase,
@@ -30,40 +31,7 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         return all_paths
 
     def serve_loop(self) -> None:
-        # To be called in the parent's serve()
-
-        if self.serve_mode == self.SERVE_MODES.INTERACTIVE:
-            print("in collision?", self.is_robot_in_collision())
-            self.pybullet_client.stepSimulation()
-            time.sleep(1 / 240)
-        elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
-            # Idle mode - just step simulation while user configures settings
-            self.pybullet_client.stepSimulation()
-            time.sleep(1 / 240)
-        elif self.serve_mode == self.SERVE_MODES.GENERATE_DEMOS:
-            raise NotImplementedError()
-            initial_joint_positions = self.randomize_ee_pose()
-
-            success = self.plan_execute_record_trajectory(
-                initial_joint_positions, self.splatsim_robot.articulation_config.joint_signs
-            )
-            if success:
-                self.trajectory_count += 1
-
-            if self.trajectory_count > self.MAX_TRAJECTORY_COUNT:
-                print(
-                    f"Exiting record_demos mode because max trajectory count of {self.MAX_TRAJECTORY_COUNT} was reached in folder {self.path}"
-                )
-                self.serve_mode = self.SERVE_MODES.INTERACTIVE
-        elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-            # Handle active trajectory generation mode
-            self.trajectory_generator.generate_trajectory_batch()
-
-            if self.trajectory_generator.is_complete():
-                print(f"[GUI] Completed trajectory generation. Switching to idle mode.")
-                self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
-        else:
-            raise ValueError(f"Unknown serve mode {self.serve_mode}. ")
+        pass
 
     # =========================================================================
     # Gym Environment Interface
@@ -218,50 +186,49 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
             SplatObjectConfig(
                 object_name="small_engine_new",
                 splat_object_name="small_engine_new",
-                grasp_config=[],
+                grasp_configs=[],
                 randomize_pose=False,
                 rotation_range_z=(0, 0),
-                is_in_scene_splat=True,
+                load_splat=False, # Because it's already in the scene splat
                 table_pos=(-0.48, 0.36),
                 table_quat=(0, 0, -0.7071068, 0.7071068),
             ),
-            # table has a plane for objects to sit on at z = 0
+            # # table has a plane for objects to sit on at z = 0
             CuboidObjectConfig(
                 object_name="table",
                 size=(1.5, 0.90, 0.05),
                 position=(0, 0.25, -0.025),
                 mass=0,
                 color_rgb=(223, 205, 192),
+                load_splat=False,
             ),
-            # wall is at -0.2 on y axis
+            # # wall is at -0.2 on y axis
             CuboidObjectConfig(
                 object_name="wall",
                 size=(3.0, 0.05, 1.5),
                 position=(0, -0.225, 0.75),
                 mass=0,
                 color_rgb=(223, 205, 192),
+                load_splat=False,
             ),
-
-            # SplatObjectConfig(
-            #     object_name="thinkpad_box",
-            #     splat_object_name="thinkpad_box",
-            #     grasp_config=[],
-            #     randomize_pose=False,
-            #     rotation_range_z=(0, 0),
-            #     is_in_scene_splat=False,
-            #     table_pos=(0.48, 0.20),
-            #     table_quat=(0, 0, 0, 1),
-            # ),
-            # SplatObjectConfig(
-            #     object_name="starwars_box",
-            #     splat_object_name="starwars_box",
-            #     grasp_config=[],
-            #     randomize_pose=False,
-            #     rotation_range_z=(0, 0),
-            #     is_in_scene_splat=False,
-            #     table_pos=(0.48, 0.40),
-            #     table_quat=(0, 0, 0, 1),
-            # ),
+            SplatObjectConfig(
+                object_name="thinkpad_box",
+                splat_object_name="thinkpad_box",
+                grasp_configs=[],
+                randomize_pose=False,
+                rotation_range_z=(0, 0),
+                table_pos=(-0.1, 0.20),
+                table_quat=(0, 0, 0, 1),
+            ),
+            SplatObjectConfig(
+                object_name="starwars_box",
+                splat_object_name="starwars_box",
+                grasp_configs=[],
+                randomize_pose=False,
+                rotation_range_z=(0, 0),
+                table_pos=(-0.2, 0.50),
+                table_quat=(0, 0, 1, 0), #rotated 180 degrees about z
+            ),
         ],
     )
 
@@ -274,4 +241,10 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
             cameraYaw=180,             # 0 degrees = looking from +y towards origin
             cameraPitch=-30,         # -30 degrees = looking down at ~30 degree angle
             cameraTargetPosition=[0, 0, 0.3]  # Look at point above the floor
+        )
+
+    def _get_default_trajectory_gen_config(self) -> TrajectoryGenModeConfig:
+        return TrajectoryGenModeConfig(
+            # Approach lever
+            q_goal=[1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029]
         )

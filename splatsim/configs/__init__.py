@@ -6,6 +6,11 @@ from .env_config import (
     CuboidObjectConfig,
     SplatObjectConfig,
 )
+from .mode_config import (
+    SplatSimModeConfig,
+    InteractiveModeConfig,
+    TrajectoryGenModeConfig,
+)
 
 __all__ = [
     "DebugModes",
@@ -14,4 +19,7 @@ __all__ = [
     "ObjectConfig",
     "CuboidObjectConfig",
     "SplatObjectConfig",
+    "SplatSimModeConfig",
+    "InteractiveModeConfig",
+    "TrajectoryGenModeConfig",
 ]

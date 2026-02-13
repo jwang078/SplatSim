@@ -13,16 +13,14 @@ robot_iphone:
     - [0.0, 0.0]
     - [0.0, 0.0]
     - [0.0, 0.0]
-  urdf_path:
-  - ./splatsim/robot_definitions/urdf/sisbot.urdf
-  base_position:
-  - [0.0, 0.0, -0.078]
+  urdf_path: ./splatsim/robot_definitions/urdf/sisbot.urdf
+  base_position: [0.0, 0.0, -0.078]
   note: the -0.1 is from the URDF definition and -0.022 is the base plate that the
     robot is mounted on
-  joint_states:
-  - [0, 0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
-    0.0, 0.0, 0.0, 0.7999999999999996, 0.0, -0.8000070728762431, 0.0, 0.7999947291384548,
-    0.799996381456464, 0.0, -0.799988452159267, 0.0, 0.7999926186486127]
+  articulation_config:
+    initial_joint_positions: [0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
+      0.0, 0.0, 0.0, 0.7999999999999996, 0.0, -0.8000070728762431, 0.0, 0.7999947291384548,
+      0.799996381456464, 0.0, -0.799988452159267, 0.0, 0.7999926186486127]
   source_path: /home/jennyw2/data/test_data/robot_iphone
   model_path: /home/jennyw2/data/output/robot_iphone
   use_gripper: true
@@ -43,13 +41,11 @@ robot_iphone_w_engine:
     - [0.0, 0.0]
     - [0.0, 0.0]
     - [0.0, 0.0]
-  urdf_path:
-  - ./splatsim/robot_definitions/urdf/sisbot.urdf
-  base_position:
-  - [0.0, 0.0, -0.078]
-  joint_states:
-  - [0, 0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
-    0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
+  urdf_path: ./splatsim/robot_definitions/urdf/sisbot.urdf
+  base_position: [0.0, 0.0, -0.078]
+  articulation_config:
+    initial_joint_positions: [0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
+      0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_2_images_500_highres_20match_540height/sfm_disk_disk+lightglue/undistorted
   model_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height
   use_gripper: true
@@ -71,13 +67,12 @@ robot_iphone_w_engine_new:
     - [0.0, 0.0]
     - [0.0, 0.1]
     - [0.0, 0.0]
-  urdf_path:
-  - ./splatsim/robot_definitions/urdf/sisbot.urdf
-  base_position:
-  - [0.0, 0.0, -0.088]
-  joint_states:
-  - [0, 1.5707963267948966, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966,
-    -1.5707963267948966, 0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
+  urdf_path: ./splatsim/robot_definitions/urdf/sisbot.urdf
+  base_position: [0.0, 0.0, -0.088]
+  articulation_config:
+    initial_joint_positions: [1.5707963267948966, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966,
+      -1.5707963267948966, 0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
+    joint_signs: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle/sfm_disk_disk+lightglue/undistorted
   model_path: /home/jennyw2/code/gaussian-splatting/output/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle
   use_gripper: true
@@ -99,13 +94,11 @@ bwa_open_space:
     - [0.0, 0.0]
     - [0.0, 0.0]
     - [0.0, 0.0]
-  urdf_path:
-  - ./splatsim/robot_definitions/urdf/sisbot.urdf
-  base_position:
-  - [0.0, 0.0, -0.078]
-  joint_states:
-  - [0, 0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
-    0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
+  urdf_path: ./splatsim/robot_definitions/urdf/sisbot.urdf
+  base_position: [0.0, 0.0, -0.078]
+  articulation_config:
+    initial_joint_positions: [0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
+      0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0, 0.0, 0, 0.0, 0]
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/2025-10-24_new_bedford_engine_visit_GX010016_notwideangle_better_images_500_20match_540height/sfm_disk_disk+lightglue/undistorted
   model_path: /home/jennyw2/code/gaussian-splatting/output/2025-10-24_new_bedford_engine_visit_GX010016_notwideangle_better_images_500_20match_540height
   use_gripper: true
@@ -122,12 +115,10 @@ sim_franka:
     bounding_box:
     - [-0.1541, -0.1294, -0.0008]
     - [0.6763, 0.1342, 0.8317]
-  urdf_path:
-  - /home/nomaan/miniconda3/envs/splatsim/lib/python3.7/site-packages/pybullet_data/franka_panda/panda.urdf
-  base_position:
-  - [0.0, 0.0, -0.0]
-  joint_states:
-  - []
+  urdf_path: /home/nomaan/miniconda3/envs/splatsim/lib/python3.7/site-packages/pybullet_data/franka_panda/panda.urdf
+  base_position: [0.0, 0.0, -0.0]
+  articulation_config:
+    initial_joint_positions: []
 mug:
   transformation:
     matrix:
@@ -158,14 +149,12 @@ small_engine:
     - [0.0, 0.0]
     - [0.0, 0.0]
   ply_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height/point_cloud/iteration_30000/point_cloud.ply
-  urdf_path:
-  - /home/jennyw2/data/small_engine_on_table_2/small_engine_with_prismatic_cap2/urdf/small_engine_with_prismatic_cap2.urdf
+  urdf_path: /home/jennyw2/data/small_engine_on_table_2/small_engine_with_prismatic_cap2/urdf/small_engine_with_prismatic_cap2.urdf
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_2_images_500_highres_20match_540height/sfm_disk_disk+lightglue/undistorted
   model_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height
-  joint_states:
-  - [0]
-  base_position:
-  - [0.0, 0.0, 0.345]
+  articulation_config:
+    initial_joint_positions: []
+  base_position: [0.0, 0.0, 0.345]
   use_fixed_base: true
 small_engine_new:
   transformation:
@@ -182,14 +171,12 @@ small_engine_new:
     - [0.0, 0.0]
     - [0.0, 0.0]
     - [0.0, 0.0]
-  urdf_path:
-  - /home/jennyw2/data/small_engine_on_table_2/small_engine_with_prismatic_cap2/urdf/small_engine_with_prismatic_cap2.urdf
+  urdf_path: /home/jennyw2/data/small_engine_on_table_2/small_engine_with_prismatic_cap2/urdf/small_engine_with_prismatic_cap2.urdf
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle/sfm_disk_disk+lightglue/undistorted
   model_path: /home/jennyw2/code/gaussian-splatting/output/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle
-  joint_states:
-  - [0]
-  base_position:
-  - [0.0, 0.0, 0.180955]
+  articulation_config:
+    initial_joint_positions: []
+  base_position: [0.0, 0.0, 0.180955]
   use_fixed_base: true
 thinkpad_box:
   transformation:
@@ -206,14 +193,12 @@ thinkpad_box:
     - [-0.01, 0.01]
     - [-0.01, 0.01]
     - [-0.01, 0.01]
-  urdf_path:
-  - /home/jennyw2/code/SplatSim/splatsim/robot_definitions/urdf/boxes/thinkpad_box.urdf
+  urdf_path: /home/jennyw2/code/SplatSim/splatsim/robot_definitions/urdf/boxes/thinkpad_box.urdf
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/boxes_thinkpadbox_images_500_500match_540height_OPENCVcam/sfm_disk_disk+lightglue/undistorted
   model_path: /home/jennyw2/code/gaussian-splatting/output/boxes_thinkpadbox_images_500_500match_540height_OPENCVcam
-  joint_states:
-  - [0]
-  base_position:
-  - [0.0, 0.0, 0.0]
+  articulation_config:
+    initial_joint_positions: []
+  base_position: [0.0, 0.0, 0.0]
   use_fixed_base: true
 starwars_box:
   transformation:
@@ -230,14 +215,12 @@ starwars_box:
     - [-0.01, 0.01]
     - [-0.01, 0.01]
     - [-0.01, 0.01]
-  urdf_path:
-  - /home/jennyw2/code/SplatSim/splatsim/robot_definitions/urdf/boxes/starwars_box.urdf
+  urdf_path: /home/jennyw2/code/SplatSim/splatsim/robot_definitions/urdf/boxes/starwars_box.urdf
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/boxes_starwarsbox_images_500_500match_540height_OPENCVcam/sfm_disk_disk+lightglue/undistorted
   model_path: /home/jennyw2/code/gaussian-splatting/output/boxes_starwarsbox_images_500_500match_540height_OPENCVcam
-  joint_states:
-  - [0]
-  base_position:
-  - [0.0, 0.0, 0.0]
+  articulation_config:
+    initial_joint_positions: []
+  base_position: [0.0, 0.0, 0.0]
   use_fixed_base: true
 plastic_apple:
   transformation:

@@ -9,7 +9,8 @@ from argparse import ArgumentParser
 
 # Import Gaussian splat utilities
 from gaussian_splatting.gaussian_renderer import GaussianModel
-from splatsim.utils.robot_splat_render_utils import SplatSimObject, transform_object
+from splatsim.utils.robot_splat_render_utils import transform_object
+from splatsim.configs.env_config import SplatObjectObject
 
 
 def main():
