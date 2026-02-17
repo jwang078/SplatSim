@@ -184,8 +184,8 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
         ),
         objects=[
             SplatObjectConfig(
-                object_name="small_engine_new",
-                splat_object_name="small_engine_new",
+                name="small_engine_new",
+                splat_name="small_engine_new",
                 grasp_configs=[],
                 randomize_pose=False,
                 rotation_range_z=(0, 0),
@@ -193,9 +193,9 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 table_pos=(-0.48, 0.36),
                 table_quat=(0, 0, -0.7071068, 0.7071068),
             ),
-            # # table has a plane for objects to sit on at z = 0
+            # table has a plane for objects to sit on at z = 0
             CuboidObjectConfig(
-                object_name="table",
+                name="table",
                 size=(1.5, 0.90, 0.05),
                 position=(0, 0.25, -0.025),
                 mass=0,
@@ -204,7 +204,7 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
             ),
             # # wall is at -0.2 on y axis
             CuboidObjectConfig(
-                object_name="wall",
+                name="wall",
                 size=(3.0, 0.05, 1.5),
                 position=(0, -0.225, 0.75),
                 mass=0,
@@ -212,8 +212,8 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 load_splat=False,
             ),
             SplatObjectConfig(
-                object_name="thinkpad_box",
-                splat_object_name="thinkpad_box",
+                name="box1",
+                splat_name="thinkpad_box",
                 grasp_configs=[],
                 randomize_pose=False,
                 rotation_range_z=(0, 0),
@@ -221,8 +221,8 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 table_quat=(0, 0, 0, 1),
             ),
             SplatObjectConfig(
-                object_name="starwars_box",
-                splat_object_name="starwars_box",
+                name="box2",
+                splat_name="starwars_box",
                 grasp_configs=[],
                 randomize_pose=False,
                 rotation_range_z=(0, 0),

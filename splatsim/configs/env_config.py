@@ -56,7 +56,7 @@ class ArticulationConfig:
 @dataclass
 class ObjectConfig(ABC):
     """Abstract base class fora config for an object in SplatSim"""
-    object_name: str
+    name: str
 
     base_position: List[float] = Default(lambda: [[0, 0, 0]])
     source_path: Optional[str] = Default(None)
@@ -114,7 +114,7 @@ class ObjectConfig(ABC):
 
         # Validation
         if self.is_articulated and self.articulation_config is None:
-            raise TypeError(f"is_articulated is True but articulation_config is missing for {self.object_name}")
+            raise TypeError(f"is_articulated is True but articulation_config is missing for {self.name}")
 
     @classmethod
     def _get_yaml_data(cls) -> Dict[str, Dict[str, Any]]:
@@ -130,15 +130,15 @@ class ObjectConfig(ABC):
         return cls._YAML_CACHE
 
     def _load_yaml_config(self) -> Dict[str, Any]:
-        splat_object_name = getattr(self, "splat_object_name", None)
-        if splat_object_name is None:
+        splat_name = getattr(self, "splat_name", None)
+        if splat_name is None:
             # Fall back to object name
-            splat_object_name = getattr(self, "object_name", None)
-        if splat_object_name is None:
+            splat_name = getattr(self, "object_name", None)
+        if splat_name is None:
             return {}
         all_configs = self._get_yaml_data()
-        if splat_object_name in all_configs:
-            return all_configs[splat_object_name]
+        if splat_name in all_configs:
+            return all_configs[splat_name]
         
 
 @dataclass
@@ -158,7 +158,7 @@ class CuboidObjectConfig(ObjectConfig):
 @dataclass(kw_only=True)
 class SplatObjectConfig(ObjectConfig):
     """Splat-rendered object."""
-    splat_object_name: str
+    splat_name: str
 
     # Capture all the instance overrides (highest priority)
     urdf_path: Optional[str] = Default(None)
@@ -203,7 +203,7 @@ class EnvConfig:
 class SplatSimObject:
     # name: str
     # splat_name: str
-    object_config: ObjectConfig
+    config: ObjectConfig
     sim_id: Optional[int] = None
     mass: float = 0.0 # Default to static object
     gaussians: Any = None

@@ -488,14 +488,14 @@ class AppleOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
         "name": "apple_on_plate",
         "objects": [
             {
-                "object_name": "plastic_apple",
-                "splat_object_name": "plastic_apple",
+                "name": "plastic_apple",
+                "splat_name": "plastic_apple",
                 "grasp_config": [ObjectOnPlatePybulletRobotServer.GRASP_CONFIGS["apple"]],
                 "rotation_range_z": [0, 0],
             },
             {
-                "object_name": "plate",
-                "splat_object_name": "plate",
+                "name": "plate",
+                "splat_name": "plate",
                 "grasp_config": [],
                 "rotation_range_z": [-np.pi / 6, np.pi / 6],
             },
@@ -508,8 +508,8 @@ class BananaOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
         "name": "banana_on_plate",
         "objects": [
             {
-                "object_name": "plastic_banana",
-                "splat_object_name": "plastic_banana",
+                "name": "plastic_banana",
+                "splat_name": "plastic_banana",
                 "grasp_config": [
                     ObjectOnPlatePybulletRobotServer.GRASP_CONFIGS["banana1"],
                     ObjectOnPlatePybulletRobotServer.GRASP_CONFIGS["banana2"],
@@ -517,8 +517,8 @@ class BananaOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
                 "rotation_range_z": [0, 0],
             },
             {
-                "object_name": "plate",
-                "splat_object_name": "plate",
+                "name": "plate",
+                "splat_name": "plate",
                 "grasp_config": [],
                 "rotation_range_z": [-np.pi / 6, np.pi / 6],
             },
@@ -531,14 +531,14 @@ class OrangeOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
         "name": "orange_on_plate",
         "objects": [
             {
-                "object_name": "plastic_orange",
-                "splat_object_name": "plastic_orange",
+                "name": "plastic_orange",
+                "splat_name": "plastic_orange",
                 "grasp_config": [ObjectOnPlatePybulletRobotServer.GRASP_CONFIGS["orange"]],
                 "rotation_range_z": [0, 0],
             },
             {
-                "object_name": "plate",
-                "splat_object_name": "plate",
+                "name": "plate",
+                "splat_name": "plate",
                 "grasp_config": [],
                 "rotation_range_z": [-np.pi / 6, np.pi / 6],
             },

@@ -65,11 +65,11 @@ def get_transformation_list(splatsim_obj: SplatSimObject, use_link_centers=True,
     Returns:
         List of (r_rel, t) tuples for each joint
     """
-    assert splatsim_obj.object_config.articulation_config is not None, "splatsim_obj must have articulation_config"
-    assert splatsim_obj.object_config.articulation_config.initial_link_poses is not None, "articulation_config must have initial_link_poses"
+    assert splatsim_obj.config.articulation_config is not None, "splatsim_obj must have articulation_config"
+    assert splatsim_obj.config.articulation_config.initial_link_poses is not None, "articulation_config must have initial_link_poses"
 
     robot_uid = splatsim_obj.sim_id
-    initial_link_states = splatsim_obj.object_config.articulation_config.initial_link_poses
+    initial_link_states = splatsim_obj.config.articulation_config.initial_link_poses
     num_joints = p.getNumJoints(robot_uid)
 
     if cached_link_states is not None:
@@ -133,9 +133,9 @@ def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=Tru
     return transformations_list
 
 def crop_splat(splatsim_obj: SplatSimObject, keep_within_aabb=True):
-    assert type(splatsim_obj.object_config) == SplatObjectConfig
+    assert type(splatsim_obj.config) == SplatObjectConfig
     pc = splatsim_obj.gaussians
-    aabb = splatsim_obj.object_config.aabb.bounding_box
+    aabb = splatsim_obj.config.aabb.bounding_box
     if aabb is None:
         return
 
@@ -176,7 +176,7 @@ def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base
     # xyz is in global frame. pc is in splat frame
     pc = splatsim_obj.gaussians
     robot_uid = splatsim_obj.sim_id
-    segmented_list = splatsim_obj.object_config.articulation_config.segmented_list
+    segmented_list = splatsim_obj.config.articulation_config.segmented_list
 
     # If writing to output_slices, use them as our working buffers
     if output_slices is not None:
@@ -207,7 +207,7 @@ def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base
     if use_base_position:
         if 'base_position' not in splatsim_obj._cache:
             splatsim_obj._cache['base_position'] = torch.tensor(
-                splatsim_obj.object_config.base_position,
+                splatsim_obj.config.base_position,
                 device='cuda'
             ).float()
         base_position = splatsim_obj._cache['base_position']
@@ -412,7 +412,7 @@ def transform_object(splatsim_obj: SplatSimObject, pos=None, quat=None, transfor
     if use_base_position:
         if 'base_position' not in splatsim_obj._cache:
             splatsim_obj._cache['base_position'] = torch.tensor(
-                splatsim_obj.object_config.base_position,
+                splatsim_obj.config.base_position,
                 device=device
             ).float()
         base_pos = splatsim_obj._cache['base_position']
@@ -455,8 +455,8 @@ def transform_object(splatsim_obj: SplatSimObject, pos=None, quat=None, transfor
         pc._features_dc = features_dc_obj
         pc._features_rest = features_rest_obj
         pc._scaling = scales_obj
-        if splatsim_obj.object_config.articulation_config is not None and splatsim_obj.sim_id is not None:
-            splatsim_obj.object_config.articulation_config.initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
+        if splatsim_obj.config.articulation_config is not None and splatsim_obj.sim_id is not None:
+            splatsim_obj.config.articulation_config.initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
 
     return xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
 
@@ -515,9 +515,9 @@ def transform_shs(shs_feat, rotation_matrix):
 
 
 def get_segmented_indices(splatsim_obj: SplatSimObject):
-    assert type(splatsim_obj.object_config) == SplatObjectConfig
+    assert type(splatsim_obj.config) == SplatObjectConfig
     pc = splatsim_obj.gaussians
-    aabb = splatsim_obj.object_config.aabb.bounding_box
+    aabb = splatsim_obj.config.aabb.bounding_box
 
     # Defining a cube in Gaussian space to segment out the robot
     xyz = pc.get_xyz # 3D means shape (N, 3)

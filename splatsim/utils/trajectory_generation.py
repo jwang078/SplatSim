@@ -88,7 +88,7 @@ class TrajectoryGenerator:
 
     def get_obstacle_ids(self) -> List[int]:
         return self.loaded_obstacle_ids + [
-            obj.sim_id for obj in self.splatsim_objects if obj.sim_id is not None and obj.object_config.object_name != "robot"
+            obj.sim_id for obj in self.splatsim_objects if obj.sim_id is not None and obj.config.object_name != "robot"
         ]
 
     def register_obstacle(self, sim_id: int):

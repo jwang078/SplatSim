@@ -255,7 +255,7 @@ class PybulletRobotServerBase:
             ValueError: If no table object is defined in ENV_CONFIG.
         """
         for obj in self.ENV_CONFIG.objects:
-            if obj.object_name == "table" and isinstance(obj, CuboidObjectConfig):
+            if obj.name == "table" and isinstance(obj, CuboidObjectConfig):
                 position = obj.position
                 size = obj.size
                 x_center, y_center = position[0], position[1]
@@ -353,7 +353,6 @@ class PybulletRobotServerBase:
         # Placeholder object for rendering purposes
         self.scene_gaussian = GaussianModel(3)
 
-        self.object_config_path = str(SPLATSIM_ROOT / "configs" / "object_configs" / "objects.yaml")
         self.grasp_poses = {}
 
         self.pybullet_client = p
@@ -373,9 +372,6 @@ class PybulletRobotServerBase:
         self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
 
 
-        with open(self.object_config_path, "r") as file:
-            self.object_config = yaml.safe_load(file)
-
         # TODO this mock class fails for the apple on plate task, etc
         class MockModelsLib:
             model_name_list = {}
@@ -385,8 +381,8 @@ class PybulletRobotServerBase:
         self.splatsim_objects: List[SplatSimObject] = []
         self.splatsim_robot: SplatSimObject = self.create_object(
             SplatObjectConfig(
-                object_name="robot",
-                splat_object_name=self.robot_name,
+                name="robot",
+                splat_name=self.robot_name,
                 randomize_pose=False
             )
         )
@@ -399,7 +395,7 @@ class PybulletRobotServerBase:
             env_config_name=self.ENV_CONFIG.name,
             get_ee_link_fn=lambda: self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id) - 1,
             splatsim_objects=self.splatsim_objects,
-            wrist_camera_link_name=self.splatsim_robot.object_config.wrist_camera_link_name,
+            wrist_camera_link_name=self.splatsim_robot.config.wrist_camera_link_name,
             trajectory_gen_config=self._get_default_trajectory_gen_config(),
         )
 
@@ -415,8 +411,8 @@ class PybulletRobotServerBase:
                 raise ValueError(f"background_splat_name has not been set for env {type(self)}")
             self.splatsim_background: SplatSimObject = self.create_object(
                 SplatObjectConfig(
-                    object_name="background",
-                    splat_object_name=self.background_splat_name,
+                    name="background",
+                    splat_name=self.background_splat_name,
                     keep_within_aabb=False,
                     load_urdf=False,
                     is_articulated=False,
@@ -438,16 +434,6 @@ class PybulletRobotServerBase:
                 self.ur5e_ee_id = joint_id
 
         for object_config in self.ENV_CONFIG.objects:
-            # object_name = object_cfg.object_name
-            # splat_object_name = getattr(object_cfg, "splat_object_name", None)
-            # nested_object_config = getattr(object_cfg, "object_config", None) or {}
-            # object_config = {
-            #     **self.object_config.get(object_name, {}),
-            #     **nested_object_config,
-            #     **object_cfg.to_dict(),
-            # }
-            # grasp_config = getattr(object_cfg, "grasp_config", []) or []
-
             # Already adds the splatsim_object to self.splatsim_objects
             self.create_object(
                 object_config=object_config,
@@ -468,13 +454,13 @@ class PybulletRobotServerBase:
 
         # Always set up the base camera because wrist_rgb is initialized from it
         self.base_camera = self.setup_camera_from_dataset(
-            self.splatsim_background.object_config, cam_i=self.cam_i, use_train=True
+            self.splatsim_background.config, cam_i=self.cam_i, use_train=True
         )
 
         if "wrist_rgb" in self.camera_names:
             # TODO Hardcoding a splat dataset / recovered camera from a GoPro
             self.wrist_camera = self.setup_camera_from_dataset(
-                SplatObjectConfig(object_name="wrist_cam_load", splat_object_name="bwa_open_space"),
+                SplatObjectConfig(name="wrist_cam_load", splat_name="bwa_open_space"),
                 cam_i=3, use_train=True
             )
         else:
@@ -486,8 +472,8 @@ class PybulletRobotServerBase:
             )
 
         # Add the index of the wrist_camera_link to the wrist camera if it's available
-        if self.splatsim_robot.object_config.wrist_camera_link_name is not None:
-            wrist_camera_link_name = self.splatsim_robot.object_config.wrist_camera_link_name
+        if self.splatsim_robot.config.wrist_camera_link_name is not None:
+            wrist_camera_link_name = self.splatsim_robot.config.wrist_camera_link_name
             num_joints = p.getNumJoints(self.splatsim_robot.sim_id)
             for i in range(num_joints):
                 info = p.getJointInfo(self.splatsim_robot.sim_id, i)
@@ -505,7 +491,7 @@ class PybulletRobotServerBase:
 
         # current gripper state
         self.current_gripper_action = GripperState.OPEN
-        self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.object_config.articulation_config.initial_joint_positions)
+        self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.config.articulation_config.initial_joint_positions)
 
         # Gym-related state
         self._step_count = 0
@@ -541,26 +527,26 @@ class PybulletRobotServerBase:
     def load_urdf(self, splatsim_obj: SplatSimObject):
         # This must be called after the gaussians are finalized
         # ex: after the gaussians are transformed to be in the simulator's coordinate frame
-        use_fixed_base = splatsim_obj.object_config.use_fixed_base
-        global_scaling = splatsim_obj.object_config.global_scaling
-        is_articulated = splatsim_obj.object_config.is_articulated
-        base_position = splatsim_obj.object_config.base_position
+        use_fixed_base = splatsim_obj.config.use_fixed_base
+        global_scaling = splatsim_obj.config.global_scaling
+        is_articulated = splatsim_obj.config.is_articulated
+        base_position = splatsim_obj.config.base_position
 
         if is_articulated:
             flags = self.pybullet_client.URDF_USE_IMPLICIT_CYLINDER
         else:
             flags = 0
 
-        if type(splatsim_obj.object_config) == SplatObjectConfig:
+        if type(splatsim_obj.config) == SplatObjectConfig:
             # Find possible URDF config
-            if splatsim_obj.object_config.object_name in self.models_lib.model_name_list:
-                urdf_path = self.models_lib[splatsim_obj.object_config.splat_object_name]
-            elif splatsim_obj.object_config.urdf_path is not None:
-                urdf_path = resolve_splatsim_path(splatsim_obj.object_config.urdf_path)
+            if splatsim_obj.config.name in self.models_lib.model_name_list:
+                urdf_path = self.models_lib[splatsim_obj.config.splat_name]
+            elif splatsim_obj.config.urdf_path is not None:
+                urdf_path = resolve_splatsim_path(splatsim_obj.config.urdf_path)
                 if not os.path.exists(urdf_path):
                     raise FileNotFoundError(f"URDF file not found: {urdf_path}")
             else:
-                raise ValueError(f"urdf_path not found for object {splatsim_obj.object_config.object_name}")
+                raise ValueError(f"urdf_path not found for object {splatsim_obj.config.name}")
 
             # TODO possibly do custom quat
             quat = self.pybullet_client.getQuaternionFromEuler([0, 0, 0])
@@ -573,13 +559,13 @@ class PybulletRobotServerBase:
                 flags=flags,
             )
             mass = self.pybullet_client.getDynamicsInfo(object_loaded, -1)[0]
-        elif type(splatsim_obj.object_config) == CuboidObjectConfig:
+        elif type(splatsim_obj.config) == CuboidObjectConfig:
             # Find primitive shape config
             # position, orientation, size
             # TODO orientation
-            lx, ly, lz = splatsim_obj.object_config.size
-            position = splatsim_obj.object_config.position
-            color_rgb = splatsim_obj.object_config.color_rgb
+            lx, ly, lz = splatsim_obj.config.size
+            position = splatsim_obj.config.position
+            color_rgb = splatsim_obj.config.color_rgb
 
             # Apply global scaling
             lx, ly, lz = (
@@ -598,48 +584,11 @@ class PybulletRobotServerBase:
             set_pose(object_loaded, Pose(point=position))
             # TODO set orientation
             if use_fixed_base:
-                splatsim_obj.object_config.mass = 0.0
-            self.pybullet_client.changeDynamics(object_loaded, -1, mass=splatsim_obj.object_config.mass)
-        # elif (
-        #     len(splatsim_obj.gaussians._xyz) > 0
-        # ):  # The gaussian splat was loaded, but there's no urdf
-        #     # Create a box that covers the gaussian means in the gaussian splat. This is an approximation
-        #     lx = max(splatsim_obj.gaussians._xyz[:, 0]) - min(
-        #         splatsim_obj.gaussians._xyz[:, 0]
-        #     )
-        #     ly = max(splatsim_obj.gaussians._xyz[:, 1]) - min(
-        #         splatsim_obj.gaussians._xyz[:, 1]
-        #     )
-        #     lz = max(splatsim_obj.gaussians._xyz[:, 2]) - min(
-        #         splatsim_obj.gaussians._xyz[:, 2]
-        #     )
-
-        #     position = splatsim_obj.object_config.get("position", [0, 0, 0])
-
-        #     # Apply global scaling
-        #     lx, ly, lz = (
-        #         lx * global_scaling,
-        #         ly * global_scaling,
-        #         lz * global_scaling,
-        #     )
-        #     position = [
-        #         position[0] * global_scaling,
-        #         position[1] * global_scaling,
-        #         position[2] * global_scaling,
-        #     ]
-
-        #     object_loaded = create_box(lx, ly, lz, color=BLUE)
-        #     set_pose(object_loaded, Pose(point=position))
-        #     # TODO set orientation
-        #     mass = (
-        #         0
-        #         if use_fixed_base or "mass" not in splatsim_obj.object_config
-        #         else splatsim_obj.object_config["mass"]
-        #     )
-        #     self.pybullet_client.changeDynamics(object_loaded, -1, mass=mass)
+                splatsim_obj.config.mass = 0.0
+            self.pybullet_client.changeDynamics(object_loaded, -1, mass=splatsim_obj.config.mass)
         else:
             raise ValueError(
-                f"Could not parse object config for object name {splatsim_obj.object_config.object_name}"
+                f"Could not parse object config for object name {splatsim_obj.config.name}"
             )
 
         splatsim_obj.sim_id = object_loaded
@@ -654,11 +603,11 @@ class PybulletRobotServerBase:
 
     def load_gaussian_splat(self, splatsim_obj: SplatSimObject):
         # Most of these representations are in the splat frame, so we need to transform to simulator frame
-        if type(splatsim_obj.object_config) == SplatObjectConfig:
-            if splatsim_obj.object_config.ply_path is not None:
-                splatsim_obj.gaussians.load_ply(splatsim_obj.object_config.ply_path)
-            elif splatsim_obj.object_config.model_path is not None:
-                model_path = resolve_splatsim_path(splatsim_obj.object_config.model_path)
+        if type(splatsim_obj.config) == SplatObjectConfig:
+            if splatsim_obj.config.ply_path is not None:
+                splatsim_obj.gaussians.load_ply(splatsim_obj.config.ply_path)
+            elif splatsim_obj.config.model_path is not None:
+                model_path = resolve_splatsim_path(splatsim_obj.config.model_path)
                 if not os.path.exists(model_path):
                     raise FileNotFoundError(f"Model path not found: {model_path}")
 
@@ -667,14 +616,14 @@ class PybulletRobotServerBase:
                 ply_path = os.path.join(pc_dir, f"iteration_{iteration}", "point_cloud.ply")
                 splatsim_obj.gaussians.load_ply(ply_path)
             else:
-                raise ValueError(f"Object {splatsim_obj.object_config.object_name} has no ply_path or model_path")
+                raise ValueError(f"Object {splatsim_obj.config.name} has no ply_path or model_path")
             
             # Transform the xyz, rotation, and shs features to the canonical frame (the world frame for the simulator)
             # We will work in the coordinate frame of the simulator from now on
-            assert splatsim_obj.object_config.transformation is not None
+            assert splatsim_obj.config.transformation is not None
             Trans_canonical = (
                 torch.from_numpy(
-                    np.array(splatsim_obj.object_config.transformation.matrix)
+                    np.array(splatsim_obj.config.transformation.matrix)
                 )
                 .to(device=splatsim_obj.gaussians.get_xyz.device)
                 .float()
@@ -695,16 +644,16 @@ class PybulletRobotServerBase:
             splatsim_obj.gaussians._features_dc = splatsim_obj.gaussians._features_dc.detach()
             splatsim_obj.gaussians._scaling = splatsim_obj.gaussians._scaling.detach()
 
-            crop_splat(splatsim_obj, keep_within_aabb=splatsim_obj.object_config.keep_within_aabb)
+            crop_splat(splatsim_obj, keep_within_aabb=splatsim_obj.config.keep_within_aabb)
 
-        elif type(splatsim_obj.object_config) == CuboidObjectConfig:
-            assert splatsim_obj.object_config.size is not None
-            lx, ly, lz = splatsim_obj.object_config.size
+        elif type(splatsim_obj.config) == CuboidObjectConfig:
+            assert splatsim_obj.config.size is not None
+            lx, ly, lz = splatsim_obj.config.size
             # Default to brown color for rendering
             cuboid_params = create_cuboid_gaussians(
                 side_lengths=(lx, ly, lz),
                 spacing=0.005,
-                color_rgb=splatsim_obj.object_config.color_rgb,
+                color_rgb=splatsim_obj.config.color_rgb,
             )
             splatsim_obj.gaussians._xyz = cuboid_params["_xyz"]
             splatsim_obj.gaussians._rotation = cuboid_params["_rotation"]
@@ -729,7 +678,7 @@ class PybulletRobotServerBase:
         return splatsim_obj
 
     def delete_object(self, object_name):
-        index = [splatsim_obj.object_config.object_name for splatsim_obj in self.splatsim_objects].index(
+        index = [splatsim_obj.config.name for splatsim_obj in self.splatsim_objects].index(
             object_name
         )
         splatsim_obj = self.splatsim_objects.pop(index)
@@ -744,10 +693,10 @@ class PybulletRobotServerBase:
 
     def clear_temp_objects(self):
         non_temp_object_names = [
-            self.splatsim_robot.object_config.object_name,
-            self.splatsim_background.object_config.object_name,
-        ] + [obj_cfg.object_name for obj_cfg in self.ENV_CONFIG.objects]
-        all_object_names = [splatsim_obj.object_config.object_name for splatsim_obj in self.splatsim_objects]
+            self.splatsim_robot.config.name,
+            self.splatsim_background.config.name,
+        ] + [obj_cfg.name for obj_cfg in self.ENV_CONFIG.objects]
+        all_object_names = [splatsim_obj.config.name for splatsim_obj in self.splatsim_objects]
         deleted_obj_names = []
         for obj_name in all_object_names:
             if obj_name not in non_temp_object_names:
@@ -758,39 +707,30 @@ class PybulletRobotServerBase:
     def create_object(
         self,
         object_config: ObjectConfig,
-        # object_name,
-        # splat_object_name=None,
-        # object_config: Optional[ObjectConfig] = None,
-        # TODO move these to within object_config
-        # keep_within_aabb=True,
-        # load_splat=True,
-        # load_urdf=True,
-        # can_articulate=True,
-        # grasp_config={},
     ):
         """
         Create a splatsim object from configs
         """
         splatsim_obj = SplatSimObject(
             gaussians=GaussianModel(3),
-            object_config=object_config,
+            config=object_config,
             # set sim_id and mass later
         )
 
-        if splatsim_obj.object_config.load_urdf:
+        if splatsim_obj.config.load_urdf:
             self.load_urdf(splatsim_obj)
         else:
             splatsim_obj.sim_id = None
             splatsim_obj.mass = 0
 
-        if splatsim_obj.object_config.is_articulated:
-            assert splatsim_obj.object_config.articulation_config is not None
-            assert splatsim_obj.object_config.object_name == "robot", "Only the robot can be articulated for now"
-            assert type(splatsim_obj.object_config) == SplatObjectConfig, "Only splat objects can be articulated for now"
+        if splatsim_obj.config.is_articulated:
+            assert splatsim_obj.config.articulation_config is not None
+            assert splatsim_obj.config.name == "robot", "Only the robot can be articulated for now"
+            assert type(splatsim_obj.config) == SplatObjectConfig, "Only splat objects can be articulated for now"
 
-            articulation_config = splatsim_obj.object_config.articulation_config
+            articulation_config = splatsim_obj.config.articulation_config
 
-            if splatsim_obj.object_config.object_name == "robot":
+            if splatsim_obj.config.name == "robot":
                 self.splatsim_robot = splatsim_obj
                 if self.use_gripper:
                     self.setup_gripper()
@@ -809,26 +749,26 @@ class PybulletRobotServerBase:
                 articulation_config.joint_signs = articulation_config.joint_signs[:num_joints]
 
             # Use the config to find these values
-            self.teleport_joint_state(splatsim_obj, splatsim_obj.object_config.articulation_config.initial_joint_positions)
+            self.teleport_joint_state(splatsim_obj, splatsim_obj.config.articulation_config.initial_joint_positions)
             # Let the gripper move (it isn't teleporting rn)
             for _ in range(100):
                 self.pybullet_client.stepSimulation()
             initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
             articulation_config.initial_link_poses = initial_link_poses
 
-        if splatsim_obj.object_config.load_splat:
+        if splatsim_obj.config.load_splat:
             self.load_gaussian_splat(splatsim_obj)
         else:
             splatsim_obj.gaussians = None
 
-        if splatsim_obj.object_config.is_articulated:
-            assert splatsim_obj.object_config.articulation_config is not None
-            assert splatsim_obj.object_config.object_name == "robot", "Only the robot can be articulated for now"
-            assert type(splatsim_obj.object_config) == SplatObjectConfig, "Only splat objects can be articulated for now"
-            articulation_config = splatsim_obj.object_config.articulation_config
+        if splatsim_obj.config.is_articulated:
+            assert splatsim_obj.config.articulation_config is not None
+            assert splatsim_obj.config.name == "robot", "Only the robot can be articulated for now"
+            assert type(splatsim_obj.config) == SplatObjectConfig, "Only splat objects can be articulated for now"
+            articulation_config = splatsim_obj.config.articulation_config
 
             segmentation_labels = np.load(
-                resolve_splatsim_path("./data/labels_path/" + splatsim_obj.object_config.splat_object_name + "_labels.npy")
+                resolve_splatsim_path("./data/labels_path/" + splatsim_obj.config.splat_name + "_labels.npy")
             )
             segmentation_labels = (
                 torch.from_numpy(segmentation_labels)
@@ -860,10 +800,10 @@ class PybulletRobotServerBase:
         # if object_name not in [
         #     splatsim_obj.splat_name for splatsim_obj in self.splatsim_objects
         # ]:
-        #     print(f"Object {object_name} not found in splat_object_name_list.")
+        #     print(f"Object {object_name} not found in splat_name_list.")
         #     return
 
-        object_i = [splatsim_obj.object_config.object_name for splatsim_obj in self.splatsim_objects].index(
+        object_i = [splatsim_obj.config.name for splatsim_obj in self.splatsim_objects].index(
             object_name
         )
         splatsim_obj = self.splatsim_objects[object_i]
@@ -891,10 +831,10 @@ class PybulletRobotServerBase:
         self, splatsim_obj: SplatSimObject, joint_state: List[float]
     ) -> None:
         """Set the joint states of an articulated object in the simulation and hold position."""
-        if not splatsim_obj.object_config.is_articulated:
-            raise ValueError(f"Object {splatsim_obj.object_config.object_name} is not articulated.")
-        if splatsim_obj.object_config.articulation_config is None:
-            raise ValueError(f"Object {splatsim_obj.object_config.object_name} has no articulation config.")
+        if not splatsim_obj.config.is_articulated:
+            raise ValueError(f"Object {splatsim_obj.config.name} is not articulated.")
+        if splatsim_obj.config.articulation_config is None:
+            raise ValueError(f"Object {splatsim_obj.config.name} has no articulation config.")
         
         if splatsim_obj.sim_id is None:
             raise ValueError(
@@ -910,7 +850,7 @@ class PybulletRobotServerBase:
         for i in range(1, min(len(joint_state), num_joints)):
             target_position = (
                 joint_state[i - 1]
-                * splatsim_obj.object_config.articulation_config.joint_signs[i - 1]
+                * splatsim_obj.config.articulation_config.joint_signs[i - 1]
             )
             # Teleport joint to target position
             self.pybullet_client.resetJointState(
@@ -1049,13 +989,13 @@ class PybulletRobotServerBase:
         for splatsim_obj in self.splatsim_objects:
             if splatsim_obj.gaussians is None:
                 continue
-            if not splatsim_obj.object_config.load_splat:
+            if not splatsim_obj.config.load_splat:
                 continue
             if self.debug_mode == DebugModes.NO_BACKGROUND and splatsim_obj == self.splatsim_background:
                 continue
 
             n_gaussians = splatsim_obj.gaussians.get_xyz.shape[0]
-            self._scene_gaussian_offsets[splatsim_obj.object_config.object_name] = (total_gaussians, total_gaussians + n_gaussians)
+            self._scene_gaussian_offsets[splatsim_obj.config.name] = (total_gaussians, total_gaussians + n_gaussians)
             total_gaussians += n_gaussians
 
         # Pre-allocate scene gaussian buffers
@@ -1088,10 +1028,10 @@ class PybulletRobotServerBase:
                     continue
 
                 # Skip objects not in the offset map (filtered during init)
-                if splatsim_obj.object_config.object_name not in self._scene_gaussian_offsets:
+                if splatsim_obj.config.name not in self._scene_gaussian_offsets:
                     continue
 
-                start_idx, end_idx = self._scene_gaussian_offsets[splatsim_obj.object_config.object_name]
+                start_idx, end_idx = self._scene_gaussian_offsets[splatsim_obj.config.name]
 
                 # Build output_slices dict for zero-copy writes directly into scene_gaussian buffers
                 output_slices = {
@@ -1103,7 +1043,7 @@ class PybulletRobotServerBase:
                     '_features_rest': self.scene_gaussian._features_rest[start_idx:end_idx],
                 }
 
-                if splatsim_obj.object_config.is_articulated:
+                if splatsim_obj.config.is_articulated:
                     assert (
                         splatsim_obj == self.splatsim_robot
                     ), "Other articulated objects are not implemented yet"
@@ -1128,9 +1068,9 @@ class PybulletRobotServerBase:
                             splatsim_obj._cache['rotation_tensor'] = torch.zeros(4, device="cuda", dtype=torch.float32)
                             splatsim_obj._cache['rotation_rolled'] = torch.zeros(4, device="cuda", dtype=torch.float32)
                         cur_object_position = splatsim_obj._cache['position_tensor']
-                        cur_object_position.copy_(torch.as_tensor(data[splatsim_obj.object_config.object_name + "_position"], device="cuda"))
+                        cur_object_position.copy_(torch.as_tensor(data[splatsim_obj.config.name + "_position"], device="cuda"))
                         rot_raw = splatsim_obj._cache['rotation_tensor']
-                        rot_raw.copy_(torch.as_tensor(data[splatsim_obj.object_config.object_name + "_orientation"], device="cuda"))
+                        rot_raw.copy_(torch.as_tensor(data[splatsim_obj.config.name + "_orientation"], device="cuda"))
                         # Roll quaternion from xyzw to wxyz format using pre-allocated tensor
                         cur_object_rotation = splatsim_obj._cache['rotation_rolled']
                         cur_object_rotation[0] = rot_raw[3]  # w
@@ -1485,13 +1425,13 @@ class PybulletRobotServerBase:
     def get_current_object_pose(self, object_name=None, object_id=None):
         if object_name is not None:
             if object_name not in [
-                splatsim_obj.object_config.object_name for splatsim_obj in self.splatsim_objects
+                splatsim_obj.config.name for splatsim_obj in self.splatsim_objects
             ]:
                 raise ValueError(
                     f"Object name '{object_name}' not found when querying its pose."
                 )
             queried_object_id = [
-                splatsim_obj.object_config.object_name for splatsim_obj in self.splatsim_objects
+                splatsim_obj.config.name for splatsim_obj in self.splatsim_objects
             ].index(object_name)
             if object_id is not None:
                 assert object_id == queried_object_id
@@ -1551,7 +1491,7 @@ class PybulletRobotServerBase:
             "action": action,
         }
 
-        # gripper_position is for gello integration. It's a shame that it intersects with self.splat_object_name_list convetion
+        # gripper_position is for gello integration. It's a shame that it intersects with self.splat_name_list convetion
         observations["gripper_position"] = [self.current_gripper_state]
 
         for i in range(len(self.splatsim_objects)):
@@ -1563,8 +1503,8 @@ class PybulletRobotServerBase:
             ) = self.pybullet_client.getBasePositionAndOrientation(
                 self.splatsim_objects[i].sim_id
             )
-            observations[self.splatsim_objects[i].object_config.object_name + "_position"] = object_pos
-            observations[self.splatsim_objects[i].object_config.object_name + "_orientation"] = object_quat
+            observations[self.splatsim_objects[i].config.name + "_position"] = object_pos
+            observations[self.splatsim_objects[i].config.name + "_orientation"] = object_quat
 
         if self.do_render_from_splat and len(self.camera_names) > 0:
             # Capture link state snapshot for synchronized rendering
@@ -1640,9 +1580,9 @@ class PybulletRobotServerBase:
                 my_object_env_config = [
                     conf
                     for conf in self.ENV_CONFIG.objects
-                    if conf.object_name == self.splatsim_objects[i].object_config.object_name
+                    if conf.name == self.splatsim_objects[i].config.name
                 ][0]
-                my_object_config = self.splatsim_objects[i].object_config
+                my_object_config = self.splatsim_objects[i].config
                 table_pos = getattr(my_object_env_config, "table_pos", None)
                 if table_pos is not None:
                     table_quat = getattr(my_object_env_config, "table_quat", (0, 0, 0, 1))
@@ -1702,8 +1642,8 @@ class PybulletRobotServerBase:
                 for j in range(len(self.splatsim_objects)):
                     if self.splatsim_objects[j].sim_id is None:
                         continue
-                    both_not_randomizable = not self.splatsim_objects[i].object_config.randomize_pose \
-                        and not self.splatsim_objects[j].object_config.randomize_pose
+                    both_not_randomizable = not self.splatsim_objects[i].config.randomize_pose \
+                        and not self.splatsim_objects[j].config.randomize_pose
                     if i != j and not both_not_randomizable:
                         collison_between_objects_1 = pairwise_collision(
                             self.splatsim_objects[i].sim_id,
@@ -1936,7 +1876,7 @@ class PybulletRobotServerBase:
             # To be called in the parent's serve()
             if self.serve_mode == self.SERVE_MODES.INTERACTIVE:
                 self.pybullet_client.stepSimulation()
-                
+
                 time.sleep(1 / 240)
             elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
                 # Idle mode - just step simulation while user configures settings

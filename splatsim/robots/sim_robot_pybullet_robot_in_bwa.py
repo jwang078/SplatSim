@@ -114,8 +114,8 @@ class OpenSpaceBWAPybulletRobotServer(BWAPybulletRobotServer):
         "name": "open_space_bwa",
         "objects": [
             # {
-            #     "object_name": "small_engine",
-            #     "splat_object_name": "small_engine",
+            #     "name": "small_engine",
+            #     "splat_name": "small_engine",
             #     "grasp_config": [],
             #     "randomize_pose": False,
             #     "table_pos": [0.3, 0.55],
@@ -123,15 +123,15 @@ class OpenSpaceBWAPybulletRobotServer(BWAPybulletRobotServer):
             #     "rotation_range_z": [0, 0],
             # },
             # {
-            #     "object_name": "plastic_apple",
-            #     "splat_object_name": "plastic_apple",
+            #     "name": "plastic_apple",
+            #     "splat_name": "plastic_apple",
             #     "grasp_config": [],
             #     "randomize_pose": True,
             #     "rotation_range_z": [0, 0],
             # },
             # {
-            #     "object_name": "redblock",
-            #     "splat_object_name": "redblock",
+            #     "name": "redblock",
+            #     "splat_name": "redblock",
             #     "grasp_config": [],
             #     "randomize_pose": True,
             #     "rotation_range_z": [0, 0],
