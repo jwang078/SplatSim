@@ -32,6 +32,7 @@ class BWAPybulletRobotServer(PybulletRobotServerBase):
 
     def serve_loop(self) -> None:
         # To be called in the parent's serve()
+        # GENERATE_TRAJECTORIES is handled by the base class serve() method.
 
         if self.serve_mode == self.SERVE_MODES.INTERACTIVE:
             self.pybullet_client.stepSimulation()
@@ -50,13 +51,8 @@ class BWAPybulletRobotServer(PybulletRobotServerBase):
                     f"Exiting record_demos mode because max trajectory count of {self.MAX_TRAJECTORY_COUNT} was reached in folder {self.path}"
                 )
                 self.serve_mode = self.SERVE_MODES.INTERACTIVE
-        elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-            # Handle trajectory generation mode
-            self.trajectory_generator.generate_trajectory_batch()
-
-            if self.trajectory_generator.is_complete():
-                print(f"[GUI] Completed trajectory generation. Switching to interactive mode.")
-                self.serve_mode = self.SERVE_MODES.INTERACTIVE
+        elif self.serve_mode in (self.SERVE_MODES.GENERATE_TRAJECTORIES, self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE):
+            pass  # Handled by base class serve()
         else:
             raise ValueError(f"Unknown serve mode {self.serve_mode}. ")
 

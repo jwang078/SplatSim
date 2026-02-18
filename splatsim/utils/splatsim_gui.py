@@ -276,6 +276,21 @@ class ThreadedTkinterGui(ABC):
             self._button_flags[key] = False
         return pressed
 
+    def peek_button(self, key: str) -> bool:
+        """Check a button press flag without clearing it.
+
+        Use this to detect button presses from long-running operations
+        without consuming the event (so process_buttons can still handle it).
+
+        Args:
+            key: The button callback key
+
+        Returns:
+            True if button was pressed since last check/clear
+        """
+        with self._lock:
+            return self._button_flags.get(key, False)
+
     def check_buttons(self, keys: List[str]) -> Dict[str, bool]:
         """Check and clear multiple button press flags.
 
@@ -666,11 +681,6 @@ class TrajectoryGenModePanel(ModePanel):
         builder = GuiBuilder(parent, gui, style)
         traj_config = config.get("trajectory_generator", {})
 
-        builder.add_str_param(
-            StrParam("experiment_name", "Experiment Name", "", width=25),
-            traj_config.get("experiment_name", "")
-        )
-
         int_params = [
             IntParam("num_base_trajectories", "Num Trajectories", 1, 1000),
             IntParam("obstacles_per_base_trajectory", "Obstacles/Traj", 0, 10),
@@ -693,6 +703,19 @@ class TrajectoryGenModePanel(ModePanel):
         builder.add_bool_param(
             BoolParam("disable_camera_scoring_for_rrt", "Disable Cam Score"),
             traj_config.get("disable_camera_scoring_for_rrt", False)
+        )
+        builder.add_bool_param(
+            BoolParam("debug_visualize", "Debug Visualize"),
+            traj_config.get("debug_visualize", False)
+        )
+
+        builder.add_str_param(
+            StrParam("lerobot_repo_id", "LeRobot Repo ID (user/name)", "", width=25),
+            traj_config.get("lerobot_repo_id", "")
+        )
+        builder.add_bool_param(
+            BoolParam("push_to_hub", "Push to Hub"),
+            traj_config.get("push_to_hub", False)
         )
 
         builder.add_button_row([

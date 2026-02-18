@@ -31,7 +31,6 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         return all_paths
 
     def serve_loop(self) -> None:
-        import pdb; pdb.set_trace()
         pass
 
     # =========================================================================
@@ -230,10 +229,16 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 randomize_pose=False,
                 rotation_range_z=(0, 0),
 
-                position_range_x=(-0.2, 0.5),
-                position_range_y=(0.15, 0.3),
+                # Parallel boxes
+                # position_range_x=(-0.2, 0.5),
+                # position_range_y=(0.15, 0.3),
+                # base_quat=(0, 0, 0, 1),
 
-                base_quat=(0, 0, 0, 1),
+                # boxes at 90 degree angle
+                position_range_x=(0.1, 0.5),
+                position_range_y=(0.3, 0.5),
+                base_quat=(0, 0, 0.707, 0.707),
+
             ),
             SplatObjectConfig(
                 name="box2",
@@ -242,9 +247,14 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 randomize_pose=False,
                 rotation_range_z=(0, 0),
 
-                position_range_x=(-0.2, 0.5),
-                position_range_y=(0.4, 0.6),
+                # Parallel boxes
+                # position_range_x=(-0.2, 0.5),
+                # position_range_y=(0.5, 0.7),
+                # base_quat=(0, 0, 1, 0), #rotated 180 degrees about z
 
+                # Boxes at 90 degree angle
+                position_range_x=(-0.2, 0.3),
+                position_range_y=(0.5, 0.7),
                 base_quat=(0, 0, 1, 0), #rotated 180 degrees about z
             ),
         ],
@@ -264,5 +274,9 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
     def _get_default_trajectory_gen_config(self) -> TrajectoryGenModeConfig:
         return TrajectoryGenModeConfig(
             # Approach lever
-            q_goal=[1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029]
+            # q_goal=[1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029]
+            # Ran self.get_current_ee_pose()
+            ee_pos_goal=[-0.055376041813745544, 0.5553767189597264, 0.28558461043322814],
+            ee_quat_goal=[0.8074376258351692, 0.1106042613918073, -0.5450490313370774, 0.19680632913133583],
+            debug_visualize=False
         )

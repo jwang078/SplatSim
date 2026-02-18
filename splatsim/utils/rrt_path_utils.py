@@ -7,29 +7,12 @@ import itertools
 
 import pybullet as p
 import pybullet_data
-from pybullet_planning import BASE_LINK, RED, BLUE, GREEN
-from pybullet_planning import Pose, Point, Euler
-from pybullet_planning import plan_joint_motion, get_movable_joints
-from pybullet_planning import connect, disconnect, set_camera_pose, load_pybullet, \
-    wait_for_user, set_joint_positions, get_movable_joints, plan_joint_motion, \
-    get_collision_fn, smooth_path, create_box, set_pose, Point, get_extend_fn
-from pybullet_planning import get_collision_fn, get_floating_body_collision_fn, expand_links, create_box
-from pybullet_planning import dump_world, set_pose
-from pybullet_planning import load_pybullet, connect, wait_for_user, LockRenderer, has_gui, WorldSaver, HideOutput, \
-    reset_simulation, disconnect, set_camera_pose, has_gui, set_camera, wait_for_duration, wait_if_gui, apply_alpha
-from pybullet_planning import Pose, Point, Euler
-from pybullet_planning import multiply, invert, get_distance
-from pybullet_planning import create_obj, create_attachment, Attachment
-from pybullet_planning import link_from_name, get_link_pose, get_moving_links, get_link_name, get_disabled_collisions, \
-    get_body_body_disabled_collisions, has_link, are_links_adjacent
-from pybullet_planning import get_num_joints, get_joint_names, get_movable_joints, set_joint_positions, joint_from_name, \
-    joints_from_names, get_sample_fn, plan_joint_motion
-from pybullet_planning import dump_world, set_pose
-from pybullet_planning import get_collision_fn, get_floating_body_collision_fn, expand_links, create_box
-from pybullet_planning import pairwise_collision, pairwise_collision_info, draw_collision_diagnosis, body_collision_info
+from pybullet_planning import RED
+from pybullet_planning import Pose
+from pybullet_planning import get_movable_joints, plan_joint_motion, smooth_path, create_box, set_pose, get_extend_fn
+from pybullet_planning import get_sample_fn
 import numpy as np
 import time
-from pybullet_planning.interfaces.robots import get_collision_fn
 
 # Optional for smooth interpolation
 try:
@@ -141,9 +124,14 @@ def get_joint_limits(robot_id, joint_indices):
         uppers.append(upper)
     return np.array(lowers), np.array(uppers)
 
-def set_robot_joint_positions(robot_id, joint_indices, q):
+def set_robot_joint_positions(robot_id, joint_indices, q, hold=True):
     for idx, qi in zip(joint_indices, q):
         p.resetJointState(robot_id, idx, qi)
+        if hold:
+            p.setJointMotorControl2(
+                robot_id, idx, p.POSITION_CONTROL,
+                targetPosition=qi, force=150, maxVelocity=3.14,
+            )
     # Always assume that the robot gripper is open in these demos
     open_gripper(robot_id)
     p.stepSimulation()

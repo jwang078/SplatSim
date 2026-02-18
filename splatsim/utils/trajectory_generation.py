@@ -4,10 +4,11 @@ import os
 import re
 import json
 from typing import Optional, Tuple, List
+from pybullet_planning import create_box, set_pose, Pose, RED
+
 from splatsim.configs import TrajectoryGenModeConfig
 from splatsim.utils import rrt_path_utils
 from splatsim.configs.env_config import SplatSimObject
-
 
 class TrajectoryGenerator:
     """Helper class for RRT-based trajectory generation."""
@@ -88,7 +89,7 @@ class TrajectoryGenerator:
 
     def get_obstacle_ids(self) -> List[int]:
         return self.loaded_obstacle_ids + [
-            obj.sim_id for obj in self.splatsim_objects if obj.sim_id is not None and obj.config.object_name != "robot"
+            obj.sim_id for obj in self.splatsim_objects if obj.sim_id is not None and obj.config.name != "robot"
         ]
 
     def register_obstacle(self, sim_id: int):
@@ -99,7 +100,6 @@ class TrajectoryGenerator:
 
     def _load_cuboid_obstacles(self, cuboids_fn: str) -> List[int]:
         """Load cuboid obstacles from NPZ file and create PyBullet bodies."""
-        from pybullet_planning import create_box, set_pose, Pose, RED
 
         cuboid_bboxes = rrt_path_utils.load_cuboids(cuboids_fn)
         obstacle_ids = []
@@ -114,9 +114,11 @@ class TrajectoryGenerator:
 
     def _init_zarr_storage(self):
         """Initialize Zarr storage for trajectory data."""
-        experiment_name = self._traj_config.get("experiment_name", "")
-        if experiment_name:
-            output_dir = os.path.join("output", f"{self.env_config_name}_{experiment_name}_trajectories.zarr")
+        repo_id = self._traj_config.get("lerobot_repo_id", "")
+        if repo_id:
+            # Use repo_id as the folder name (replace '/' with '_' for filesystem safety)
+            safe_name = repo_id.replace("/", "_")
+            output_dir = os.path.join("output", f"{safe_name}_trajectories.zarr")
         else:
             output_dir = os.path.join("output", f"{self.env_config_name}_trajectories.zarr")
         self.zarr_root = zarr.open(output_dir, mode="a")
@@ -141,8 +143,15 @@ class TrajectoryGenerator:
         return self.trajectory_count >= self._traj_config["num_base_trajectories"]
 
     def generate_trajectory_batch(self):
-        """Generate one base trajectory with multiple obstacle configurations."""
-        # Take into account any folder naming from experiment_name
+        """Generate one base trajectory with multiple obstacle configurations.
+
+        Returns:
+            Optional[List[dict]]: List of episode dicts, each containing:
+                - "joint_positions": np.ndarray of shape (N, DOF)
+                - "obstacle_info": dict with obstacle metadata (e.g. {"obstacles": [...]})
+                - "zarr_group": zarr.Group reference for saving images later
+            Returns None if planning failed.
+        """
         self._init_zarr_storage()
 
         # 1. Get start/goal configurations
@@ -153,61 +162,43 @@ class TrajectoryGenerator:
             q_start = np.array(q_start)
 
         q_goal = self._traj_config.get("q_goal")
-        if q_goal is None:
+        has_ee_goal = (
+            self._traj_config.get("ee_pos_goal") is not None
+            or self._traj_config.get("ee_quat_goal") is not None
+        )
+
+        if has_ee_goal:
+            # Resolve EE goal to joint-space candidates via IK
+            q_goal_candidates = self._resolve_ee_goal_to_q_goals()
+            if len(q_goal_candidates) == 0:
+                return None  # Failed, will retry next iteration
+            q_goal = q_goal_candidates[0]
+            q_goal_fallbacks = q_goal_candidates[1:]
+        elif q_goal is None:
             q_goal = self._get_random_collision_free_q()
+            q_goal_fallbacks = []
         else:
             q_goal = np.array(q_goal)
+            q_goal_fallbacks = []
 
+        # 2. Generate base trajectory (with optional camera scoring + fallback goals)
+        all_q_goals = [q_goal] + q_goal_fallbacks
+        result = self._plan_with_fallback_goals(q_start, all_q_goals)
+        if result is None:
+            return None  # Failed, will retry next iteration
+        base_traj, q_goal = result
 
-        # 2. Generate base trajectory (with optional camera scoring)
-        if not self._traj_config.get("disable_camera_scoring_for_rrt", False):
-            # Camera-aware mode: verify camera link is available BEFORE generating paths
-            if self.camera_link_index is None:
-                raise ValueError(
-                    "Camera scoring enabled (disable_camera_scoring_for_rrt=False) but camera link not available. "
-                    f"Check that wrist_camera_link_name='{self.wrist_camera_link_name}' exists in robot URDF."
-                )
-
-            # Generate multiple candidates and select best
-            num_candidates = self._traj_config.get("num_path_candidates", 5)
-            max_attempts = self._traj_config.get("max_path_attempts", 20)
-
-            candidate_paths = self._generate_multiple_path_candidates(
-                q_start, q_goal, num_candidates, max_attempts
+        # Debug visualization: show start, goal, then playback trajectory
+        if self._traj_config.get("debug_visualize", False):
+            rrt_path_utils.show_joint_config_in_gui(self.robot_id, self.joint_indices, q_start)
+            input("[debug_visualize] Showing q_start. Press Enter to show q_goal...")
+            rrt_path_utils.show_joint_config_in_gui(self.robot_id, self.joint_indices, q_goal)
+            input("[debug_visualize] Showing q_goal. Press Enter to play trajectory...")
+            rrt_path_utils.playback_path_in_gui(
+                base_traj, self.robot_id, self.joint_indices,
+                path_name="base_traj",
+                fps=self._traj_config["robot_update_rate"],
             )
-
-            if len(candidate_paths) == 0:
-                return  # Failed, will retry next iteration
-
-            # Compute target position (camera pose at goal)
-            target_position, _ = self._get_camera_link_pose(q_goal)
-
-            # Score all candidates
-            k_exp = self._traj_config.get("k_exp", 5.0)
-            k_sig = self._traj_config.get("k_sig", 15.0)
-            threshold = self._traj_config.get("threshold", 0.4)
-
-            scored_paths = []
-            for i, path in enumerate(candidate_paths):
-                score = self._compute_camera_score(path, target_position, k_exp, k_sig, threshold)
-                scored_paths.append((score, i, path))
-
-                if self._traj_config.get("verbose", False):
-                    print(f"Path {i}: score = {score:.4f}")
-
-            # Select path with highest score
-            scored_paths.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_idx, base_traj = scored_paths[0]
-            print("All scores:", [score for score, _, _ in scored_paths])
-
-            if self._traj_config.get("verbose", False):
-                print(f"Selected path {best_idx} with score {best_score:.4f}")
-        else:
-            # Standard mode: generate single path
-            base_traj = self._plan_rrt_path(q_start, q_goal)
-
-            if base_traj is None:
-                return  # Failed, will retry next iteration
 
         # 2b. Extend the path so that it stays at the last position for a second
         num_extra_steps = int(1 * self._traj_config["robot_update_rate"])
@@ -218,11 +209,19 @@ class TrajectoryGenerator:
         # 3. Get EE trajectory for obstacle placement
         base_ee_traj = self._get_ee_trajectory(base_traj)
 
+        results = []
+
         # 4. Save base trajectory (no obstacles) if configured
         if self._traj_config.get("save_base_trajectory", True):
-            self._save_trajectory_zarr(
-                base_traj, self.trajectory_count, 0, 0, {"obstacles": []}
+            obstacle_info = {"obstacles": []}
+            zarr_group = self._save_trajectory_zarr(
+                base_traj, self.trajectory_count, 0, 0, obstacle_info
             )
+            results.append({
+                "joint_positions": base_traj,
+                "obstacle_info": obstacle_info,
+                "zarr_group": zarr_group,
+            })
 
         # 5. Generate trajectories with obstacles
         if self._traj_config["obstacles_per_base_trajectory"] > 0:
@@ -233,6 +232,8 @@ class TrajectoryGenerator:
                 obstacle_ids, obstacle_infos = self._add_random_obstacles(
                     [q_start, q_goal], base_ee_traj
                 )
+
+                obstacle_info = {"obstacles": obstacle_infos}
 
                 # Generate multiple paths per obstacle configuration
                 for path_i in range(self._traj_config["paths_per_obstacle"]):
@@ -247,18 +248,24 @@ class TrajectoryGenerator:
                         extra_steps = np.tile(last_q, (num_extra_steps, 1))
                         modified_traj = np.vstack((modified_traj, extra_steps))
 
-                        self._save_trajectory_zarr(
+                        zarr_group = self._save_trajectory_zarr(
                             modified_traj,
                             self.trajectory_count,
                             obstacle_i,
                             path_i,
-                            {"obstacles": obstacle_infos},
+                            obstacle_info,
                         )
+                        results.append({
+                            "joint_positions": modified_traj,
+                            "obstacle_info": obstacle_info,
+                            "zarr_group": zarr_group,
+                        })
 
                 # Remove obstacles for next iteration
                 self._remove_obstacles(obstacle_ids)
 
         self.trajectory_count += 1
+        return results
 
     def _get_random_collision_free_q(self) -> np.ndarray:
         """Generate random collision-free joint configuration."""
@@ -272,6 +279,213 @@ class TrajectoryGenerator:
             verbose=self._traj_config.get("verbose", False),
         )
 
+    # =========================================================================
+    # End-Effector Goal Resolution via IK
+    # =========================================================================
+
+    def _resolve_ee_goal_to_q_goals(self) -> List[np.ndarray]:
+        """Resolve end-effector pose goal(s) to joint-space goal candidates via IK.
+
+        Handles three cases:
+        1. ee_pos_goal + ee_quat_goal: Full pose. Run IK from multiple random seeds.
+        2. ee_pos_goal only: Sample multiple orientations, run IK for each.
+        3. ee_quat_goal only: Sample multiple positions via FK, run IK for each.
+
+        Returns:
+            List of collision-free q_goal candidates (may be empty if all IK attempts fail).
+        """
+        ee_pos = self._traj_config.get("ee_pos_goal")
+        ee_quat = self._traj_config.get("ee_quat_goal")
+        num_candidates = self._traj_config.get("num_ik_candidates", 8)
+        ee_link_index = self.get_ee_link_fn()
+
+        candidates = []
+
+        if ee_pos is not None and ee_quat is not None:
+            # Full pose specified — solve IK from multiple random seeds
+            for _ in range(num_candidates):
+                q = self._solve_ik(ee_pos, ee_quat, ee_link_index)
+                if q is not None:
+                    candidates.append(q)
+
+        elif ee_pos is not None:
+            # Position only — sample random orientations
+            for _ in range(num_candidates):
+                sampled_quat = self._sample_random_quaternion()
+                q = self._solve_ik(ee_pos, sampled_quat, ee_link_index)
+                if q is not None:
+                    candidates.append(q)
+
+        elif ee_quat is not None:
+            # Orientation only — sample positions from reachable workspace
+            for _ in range(num_candidates):
+                sampled_pos = self._sample_reachable_position()
+                q = self._solve_ik(sampled_pos, ee_quat, ee_link_index)
+                if q is not None:
+                    candidates.append(q)
+
+        candidates = self._deduplicate_q_candidates(candidates)
+
+        if len(candidates) == 0:
+            print(f"[TrajectoryGenerator] Failed to find any valid IK solution for EE goal "
+                  f"(tried {num_candidates} candidates). "
+                  f"ee_pos_goal={ee_pos}, ee_quat_goal={ee_quat}")
+        else:
+            print(f"[TrajectoryGenerator] Resolved EE goal to {len(candidates)} IK candidate(s)")
+
+        return candidates
+
+    def _solve_ik(
+        self,
+        ee_pos: List[float],
+        ee_quat: List[float],
+        ee_link_index: int,
+    ) -> Optional[np.ndarray]:
+        """Solve IK for a given EE pose. Returns collision-free joint config or None."""
+        # Seed robot at random joint config for diverse IK solutions
+        seed_q = self._get_random_q_within_limits()
+        for idx, qi in zip(self.joint_indices, seed_q):
+            self.pb.resetJointState(self.robot_id, idx, qi)
+
+        q_solution = self.pb.calculateInverseKinematics(
+            self.robot_id,
+            ee_link_index,
+            ee_pos,
+            ee_quat,
+            maxNumIterations=100000,
+            residualThreshold=1e-10,
+            lowerLimits=self.lower_limits.tolist(),
+            upperLimits=self.upper_limits.tolist(),
+        )
+
+        # Extract only the joints we control
+        q_solution = np.array(q_solution[:len(self.joint_indices)])
+
+        # Wrap to [-pi, pi]
+        q_solution = ((q_solution + np.pi) % (2 * np.pi)) - np.pi
+
+        # Check joint limits
+        if np.any(q_solution < self.lower_limits) or np.any(q_solution > self.upper_limits):
+            return None
+
+        # Check collision
+        if rrt_path_utils.state_in_collision(
+            self.robot_id, self.joint_indices, q_solution,
+            self.get_obstacle_ids(), distance_threshold=0.01, verbose=False
+        ):
+            return None
+
+        # Verify IK accuracy via FK
+        for idx, qi in zip(self.joint_indices, q_solution):
+            self.pb.resetJointState(self.robot_id, idx, qi)
+        link_state = self.pb.getLinkState(self.robot_id, ee_link_index, computeForwardKinematics=True)
+
+        actual_pos = np.array(link_state[0])
+        if np.linalg.norm(actual_pos - np.array(ee_pos)) > 0.005:  # 5mm tolerance
+            return None
+
+        # If ee_quat_goal was user-specified, also check orientation accuracy
+        if self._traj_config.get("ee_quat_goal") is not None:
+            actual_quat = np.array(link_state[1])
+            target_quat = np.array(ee_quat)
+            dot = np.abs(np.dot(actual_quat, target_quat))
+            dot = np.clip(dot, -1.0, 1.0)
+            angle_error_deg = np.degrees(2 * np.arccos(dot))
+            if angle_error_deg > 1.0:  # 1 degree tolerance
+                return None
+
+        return q_solution
+
+    def _get_random_q_within_limits(self) -> np.ndarray:
+        """Generate random joint configuration within joint limits (no collision check)."""
+        return np.random.uniform(self.lower_limits, self.upper_limits)
+
+    def _sample_random_quaternion(self) -> List[float]:
+        """Sample a uniformly random unit quaternion in PyBullet (x,y,z,w) format."""
+        euler = [
+            np.random.uniform(-np.pi, np.pi),
+            np.random.uniform(-np.pi, np.pi),
+            np.random.uniform(-np.pi, np.pi),
+        ]
+        return list(self.pb.getQuaternionFromEuler(euler))
+
+    def _sample_reachable_position(self) -> List[float]:
+        """Sample a position in the robot's reachable workspace via FK on a random config."""
+        random_q = self._get_random_q_within_limits()
+        for idx, qi in zip(self.joint_indices, random_q):
+            self.pb.resetJointState(self.robot_id, idx, qi)
+        ee_link_index = self.get_ee_link_fn()
+        link_state = self.pb.getLinkState(self.robot_id, ee_link_index, computeForwardKinematics=True)
+        return list(link_state[0])
+
+    def _deduplicate_q_candidates(
+        self, candidates: List[np.ndarray], threshold_rad: float = 0.1
+    ) -> List[np.ndarray]:
+        """Remove near-duplicate joint configurations."""
+        if len(candidates) <= 1:
+            return candidates
+        unique = [candidates[0]]
+        for candidate in candidates[1:]:
+            is_duplicate = any(
+                np.linalg.norm(candidate - existing) < threshold_rad
+                for existing in unique
+            )
+            if not is_duplicate:
+                unique.append(candidate)
+        return unique
+
+    # =========================================================================
+    # Multi-Candidate Planning (for EE goals with multiple IK solutions)
+    # =========================================================================
+
+    def _plan_with_fallback_goals(
+        self,
+        q_start: np.ndarray,
+        q_goal_candidates: List[np.ndarray],
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Try RRT planning with each goal candidate until one succeeds.
+
+        Returns:
+            Tuple of (trajectory, q_goal_used) or None if all candidates fail.
+        """
+        for i, q_goal in enumerate(q_goal_candidates):
+            if not self._traj_config.get("disable_camera_scoring_for_rrt", False):
+                if self.camera_link_index is None:
+                    raise ValueError(
+                        "Camera scoring enabled but camera link not available. "
+                        f"Check that wrist_camera_link_name='{self.wrist_camera_link_name}' exists in robot URDF."
+                    )
+
+                num_candidates = self._traj_config.get("num_path_candidates", 5)
+                max_attempts = self._traj_config.get("max_path_attempts", 20)
+                candidate_paths = self._generate_multiple_path_candidates(
+                    q_start, q_goal, num_candidates, max_attempts
+                )
+
+                if len(candidate_paths) > 0:
+                    target_position, _ = self._get_camera_link_pose(q_goal)
+                    k_exp = self._traj_config.get("k_exp", 5.0)
+                    k_sig = self._traj_config.get("k_sig", 15.0)
+                    threshold = self._traj_config.get("threshold", 0.4)
+
+                    scored_paths = []
+                    for j, path in enumerate(candidate_paths):
+                        score = self._compute_camera_score(path, target_position, k_exp, k_sig, threshold)
+                        scored_paths.append((score, j, path))
+
+                    scored_paths.sort(key=lambda x: x[0], reverse=True)
+                    best_score, best_idx, best_path = scored_paths[0]
+                    print(f"[TrajectoryGenerator] IK candidate {i}: best camera score = {best_score:.4f}")
+                    return best_path, q_goal
+            else:
+                base_traj = self._plan_rrt_path(q_start, q_goal)
+                if base_traj is not None:
+                    print(f"[TrajectoryGenerator] RRT succeeded with IK candidate {i}")
+                    return base_traj, q_goal
+
+        print(f"[TrajectoryGenerator] RRT planning failed for all {len(q_goal_candidates)} IK candidates.")
+        return None
+
     def _plan_rrt_path(
         self,
         q_start: np.ndarray,
@@ -283,7 +497,7 @@ class TrajectoryGenerator:
         if additional_obstacles:
             obstacles.extend(additional_obstacles)
 
-        return rrt_path_utils.get_path(
+        path = rrt_path_utils.get_path(
             q_start,
             q_goal,
             self.robot_id,
@@ -297,6 +511,14 @@ class TrajectoryGenerator:
             use_gui=False,
             verbose=self._traj_config.get("verbose", False),
         )
+
+        # Snap endpoints to exact q_start/q_goal. Smoothing and resampling can
+        # introduce small drift that shifts EE orientation at the goal.
+        if path is not None:
+            path[0] = q_start
+            path[-1] = q_goal
+
+        return path
 
     def _get_ee_trajectory(self, joint_trajectory: np.ndarray) -> np.ndarray:
         """Compute end-effector positions for joint trajectory."""
@@ -442,6 +664,9 @@ class TrajectoryGenerator:
             path = self._plan_rrt_path(plan_start, plan_goal, additional_obstacles)
 
             if path is not None:
+                # Ensure exact goal is included at the end. This is because we perturbed goal to get multiple path candidates
+                if not np.allclose(path[-1], q_goal):
+                    path = np.vstack([path, q_goal])
                 paths.append(path)
 
                 if self._traj_config.get("verbose", False):
@@ -532,7 +757,11 @@ class TrajectoryGenerator:
         traj_idx: int,
         obstacle_info: dict,
     ):
-        """Save trajectory to Zarr format."""
+        """Save trajectory to Zarr format.
+
+        Returns:
+            zarr.Group: The trajectory group where data was saved, for adding images later.
+        """
         # Create hierarchy: scenario_XXXX/obstacle_config_XX/traj_XX
         scenario_name = f"scenario_{scenario_idx:04d}"
         obstacle_name = f"obstacle_config_{obstacle_config_idx:02d}"
@@ -566,7 +795,4 @@ class TrajectoryGenerator:
             "qs", data=trajectory, dtype="f4", chunks=(N_SAMPLES, DOF)
         )
 
-        # TODO: If render_images is True, execute trajectory and save observations
-        if self._traj_config.get("render_images", False):
-            # Call back to base class method to execute and record
-            pass
+        return traj_grp

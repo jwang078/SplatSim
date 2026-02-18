@@ -72,6 +72,10 @@ from splatsim.configs.env_config import (
     ArticulationConfig,
 )
 from splatsim.configs.mode_config import TrajectoryGenModeConfig
+from collections import defaultdict
+
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.transforms import ImageTransformsConfig, ImageTransformConfig
 
 
 from pathlib import Path
@@ -397,7 +401,7 @@ class PybulletRobotServerBase:
             robot_id=self.splatsim_robot.sim_id,
             joint_indices=list(range(1, 7)), # excludes gripper
             env_config_name=self.ENV_CONFIG.name,
-            get_ee_link_fn=lambda: self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id) - 1,
+            get_ee_link_fn=lambda: self._get_ee_link_index(),
             splatsim_objects=self.splatsim_objects,
             wrist_camera_link_name=self.splatsim_robot.config.wrist_camera_link_name,
             trajectory_gen_config=self._get_default_trajectory_gen_config(),
@@ -854,21 +858,21 @@ class PybulletRobotServerBase:
                 f"Expected at most {num_joints - 1} joint states, got {len(joint_state)}."
             )
 
-        for i in range(1, min(len(joint_state), num_joints)):
+        for i in range(0, min(len(joint_state), num_joints)):
             target_position = (
-                joint_state[i - 1]
-                * splatsim_obj.config.articulation_config.joint_signs[i - 1]
+                joint_state[i]
+                * splatsim_obj.config.articulation_config.joint_signs[i]
             )
             # Teleport joint to target position
             self.pybullet_client.resetJointState(
                 splatsim_obj.sim_id,
-                i,
+                i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
                 target_position,
             )
             # Set position control to hold the joint at target position
             self.pybullet_client.setJointMotorControl2(
                 splatsim_obj.sim_id,
-                i,
+                i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
                 p.POSITION_CONTROL,
                 targetPosition=target_position,
                 force=150,
@@ -881,12 +885,12 @@ class PybulletRobotServerBase:
             f"got {len(joint_state)}."
         )
 
-        for i in range(1, self.num_dofs()):
+        for i in range(0, self.num_dofs()):
             self.pybullet_client.setJointMotorControl2(
                 self.splatsim_robot.sim_id,
-                i,
+                i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
                 p.POSITION_CONTROL,
-                targetPosition=joint_state[i - 1],
+                targetPosition=joint_state[i],
                 # Set a more realistic force for the robot
                 force=150,
                 maxVelocity=3.14,
@@ -1422,10 +1426,15 @@ class PybulletRobotServerBase:
 
         return splatsim_camera
 
+    def _get_ee_link_index(self) -> int:
+        """Return the link index used as the end-effector for trajectory planning."""
+        return int(self.wrist_camera.tracked_link_index)
+
     def get_current_ee_pose(self):
+        ee_link = self._get_ee_link_index()
         dummy_ee_pos, dummy_ee_quat = (
-            self.pybullet_client.getLinkState(self.splatsim_robot.sim_id, 6)[0],
-            self.pybullet_client.getLinkState(self.splatsim_robot.sim_id, 6)[1],
+            self.pybullet_client.getLinkState(self.splatsim_robot.sim_id, ee_link)[0],
+            self.pybullet_client.getLinkState(self.splatsim_robot.sim_id, ee_link)[1],
         )
         return dummy_ee_pos, dummy_ee_quat
 
@@ -1647,9 +1656,9 @@ class PybulletRobotServerBase:
             )
 
             # reset the joint positions to the initial joint positions
-            for i in range(1, self.num_dofs()):
+            for i in range(0, self.num_dofs()):
                 self.pybullet_client.resetJointState(
-                    self.splatsim_robot.sim_id, i, initial_joint_positions[i - 1]
+                    self.splatsim_robot.sim_id, i + 1, initial_joint_positions[i]
                 )
 
             if not self.is_robot_in_collision():
@@ -1793,11 +1802,11 @@ class PybulletRobotServerBase:
         for i in range(100):
             self.pybullet_client.stepSimulation()
             self.open_gripper()
-            for k in range(1, self.num_dofs()):
+            for k in range(0, self.num_dofs()):
                 self.pybullet_client.resetJointState(
                     self.splatsim_robot.sim_id,
-                    k,
-                    initial_joint_positions[k - 1] * joint_signs[k - 1],
+                    k + 1,
+                    initial_joint_positions[k] * joint_signs[k],
                 )
 
         if len(all_paths) == 0:
@@ -1815,6 +1824,281 @@ class PybulletRobotServerBase:
             self.delete_trajectory_folder()
             return False
 
+    # =========================================================================
+    # Mode Transition Hooks
+    # =========================================================================
+
+    def _enter_mode(self, mode: 'PybulletRobotServerBase.SERVE_MODES'):
+        """Called when entering a new serve mode. Override in subclasses for custom behavior."""
+        if mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+            self._init_lerobot_dataset()
+
+    def _exit_mode(self, mode: 'PybulletRobotServerBase.SERVE_MODES'):
+        """Called when exiting a serve mode. Override in subclasses for custom behavior."""
+        if mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+            self._finalize_lerobot_dataset()
+
+    # =========================================================================
+    # LeRobot Dataset Lifecycle
+    # =========================================================================
+
+    def _create_lerobot_dataset(self, repo_id: str) -> LeRobotDataset:
+        """Create a fresh LeRobot dataset with the standard features."""
+        image_keys = list(self.camera_names)
+        traj_config = self.trajectory_generator._traj_config
+        return LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=traj_config.get("robot_update_rate", 20),
+            robot_type="lerobot_splatsim",
+            use_videos=True,
+            features={
+                **{
+                    f"observation.images.{key}": {
+                        "dtype": "image",
+                        "shape": (3, 224, 224),
+                        "names": ["channels", "height", "width"],
+                    }
+                    for key in image_keys
+                },
+                "observation.state": {
+                    "dtype": "float32",
+                    "shape": (7,),
+                    "names": [
+                        "joint_1", "joint_2", "joint_3",
+                        "joint_4", "joint_5", "joint_6", "gripper",
+                    ],
+                },
+                "action": {
+                    "dtype": "float32",
+                    "shape": (7,),
+                    "names": [
+                        "joint_1", "joint_2", "joint_3",
+                        "joint_4", "joint_5", "joint_6", "gripper",
+                    ],
+                },
+            },
+        )
+
+    def _init_lerobot_dataset(self):
+        """Initialize LeRobot dataset for trajectory generation with rendering."""
+        traj_config = self.trajectory_generator._traj_config
+        repo_id = traj_config.get("lerobot_repo_id", "")
+        if not repo_id:
+            print("[LeRobot] No lerobot_repo_id configured, skipping LeRobot dataset creation.")
+            self._lerobot_saver = None
+            return
+
+        import shutil
+        local_dir = os.path.expanduser(f"~/.cache/huggingface/lerobot/{repo_id}")
+
+        if os.path.exists(local_dir):
+            print(f"[LeRobot] Found existing dataset at {local_dir}, attempting to load...")
+            try:
+                self._lerobot_saver = LeRobotDataset(repo_id)
+                print(f"[LeRobot] Successfully loaded existing dataset ({self._lerobot_saver.meta.total_episodes} episodes).")
+            except Exception as e:
+                print(f"[LeRobot] WARNING: Failed to load existing dataset: {e}")
+                print(f"[LeRobot] Removing corrupt local cache at {local_dir} and creating fresh dataset.")
+                shutil.rmtree(local_dir)
+                self._lerobot_saver = self._create_lerobot_dataset(repo_id)
+        else:
+            print(f"[LeRobot] Creating new dataset at {local_dir}")
+            self._lerobot_saver = self._create_lerobot_dataset(repo_id)
+
+    def _finalize_lerobot_dataset(self):
+        """Finalize and optionally push the LeRobot dataset."""
+        if not hasattr(self, '_lerobot_saver') or self._lerobot_saver is None:
+            return
+
+        print("[LeRobot] Finalizing dataset...")
+        self._lerobot_saver.finalize()
+
+        traj_config = self.trajectory_generator._traj_config
+        if traj_config.get("push_to_hub", False):
+            self._push_lerobot_to_hub()
+
+        self._lerobot_saver = None
+
+    def _push_lerobot_to_hub(self):
+        """Push the LeRobot dataset to hub, retrying with user input on failure.
+
+        Loops until either:
+        - push_to_hub() succeeds
+        - the user enters an empty string to skip
+        """
+        while True:
+            repo_id = self._lerobot_saver.repo_id
+            print(f"[LeRobot] Pushing dataset to hub as '{repo_id}'...")
+            try:
+                self._lerobot_saver.push_to_hub()
+                print(f"[LeRobot] Successfully pushed to hub as '{repo_id}'.")
+                return
+            except Exception as e:
+                print(f"[LeRobot] ERROR: Failed to push to hub: {e}")
+                print("[LeRobot] Repo ID should be in 'username/dataset_name' format.")
+                print("[LeRobot] Make sure you are authenticated with `huggingface-cli login`.")
+                new_repo_id = input("[LeRobot] Enter a new repo_id to retry (or press Enter to skip): ").strip()
+                if not new_repo_id:
+                    print("[LeRobot] Skipping push to hub. Dataset is saved locally.")
+                    return
+                self._lerobot_saver.repo_id = new_repo_id
+
+    # =========================================================================
+    # Scene State Save / Restore
+    # =========================================================================
+
+    def _save_scene_state(self) -> dict:
+        """Snapshot positions, orientations, and joint states of all splatsim_objects."""
+        state = {}
+        for obj in self.splatsim_objects:
+            if obj.sim_id is None or obj == self.splatsim_background:
+                continue
+            if obj.config.is_articulated:
+                num_joints = self.pybullet_client.getNumJoints(obj.sim_id)
+                joint_states = [
+                    self.pybullet_client.getJointState(obj.sim_id, i)
+                    for i in range(num_joints)
+                ]
+                state[obj.config.name] = {
+                    "pos_orn": self.pybullet_client.getBasePositionAndOrientation(obj.sim_id),
+                    "joint_states": [(js[0], js[1]) for js in joint_states],
+                }
+            else:
+                state[obj.config.name] = {
+                    "pos_orn": self.pybullet_client.getBasePositionAndOrientation(obj.sim_id),
+                }
+        return state
+
+    def _restore_scene_state(self, state: dict):
+        """Restore all object positions, orientations, and joint states from snapshot."""
+        for obj in self.splatsim_objects:
+            if obj.config.name not in state:
+                continue
+            saved = state[obj.config.name]
+            pos, orn = saved["pos_orn"]
+            self.pybullet_client.resetBasePositionAndOrientation(obj.sim_id, pos, orn)
+            if obj.config.is_articulated and "joint_states" in saved:
+                for i, (jp, jv) in enumerate(saved["joint_states"]):
+                    self.pybullet_client.resetJointState(obj.sim_id, i, jp, jv)
+
+    # =========================================================================
+    # Trajectory Generation + Rendering Pipeline
+    # =========================================================================
+
+    def _is_stop_requested(self) -> bool:
+        """Check if the user has pressed Stop in the GUI (non-consuming peek)."""
+        return self._splatsim_gui.peek_button("stop_traj")
+
+    def _generate_and_render_one_episode(self):
+        """Generate trajectories, render each step, and save to LeRobot + Zarr."""
+        self.reset()
+        # Snapshot scene state AFTER reset, BEFORE trajectory generation
+        scene_state = self._save_scene_state()
+
+        episodes = self.trajectory_generator.generate_trajectory_batch()
+        if episodes is None:
+            return  # Planning failed, will retry next iteration
+
+        for episode in episodes:
+            if self._is_stop_requested():
+                print("[TrajectoryGen] Stop requested, finishing current batch early.")
+                break
+            # Restore scene to post-reset state before rendering each episode
+            self._restore_scene_state(scene_state)
+            self._render_and_save_episode(episode)
+
+    def _render_and_save_episode(self, episode: dict):
+        """Teleport through a trajectory, render images, save frames to LeRobot + Zarr."""
+        joint_trajectory = episode["joint_positions"]  # (N, DOF)
+        obstacle_info = episode.get("obstacle_info", {"obstacles": []})
+        zarr_group = episode.get("zarr_group")
+
+        # Set up obstacles from metadata
+        loaded_obstacle_names = []
+        for i, obstacle in enumerate(obstacle_info.get("obstacles", [])):
+            if obstacle["type"] == "cuboid":
+                obstacle_name = f"_render_obstacle_cuboid{i}"
+                obstacle_config = CuboidObjectConfig(
+                    name=obstacle_name,
+                    size=tuple(obstacle["size"]),
+                    position=tuple(obstacle["pos"]),
+                    base_quat=tuple(obstacle["orn"]),
+                    load_splat=True,
+                    load_urdf=True,
+                    randomize_pose=False,
+                )
+                self.create_object(obstacle_config)
+                loaded_obstacle_names.append(obstacle_name)
+            else:
+                print(f"[Render] Unknown obstacle type: {obstacle['type']}, skipping.")
+
+        # Ensure rendering is enabled
+        self.enable_rendering()
+
+        # Collect image buffers for Zarr saving
+        image_buffers = defaultdict(list)
+
+        stopped_early = False
+        import pdb; pdb.set_trace()
+        for step_idx in range(len(joint_trajectory)):
+            if self._is_stop_requested():
+                print(f"[TrajectoryGen] Stop requested at step {step_idx}/{len(joint_trajectory)}, saving partial episode.")
+                stopped_early = True
+                break
+
+            q = joint_trajectory[step_idx]
+
+            # Teleport robot to this joint configuration
+            self.teleport_joint_state(self.splatsim_robot, list(q))
+
+            # Render observations (includes images)
+            obs = self.get_observations()
+
+            # Pad to 7 DOF (6 joints + gripper at 0)
+            state_7 = np.zeros(7, dtype=np.float32)
+            state_7[:len(q)] = q
+
+            # Action = current joint positions (per user preference)
+            action_7 = state_7.copy()
+
+            # Save to LeRobot dataset
+            if hasattr(self, '_lerobot_saver') and self._lerobot_saver is not None:
+                frame = {
+                    "observation.state": state_7,
+                    "action": action_7,
+                    "task": "",
+                }
+                for cam in self.camera_names:
+                    if obs.get(cam) is not None:
+                        frame[f"observation.images.{cam}"] = obs[cam]
+                self._lerobot_saver.add_frame(frame)
+
+            # Collect images for Zarr saving
+            for cam in self.camera_names:
+                if obs.get(cam) is not None:
+                    # Convert from (C, H, W) float [0,1] to (H, W, C) uint8
+                    img = obs[cam]
+                    img = np.transpose(img, (1, 2, 0))  # CxHxW -> HxWxC
+                    img = (img * 255).astype(np.uint8)
+                    image_buffers[cam].append(img)
+
+        # Save episode to LeRobot (skip partial episodes from early stop)
+        if not stopped_early and hasattr(self, '_lerobot_saver') and self._lerobot_saver is not None:
+            self._lerobot_saver.save_episode()
+
+        # Save images to Zarr (save even if partial — zarr is more forgiving)
+        if zarr_group is not None:
+            for cam_name, frames in image_buffers.items():
+                if len(frames) > 0:
+                    images = np.stack(frames, axis=0)  # (T, H, W, C)
+                    if cam_name in zarr_group:
+                        del zarr_group[cam_name]
+                    zarr_group.create_dataset(cam_name, data=images, dtype="f4")
+
+        # Clean up obstacles
+        for obstacle_name in loaded_obstacle_names:
+            self.delete_object(obstacle_name)
+
     def serve(self) -> None:
         self.reset()
 
@@ -1823,19 +2107,9 @@ class PybulletRobotServerBase:
 
         print("Ready to serve.")
 
-        # # Set motors to hold current position to prevent arm from falling due to gravity
-        # for i in range(1, self.num_dofs()):
-        #     current_pos = self.pybullet_client.getJointState(
-        #         self.splatsim_robot.sim_id, i
-        #     )[0]
-        #     self.pybullet_client.setJointMotorControl2(
-        #         self.splatsim_robot.sim_id,
-        #         i,
-        #         self.pybullet_client.POSITION_CONTROL,
-        #         targetPosition=current_pos,
-        #         force=500,  # Enough force to hold against gravity
-        #     )
-        
+        self._lerobot_saver = None
+        _prev_serve_mode = self.serve_mode
+
         while True:
             # Let the GUI handle all mode/button transitions
             self._splatsim_gui.process_mode_transitions()
@@ -1843,16 +2117,21 @@ class PybulletRobotServerBase:
             # Check debug mode dropdown for changes
             self._check_debug_mode()
 
-            # To be called in the parent's serve()
-            if self.serve_mode == self.SERVE_MODES.INTERACTIVE:
-                self.pybullet_client.stepSimulation()
+            # Detect and handle mode transitions
+            current_mode = self.serve_mode
+            if _prev_serve_mode != current_mode:
+                self._exit_mode(_prev_serve_mode)
+                self._enter_mode(current_mode)
+                _prev_serve_mode = current_mode
 
+            if current_mode == self.SERVE_MODES.INTERACTIVE:
+                self.pybullet_client.stepSimulation()
                 time.sleep(1 / 240)
-            elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
+            elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
                 # Idle mode - just step simulation while user configures settings
                 self.pybullet_client.stepSimulation()
                 time.sleep(1 / 240)
-            elif self.serve_mode == self.SERVE_MODES.GENERATE_DEMOS:
+            elif current_mode == self.SERVE_MODES.GENERATE_DEMOS:
                 raise NotImplementedError()
                 initial_joint_positions = self.randomize_ee_pose()
 
@@ -1867,15 +2146,15 @@ class PybulletRobotServerBase:
                         f"Exiting record_demos mode because max trajectory count of {self.MAX_TRAJECTORY_COUNT} was reached in folder {self.path}"
                     )
                     self.serve_mode = self.SERVE_MODES.INTERACTIVE
-            elif self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-                # Handle active trajectory generation mode
-                self.trajectory_generator.generate_trajectory_batch()
+            elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+                # Generate trajectories, render images, and save to LeRobot + Zarr
+                self._generate_and_render_one_episode()
 
                 if self.trajectory_generator.is_complete():
                     print(f"[GUI] Completed trajectory generation. Switching to idle mode.")
                     self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
             else:
-                raise ValueError(f"Unknown serve mode {self.serve_mode}. ")
+                raise ValueError(f"Unknown serve mode {current_mode}. ")
 
             self.serve_loop()
 
@@ -2254,21 +2533,21 @@ class PybulletRobotServerBase:
         while k < len(path):
             error = 0
 
-            for j in range(1, self.num_dofs()):
+            for j in range(0, self.num_dofs()):
                 self.pybullet_client.setJointMotorControl2(
                     self.splatsim_robot.sim_id,
-                    j,
+                    j + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
                     p.POSITION_CONTROL,
-                    targetPosition=path[k][j - 1],
+                    targetPosition=path[k][j],
                     force=250,
                     maxVelocity=0.2,
                 )
 
             # get current joint positions
             joint_states = []
-            for i in range(1, self.num_dofs()):
+            for i in range(0, self.num_dofs()):
                 joint_states.append(
-                    self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
+                    self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i + 1)[0]
                 )
 
             error = np.linalg.norm(np.array(joint_states) - path[k][:6])
