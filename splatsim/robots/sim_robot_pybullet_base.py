@@ -16,6 +16,7 @@ from argparse import ArgumentParser
 
 from dataclasses import dataclass, field
 import numpy as np
+import quaternion
 import threading
 from e3nn import o3
 
@@ -64,6 +65,7 @@ from splatsim.configs.env_config import (
     DebugModes,
     EnvConfig,
     CuboidObjectConfig,
+    GraspConfig,
     SplatObjectConfig,
     ObjectConfig,
     SplatSimObject,
@@ -249,7 +251,7 @@ class PybulletRobotServerBase:
         """Compute table limits from ENV_CONFIG.
 
         Returns:
-            Tuple of ((x_min, x_max), (y_min, y_max)) computed from the table object in ENV_CONFIG.
+            Tuple of ((x_min, x_max), (y_min, y_max), (0, 0)) computed from the table object in ENV_CONFIG.
 
         Raises:
             ValueError: If no table object is defined in ENV_CONFIG.
@@ -260,7 +262,7 @@ class PybulletRobotServerBase:
                 size = obj.size
                 x_center, y_center = position[0], position[1]
                 x_half, y_half = size[0] / 2, size[1] / 2
-                return ((x_center - x_half, x_center + x_half), (y_center - y_half, y_center + y_half))
+                return ((x_center - x_half, x_center + x_half), (y_center - y_half, y_center + y_half), (0, 0))
         raise ValueError("TABLE_LIMITS requested but no 'table' object is defined in ENV_CONFIG['objects'].")
 
     # Gym environment constants
@@ -325,6 +327,8 @@ class PybulletRobotServerBase:
         self.image_width = image_width
         self.image_height = image_height
         self.use_gripper = use_gripper
+        self.splatsim_robot = None
+        self.splatsim_background = None
         if isinstance(debug_mode, str):
             debug_mode = self.DEBUG_MODES(debug_mode)
         assert debug_mode in self.DEBUG_MODES, f"debug_mode must be one of {list(self.DEBUG_MODES)}, got {debug_mode}"
@@ -439,7 +443,7 @@ class PybulletRobotServerBase:
                 object_config=object_config,
             )
 
-        self.randomize_object_pose()
+        self.randomize_object_poses()
 
         # TODO put all trajectory saving into TrajectoryGenerator
         # trajectory path
@@ -564,7 +568,7 @@ class PybulletRobotServerBase:
             # position, orientation, size
             # TODO orientation
             lx, ly, lz = splatsim_obj.config.size
-            position = splatsim_obj.config.position
+            # position = splatsim_obj.config.position
             color_rgb = splatsim_obj.config.color_rgb
 
             # Apply global scaling
@@ -573,15 +577,15 @@ class PybulletRobotServerBase:
                 ly * global_scaling,
                 lz * global_scaling,
             )
-            position = [
-                position[0] * global_scaling,
-                position[1] * global_scaling,
-                position[2] * global_scaling,
-            ]
+            # position = [
+            #     position[0] * global_scaling,
+            #     position[1] * global_scaling,
+            #     position[2] * global_scaling,
+            # ]
 
             # TODO check if this box is created with (0,0,0) at the center of the box
             object_loaded = create_box(lx, ly, lz, color=color_rgb)
-            set_pose(object_loaded, Pose(point=position))
+            # set_pose(object_loaded, Pose(point=position))
             # TODO set orientation
             if use_fixed_base:
                 splatsim_obj.config.mass = 0.0
@@ -781,6 +785,9 @@ class PybulletRobotServerBase:
                 splatsim_obj=splatsim_obj,
             )
             articulation_config.segmented_list = segmented_list
+
+        # Set the position of the object
+        self.randomize_object_pose(splatsim_obj)
 
         self.splatsim_objects.append(splatsim_obj)
 
@@ -1567,91 +1574,54 @@ class PybulletRobotServerBase:
         if frames_to_display:
             self._splatsim_gui.update_camera_images(frames_to_display)
 
-    def randomize_object_pose(self):
-        collison_between_objects = True
-        while collison_between_objects:
-            collison_between_objects = False
-            for i in range(len(self.splatsim_objects)):
-                if (
-                    self.splatsim_objects[i] == self.splatsim_robot
-                    or self.splatsim_objects[i] == self.splatsim_background
-                ):
-                    continue  # only randomize the objects, not the robot
-                my_object_env_config = [
-                    conf
-                    for conf in self.ENV_CONFIG.objects
-                    if conf.name == self.splatsim_objects[i].config.name
-                ][0]
-                my_object_config = self.splatsim_objects[i].config
-                table_pos = getattr(my_object_env_config, "table_pos", None)
-                if table_pos is not None:
-                    table_quat = getattr(my_object_env_config, "table_quat", (0, 0, 0, 1))
-                    base_position = my_object_config.base_position
-                    pos = [
-                        table_pos[0] + base_position[0],
-                        table_pos[1] + base_position[1],
-                        0.0 + base_position[2],
-                    ]
-                    if self.splatsim_objects[i].sim_id is None:
-                        import pdb
+    def randomize_object_pose(self, splatsim_obj: SplatSimObject):
+        if splatsim_obj == self.splatsim_robot or splatsim_obj == self.splatsim_background:
+            return  # Don't randomize robot or background
+        if splatsim_obj.sim_id is None:
+            return  # Can't randomize pose of an object that isn't loaded in the simulator
 
-                        pdb.set_trace()
-                    self.pybullet_client.resetBasePositionAndOrientation(
-                        self.splatsim_objects[i].sim_id,
-                        pos,
-                        table_quat,
-                    )
-                elif my_object_env_config.randomize_pose:
-                    # randomly reset the object position and orientation
-                    # TODO remove hardcoding
-                    x = random.uniform(self.TABLE_LIMITS[0][0], self.TABLE_LIMITS[0][1])
-                    y = random.uniform(self.TABLE_LIMITS[1][0], self.TABLE_LIMITS[1][1])
-                    base_position = my_object_config.get("base_position", [[0, 0, 0]])[
-                        0
-                    ]
-                    pos = [
-                        x + base_position[0],
-                        y + base_position[1],
-                        0.0 + base_position[2],
-                    ]
-                    # random euler angles for the orientation of the object
-                    euler_z = random.uniform(
-                        my_object_env_config.rotation_range_z[0],
-                        my_object_env_config.rotation_range_z[1],
-                    )
-                    # random quaternion for the orientation of the object
-                    # get object name from the object id
-                    if len(self.splatsim_objects[i].grasp_configs) > 0:
-                        grasp_config = random.choice(
-                            self.splatsim_objects[i].grasp_configs
-                        )
-                    else:
-                        grasp_config = {"grasp_pose": [], "object_rot": [0, 0, 0]}
-                    self.grasp_poses[i] = grasp_config["grasp_pose"]
-                    object_rot = grasp_config["object_rot"]
-                    quat = self.pybullet_client.getQuaternionFromEuler(
-                        [object_rot[0], object_rot[1], euler_z]
-                    )
-                    self.pybullet_client.resetBasePositionAndOrientation(
-                        self.splatsim_objects[i].sim_id, pos, quat
-                    )
+        cfg = splatsim_obj.config
+        bp = cfg.base_position
+        global_scaling = cfg.global_scaling
 
-            for i in range(len(self.splatsim_objects)):
-                if self.splatsim_objects[i].sim_id is None:
+        x_range = self.TABLE_LIMITS[0] if cfg.position_range_x is None else cfg.position_range_x
+        y_range = self.TABLE_LIMITS[1] if cfg.position_range_y is None else cfg.position_range_y
+        z_range = self.TABLE_LIMITS[2] if cfg.position_range_z is None else cfg.position_range_z
+
+        x = random.uniform(x_range[0], x_range[1]) * global_scaling
+        y = random.uniform(y_range[0], y_range[1]) * global_scaling
+        z = random.uniform(z_range[0], z_range[1]) * global_scaling
+        pos = [x + bp[0], y + bp[1], z + bp[2]]
+        euler_z = random.uniform(cfg.rotation_range_z[0], cfg.rotation_range_z[1])
+
+        quat = self.pybullet_client.getQuaternionFromEuler(
+            [0, 0, euler_z]
+        )
+        quat = np.quaternion(quat[3], quat[0], quat[1], quat[2]) * np.quaternion(*cfg.base_quat)
+        quat = [quat.w, quat.x, quat.y, quat.z]
+        self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, pos, quat)
+
+    def randomize_object_poses(self):
+        collision = True
+        while collision:
+            collision = False
+            
+            for obj in random.sample(self.splatsim_objects, len(self.splatsim_objects)):
+                self.randomize_object_pose(obj)
+
+            # Check for collisions
+            for i, obj_i in enumerate(self.splatsim_objects):
+                if obj_i.sim_id is None:
                     continue
-                for j in range(len(self.splatsim_objects)):
-                    if self.splatsim_objects[j].sim_id is None:
+                for j, obj_j in enumerate(self.splatsim_objects):
+                    if obj_j.sim_id is None or i == j:
                         continue
-                    both_not_randomizable = not self.splatsim_objects[i].config.randomize_pose \
-                        and not self.splatsim_objects[j].config.randomize_pose
-                    if i != j and not both_not_randomizable:
-                        collison_between_objects_1 = pairwise_collision(
-                            self.splatsim_objects[i].sim_id,
-                            self.splatsim_objects[j].sim_id,
-                        )
-                        if collison_between_objects_1:
-                            collison_between_objects = True
-                            break
+                    if not obj_i.config.randomize_pose and not obj_j.config.randomize_pose:
+                        # This collision cannot be fixed
+                        continue
+                    if pairwise_collision(obj_i.sim_id, obj_j.sim_id):
+                        collision = True
+                        break
 
     def randomize_ee_pose(self, max_attempts=100):
         # generating random initial joint state using random end effector position and orientation

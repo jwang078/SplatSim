@@ -385,7 +385,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
             time.sleep(1 / 240)
         elif self.serve_mode == self.SERVE_MODES.GENERATE_DEMOS:
             # self.get_camera_image_from_end_effector()
-            self.randomize_object_pose()
+            self.randomize_object_poses()
             self.randomize_plate_and_drop_pose()
 
             self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.articulation_config.initial_joint_positions)
@@ -439,7 +439,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
         self._episode_started = True
 
         # From GENERATE_DEMOS (serve_loop)
-        self.randomize_object_pose()
+        self.randomize_object_poses()
         self.randomize_plate_and_drop_pose()
 
         # Get initial joint state and joint signs

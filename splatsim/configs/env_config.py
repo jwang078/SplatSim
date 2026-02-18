@@ -58,7 +58,9 @@ class ObjectConfig(ABC):
     """Abstract base class fora config for an object in SplatSim"""
     name: str
 
-    base_position: List[float] = Default(lambda: [[0, 0, 0]])
+    base_position: List[float] = Default(lambda: [0, 0, 0])
+    base_quat: Tuple[float, float, float, float] = Default((0.0, 0.0, 0.0, 1.0))
+    
     source_path: Optional[str] = Default(None)
     model_path: Optional[str] = Default(None)
     is_articulated: Optional[bool] = Default(False)
@@ -70,6 +72,13 @@ class ObjectConfig(ABC):
     load_splat: Optional[bool] = Default(True)
     load_urdf: Optional[bool] = Default(True)
     randomize_pose: Optional[bool] = Default(True)
+
+    rotation_range_z: Tuple[float, float] = Default((0.0, 0.0))
+    
+    # Defaults to TABLE_LIMITS if not specified, otherwise uses the provided range for randomization
+    position_range_x: Optional[Tuple[float, float]] = Default(None)
+    position_range_y: Optional[Tuple[float, float]] = Default(None)
+    position_range_z: Optional[Tuple[float, float]] = Default(None)
 
 
     _YAML_CACHE: Optional[Dict[str, Any]] = None
@@ -149,7 +158,6 @@ class CuboidObjectConfig(ObjectConfig):
     mass: Optional[float] = Default(0.0)
     color_rgb: Tuple[int, int, int] = Default((0, 0, 255))
     randomize_pose: Optional[bool] = Default(False)
-    rotation_range_z: Optional[Tuple[float, float]] = Default((0.0, 0.0))
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -160,14 +168,11 @@ class SplatObjectConfig(ObjectConfig):
     """Splat-rendered object."""
     splat_name: str
 
-    # Capture all the instance overrides (highest priority)
     urdf_path: Optional[str] = Default(None)
     transformation: Optional[Transformation] = Default(None)
     aabb: AABB = Default(None)
     randomize_pose: Optional[bool] = Default(True)
-    rotation_range_z: Optional[Tuple[float, float]] = Default((0.0, 6.283))
-    table_pos: Optional[Tuple[float, float]] = Default(None)
-    table_quat: Optional[Tuple[float, float, float, float]] = Default((0.0, 0.0, 0.0, 1.0))
+    rotation_range_z: Tuple[float, float] = Default((0.0, 6.283))
     object_config: Optional[dict] = Default(None)
     keep_within_aabb: bool = Default(True)
 

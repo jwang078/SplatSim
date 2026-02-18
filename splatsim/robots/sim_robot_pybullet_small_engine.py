@@ -31,6 +31,7 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         return all_paths
 
     def serve_loop(self) -> None:
+        import pdb; pdb.set_trace()
         pass
 
     # =========================================================================
@@ -62,6 +63,8 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         self._action_accel = 0.0
         self._prev_action_accel = 0.0
         self._action_jerk = 0.0
+
+        self.randomize_object_poses()
 
         # From GENERATE_DEMOS: randomize_ee_pose()
         initial_joints = self.randomize_ee_pose()
@@ -190,14 +193,19 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 randomize_pose=False,
                 rotation_range_z=(0, 0),
                 load_splat=False, # Because it's already in the scene splat
-                table_pos=(-0.48, 0.36),
-                table_quat=(0, 0, -0.7071068, 0.7071068),
+                position_range_x=(-0.48, -0.48),
+                position_range_y=(0.36, 0.36),
+                base_quat=(0, 0, -0.7071068, 0.7071068),
             ),
             # table has a plane for objects to sit on at z = 0
             CuboidObjectConfig(
                 name="table",
                 size=(1.5, 0.90, 0.05),
-                position=(0, 0.25, -0.025),
+                randomize_pose=False,
+                position_range_x=(0, 0),
+                position_range_y=(0.25, 0.25),
+                position_range_z=(-0.025, -0.025),
+                # position=(0, 0.25, -0.025),
                 mass=0,
                 color_rgb=(223, 205, 192),
                 load_splat=False,
@@ -206,7 +214,11 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
             CuboidObjectConfig(
                 name="wall",
                 size=(3.0, 0.05, 1.5),
-                position=(0, -0.225, 0.75),
+                randomize_pose=False,
+                position_range_x=(0, 0),
+                position_range_y=(-0.225, -0.225),
+                position_range_z=(0.75, 0.75),
+                # position=(0, -0.225, 0.75),
                 mass=0,
                 color_rgb=(223, 205, 192),
                 load_splat=False,
@@ -217,8 +229,11 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 grasp_configs=[],
                 randomize_pose=False,
                 rotation_range_z=(0, 0),
-                table_pos=(-0.1, 0.20),
-                table_quat=(0, 0, 0, 1),
+
+                position_range_x=(-0.2, 0.5),
+                position_range_y=(0.15, 0.3),
+
+                base_quat=(0, 0, 0, 1),
             ),
             SplatObjectConfig(
                 name="box2",
@@ -226,8 +241,11 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 grasp_configs=[],
                 randomize_pose=False,
                 rotation_range_z=(0, 0),
-                table_pos=(-0.2, 0.50),
-                table_quat=(0, 0, 1, 0), #rotated 180 degrees about z
+
+                position_range_x=(-0.2, 0.5),
+                position_range_y=(0.4, 0.6),
+
+                base_quat=(0, 0, 1, 0), #rotated 180 degrees about z
             ),
         ],
     )
