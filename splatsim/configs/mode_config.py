@@ -1,5 +1,11 @@
+import enum
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
+
+
+class ImageResizeMode(enum.Enum):
+    LETTERBOX = "letterbox"
+    STRETCH = "stretch"
 
 
 @dataclass
@@ -46,8 +52,9 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     k_sig: float = 15.0
     threshold: float = 0.4
     lerobot_repo_id: str = ""
-    push_to_hub: bool = False
+    push_to_hub: bool = True
     debug_visualize: bool = False  # Visualize q_start, q_goal, and trajectory in PyBullet GUI
+    verbose: bool = False
 
     def __post_init__(self):
         has_ee_goal = self.ee_pos_goal is not None or self.ee_quat_goal is not None

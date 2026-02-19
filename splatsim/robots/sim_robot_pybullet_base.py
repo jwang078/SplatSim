@@ -71,7 +71,7 @@ from splatsim.configs.env_config import (
     SplatSimObject,
     ArticulationConfig,
 )
-from splatsim.configs.mode_config import TrajectoryGenModeConfig
+from splatsim.configs.mode_config import TrajectoryGenModeConfig, ImageResizeMode
 from collections import defaultdict
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -84,20 +84,20 @@ from pathlib import Path
 SPLATSIM_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-def resize_image(img: np.ndarray, output_size: Tuple[int, int], mode: str = "letterbox") -> np.ndarray:
+def resize_image(img: np.ndarray, output_size: Tuple[int, int], mode: 'ImageResizeMode') -> np.ndarray:
     """Resize image to output_size using the specified mode.
 
     Args:
         img: Input image in CHW format (channels, height, width), float32 in [0, 1]
         output_size: Target (height, width)
-        mode: Resize mode - "letterbox" or "stretch"
+        mode: ImageResizeMode enum value
 
     Returns:
         Resized image in CHW format, float32 in [0, 1]
     """
-    if mode == "letterbox":
+    if mode == ImageResizeMode.LETTERBOX:
         return letterbox(img, output_size=output_size)
-    elif mode == "stretch":
+    elif mode == ImageResizeMode.STRETCH:
         # Convert from CHW to HWC for cv2
         img_hwc = np.transpose(img, (1, 2, 0))
         # Resize using cv2 (stretches to fill, ignoring aspect ratio)
@@ -105,7 +105,7 @@ def resize_image(img: np.ndarray, output_size: Tuple[int, int], mode: str = "let
         # Convert back to CHW
         return np.transpose(img_resized, (2, 0, 1))
     else:
-        raise ValueError(f"Unknown image resize mode: {mode}. Use 'letterbox' or 'stretch'.")
+        raise ValueError(f"Unknown image resize mode: {mode}.")
 
 
 def resolve_splatsim_path(path: str) -> str:
@@ -322,7 +322,7 @@ class PybulletRobotServerBase:
         image_height: Optional[int] = None,
         debug_mode: DEBUG_MODES = DEBUG_MODES.OFF,
         trajectory_gen_config: Optional[dict] = None,
-        image_resize_mode: str = "letterbox",
+        image_resize_modes: Optional[List[ImageResizeMode]] = None,
     ):
         self._serve_mode = serve_mode
         self.robot_name = robot_name
@@ -337,8 +337,13 @@ class PybulletRobotServerBase:
             debug_mode = self.DEBUG_MODES(debug_mode)
         assert debug_mode in self.DEBUG_MODES, f"debug_mode must be one of {list(self.DEBUG_MODES)}, got {debug_mode}"
         self.debug_mode = debug_mode
-        # Image resize mode: "letterbox" (preserve aspect ratio, pad) or "stretch" (fill entire area)
-        self.image_resize_mode = image_resize_mode
+        # Image resize modes: list of ImageResizeMode values; defaults to both letterbox and stretch
+        if image_resize_modes is None:
+            image_resize_modes = [ImageResizeMode.LETTERBOX, ImageResizeMode.STRETCH]
+        self.image_resize_modes: List[ImageResizeMode] = [
+            m if isinstance(m, ImageResizeMode) else ImageResizeMode(m)
+            for m in image_resize_modes
+        ]
 
         # load labels.npy
         self.robot_labels = np.load(
@@ -1532,22 +1537,28 @@ class PybulletRobotServerBase:
             self.prep_image_rendering(data=observations, cached_link_states=cached_link_states)
             with torch.no_grad():
                 for camera_name in self.camera_names:
-                    # render_image returns numpy array directly
-                    observations[camera_name] = self.render_image(
+                    # render_image returns raw numpy array (CHW float32)
+                    raw_img = self.render_image(
                         camera_name=camera_name,
                         cached_link_states=cached_link_states
                     )
-                    # Resize to 224x224 using configured mode (letterbox or stretch)
-                    if observations[camera_name] is not None:
-                        observations[camera_name] = resize_image(observations[camera_name], (224, 224), mode=self.image_resize_mode)
+                    # Store one resized copy per active resize mode under {cam}_{mode} key
+                    for mode in self.image_resize_modes:
+                        key = f"{camera_name}_{mode.value}"
+                        if raw_img is not None:
+                            observations[key] = resize_image(raw_img, (224, 224), mode=mode)
+                        else:
+                            observations[key] = None
 
             # Display the rendered observations
             self.display_observations(observations)
 
         for camera_name in self.camera_names:
-            # For example, when self.do-render_from_splat is False
-            if camera_name not in observations:
-                observations[camera_name] = None
+            # For example, when self.do_render_from_splat is False
+            for mode in self.image_resize_modes:
+                key = f"{camera_name}_{mode.value}"
+                if key not in observations:
+                    observations[key] = None
 
         return observations
 
@@ -1561,10 +1572,12 @@ class PybulletRobotServerBase:
             return
 
         frames_to_display = {}
+        display_mode = self.image_resize_modes[0] if self.image_resize_modes else None
         for camera_name in self.camera_names:
-            if camera_name not in observations or observations[camera_name] is None:
+            key = f"{camera_name}_{display_mode.value}" if display_mode else camera_name
+            if key not in observations or observations[key] is None:
                 continue
-            frame = observations[camera_name]
+            frame = observations[key]
 
             # Convert from tensor if needed
             if isinstance(frame, torch.Tensor):
@@ -1831,6 +1844,15 @@ class PybulletRobotServerBase:
     def _enter_mode(self, mode: 'PybulletRobotServerBase.SERVE_MODES'):
         """Called when entering a new serve mode. Override in subclasses for custom behavior."""
         if mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+            # Update active resize modes from traj config before creating the dataset
+            traj_config = self.trajectory_generator._traj_config
+            active_modes = []
+            if traj_config.get("render_letterbox", True):
+                active_modes.append(ImageResizeMode.LETTERBOX)
+            if traj_config.get("render_stretch", True):
+                active_modes.append(ImageResizeMode.STRETCH)
+            if active_modes:
+                self.image_resize_modes = active_modes
             self._init_lerobot_dataset()
 
     def _exit_mode(self, mode: 'PybulletRobotServerBase.SERVE_MODES'):
@@ -1844,7 +1866,6 @@ class PybulletRobotServerBase:
 
     def _create_lerobot_dataset(self, repo_id: str) -> LeRobotDataset:
         """Create a fresh LeRobot dataset with the standard features."""
-        image_keys = list(self.camera_names)
         traj_config = self.trajectory_generator._traj_config
         return LeRobotDataset.create(
             repo_id=repo_id,
@@ -1853,12 +1874,13 @@ class PybulletRobotServerBase:
             use_videos=True,
             features={
                 **{
-                    f"observation.images.{key}": {
+                    f"observation.images.{cam}_{mode.value}": {
                         "dtype": "image",
                         "shape": (3, 224, 224),
                         "names": ["channels", "height", "width"],
                     }
-                    for key in image_keys
+                    for cam in self.camera_names
+                    for mode in self.image_resize_modes
                 },
                 "observation.state": {
                     "dtype": "float32",
@@ -1914,7 +1936,7 @@ class PybulletRobotServerBase:
         self._lerobot_saver.finalize()
 
         traj_config = self.trajectory_generator._traj_config
-        if traj_config.get("push_to_hub", False):
+        if traj_config.push_to_hub:
             self._push_lerobot_to_hub()
 
         self._lerobot_saver = None
@@ -2039,7 +2061,6 @@ class PybulletRobotServerBase:
         image_buffers = defaultdict(list)
 
         stopped_early = False
-        import pdb; pdb.set_trace()
         for step_idx in range(len(joint_trajectory)):
             if self._is_stop_requested():
                 print(f"[TrajectoryGen] Stop requested at step {step_idx}/{len(joint_trajectory)}, saving partial episode.")
@@ -2069,18 +2090,22 @@ class PybulletRobotServerBase:
                     "task": "",
                 }
                 for cam in self.camera_names:
-                    if obs.get(cam) is not None:
-                        frame[f"observation.images.{cam}"] = obs[cam]
+                    for mode in self.image_resize_modes:
+                        key = f"{cam}_{mode.value}"
+                        if obs.get(key) is not None:
+                            frame[f"observation.images.{key}"] = obs[key]
                 self._lerobot_saver.add_frame(frame)
 
             # Collect images for Zarr saving
             for cam in self.camera_names:
-                if obs.get(cam) is not None:
-                    # Convert from (C, H, W) float [0,1] to (H, W, C) uint8
-                    img = obs[cam]
-                    img = np.transpose(img, (1, 2, 0))  # CxHxW -> HxWxC
-                    img = (img * 255).astype(np.uint8)
-                    image_buffers[cam].append(img)
+                for mode in self.image_resize_modes:
+                    key = f"{cam}_{mode.value}"
+                    if obs.get(key) is not None:
+                        # Convert from (C, H, W) float [0,1] to (H, W, C) uint8
+                        img = obs[key]
+                        img = np.transpose(img, (1, 2, 0))  # CxHxW -> HxWxC
+                        img = (img * 255).astype(np.uint8)
+                        image_buffers[key].append(img)
 
         # Save episode to LeRobot (skip partial episodes from early stop)
         if not stopped_early and hasattr(self, '_lerobot_saver') and self._lerobot_saver is not None:
@@ -2150,8 +2175,17 @@ class PybulletRobotServerBase:
                 # Generate trajectories, render images, and save to LeRobot + Zarr
                 self._generate_and_render_one_episode()
 
+                # Update GUI status with current progress
+                tgen = self.trajectory_generator
+                total = tgen._traj_config.get("num_base_trajectories", "?")
+                done = tgen.trajectory_count
+                if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+                    self._splatsim_gui.set_status(f"Trajectory: {done} / {total}")
+
                 if self.trajectory_generator.is_complete():
                     print(f"[GUI] Completed trajectory generation. Switching to idle mode.")
+                    if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+                        self._splatsim_gui.set_status(f"Done: {done} / {total} trajectories")
                     self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
             else:
                 raise ValueError(f"Unknown serve mode {current_mode}. ")

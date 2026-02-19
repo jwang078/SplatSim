@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 from PIL import Image, ImageTk
+from splatsim.configs.mode_config import ImageResizeMode, SplatSimModeConfig, TrajectoryGenModeConfig
 
 
 # =============================================================================
@@ -644,7 +645,7 @@ class ModePanel:
         self.frame: Optional[ttk.LabelFrame] = None
 
     def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
-              style: GuiStyle, config: Dict[str, Any]) -> None:
+              style: GuiStyle, config: SplatSimModeConfig) -> None:
         """Build mode-specific widgets inside parent. Override in subclasses."""
         pass
 
@@ -677,9 +678,9 @@ class TrajectoryGenModePanel(ModePanel):
     BTN_STOP = "stop_traj"
 
     def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
-              style: GuiStyle, config: Dict[str, Any]) -> None:
+              style: GuiStyle, config: SplatSimModeConfig) -> None:
+        assert isinstance(config, TrajectoryGenModeConfig), "Expected TrajectoryGenModeConfig for TrajectoryGenModePanel"
         builder = GuiBuilder(parent, gui, style)
-        traj_config = config.get("trajectory_generator", {})
 
         int_params = [
             IntParam("num_base_trajectories", "Num Trajectories", 1, 1000),
@@ -690,7 +691,7 @@ class TrajectoryGenModePanel(ModePanel):
             IntParam("num_path_candidates", "Path Candidates", 1, 20),
         ]
         for param in int_params:
-            builder.add_int_param(param, traj_config.get(param.key))
+            builder.add_int_param(param, getattr(config, param.key))
 
         float_params = [
             FloatParam("k_exp", "k_exp", 0.1, 20.0),
@@ -698,25 +699,31 @@ class TrajectoryGenModePanel(ModePanel):
             FloatParam("threshold", "threshold", 0.0, 1.0),
         ]
         for param in float_params:
-            builder.add_float_param(param, traj_config.get(param.key))
+            builder.add_float_param(param, getattr(config, param.key))
 
         builder.add_bool_param(
             BoolParam("disable_camera_scoring_for_rrt", "Disable Cam Score"),
-            traj_config.get("disable_camera_scoring_for_rrt", False)
+            config.disable_camera_scoring_for_rrt
         )
         builder.add_bool_param(
             BoolParam("debug_visualize", "Debug Visualize"),
-            traj_config.get("debug_visualize", False)
+            config.debug_visualize
         )
 
         builder.add_str_param(
             StrParam("lerobot_repo_id", "LeRobot Repo ID (user/name)", "", width=25),
-            traj_config.get("lerobot_repo_id", "")
+            config.lerobot_repo_id
         )
         builder.add_bool_param(
             BoolParam("push_to_hub", "Push to Hub"),
-            traj_config.get("push_to_hub", False)
+            config.push_to_hub
         )
+        for mode in ImageResizeMode:
+            key = f"render_{mode.value}"
+            builder.add_bool_param(
+                BoolParam(key, f"Render {mode.value.capitalize()}"),
+                getattr(config, key, True)
+            )
 
         builder.add_button_row([
             ButtonConfig("Start Traj Gen", self.BTN_START),
@@ -800,6 +807,9 @@ class SplatSimGui(ThreadedTkinterGui):
         self._pending_images: Optional[Dict[str, np.ndarray]] = None
         self._image_lock = threading.Lock()
 
+        # Status text (trajectory progress, etc.)
+        self._status_var: Optional[tk.StringVar] = None
+
     def _build_ui(self):
         """Build the SplatSim UI."""
         main_frame = ttk.Frame(self._root, padding=self._style.padding)
@@ -824,7 +834,13 @@ class SplatSimGui(ThreadedTkinterGui):
         self._mode_var = tk.StringVar(value=f"Mode: {self._initial_mode}")
         self._values["_mode_var"] = self._mode_var
         mode_label = ttk.Label(main_frame, textvariable=self._mode_var, style="Header.TLabel")
-        mode_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        mode_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        builder._row += 1
+
+        # Trajectory progress status line
+        self._status_var = tk.StringVar(value="")
+        status_label = ttk.Label(main_frame, textvariable=self._status_var)
+        status_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 8))
         builder._row += 1
 
         # Mode selection buttons (one per panel)
@@ -890,6 +906,14 @@ class SplatSimGui(ThreadedTkinterGui):
             except tk.TclError:
                 pass
         self._update_panel_visibility(mode)
+
+    def set_status(self, text: str):
+        """Update the status line (e.g. trajectory progress). Thread-safe."""
+        if self._status_var is not None:
+            try:
+                self._status_var.set(text)
+            except tk.TclError:
+                pass
 
     def process_mode_transitions(self) -> None:
         """Process mode button presses and panel-specific button logic.

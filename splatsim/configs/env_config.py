@@ -7,6 +7,8 @@ import yaml
 import copy
 from abc import ABC
 
+_SPLATSIM_ROOT = Path(__file__).resolve().parent.parent.parent
+
 
 
 
@@ -82,7 +84,7 @@ class ObjectConfig(ABC):
 
 
     _YAML_CACHE: Optional[Dict[str, Any]] = None
-    _OBJECT_CONFIG_PATH: Path = Path("configs/object_configs/objects.yaml")
+    _OBJECT_CONFIG_PATH: Path = _SPLATSIM_ROOT / "configs/object_configs/objects.yaml"
 
     def __post_init__(self):
         """Resolves Priority: Instance > YAML > Global Fallback"""
