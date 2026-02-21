@@ -94,8 +94,8 @@ def main(args):
     pcd_splat = o3d.geometry.PointCloud()
     pcd_splat.points = o3d.utility.Vector3dVector(robot_xyz)
 
-    robot_path = object_configs[args.robot_name]["urdf_path"][0]
-    initial_joint_positions = object_configs[args.robot_name]['joint_states'][0]
+    robot_path = object_configs[args.robot_name]["urdf_path"]
+    initial_joint_positions = object_configs[args.robot_name]['articulation_config']['initial_joint_positions']
 
     #connect to pybullet
     physicsClient = p.connect(p.GUI)
@@ -103,7 +103,7 @@ def main(args):
     p.setRealTimeSimulation(1)
 
     #load the robot
-    base_position = object_configs[args.robot_name]["base_position"][0]
+    base_position = object_configs[args.robot_name]["base_position"]
     robot_id = p.loadURDF(robot_path, useFixedBase=True, basePosition=base_position)
 
     #get the joint states from args

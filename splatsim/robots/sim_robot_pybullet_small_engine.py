@@ -239,6 +239,7 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 position_range_y=(0.3, 0.5),
                 base_quat=(0, 0, 0.707, 0.707),
 
+                global_scaling=0.1,
             ),
             SplatObjectConfig(
                 name="box2",
@@ -256,6 +257,8 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 position_range_x=(-0.2, 0.3),
                 position_range_y=(0.5, 0.7),
                 base_quat=(0, 0, 1, 0), #rotated 180 degrees about z
+
+                global_scaling=2
             ),
         ],
     )

@@ -43,12 +43,16 @@ def get_curr_link_states(robot_uid, use_link_centers=True):
         if use_link_centers:
             link_states.append({
                 "pos": link_state[0],
-                "q": link_state[1]
+                "q": link_state[1],
+                "link_frame_pos": link_state[4],
+                "link_frame_q": link_state[5],
             })
         else:
             link_states.append({
                 "pos": link_state[4],
-                "q": link_state[5]
+                "q": link_state[5],
+                "link_frame_pos": link_state[4],
+                "link_frame_q": link_state[5],
             })
     
     return link_states
@@ -135,9 +139,12 @@ def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=Tru
 def crop_splat(splatsim_obj: SplatSimObject, keep_within_aabb=True):
     assert type(splatsim_obj.config) == SplatObjectConfig
     pc = splatsim_obj.gaussians
-    aabb = splatsim_obj.config.aabb.bounding_box
+    aabb = np.array(splatsim_obj.config.aabb.bounding_box)
+    aabb += np.array(splatsim_obj.config.aabb.urdf_bbox_adjustment).T
     if aabb is None:
         return
+
+    aabb = aabb * splatsim_obj.config.global_scaling
 
     xyz_obj = copy.deepcopy(pc._xyz)
 

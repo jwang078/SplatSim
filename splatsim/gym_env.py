@@ -64,11 +64,30 @@ class SplatSimGymEnv(gym.Env):
         if self.render_mode == "rgb_array":
             obs = self.robot_server.get_observations()
 
-            # Collect all RGB observations
+            # Collect one RGB image per camera (first resize mode only, to avoid duplicates)
             rgb_images = []
-            for key in sorted(obs.keys()):
-                if key.endswith("_rgb") and obs[key] is not None:
-                    img = obs[key]
+            camera_names = getattr(self.robot_server, "camera_names", [])
+            image_resize_modes = getattr(self.robot_server, "image_resize_modes", [])
+            if camera_names and image_resize_modes:
+                # Use the first resize mode to pick one image per camera
+                first_mode = image_resize_modes[0]
+                mode_str = first_mode.value if hasattr(first_mode, "value") else str(first_mode)
+                keys_to_render = [f"{cam}_{mode_str}" for cam in camera_names]
+            else:
+                # Fallback: collect any key containing "_rgb", one per unique camera prefix
+                seen_cameras = set()
+                keys_to_render = []
+                for key in sorted(obs.keys()):
+                    if "_rgb" in key:
+                        # Use the part up to the last underscore as the camera name
+                        cam_prefix = key.rsplit("_", 1)[0]
+                        if cam_prefix not in seen_cameras:
+                            seen_cameras.add(cam_prefix)
+                            keys_to_render.append(key)
+
+            for key in keys_to_render:
+                img = obs.get(key)
+                if img is not None:
                     if hasattr(img, 'cpu'):
                         img = img.cpu().numpy()
                     # Convert from (C, H, W) -> (H, W, C) for rendering

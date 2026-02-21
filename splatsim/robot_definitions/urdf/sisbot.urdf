@@ -601,12 +601,29 @@
 
 
   <!-- Virtual wrist camera -->
-  <link name="wrist_camera_link"/>
+  <link name="wrist_camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.072 0.051 0.034"/>
+      </geometry>
+      <material name="dark_grey">
+        <color rgba="0.2 0.2 0.2 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.072 0.051 0.034"/>
+      </geometry>
+    </collision>
+  </link>
   <joint name="wrist_camera_vis_joint" type="fixed">
     <parent link="robotiq_arg2f_base_link"/>
     <child link="wrist_camera_link"/>
     <!-- the cam is tilted down by about 18 degrees to see the gripper (0.31 rad) -->
-    <origin xyz="-0.1 0 -0.05" rpy="-0.3141 0 -1.57"/>
+    <origin xyz="-0.1 0 -0.0" rpy="-0.3141 0 -1.57"/>
+    <!-- <origin xyz="-0.1 0 -0.05" rpy="-0.3141 0 -1.57"/> -->
   </joint>
 
   <!-- make a virtual link to define a virtual camera -->

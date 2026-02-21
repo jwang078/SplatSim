@@ -649,6 +649,14 @@ class PybulletRobotServerBase:
                 inplace=True,
             )
 
+            # After transform_object, scale xyz around the centroid:
+            xyz = splatsim_obj.gaussians._xyz
+            # center = xyz.mean(dim=0, keepdim=True)
+            # splatsim_obj.gaussians._xyz = center + (xyz - center) * splatsim_obj.config.global_scaling
+            splatsim_obj.gaussians._xyz = xyz * splatsim_obj.config.global_scaling
+            # Also scale the gaussian sizes:
+            splatsim_obj.gaussians._scaling = splatsim_obj.gaussians._scaling + np.log(splatsim_obj.config.global_scaling)
+
             # Detach tensors before crop_splat since transform_object produces non-leaf tensors
             splatsim_obj.gaussians._xyz = splatsim_obj.gaussians._xyz.detach()
             splatsim_obj.gaussians._rotation = splatsim_obj.gaussians._rotation.detach()
@@ -662,6 +670,7 @@ class PybulletRobotServerBase:
         elif type(splatsim_obj.config) == CuboidObjectConfig:
             assert splatsim_obj.config.size is not None
             lx, ly, lz = splatsim_obj.config.size
+            lx, ly, lz = lx * splatsim_obj.config.global_scaling, ly * splatsim_obj.config.global_scaling, lz * splatsim_obj.config.global_scaling
             # Default to brown color for rendering
             cuboid_params = create_cuboid_gaussians(
                 side_lengths=(lx, ly, lz),
@@ -679,7 +688,7 @@ class PybulletRobotServerBase:
 
             pdb.set_trace()
             raise ValueError("Could not load gaussian splat")
-
+        
         # Disable gradients on this gaussian splat b/c we're not optimizing
         splatsim_obj.gaussians._xyz = splatsim_obj.gaussians._xyz.detach()
         splatsim_obj.gaussians._rotation = splatsim_obj.gaussians._rotation.detach()
@@ -922,13 +931,14 @@ class PybulletRobotServerBase:
             print("WARNING: No wrist camera index found")
             return None
 
-        # Use cached state for synchronization if available
+        # Use link frame origin (indices 4/5), not CoM (indices 0/1), since
+        # wrist_camera_link has no inertial and its frame is set by the joint xyz offset.
         link_idx = int(self.wrist_camera.tracked_link_index)
         if cached_link_states is not None and link_idx < len(cached_link_states):
             # Use cached state for synchronization
             cached_state = cached_link_states[link_idx]
-            T_cw = np.array(cached_state["pos"]).astype(np.float32)
-            quat = cached_state["q"]
+            T_cw = np.array(cached_state["link_frame_pos"]).astype(np.float32)
+            quat = cached_state["link_frame_q"]
         else:
             # Fall back to direct query (backward compatibility)
             link_state = p.getLinkState(
@@ -936,8 +946,8 @@ class PybulletRobotServerBase:
                 link_idx,
                 computeForwardKinematics=True,
             )
-            T_cw = np.array(link_state[0]).astype(np.float32)
-            quat = link_state[1]
+            T_cw = np.array(link_state[4]).astype(np.float32)
+            quat = link_state[5]
 
         R_cw = (
             np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3).astype(np.float32)
@@ -1604,15 +1614,14 @@ class PybulletRobotServerBase:
 
         cfg = splatsim_obj.config
         bp = cfg.base_position
-        global_scaling = cfg.global_scaling
 
         x_range = self.TABLE_LIMITS[0] if cfg.position_range_x is None else cfg.position_range_x
         y_range = self.TABLE_LIMITS[1] if cfg.position_range_y is None else cfg.position_range_y
         z_range = self.TABLE_LIMITS[2] if cfg.position_range_z is None else cfg.position_range_z
 
-        x = random.uniform(x_range[0], x_range[1]) * global_scaling
-        y = random.uniform(y_range[0], y_range[1]) * global_scaling
-        z = random.uniform(z_range[0], z_range[1]) * global_scaling
+        x = random.uniform(x_range[0], x_range[1])
+        y = random.uniform(y_range[0], y_range[1])
+        z = random.uniform(z_range[0], z_range[1])
         pos = [x + bp[0], y + bp[1], z + bp[2]]
         euler_z = random.uniform(cfg.rotation_range_z[0], cfg.rotation_range_z[1])
 
