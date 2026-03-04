@@ -165,13 +165,22 @@ def _populate_registry():
     register_env("open_space_bwa", OpenSpaceBWAPybulletRobotServer)
 
 
+def _is_port_available(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("localhost", port)) != 0
+
+
 def _get_next_port() -> int:
     """Get the next available port for a new environment instance.
 
     Thread-safe to support parallel environment creation.
+    Skips occupied ports.
     """
     global _port_counter
     with _port_lock:
+        while not _is_port_available(_port_counter):
+            _port_counter += 1
         port = _port_counter
         _port_counter += 1
     return port
@@ -209,12 +218,10 @@ def make_single_env(
 
     # Auto-assign port if not specified
     if port is None:
-        port = _get_next_port()
+        cfg["port"] = _get_next_port()
 
-    # Create robot server with config
     robot_server = robot_server_cls(
         serve_mode=PybulletRobotServerBase.SERVE_MODES.INTERACTIVE,
-        port=port,
         **cfg
     )
 

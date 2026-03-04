@@ -39,6 +39,8 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     use_obstacles: bool = True
     q_start: Optional[List[float]] = None
     q_goal: Optional[List[float]] = None # ex: 7-dof-joint robot configuration goal
+    ee_pos_start: Optional[List[float]] = None   # [x, y, z] end-effector position start
+    ee_quat_start: Optional[List[float]] = None  # [x, y, z, w] end-effector quaternion start
     ee_pos_goal: Optional[List[float]] = None    # [x, y, z] end-effector position goal
     ee_quat_goal: Optional[List[float]] = None   # [x, y, z, w] end-effector quaternion goal
     num_ik_candidates: int = 8                    # number of IK solutions to try for EE goals
@@ -53,10 +55,23 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     threshold: float = 0.4
     lerobot_repo_id: str = ""
     push_to_hub: bool = True
+    render_letterbox: bool = True
+    render_stretch: bool = True
     debug_visualize: bool = False  # Visualize q_start, q_goal, and trajectory in PyBullet GUI
-    verbose: bool = False
+    verbose: bool = True
 
     def __post_init__(self):
+        has_ee_start = self.ee_pos_start is not None or self.ee_quat_start is not None
+        if has_ee_start and self.q_start is not None:
+            raise ValueError(
+                "TrajectoryGenModeConfig: Cannot specify both q_start and ee_pos_start/ee_quat_start. "
+                "Set q_start=None when using end-effector pose starts."
+            )
+        if self.ee_pos_start is not None and len(self.ee_pos_start) != 3:
+            raise ValueError(f"ee_pos_start must be length 3 (x, y, z), got {len(self.ee_pos_start)}")
+        if self.ee_quat_start is not None and len(self.ee_quat_start) != 4:
+            raise ValueError(f"ee_quat_start must be length 4 (x, y, z, w), got {len(self.ee_quat_start)}")
+
         has_ee_goal = self.ee_pos_goal is not None or self.ee_quat_goal is not None
         if has_ee_goal and self.q_goal is not None:
             raise ValueError(

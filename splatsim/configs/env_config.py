@@ -68,12 +68,17 @@ class ObjectConfig(ABC):
     is_articulated: Optional[bool] = Default(False)
     articulation_config: Optional[ArticulationConfig] = Default(None)
     use_fixed_base: Optional[bool] = Default(False)
-    global_scaling: float = Default(1.0)
+    scaling_range_x: Tuple[float, float] = Default((1.0, 1.0))
+    scaling_range_y: Tuple[float, float] = Default((1.0, 1.0))
+    scaling_range_z: Tuple[float, float] = Default((1.0, 1.0))
     wrist_camera_link_name: Optional[str] = Default(None)
     grasp_configs: Optional[List[GraspConfig]] = Default(list)
     load_splat: Optional[bool] = Default(True)
     load_urdf: Optional[bool] = Default(True)
     randomize_pose: Optional[bool] = Default(True)
+    randomize_scale: Optional[bool] = Default(True)
+    skip_collision_robot_links: Optional[List[int]] = Default(list)  # Robot link indices to skip when checking collisions against this object.
+    use_aabb_collision: Optional[bool] = Default(False)  # If True, use fast AABB overlap test instead of PyBullet pairwise_collision for object-object checks.
 
     rotation_range_z: Tuple[float, float] = Default((0.0, 0.0))
     
@@ -160,6 +165,7 @@ class CuboidObjectConfig(ObjectConfig):
     mass: Optional[float] = Default(0.0)
     color_rgb: Tuple[int, int, int] = Default((0, 0, 255))
     randomize_pose: Optional[bool] = Default(False)
+    use_aabb_collision: Optional[bool] = Default(True)  # Cuboids are axis-aligned boxes; AABB is exact.
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -222,3 +228,4 @@ class SplatSimObject:
     # is_articulated: bool = False # For example, the robot has is_articulated=True. An object with is_articulated should have articulation_config
     # articulation_config: Optional[ArticulationConfig] = None
     _cache: dict = field(default_factory=dict)  # Cache for GPU tensors to avoid recreating each step
+    current_scale: Any = field(default_factory=lambda: np.array([1.0, 1.0, 1.0]))  # Currently applied per-axis scale

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
 import tyro
 import types
 import yaml
@@ -24,6 +25,11 @@ class Args:
 
 
 def launch_robot_server(args: Args):
+    # Match lerobot's precision settings so dataset collection
+    # uses the same tf32 precision as evaluation
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+
     with open("configs/object_configs/objects.yaml", "r") as f:
         object_config = yaml.safe_load(f)
 
