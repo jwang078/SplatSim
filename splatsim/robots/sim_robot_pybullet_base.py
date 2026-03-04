@@ -72,6 +72,7 @@ from splatsim.configs.env_config import (
     ArticulationConfig,
 )
 from splatsim.configs.mode_config import TrajectoryGenModeConfig, ImageResizeMode
+from splatsim.utils import rrt_path_utils
 from collections import defaultdict
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -392,11 +393,15 @@ class PybulletRobotServerBase:
         self.models_lib = MockModelsLib  # md.model_lib()
 
         self.splatsim_objects: List[SplatSimObject] = []
+        self._skip_pairs: set = set()
         self.splatsim_robot: SplatSimObject = self.create_object(
             SplatObjectConfig(
                 name="robot",
                 splat_name=self.robot_name,
-                randomize_pose=False
+                randomize_pose=False,
+                rotation_range_z=(0, 0),
+                position_range_x=(0, 0),
+                position_range_y=(0, 0),
             )
         )
 
@@ -430,6 +435,9 @@ class PybulletRobotServerBase:
                     load_urdf=False,
                     is_articulated=False,
                     randomize_pose=False,
+                    rotation_range_z=(0, 0),
+                    position_range_x=(0, 0),
+                    position_range_y=(0, 0),
                 )
             )
         if self.debug_mode == self.DEBUG_MODES.ROTATE_BASE_CAM:
@@ -451,8 +459,6 @@ class PybulletRobotServerBase:
             self.create_object(
                 object_config=object_config,
             )
-
-        self.randomize_object_poses()
 
         # TODO put all trajectory saving into TrajectoryGenerator
         # trajectory path
@@ -537,11 +543,10 @@ class PybulletRobotServerBase:
             )
         return np.array(joint_states)
 
-    def load_urdf(self, splatsim_obj: SplatSimObject):
+    def load_urdf(self, splatsim_obj: SplatSimObject, physics_scale: float = 1.0):
         # This must be called after the gaussians are finalized
         # ex: after the gaussians are transformed to be in the simulator's coordinate frame
         use_fixed_base = splatsim_obj.config.use_fixed_base
-        global_scaling = splatsim_obj.config.global_scaling
         is_articulated = splatsim_obj.config.is_articulated
         base_position = splatsim_obj.config.base_position
 
@@ -567,7 +572,7 @@ class PybulletRobotServerBase:
                 urdf_path,
                 base_position,
                 quat,
-                globalScaling=global_scaling,
+                globalScaling=physics_scale,  # Visual scaling (scaling_range_x/y/z) is applied to the gaussian splat at reset time via randomize_object_scale(), not at URDF load time.
                 useFixedBase=use_fixed_base,
                 flags=flags,
             )
@@ -580,12 +585,6 @@ class PybulletRobotServerBase:
             # position = splatsim_obj.config.position
             color_rgb = splatsim_obj.config.color_rgb
 
-            # Apply global scaling
-            lx, ly, lz = (
-                lx * global_scaling,
-                ly * global_scaling,
-                lz * global_scaling,
-            )
             # position = [
             #     position[0] * global_scaling,
             #     position[1] * global_scaling,
@@ -649,15 +648,8 @@ class PybulletRobotServerBase:
                 inplace=True,
             )
 
-            # After transform_object, scale xyz around the centroid:
-            xyz = splatsim_obj.gaussians._xyz
-            # center = xyz.mean(dim=0, keepdim=True)
-            # splatsim_obj.gaussians._xyz = center + (xyz - center) * splatsim_obj.config.global_scaling
-            splatsim_obj.gaussians._xyz = xyz * splatsim_obj.config.global_scaling
-            # Also scale the gaussian sizes:
-            splatsim_obj.gaussians._scaling = splatsim_obj.gaussians._scaling + np.log(splatsim_obj.config.global_scaling)
-
             # Detach tensors before crop_splat since transform_object produces non-leaf tensors
+            # Splat is loaded at scale=1; per-axis scaling is applied at reset time via randomize_object_scale()
             splatsim_obj.gaussians._xyz = splatsim_obj.gaussians._xyz.detach()
             splatsim_obj.gaussians._rotation = splatsim_obj.gaussians._rotation.detach()
             splatsim_obj.gaussians._opacity = splatsim_obj.gaussians._opacity.detach()
@@ -670,7 +662,7 @@ class PybulletRobotServerBase:
         elif type(splatsim_obj.config) == CuboidObjectConfig:
             assert splatsim_obj.config.size is not None
             lx, ly, lz = splatsim_obj.config.size
-            lx, ly, lz = lx * splatsim_obj.config.global_scaling, ly * splatsim_obj.config.global_scaling, lz * splatsim_obj.config.global_scaling
+            # CuboidObjectConfig does not use scaling_range; size is fixed at load time
             # Default to brown color for rendering
             cuboid_params = create_cuboid_gaussians(
                 side_lengths=(lx, ly, lz),
@@ -704,6 +696,7 @@ class PybulletRobotServerBase:
             object_name
         )
         splatsim_obj = self.splatsim_objects.pop(index)
+        self._recompute_skip_pairs()
 
         # Explicitly delete some values
         del splatsim_obj.gaussians
@@ -805,9 +798,11 @@ class PybulletRobotServerBase:
             articulation_config.segmented_list = segmented_list
 
         # Set the position of the object
+        self.randomize_object_scale(splatsim_obj)
         self.randomize_object_pose(splatsim_obj)
 
         self.splatsim_objects.append(splatsim_obj)
+        self._recompute_skip_pairs()
 
         # Invalidate scene gaussian buffers so they get reinitialized with the new object
         self._invalidate_scene_gaussian_buffers()
@@ -1607,18 +1602,33 @@ class PybulletRobotServerBase:
             self._splatsim_gui.update_camera_images(frames_to_display)
 
     def randomize_object_pose(self, splatsim_obj: SplatSimObject):
-        if splatsim_obj == self.splatsim_robot or splatsim_obj == self.splatsim_background:
-            return  # Don't randomize robot or background
         if splatsim_obj.sim_id is None:
-            return  # Can't randomize pose of an object that isn't loaded in the simulator
+            return
 
         cfg = splatsim_obj.config
         bp = cfg.base_position
+        bq = cfg.base_quat
 
         x_range = self.TABLE_LIMITS[0] if cfg.position_range_x is None else cfg.position_range_x
         y_range = self.TABLE_LIMITS[1] if cfg.position_range_y is None else cfg.position_range_y
         z_range = self.TABLE_LIMITS[2] if cfg.position_range_z is None else cfg.position_range_z
 
+        curr_pos, curr_quat = self.pybullet_client.getBasePositionAndOrientation(splatsim_obj.sim_id)
+        curr_euler_z = self.pybullet_client.getEulerFromQuaternion(curr_quat)[2]
+        base_z = self.pybullet_client.getEulerFromQuaternion(bq)[2]
+        # Subtract base_z to get rotation relative to base orientation, then normalize to [0, 2pi]
+        # to match rotation_range_z convention (rotation_range_z is defined relative to bq)
+        _rot_eps = 1e-3  # tolerance for floating point drift in rotation check
+        curr_euler_z_rel = (curr_euler_z - base_z) % (2 * np.pi)
+        # 2pi and 0 are the same angle; if we're within eps of 2pi, treat as 0
+        if curr_euler_z_rel > 2 * np.pi - _rot_eps:
+            curr_euler_z_rel = 0.0
+        in_range = np.all(np.array(curr_pos) >= np.array([x_range[0] + bp[0], y_range[0] + bp[1], z_range[0] + bp[2]])) \
+            and np.all(np.array(curr_pos) <= np.array([x_range[1] + bp[0], y_range[1] + bp[1], z_range[1] + bp[2]])) \
+            and cfg.rotation_range_z[0] - _rot_eps <= curr_euler_z_rel <= cfg.rotation_range_z[1] + _rot_eps
+        if not (splatsim_obj.config.randomize_pose or (not splatsim_obj.config.randomize_pose and not in_range)):
+            return
+        
         x = random.uniform(x_range[0], x_range[1])
         y = random.uniform(y_range[0], y_range[1])
         z = random.uniform(z_range[0], z_range[1])
@@ -1628,31 +1638,108 @@ class PybulletRobotServerBase:
         quat = self.pybullet_client.getQuaternionFromEuler(
             [0, 0, euler_z]
         )
-        quat = np.quaternion(quat[3], quat[0], quat[1], quat[2]) * np.quaternion(*cfg.base_quat)
+        quat = np.quaternion(quat[3], quat[0], quat[1], quat[2]) * np.quaternion(*bq)
         quat = [quat.w, quat.x, quat.y, quat.z]
+        
         self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, pos, quat)
 
-    def randomize_object_poses(self):
+    def randomize_object_scale(self, splatsim_obj: SplatSimObject):
+        cfg = splatsim_obj.config
+
+        in_range = np.all(
+            splatsim_obj.current_scale >= np.array([cfg.scaling_range_x[0], cfg.scaling_range_y[0], cfg.scaling_range_z[0]])) and np.all(
+            splatsim_obj.current_scale <= np.array([cfg.scaling_range_x[1], cfg.scaling_range_y[1], cfg.scaling_range_z[1]])
+        )
+        if not (splatsim_obj.config.randomize_scale or (not splatsim_obj.config.randomize_scale and not in_range)):
+            return  # No change in scale, skip
+        
+        new_sx = random.uniform(*cfg.scaling_range_x)
+        new_sy = random.uniform(*cfg.scaling_range_y)
+        new_sz = random.uniform(*cfg.scaling_range_z)
+        new_scale = np.array([new_sx, new_sy, new_sz])
+
+        if np.allclose(new_scale, splatsim_obj.current_scale):
+            return  # No change in scale, skip
+
+        old_scale = splatsim_obj.current_scale 
+        ratio = new_scale / old_scale
+
+        device = splatsim_obj.gaussians._xyz.device
+        dtype = splatsim_obj.gaussians._xyz.dtype
+        ratio_t = torch.tensor(ratio, device=device, dtype=dtype)
+        splatsim_obj.gaussians._xyz = splatsim_obj.gaussians._xyz * ratio_t
+        splatsim_obj.gaussians._scaling = splatsim_obj.gaussians._scaling + torch.tensor(
+            np.log(ratio), device=splatsim_obj.gaussians._scaling.device, dtype=splatsim_obj.gaussians._scaling.dtype
+        )
+
+        splatsim_obj.current_scale = new_scale
+
+        # Reload URDF at new scale (PyBullet only supports globalScaling at load time)
+        # Save and restore current pose so scale doesn't reset position/orientation
+        if splatsim_obj.sim_id is not None:
+            pos, quat = self.pybullet_client.getBasePositionAndOrientation(splatsim_obj.sim_id)
+            self.pybullet_client.removeBody(splatsim_obj.sim_id)
+            splatsim_obj.sim_id = None
+            physics_scale = float(np.cbrt(np.prod(new_scale)))  # geometric mean for uniform physics approximation
+            self.load_urdf(splatsim_obj, physics_scale=physics_scale)
+            self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, pos, quat)
+
+    def _objects_collide(self, obj_i: SplatSimObject, obj_j: SplatSimObject) -> bool:
+        """Check collision between two objects.
+
+        Both use_aabb_collision=True  → fast AABB overlap test (no PyBullet narrowphase).
+        Otherwise                     → PyBullet pairwise_collision.
+
+        PyBullet's getAABB returns world-space (aabbMin, aabbMax), so it already
+        accounts for position, orientation, and scale for both cuboids and splats.
+        """
+        if obj_i.config.use_aabb_collision and obj_j.config.use_aabb_collision:
+            min_i, max_i = self.pybullet_client.getAABB(obj_i.sim_id)
+            min_j, max_j = self.pybullet_client.getAABB(obj_j.sim_id)
+            # Overlap on all three axes ↔ collision
+            return all(max_i[k] > min_j[k] and max_j[k] > min_i[k] for k in range(3))
+        return pairwise_collision(obj_i.sim_id, obj_j.sim_id)
+
+    def randomize_objects(self):
         collision = True
         while collision:
             collision = False
-            
-            for obj in random.sample(self.splatsim_objects, len(self.splatsim_objects)):
-                self.randomize_object_pose(obj)
 
-            # Check for collisions
-            for i, obj_i in enumerate(self.splatsim_objects):
-                if obj_i.sim_id is None:
+            # Avoid a failure case where the robot is blocking all possible object placements
+            self.randomize_robot_joint_positions()
+
+            for splatsim_obj in random.sample(self.splatsim_objects, len(self.splatsim_objects)):
+                # if splatsim_obj == self.splatsim_robot or splatsim_obj == self.splatsim_background:
+                #     continue
+                self.randomize_object_scale(splatsim_obj)
+                self.randomize_object_pose(splatsim_obj)
+
+            # Gather candidate object pairs (unique, skipping table and un-fixable pairs)
+            candidates = []
+            objs = self.splatsim_objects
+            for i in range(len(objs)):
+                obj_i = objs[i]
+                if obj_i.sim_id is None or obj_i.config.name == "table":
                     continue
-                for j, obj_j in enumerate(self.splatsim_objects):
-                    if obj_j.sim_id is None or i == j:
+                for j in range(i + 1, len(objs)):
+                    obj_j = objs[j]
+                    if obj_j.sim_id is None or obj_j.config.name == "table":
                         continue
                     if not obj_i.config.randomize_pose and not obj_j.config.randomize_pose:
-                        # This collision cannot be fixed
-                        continue
-                    if pairwise_collision(obj_i.sim_id, obj_j.sim_id):
-                        collision = True
-                        break
+                        continue  # Fixed pair — collision cannot be resolved by re-randomizing
+                    both_aabb = obj_i.config.use_aabb_collision and obj_j.config.use_aabb_collision
+                    candidates.append((0 if both_aabb else 1, obj_i, obj_j))  # AABB pairs (0) sort first
+
+            # Check for collisions — AABB pairs first for maximum early-exit speed
+            for _, obj_i, obj_j in sorted(candidates, key=lambda t: t[0]):
+                if self._objects_collide(obj_i, obj_j):
+                    collision = True
+                    break
+
+    def randomize_robot_joint_positions(self):
+        """Randomize the robot's joint positions uniformly within joint limits."""
+        initial_joints = self.randomize_ee_pose()
+        self.teleport_joint_state(self.splatsim_robot, initial_joints)
 
     def randomize_ee_pose(self, max_attempts=100):
         # generating random initial joint state using random end effector position and orientation
@@ -1683,6 +1770,8 @@ class PybulletRobotServerBase:
                     self.splatsim_robot.sim_id, i + 1, initial_joint_positions[i]
                 )
 
+            # larger query distance so that more things are counted as collisions
+            # this matches rrt
             if not self.is_robot_in_collision():
                 # TODO possibly randomize gripper state here, too
                 # Though that might have to edit initial_joint_positions
@@ -1692,20 +1781,26 @@ class PybulletRobotServerBase:
         print(f"Warning: Could not find collision-free EE pose after {max_attempts} attempts")
         return initial_joint_positions
     
+    def get_skip_pairs(self) -> set:
+        return self._skip_pairs
+
+    def _recompute_skip_pairs(self):
+        self._skip_pairs = {
+            (link_idx, obj.sim_id)
+            for obj in self.splatsim_objects
+            if obj.sim_id is not None
+            for link_idx in (obj.config.skip_collision_robot_links or [])
+        }
+
     def is_robot_in_collision(self):
-        # Check for collisions between robot and scene objects
-        # Only detect actual penetration (negative contact distance), not just proximity
-        for splatsim_obj in self.splatsim_objects:
-            if splatsim_obj.sim_id is not None and splatsim_obj != self.splatsim_robot:
-                contacts = self.pybullet_client.getClosestPoints(
-                    self.splatsim_robot.sim_id, splatsim_obj.sim_id, distance=0.0
-                )
-                # Check if any contact has negative distance (actual penetration)
-                for contact in contacts:
-                    contact_distance = contact[8]  # contactDistance is at index 8
-                    if contact_distance < -0.001:  # Small tolerance for numerical stability
-                        return True
-        return False
+        joint_indices = list(range(1, 7))
+        obstacle_ids = [
+            obj.sim_id for obj in self.splatsim_objects
+            if obj.sim_id is not None and obj != self.splatsim_robot
+        ]
+        return rrt_path_utils.check_links_in_collision(
+            self.splatsim_robot.sim_id, joint_indices, q=None, obstacle_ids=obstacle_ids, skip_pairs=self.get_skip_pairs()
+        )
 
     def get_random_ee_pose(self):
         if self.TABLE_LIMITS is None:
@@ -1854,11 +1949,11 @@ class PybulletRobotServerBase:
         """Called when entering a new serve mode. Override in subclasses for custom behavior."""
         if mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
             # Update active resize modes from traj config before creating the dataset
-            traj_config = self.trajectory_generator._traj_config
+            traj_config = self.trajectory_generator.config
             active_modes = []
-            if traj_config.get("render_letterbox", True):
+            if traj_config.render_letterbox:
                 active_modes.append(ImageResizeMode.LETTERBOX)
-            if traj_config.get("render_stretch", True):
+            if traj_config.render_stretch:
                 active_modes.append(ImageResizeMode.STRETCH)
             if active_modes:
                 self.image_resize_modes = active_modes
@@ -1875,10 +1970,10 @@ class PybulletRobotServerBase:
 
     def _create_lerobot_dataset(self, repo_id: str) -> LeRobotDataset:
         """Create a fresh LeRobot dataset with the standard features."""
-        traj_config = self.trajectory_generator._traj_config
+        traj_config = self.trajectory_generator.config
         return LeRobotDataset.create(
             repo_id=repo_id,
-            fps=traj_config.get("robot_update_rate", 20),
+            fps=traj_config.robot_update_rate,
             robot_type="lerobot_splatsim",
             use_videos=True,
             features={
@@ -1912,8 +2007,8 @@ class PybulletRobotServerBase:
 
     def _init_lerobot_dataset(self):
         """Initialize LeRobot dataset for trajectory generation with rendering."""
-        traj_config = self.trajectory_generator._traj_config
-        repo_id = traj_config.get("lerobot_repo_id", "")
+        traj_config = self.trajectory_generator.config
+        repo_id = traj_config.lerobot_repo_id
         if not repo_id:
             print("[LeRobot] No lerobot_repo_id configured, skipping LeRobot dataset creation.")
             self._lerobot_saver = None
@@ -1944,7 +2039,7 @@ class PybulletRobotServerBase:
         print("[LeRobot] Finalizing dataset...")
         self._lerobot_saver.finalize()
 
-        traj_config = self.trajectory_generator._traj_config
+        traj_config = self.trajectory_generator.config
         if traj_config.push_to_hub:
             self._push_lerobot_to_hub()
 
@@ -2026,6 +2121,9 @@ class PybulletRobotServerBase:
         # Snapshot scene state AFTER reset, BEFORE trajectory generation
         scene_state = self._save_scene_state()
 
+        # Start from the current state
+        self.trajectory_generator.config.q_start = self.get_joint_state()[:6].tolist()
+
         episodes = self.trajectory_generator.generate_trajectory_batch()
         if episodes is None:
             return  # Planning failed, will retry next iteration
@@ -2039,7 +2137,16 @@ class PybulletRobotServerBase:
             self._render_and_save_episode(episode)
 
     def _render_and_save_episode(self, episode: dict):
-        """Teleport through a trajectory, render images, save frames to LeRobot + Zarr."""
+        """Step through a trajectory using motor control, render images, save frames to LeRobot + Zarr.
+
+        At each step the planner's target joint configuration is sent via command_joint_state,
+        physics is stepped for _physics_steps_per_action substeps, then the actual post-physics
+        joint state is read back.  This matches eval-time dynamics so that the saved
+        observation.state reflects what the policy will actually observe at inference time.
+
+        action  = planner target q (what the policy should output)
+        state   = actual joint positions after physics stepping (what the policy observes)
+        """
         joint_trajectory = episode["joint_positions"]  # (N, DOF)
         obstacle_info = episode.get("obstacle_info", {"obstacles": []})
         zarr_group = episode.get("zarr_group")
@@ -2066,6 +2173,12 @@ class PybulletRobotServerBase:
         # Ensure rendering is enabled
         self.enable_rendering()
 
+        # Teleport to the first waypoint so the robot starts at the right configuration
+        # before we begin issuing motor commands.
+        if len(joint_trajectory) > 0:
+            q0 = joint_trajectory[0]
+            self.teleport_joint_state(self.splatsim_robot, list(q0))
+
         # Collect image buffers for Zarr saving
         image_buffers = defaultdict(list)
 
@@ -2078,25 +2191,30 @@ class PybulletRobotServerBase:
 
             q = joint_trajectory[step_idx]
 
-            # Teleport robot to this joint configuration
-            self.teleport_joint_state(self.splatsim_robot, list(q))
+            # Build a 7-DOF command (6 joints + gripper open = 0)
+            action_7 = np.zeros(7, dtype=np.float32)
+            action_7[:len(q)] = q
 
-            # Render observations (includes images)
+            # Command the robot and step the physics simulation
+            self.command_joint_state(action_7)
+            for _ in range(self._physics_steps_per_action):
+                self.pybullet_client.stepSimulation()
+
+            # Read back the actual post-physics joint state
             obs = self.get_observations()
+            actual_joints = obs["joint_positions"]  # raw PyBullet readback, length >= 7
 
-            # Pad to 7 DOF (6 joints + gripper at 0)
+            # Pad to 7 DOF (6 joints + gripper)
             state_7 = np.zeros(7, dtype=np.float32)
-            state_7[:len(q)] = q
-
-            # Action = current joint positions (per user preference)
-            action_7 = state_7.copy()
+            state_7[:6] = actual_joints[:6]
+            state_7[6] = obs.get("gripper_position", [0.0])[0]
 
             # Save to LeRobot dataset
             if hasattr(self, '_lerobot_saver') and self._lerobot_saver is not None:
                 frame = {
                     "observation.state": state_7,
                     "action": action_7,
-                    "task": "",
+                    "task": self.get_task_description(),
                 }
                 for cam in self.camera_names:
                     for mode in self.image_resize_modes:
@@ -2148,6 +2266,11 @@ class PybulletRobotServerBase:
             # Let the GUI handle all mode/button transitions
             self._splatsim_gui.process_mode_transitions()
 
+            # Reset env button — available in all modes
+            if self._splatsim_gui.check_button(SplatSimGui.BTN_RESET_ENV):
+                print("[GUI] Reset Env pressed — resetting environment.")
+                self.reset()
+
             # Check debug mode dropdown for changes
             self._check_debug_mode()
 
@@ -2186,7 +2309,7 @@ class PybulletRobotServerBase:
 
                 # Update GUI status with current progress
                 tgen = self.trajectory_generator
-                total = tgen._traj_config.get("num_base_trajectories", "?")
+                total = tgen.config.num_base_trajectories
                 done = tgen.trajectory_count
                 if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
                     self._splatsim_gui.set_status(f"Trajectory: {done} / {total}")
@@ -2671,13 +2794,15 @@ class PybulletRobotServerBase:
             Dict space with agent_pos (state) and pixels dict (images)
             in LeRobot-compatible format.
         """
-        # Build pixels dict space for each camera
+        # Build pixels dict space for each camera+mode combination
         pixels_dict = {}
         for camera_name in self.camera_names:
-            pixels_dict[camera_name] = spaces.Box(
-                low=0, high=255,
-                shape=(224, 224, 3), dtype=np.uint8
-            )
+            for mode in self.image_resize_modes:
+                key = f"{camera_name}_{mode.value}"
+                pixels_dict[key] = spaces.Box(
+                    low=0, high=255,
+                    shape=(224, 224, 3), dtype=np.uint8
+                )
 
         obs_dict = {
             "agent_pos": spaces.Box(
@@ -2752,23 +2877,24 @@ class PybulletRobotServerBase:
             "agent_pos": np.concatenate([joint_positions, [gripper_state]]).astype(np.float32)
         }
 
-        # Images - use "pixels" dict format for LeRobot compatibility
-        # LeRobot expects: {"pixels": {"base_rgb": img, "wrist_rgb": img}} for multi-camera
-        # or {"pixels": img} for single camera
+        # Images - use "pixels" dict format for LeRobot compatibility.
+        # Keys are "{camera_name}_{mode}" (e.g. "base_rgb_letterbox") to match the
+        # rename_map convention used in LeRobot training/eval configs.
         pixels = {}
         for camera_name in self.camera_names:
-            img = raw_obs.get(camera_name)
-            if img is not None:
-                if hasattr(img, 'cpu'):
-                    img = img.cpu().numpy()
-                # Convert from (C, H, W) float32 to (H, W, C) uint8 for LeRobot
-                if img.shape[0] == 3:  # (C, H, W) format
-                    img = np.transpose(img, (1, 2, 0))  # -> (H, W, C)
-                img = (img * 255).clip(0, 255).astype(np.uint8)
-                pixels[camera_name] = img
-            else:
-                # Provide placeholder if camera not available
-                pixels[camera_name] = np.zeros((224, 224, 3), dtype=np.uint8)
+            for mode in self.image_resize_modes:
+                key = f"{camera_name}_{mode.value}"
+                img = raw_obs.get(key)
+                if img is not None:
+                    if hasattr(img, 'cpu'):
+                        img = img.cpu().numpy()
+                    # Convert from (C, H, W) float32 to (H, W, C) uint8 for LeRobot
+                    if img.ndim == 3 and img.shape[0] == 3:
+                        img = np.transpose(img, (1, 2, 0))  # -> (H, W, C)
+                    img = (img * 255).clip(0, 255).astype(np.uint8)
+                    pixels[key] = img
+                else:
+                    pixels[key] = np.zeros((224, 224, 3), dtype=np.uint8)
 
         # Use dict format for pixels (LeRobot expects this for multi-camera)
         gym_obs["pixels"] = pixels

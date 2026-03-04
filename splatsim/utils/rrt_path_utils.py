@@ -7,10 +7,10 @@ import itertools
 
 import pybullet as p
 import pybullet_data
-from pybullet_planning import RED
+from pybullet_planning import RED, smooth_path
 from pybullet_planning import Pose
-from pybullet_planning import get_movable_joints, plan_joint_motion, smooth_path, create_box, set_pose, get_extend_fn
-from pybullet_planning import get_sample_fn
+from pybullet_planning import get_movable_joints, create_box, set_pose, get_extend_fn
+from pybullet_planning import get_sample_fn, get_distance_fn, birrt
 import numpy as np
 import time
 
@@ -20,6 +20,7 @@ try:
     SCIPY_AVAILABLE = True
 except Exception:
     SCIPY_AVAILABLE = False
+
 
 def load_cuboids(cuboid_path):
     data = np.load(cuboid_path, allow_pickle=True)
@@ -72,29 +73,82 @@ def contact_tuple_debug(pt):
 # Utility / Collision API #
 ###########################
 
-def state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01, link_indices_to_check=None, verbose=True):
+_COLLISION_CLEARANCE = 0.01  # 1 cm clearance for all collision checks
+
+def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, verbose=False, obstacle_names=None, self_collision_clearance=0.0, skip_pairs=None) -> bool:
     """
-    Returns True if any robot link is closer than distance_threshold to any obstacle.
-    Uses pybullet.getClosestPoints.
-    link_indices_to_check: list of link indices to check; if None, we check all links (0..getNumJoints1)
+    Single source-of-truth collision checker.
+
+    Checks the robot at configuration q (or the current state if q is None) against obstacles and itself.
+      1. Each link in link_indices_to_check against every obstacle (1 cm clearance).
+      2. Self-collision between all non-adjacent link pairs in link_indices_to_check (0 clearance by default).
+
+    Args:
+        robot_id: PyBullet body ID of the robot.
+        joint_indices: Movable joint indices (used to set configuration).
+        q: Joint configuration to check. If None, uses the robot's current joint state (no teleport).
+        obstacle_ids: List of PyBullet body IDs to treat as obstacles.
+        link_indices_to_check: Links to check. None = all links (base link -1 + all joints).
+        verbose: If True, print the first collision found.
+        obstacle_names: Optional dict mapping body ID -> name string for readable verbose output.
+        self_collision_clearance: Distance threshold for self-collision checks (default 0.0 = actual intersection only).
+            Use 0.0 to avoid false positives when arm links are legitimately close (e.g. IK solutions).
+        skip_pairs: Optional set of (robot_link_index, obstacle_body_id) tuples to skip.
+            Used to exclude known always-touching pairs (e.g. shoulder_link vs table).
+
+    Returns:
+        True if any collision is detected, False otherwise.
     """
-    set_robot_joint_positions(robot_id, joint_indices, q)
-    # Allow a small sleep for certain simulators, but generally resetJointState is immediate.
-    p.stepSimulation()
+    if q is not None:
+        set_robot_joint_positions(robot_id, joint_indices, q)
+        p.stepSimulation()
 
     if link_indices_to_check is None:
-        link_indices_to_check = joint_indices
+        link_indices_to_check = list(range(-1, p.getNumJoints(robot_id)))
 
+    def _robot_link_name(link_i):
+        if link_i == -1:
+            return "base_link(-1)"
+        info = p.getJointInfo(robot_id, link_i)
+        return f"{info[12].decode('utf-8')}({link_i})"
+
+    def _obs_name(obs):
+        if obstacle_names and obs in obstacle_names:
+            return f"{obstacle_names[obs]}(id={obs})"
+        return str(obs)
+
+    # Check robot links against obstacles.
+    # linkIndexB is intentionally omitted so PyBullet checks all links of the obstacle body,
+    # not just its base link (-1). This matters for multi-link obstacle bodies (splat objects, boxes).
     for link_i in link_indices_to_check:
         for obs in obstacle_ids:
-            for base_link_id in [-1, 1]:
-                # Use -1 for base link of obstacle (works for simple URDFs like plane.urdf)
-                pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=distance_threshold, linkIndexA=link_i, linkIndexB=base_link_id)
-                if len(pts) > 0: # TODO I'm not sure why there's always 1 point in collision. setting the 1 to 0 made this always true
-                    if verbose:
-                        print(f"Collision detected between link {link_i} and obstacle {obs} with points {len(pts)}. linkIndexB={base_link_id}")
-                    return True
+            if skip_pairs and (link_i, obs) in skip_pairs:
+                continue
+            pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=_COLLISION_CLEARANCE,
+                                     linkIndexA=link_i)
+            if len(pts) > 0:
+                if verbose:
+                    print(f"Collision: robot {_robot_link_name(link_i)} vs obstacle {_obs_name(obs)}")
+                return True
+
+    # Check self-collisions between non-adjacent link pairs
+    for a, b in itertools.combinations(link_indices_to_check, 2):
+        if not are_adjacent_links(robot_id, a, b):
+            if len(p.getClosestPoints(robot_id, robot_id, self_collision_clearance, linkIndexA=a, linkIndexB=b)) > 0:
+                if verbose:
+                    print(f"Self-collision: robot {_robot_link_name(a)} vs {_robot_link_name(b)}")
+                return True
+
     return False
+
+
+def state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=None, link_indices_to_check=None, verbose=True):
+    """Deprecated: use check_links_in_collision instead. Kept for backwards compatibility."""
+    return check_links_in_collision(
+        robot_id, joint_indices, q, obstacle_ids,
+        link_indices_to_check=link_indices_to_check,
+        verbose=verbose,
+    )
 
 def get_movable_joints(robot_id):
     """Return list of joint indices for revolute/continuous/prismatic joints that we consider movable."""
@@ -245,11 +299,11 @@ def setup_env(args, robot_base_position, use_old_walls=False, use_obstacles=True
 
     return ll, ul, obstacle_ids, robot_id, joint_indices
 
-def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, max_tries=10000, verbose=True) -> np.ndarray:
+def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, max_tries=10000, verbose=True, link_indices_to_check=None, skip_pairs=None) -> np.ndarray:
     sample_fn = get_sample_fn(robot_id, joint_indices)
     for _ in range(max_tries):
         q = sample_fn()
-        if not state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=0.01, verbose=verbose):
+        if not check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=link_indices_to_check, verbose=verbose, skip_pairs=skip_pairs):
             return np.array(q)
     raise RuntimeError("Failed to find collision-free joint angles after many tries")
 
@@ -271,40 +325,49 @@ def check_self_collision(robot_id, joint_indices, distance=0.0):
                 return True
     return False
 
+_GRIPPER_LINK_START = 7  # Links 7+ are gripper links; arm links are 0-6 inclusive
+
 def are_adjacent_links(robot_id, linkA, linkB):
     """
-    Heuristic: skip link pairs that are directly connected.
+    Returns True if the link pair should be skipped for self-collision checking.
+    Two cases:
+      1. Directly connected links (parent-child relationship).
+      2. Both links are gripper links (joint index >= 7) — gripper geometry
+         overlaps by design so any intra-gripper pair is excluded.
     """
+    # Both gripper links: always skip
+    if linkA >= _GRIPPER_LINK_START and linkB >= _GRIPPER_LINK_START:
+        return True
     if linkA == -1 or linkB == -1:
         return False
     parentA = p.getJointInfo(robot_id, linkA)[16]
     parentB = p.getJointInfo(robot_id, linkB)[16]
     return parentA == linkB or parentB == linkA
 
-def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal, verbose=True):
-    # Use pybullet planning
-
+def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal, verbose=True, obstacle_names=None, skip_pairs=None):
     if verbose:
         print("Planning with pybullet planning...")
-    # move robot to q_start
     set_robot_joint_positions(robot_id, joint_indices, q_start)
 
-    path = plan_joint_motion(
-        robot_id,
+    sample_fn = get_sample_fn(robot_id, joint_indices)
+    distance_fn = get_distance_fn(robot_id, joint_indices)
+    extend_fn = get_extend_fn(robot_id, joint_indices)
 
-        # movable_joints[1:6],
-        joint_indices,
+    def collision_fn(q):
+        return check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, skip_pairs=skip_pairs)
 
-        q_goal,
-        # start_conf=q_start,
-        obstacles=obstacle_ids,
-        self_collisions=True, #False,
-        # algorithm='rrt_connect',  # or 'birrt' / 'rrt'
-        # custom_limits=None,
-    )
+    path = birrt(q_start, q_goal, distance_fn, sample_fn, extend_fn, collision_fn)
     if path is None:
-        if verbose:
-            print("PyBullet planning failed.")
+        start_in_col = check_links_in_collision(robot_id, joint_indices, q_start, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs)
+        goal_in_col = check_links_in_collision(robot_id, joint_indices, q_goal, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs)
+        if start_in_col and goal_in_col:
+            print("PyBullet planning failed: both q_start and q_goal are in collision.")
+        elif start_in_col:
+            print("PyBullet planning failed: q_start is in collision.")
+        elif goal_in_col:
+            print("PyBullet planning failed: q_goal is in collision.")
+        else:
+            print("PyBullet planning failed: start and goal are collision-free individually, but no path was found (environment may be too constrained or max iterations exhausted).")
         return None
     
     path = np.array(path)
@@ -365,6 +428,134 @@ def resample_path_by_distance(path: np.ndarray, n_points: int) -> np.ndarray:
         
     return resampled_path
 
+def _ruckig_run_segment(
+    waypoints: np.ndarray,
+    start_vel: np.ndarray,
+    start_acc: np.ndarray,
+    end_vel: np.ndarray,
+    end_acc: np.ndarray,
+    max_joint_vel: np.ndarray,
+    max_joint_acc: np.ndarray,
+    max_joint_jerk: np.ndarray,
+    control_hz: float,
+) -> tuple:
+    """Run ruckig on a single segment. Returns (samples, final_vel, final_acc)."""
+    from ruckig import InputParameter, Ruckig, Trajectory, Synchronization, ControlInterface  # type: ignore
+
+    dof = waypoints.shape[1]
+    dt = 1.0 / control_hz
+    n_intermediates = len(waypoints) - 2
+    otg = Ruckig(dof, dt, max(n_intermediates, 0))
+
+    inp = InputParameter(dof)
+    inp.control_interface = ControlInterface.Position
+    inp.synchronization = Synchronization.Phase
+    inp.current_position = waypoints[0].tolist()
+    inp.current_velocity = start_vel.tolist()
+    inp.current_acceleration = start_acc.tolist()
+    if n_intermediates > 0:
+        inp.intermediate_positions = waypoints[1:-1].tolist()
+    inp.target_position = waypoints[-1].tolist()
+    inp.target_velocity = end_vel.tolist()
+    inp.target_acceleration = end_acc.tolist()
+    inp.max_velocity = max_joint_vel.tolist()
+    inp.max_acceleration = max_joint_acc.tolist()
+    inp.max_jerk = max_joint_jerk.tolist()
+
+    traj = Trajectory(dof)
+    result = otg.calculate(inp, traj)
+    if result < 0:
+        raise RuntimeError(f"Ruckig trajectory calculation failed with result: {result}")
+
+    duration = traj.duration
+    n_points = max(int(np.ceil(duration * control_hz)), 2)
+    ts = np.linspace(0, duration, n_points)
+    samples = np.array([traj.at_time(t)[0] for t in ts])
+    final_vel = np.array(traj.at_time(duration)[1])
+    final_acc = np.array(traj.at_time(duration)[2])
+    return samples, final_vel, final_acc
+
+
+def _find_sharp_waypoint_indices(waypoints: np.ndarray, threshold_deg: float) -> list:
+    """Return indices of waypoints where the turn angle exceeds threshold_deg."""
+    sharp = []
+    for i in range(1, len(waypoints) - 1):
+        v_in = waypoints[i] - waypoints[i - 1]
+        v_out = waypoints[i + 1] - waypoints[i]
+        n_in = np.linalg.norm(v_in)
+        n_out = np.linalg.norm(v_out)
+        if n_in < 1e-9 or n_out < 1e-9:
+            continue
+        cos_angle = np.clip(np.dot(v_in, v_out) / (n_in * n_out), -1.0, 1.0)
+        angle = np.degrees(np.arccos(cos_angle))
+        if angle > threshold_deg:
+            sharp.append(i)
+    return sharp
+
+
+def ruckig_parametrize_path(
+    waypoints: np.ndarray,
+    max_joint_vel: np.ndarray,
+    max_joint_acc: np.ndarray,
+    max_joint_jerk: np.ndarray,
+    control_hz: float,
+    sharp_angle_threshold_deg: float = 45.0,
+) -> np.ndarray:
+    """
+    Time-optimal path parametrization using Ruckig.
+
+    Splits the path at sharp-angle waypoints (angle > threshold) and runs
+    ruckig per-segment with zero velocity at sharp boundaries, allowing a brief
+    deceleration only where the geometry demands it. Gradual sections are handled
+    in a single ruckig call with free pass-through velocity.
+
+    Args:
+        waypoints: (N, DOF) joint-space waypoints.
+        max_joint_vel: (DOF,) max joint velocities in rad/s.
+        max_joint_acc: (DOF,) max joint accelerations in rad/s^2.
+        max_joint_jerk: (DOF,) max joint jerks in rad/s^3.
+        control_hz: Output sample rate in Hz.
+        sharp_angle_threshold_deg: Waypoints with turn angle above this (degrees)
+            become hard stop boundaries between segments.
+
+    Returns:
+        (M, DOF) trajectory sampled at control_hz.
+    """
+    waypoints = np.array(waypoints)
+    dof = waypoints.shape[1]
+    zeros = np.zeros(dof)
+
+    sharp_indices = _find_sharp_waypoint_indices(waypoints, sharp_angle_threshold_deg)
+
+    # Build segment boundaries: split at sharp waypoints (inclusive on both sides)
+    split_points = sorted(set([0] + sharp_indices + [len(waypoints) - 1]))
+    segments = []
+    for k in range(len(split_points) - 1):
+        segments.append(waypoints[split_points[k] : split_points[k + 1] + 1])
+
+    all_samples = []
+    for seg_idx, seg in enumerate(segments):
+        is_last = seg_idx == len(segments) - 1
+        end_vel = zeros if (is_last or split_points[seg_idx + 1] in sharp_indices) else zeros
+        samples, _, _ = _ruckig_run_segment(
+            seg,
+            start_vel=zeros,
+            start_acc=zeros,
+            end_vel=end_vel,
+            end_acc=zeros,
+            max_joint_vel=max_joint_vel,
+            max_joint_acc=max_joint_acc,
+            max_joint_jerk=max_joint_jerk,
+            control_hz=control_hz,
+        )
+        # Drop the last point of each segment except the final one to avoid duplicates
+        if not is_last:
+            samples = samples[:-1]
+        all_samples.append(samples)
+
+    return np.concatenate(all_samples, axis=0)
+
+
 def resample_path(path: np.ndarray, n_points: int) -> np.ndarray:
     """
     Resamples a path to have a specific number of points using linear interpolation.
@@ -405,48 +596,29 @@ def open_gripper(robot_id):
         p.resetJointState(robot_id, idx, 0.0)
     p.stepSimulation()
 
-def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, time_per_traj, robot_update_rate, rrt_vis_fps=5, use_gui=False, verbose=True):
-    N_SAMPLES = int(robot_update_rate * time_per_traj)
+
+
+def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, robot_update_rate, use_gui=False, verbose=True, max_joint_vel=None, max_joint_acc=None, max_joint_jerk=None, obstacle_names=None, skip_pairs=None):
+    dof = len(joint_indices)
+    if max_joint_vel is None:
+        max_joint_vel = np.full(dof, 0.5)   # rad/s
+    if max_joint_acc is None:
+        max_joint_acc = np.full(dof, 1.0)   # rad/s^2
+    if max_joint_jerk is None:
+        max_joint_jerk = np.full(dof, 10.0)  # rad/s^3, ~10x max_acc
     # Set joints to q_start
     set_robot_joint_positions(robot_id, joint_indices, q_start)
 
     # movable_joints = get_movable_joints(robot_id)
 
     # RRT-Connect planner
-    rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal, verbose=verbose)
+    rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal, verbose=verbose, obstacle_names=obstacle_names, skip_pairs=skip_pairs)
     if rrt_path is None:
         return None
-    
-    
-    def collision_all_links(q, distance=0.0):
-        # q is a sequence for movable_joints
-        set_robot_joint_positions(robot_id, joint_indices, q)
-        open_gripper(robot_id)
 
-        # let the solver update (resetJointState is immediate but step once to be safe)
-        p.stepSimulation()
-        # check base link (-1) and all child links
-        for link_i in range(-1, p.getNumJoints(robot_id)):
-            for obs in obstacle_ids:
-                pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=distance,
-                                         linkIndexA=link_i, linkIndexB=-1)
-                if len(pts) > 0:
-                    return True
-        # Optionally check self-collisions (uncomment if desired)
-        for a,b in itertools.combinations(range(-1, p.getNumJoints(robot_id)), 2):
-            if not are_adjacent_links(robot_id, a, b):
-                if len(p.getClosestPoints(robot_id, robot_id, distance, linkIndexA=a, linkIndexB=b))>0:
-                    return True
-        return False
-    collision_fn = collision_all_links
-    
-    # Only checks a subset of all movable joints (aka doesn't check gripper fingers)
-    # collision_fn = get_collision_fn(
-    #     robot_id, 
-    #     joint_indices, 
-    #     obstacles=obstacle_ids,
-    #     self_collisions=True
-    # )
+
+    def collision_fn(q):
+        return check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, skip_pairs=skip_pairs)
 
     # 0.05 radians
     resolutions = [0.05] * len(joint_indices)
@@ -459,17 +631,18 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, tim
     smoothed_path = smooth_path(
         rrt_path.tolist(),
         extend_fn,
-        collision_fn,     # The function to check for collisions
-        iterations=50     # Number of shortcutting attempts
+        collision_fn,
+        max_smooth_iterations=50,
     )
 
-    # Convert to time-parametrized trajectory
-    # Don't use cubic spline because that might introduce obstacle collisions. Do a lerp
-    num_samples = max(N_SAMPLES, len(rrt_path))
-    time_parametrized_path = resample_path_by_distance(smoothed_path, num_samples)
-
-    # sampler = joints_to_trajectory(rrt_path, total_time=time_per_traj, use_cubic_spline=True)
-    # ts, time_parametrized_path = sampler(n_samples=num_samples)
+    # Ruckig handles geometry directly from sparse waypoints — no pre-resampling needed.
+    time_parametrized_path = ruckig_parametrize_path(
+        smoothed_path,
+        max_joint_vel=max_joint_vel,
+        max_joint_acc=max_joint_acc,
+        max_joint_jerk=max_joint_jerk,
+        control_hz=robot_update_rate,
+    )
 
     # Visualize in GUI if requested
     if use_gui:
@@ -477,9 +650,9 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, tim
         # input("Showing start pose. Press Enter to continue...")
         # show_joint_config_in_gui(robot_id, joint_indices, q_goal)
         # input("Showing goal pose. Press Enter to continue...")
-        # playback_path_in_gui(rrt_path, robot_id, joint_indices, path_name="RRT", fps=rrt_vis_fps, playback_speed=1.0)
-        playback_path_in_gui(time_parametrized_path, robot_id, joint_indices, path_name="Time-Parametrized", fps=robot_update_rate, playback_speed=1.0)
-    
+        playback_path_in_gui(resample_path_by_distance(smoothed_path, n_points=140), robot_id, joint_indices, path_name="Joint Dist Sampled", fps=robot_update_rate, playback_speed=1.0)
+        playback_path_in_gui(time_parametrized_path, robot_id, joint_indices, path_name="Smoothed then Time-Parametrized", fps=robot_update_rate, playback_speed=1.0)
+
     return time_parametrized_path
 
 def playback_path_in_gui(path, robot_id, joint_indices, path_name, fps=240, playback_speed=1.0):
@@ -497,11 +670,11 @@ def show_joint_config_in_gui(robot_id, joint_indices, q):
     if not p.isConnected():
         print("Not connected to PyBullet GUI.")
         return
-    set_robot_joint_positions(robot_id, joint_indices, q)
-    for _ in range(240):
-        p.stepSimulation()
-        time.sleep(1.0 / 240.0)
-
+    # Use resetJointState only — no stepSimulation, no motor control.
+    # stepSimulation would let physics push the robot away from the desired pose
+    # (especially with obstacles nearby), so the GUI would not reflect the true config.
+    for idx, qi in zip(joint_indices, q):
+        p.resetJointState(robot_id, idx, qi)
 
 def compute_camera_alignment_score(
     cam_position: np.ndarray,

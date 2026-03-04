@@ -144,7 +144,9 @@ def crop_splat(splatsim_obj: SplatSimObject, keep_within_aabb=True):
     if aabb is None:
         return
 
-    aabb = aabb * splatsim_obj.config.global_scaling
+    # No AABB scaling needed here: gaussians are loaded at scale=1 and the
+    # stored AABB bounding_box was computed at scale=1. Per-axis scaling is
+    # applied later in randomize_object_scale() at reset time.
 
     xyz_obj = copy.deepcopy(pc._xyz)
 

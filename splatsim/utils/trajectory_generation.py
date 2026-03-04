@@ -85,8 +85,27 @@ class TrajectoryGenerator:
 
     def get_obstacle_ids(self) -> List[int]:
         return self.loaded_obstacle_ids + [
-            obj.sim_id for obj in self.splatsim_objects if obj.sim_id is not None and obj.config.name != "robot"
+            obj.sim_id for obj in self.splatsim_objects
+            if obj.sim_id is not None
+            and obj.config.name != "robot"
         ]
+
+    def get_obstacle_names(self) -> dict:
+        """Returns a dict mapping PyBullet body ID -> object name for verbose collision messages."""
+        return {
+            obj.sim_id: obj.config.name
+            for obj in self.splatsim_objects
+            if obj.sim_id is not None
+        }
+
+    def get_skip_pairs(self) -> set:
+        """Returns a set of (robot_link_index, obstacle_body_id) pairs to skip during collision checks."""
+        pairs = set()
+        for obj in self.splatsim_objects:
+            if obj.sim_id is not None and obj.config.skip_collision_robot_links:
+                for link_idx in obj.config.skip_collision_robot_links:
+                    pairs.add((link_idx, obj.sim_id))
+        return pairs
 
     def register_obstacle(self, sim_id: int):
         """Register an obstacle by its PyBullet body ID."""
@@ -152,10 +171,22 @@ class TrajectoryGenerator:
 
         # 1. Get start/goal configurations
         q_start = self.config.q_start
-        if q_start is None:
-            q_start = self._get_random_collision_free_q()
+        has_ee_start = (
+            self.config.ee_pos_start is not None
+            or self.config.ee_quat_start is not None
+        )
+        if q_start is not None:
+            all_q_starts = [np.array(q_start)]
+        elif has_ee_start:
+            all_q_starts = self._resolve_ee_pose_to_q_candidates(
+                self.config.ee_pos_start, self.config.ee_quat_start, label="start"
+            )
+            if len(all_q_starts) == 0:
+                return None
         else:
-            q_start = np.array(q_start)
+            all_q_starts = [self._get_random_collision_free_q()]
+
+        q_start = all_q_starts[0]
 
         q_goal = self.config.q_goal
         has_ee_goal = (
@@ -179,17 +210,26 @@ class TrajectoryGenerator:
 
         # 2. Generate base trajectory (with optional camera scoring + fallback goals)
         all_q_goals = [q_goal] + q_goal_fallbacks
+
+        if self.config.debug_visualize:
+            for i, qs in enumerate(all_q_starts):
+                rrt_path_utils.show_joint_config_in_gui(self.robot_id, self.joint_indices, qs)
+                input(f"[debug_visualize] q_start candidate {i+1}/{len(all_q_starts)}. Press Enter for next...")
+            for i, qg in enumerate(all_q_goals):
+                rrt_path_utils.show_joint_config_in_gui(self.robot_id, self.joint_indices, qg)
+                input(f"[debug_visualize] q_goal candidate {i+1}/{len(all_q_goals)}. Press Enter for next...")
+
         result = self._plan_with_fallback_goals(q_start, all_q_goals)
         if result is None:
             return None  # Failed, will retry next iteration
         base_traj, q_goal = result
 
-        # Debug visualization: show start, goal, then playback trajectory
+        # Debug visualization: show the chosen start/goal then play back the trajectory
         if self.config.debug_visualize:
             rrt_path_utils.show_joint_config_in_gui(self.robot_id, self.joint_indices, q_start)
-            input("[debug_visualize] Showing q_start. Press Enter to show q_goal...")
+            input("[debug_visualize] Showing chosen q_start. Press Enter to show chosen q_goal...")
             rrt_path_utils.show_joint_config_in_gui(self.robot_id, self.joint_indices, q_goal)
-            input("[debug_visualize] Showing q_goal. Press Enter to play trajectory...")
+            input("[debug_visualize] Showing chosen q_goal. Press Enter to play trajectory...")
             rrt_path_utils.playback_path_in_gui(
                 base_traj, self.robot_id, self.joint_indices,
                 path_name="base_traj",
@@ -273,6 +313,7 @@ class TrajectoryGenerator:
             self.upper_limits,
             max_tries=10000,
             verbose=self.config.verbose,
+            skip_pairs=self.get_skip_pairs(),
         )
 
     # =========================================================================
@@ -280,32 +321,39 @@ class TrajectoryGenerator:
     # =========================================================================
 
     def _resolve_ee_goal_to_q_goals(self) -> List[np.ndarray]:
-        """Resolve end-effector pose goal(s) to joint-space goal candidates via IK.
+        """Resolve end-effector pose goal(s) to joint-space goal candidates via IK."""
+        return self._resolve_ee_pose_to_q_candidates(
+            self.config.ee_pos_goal, self.config.ee_quat_goal, label="goal"
+        )
+
+    def _resolve_ee_pose_to_q_candidates(
+        self,
+        ee_pos: Optional[List[float]],
+        ee_quat: Optional[List[float]],
+        label: str = "pose",
+    ) -> List[np.ndarray]:
+        """Resolve an end-effector pose to joint-space candidates via IK.
 
         Handles three cases:
-        1. ee_pos_goal + ee_quat_goal: Full pose. Run IK from multiple random seeds.
-        2. ee_pos_goal only: Sample multiple orientations, run IK for each.
-        3. ee_quat_goal only: Sample multiple positions via FK, run IK for each.
+        1. ee_pos + ee_quat: Full pose. Run IK from multiple random seeds.
+        2. ee_pos only: Sample multiple orientations, run IK for each.
+        3. ee_quat only: Sample multiple positions via FK, run IK for each.
 
         Returns:
-            List of collision-free q_goal candidates (may be empty if all IK attempts fail).
+            List of collision-free q candidates (may be empty if all IK attempts fail).
         """
-        ee_pos = self.config.get("ee_pos_goal")
-        ee_quat = self.config.get("ee_quat_goal")
-        num_candidates = self.config.get("num_ik_candidates", 8)
+        num_candidates = self.config.num_ik_candidates
         ee_link_index = self.get_ee_link_fn()
 
         candidates = []
 
         if ee_pos is not None and ee_quat is not None:
-            # Full pose specified — solve IK from multiple random seeds
             for _ in range(num_candidates):
                 q = self._solve_ik(ee_pos, ee_quat, ee_link_index)
                 if q is not None:
                     candidates.append(q)
 
         elif ee_pos is not None:
-            # Position only — sample random orientations
             for _ in range(num_candidates):
                 sampled_quat = self._sample_random_quaternion()
                 q = self._solve_ik(ee_pos, sampled_quat, ee_link_index)
@@ -313,7 +361,6 @@ class TrajectoryGenerator:
                     candidates.append(q)
 
         elif ee_quat is not None:
-            # Orientation only — sample positions from reachable workspace
             for _ in range(num_candidates):
                 sampled_pos = self._sample_reachable_position()
                 q = self._solve_ik(sampled_pos, ee_quat, ee_link_index)
@@ -323,11 +370,11 @@ class TrajectoryGenerator:
         candidates = self._deduplicate_q_candidates(candidates)
 
         if len(candidates) == 0:
-            print(f"[TrajectoryGenerator] Failed to find any valid IK solution for EE goal "
+            print(f"[TrajectoryGenerator] Failed to find any valid IK solution for EE {label} "
                   f"(tried {num_candidates} candidates). "
-                  f"ee_pos_goal={ee_pos}, ee_quat_goal={ee_quat}")
+                  f"ee_pos={ee_pos}, ee_quat={ee_quat}")
         else:
-            print(f"[TrajectoryGenerator] Resolved EE goal to {len(candidates)} IK candidate(s)")
+            print(f"[TrajectoryGenerator] Resolved EE {label} to {len(candidates)} IK candidate(s)")
 
         return candidates
 
@@ -364,11 +411,17 @@ class TrajectoryGenerator:
         if np.any(q_solution < self.lower_limits) or np.any(q_solution > self.upper_limits):
             return None
 
-        # Check collision
-        if rrt_path_utils.state_in_collision(
+        in_col = rrt_path_utils.check_links_in_collision(
             self.robot_id, self.joint_indices, q_solution,
-            self.get_obstacle_ids(), distance_threshold=0.01, verbose=False
-        ):
+            self.get_obstacle_ids(),
+            verbose=True,
+            obstacle_names=self.get_obstacle_names(),
+            skip_pairs=self.get_skip_pairs(),
+        )
+        if self.config.debug_visualize:
+            rrt_path_utils.show_joint_config_in_gui(self.robot_id, self.joint_indices, q_solution)
+            input(f"[debug_visualize] IK candidate: {'IN COLLISION — rejecting' if in_col else 'collision-free — keeping'}. Press Enter...")
+        if in_col:
             return None
 
         # Verify IK accuracy via FK
@@ -381,7 +434,7 @@ class TrajectoryGenerator:
             return None
 
         # If ee_quat_goal was user-specified, also check orientation accuracy
-        if self.config.get("ee_quat_goal") is not None:
+        if self.config.ee_quat_goal is not None:
             actual_quat = np.array(link_state[1])
             target_quat = np.array(ee_quat)
             dot = np.abs(np.dot(actual_quat, target_quat))
@@ -445,24 +498,24 @@ class TrajectoryGenerator:
             Tuple of (trajectory, q_goal_used) or None if all candidates fail.
         """
         for i, q_goal in enumerate(q_goal_candidates):
-            if not self.config.get("disable_camera_scoring_for_rrt", False):
+            if not self.config.disable_camera_scoring_for_rrt:
                 if self.camera_link_index is None:
                     raise ValueError(
                         "Camera scoring enabled but camera link not available. "
                         f"Check that wrist_camera_link_name='{self.wrist_camera_link_name}' exists in robot URDF."
                     )
 
-                num_candidates = self.config.get("num_path_candidates", 5)
-                max_attempts = self.config.get("max_path_attempts", 20)
+                num_candidates = self.config.num_path_candidates
+                max_attempts = self.config.max_path_attempts
                 candidate_paths = self._generate_multiple_path_candidates(
                     q_start, q_goal, num_candidates, max_attempts
                 )
 
                 if len(candidate_paths) > 0:
                     target_position, _ = self._get_camera_link_pose(q_goal)
-                    k_exp = self.config.get("k_exp", 5.0)
-                    k_sig = self.config.get("k_sig", 15.0)
-                    threshold = self.config.get("threshold", 0.4)
+                    k_exp = self.config.k_exp
+                    k_sig = self.config.k_sig
+                    threshold = self.config.threshold
 
                     scored_paths = []
                     for j, path in enumerate(candidate_paths):
@@ -479,7 +532,7 @@ class TrajectoryGenerator:
                     print(f"[TrajectoryGenerator] RRT succeeded with IK candidate {i}")
                     return base_traj, q_goal
 
-        print(f"[TrajectoryGenerator] RRT planning failed for all {len(q_goal_candidates)} IK candidates.")
+        print(f"[TrajectoryGenerator] RRT planning failed for all {len(q_goal_candidates)} IK goal candidate(s). See per-candidate diagnostics above.")
         return None
 
     def _plan_rrt_path(
@@ -501,11 +554,11 @@ class TrajectoryGenerator:
             obstacles,
             self.lower_limits,
             self.upper_limits,
-            self.config.time_per_traj,
             self.config.robot_update_rate,
-            rrt_vis_fps=self.config.rrt_vis_fps,
-            use_gui=False,
+            use_gui=self.config.debug_visualize,
             verbose=self.config.verbose,
+            obstacle_names=self.get_obstacle_names(),
+            skip_pairs=self.get_skip_pairs(),
         )
 
         # Snap endpoints to exact q_start/q_goal. Smoothing and resampling can
@@ -645,7 +698,7 @@ class TrajectoryGenerator:
             attempts += 1
 
             # First path uses exact start/goal, subsequent paths use perturbations
-            if len(paths) == 0:
+            if len(paths) == 0 and attempts == 0:
                 plan_start = q_start
                 plan_goal = q_goal
             else:
@@ -665,11 +718,12 @@ class TrajectoryGenerator:
                     path = np.vstack([path, q_goal])
                 paths.append(path)
 
-                if self.config.get("verbose", False):
+                if self.config.verbose:
                     perturbation_info = "" if len(paths) == 1 else f", perturbed={perturbation_scale:.3f}"
                     print(f"Generated path {len(paths)}/{num_candidates} (attempt {attempts}/{max_attempts}{perturbation_info})")
+                attempts = 0  # Reset attempts after a successful path
 
-        if self.config.get("verbose", False) and len(paths) < num_candidates:
+        if self.config.verbose and len(paths) < num_candidates:
             print(f"Warning: Only generated {len(paths)}/{num_candidates} valid paths after {max_attempts} attempts")
 
         return paths

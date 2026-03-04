@@ -63,16 +63,17 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         self._prev_action_accel = 0.0
         self._action_jerk = 0.0
 
-        self.randomize_object_poses()
+        # This now also randomizes the robot's joints
+        self.randomize_objects()
 
         # From GENERATE_DEMOS: randomize_ee_pose()
-        initial_joints = self.randomize_ee_pose()
-        self.teleport_joint_state(self.splatsim_robot, initial_joints)
-        self.open_gripper()
+        # initial_joints = self.randomize_ee_pose()
+        # self.teleport_joint_state(self.splatsim_robot, initial_joints)
+        # self.open_gripper()
 
-        # Let simulation settle
-        for _ in range(100):
-            self.pybullet_client.stepSimulation()
+        # # Let simulation settle
+        # for _ in range(100):
+        #     self.pybullet_client.stepSimulation()
 
         metrics = self.check_metrics()
 
@@ -129,6 +130,8 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
         # Check position distance
         pos_diff = np.linalg.norm(np.array(pos) - np.array(target_ee_pos))
+        # print(f"Current EE position: {pos}")
+        # print(f"Position difference: {pos_diff:.4f} m (tolerance: {pos_tolerance_m:.4f} m)")
         if pos_diff > pos_tolerance_m:
             success = False
 
@@ -141,7 +144,10 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         angle_rad = 2 * np.arccos(dot)
         angle_deg = np.degrees(angle_rad)
 
-        if angle_deg <= quat_tolerance_deg:
+        # print(f"Current EE orientation (quat): {quat}")
+        # print(f"Orientation difference: {angle_deg:.2f} deg (tolerance: {quat_tolerance_deg:.2f} deg)")
+
+        if angle_deg > quat_tolerance_deg:
             success = False
 
         cam_position, cam_rotation = self.get_wrist_camera_transform()
@@ -179,8 +185,13 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
         name="upright_robot_small_engine_new",
         task=TaskConfig(
             task_description="<control_mode> joint <control_mode>",
-            target_ee_pos=(-0.003126271918487248, 0.4626016957140267, 0.31067939915838083),
-            target_ee_quat=(-0.5883302720488017, 0.318663764807395, 0.472865116611213, 0.5733406295406109),
+
+            # Approach lever
+            # q_goal=[1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029]
+            # Ran self.get_current_ee_pose()
+            target_ee_pos=(-0.10123532289544344, 0.5484031509107826, 0.26692192875731213),
+            target_ee_quat=(0.8074376258351692, 0.1106042613918073, -0.5450490313370774, 0.19680632913133583),
+            
             pos_tolerance_m=0.03,  # 3 centimeters
             quat_tolerance_deg=10.0,  # 10 degrees
         ),
@@ -199,15 +210,17 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
             # table has a plane for objects to sit on at z = 0
             CuboidObjectConfig(
                 name="table",
-                size=(1.5, 0.90, 0.05),
+                size=(1.5, 1.0, 0.05),
+                # size=(1.5, 0.90, 0.05),
                 randomize_pose=False,
                 position_range_x=(0, 0),
-                position_range_y=(0.25, 0.25),
+                position_range_y=(0.3, 0.3),
+                # position_range_y=(0.25, 0.25),
                 position_range_z=(-0.025, -0.025),
-                # position=(0, 0.25, -0.025),
                 mass=0,
                 color_rgb=(223, 205, 192),
                 load_splat=False,
+                skip_collision_robot_links=[0],  # Robot is mounted on the table; shoulder_link (link 0) is always within 1cm of the table surface
             ),
             # # wall is at -0.2 on y axis
             CuboidObjectConfig(
@@ -226,7 +239,7 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 name="box1",
                 splat_name="thinkpad_box",
                 grasp_configs=[],
-                randomize_pose=False,
+                randomize_pose=True,
                 rotation_range_z=(0, 0),
 
                 # Parallel boxes
@@ -235,17 +248,21 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 # base_quat=(0, 0, 0, 1),
 
                 # boxes at 90 degree angle
-                position_range_x=(0.1, 0.5),
+                position_range_x=(0.15, 0.5),
                 position_range_y=(0.3, 0.5),
                 base_quat=(0, 0, 0.707, 0.707),
 
-                global_scaling=0.1,
+                scaling_range_x=(0.9, 1.1),
+                scaling_range_y=(0.9, 1.1),
+                scaling_range_z=(0.9, 1.1),
+
+                use_aabb_collision=True, # Box is axis-aligned, so AABB is exact and faster than PyBullet collision checks
             ),
             SplatObjectConfig(
                 name="box2",
                 splat_name="starwars_box",
                 grasp_configs=[],
-                randomize_pose=False,
+                randomize_pose=True,
                 rotation_range_z=(0, 0),
 
                 # Parallel boxes
@@ -254,11 +271,15 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 # base_quat=(0, 0, 1, 0), #rotated 180 degrees about z
 
                 # Boxes at 90 degree angle
-                position_range_x=(-0.2, 0.3),
-                position_range_y=(0.5, 0.7),
+                position_range_x=(-0.4, 0.3),
+                position_range_y=(0.6, 0.8),
                 base_quat=(0, 0, 1, 0), #rotated 180 degrees about z
 
-                global_scaling=2
+                scaling_range_x=(0.9, 1.1),
+                scaling_range_y=(0.9, 1.1),
+                scaling_range_z=(0.9, 1.1),
+
+                use_aabb_collision=True, # Box is axis-aligned, so AABB is exact and faster than PyBullet collision checks
             ),
         ],
     )
@@ -275,11 +296,11 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
         )
 
     def _get_default_trajectory_gen_config(self) -> TrajectoryGenModeConfig:
+        assert self.ENV_CONFIG.task is not None, "SmallEngine env requires a task config"
+        assert self.ENV_CONFIG.task.target_ee_pos is not None, "SmallEngine task config requires target_ee_pos"
+        assert self.ENV_CONFIG.task.target_ee_quat is not None, "SmallEngine task config requires target_ee_quat"
         return TrajectoryGenModeConfig(
-            # Approach lever
-            # q_goal=[1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029]
-            # Ran self.get_current_ee_pose()
-            ee_pos_goal=[-0.055376041813745544, 0.5553767189597264, 0.28558461043322814],
-            ee_quat_goal=[0.8074376258351692, 0.1106042613918073, -0.5450490313370774, 0.19680632913133583],
+            ee_pos_goal=list(self.ENV_CONFIG.task.target_ee_pos),
+            ee_quat_goal=list(self.ENV_CONFIG.task.target_ee_quat),
             debug_visualize=False
         )

@@ -10,6 +10,7 @@ from tkinter import ttk
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+import dataclasses
 
 import numpy as np
 from PIL import Image, ImageTk
@@ -163,9 +164,18 @@ class ThreadedTkinterGui(ABC):
             self._thread.join(timeout=5.0)
 
         # If the thread is still alive after the timeout, the Tk mainloop is
-        # stuck.  Null out _root so that __del__ / GC won't touch a live
-        # interpreter from the wrong thread.
+        # stuck.  Neuter all tk.Variable objects so that GC from the main thread
+        # cannot call back into the Tcl interpreter (which lives on the GUI
+        # thread), preventing the Tcl_AsyncDelete / "main thread is not in main
+        # loop" crash.
         if self._thread is not None and self._thread.is_alive():
+            with self._lock:
+                for var in self._values.values():
+                    try:
+                        var._tk = None  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                self._values.clear()
             self._root = None
 
     def _destroy_window(self):
@@ -187,7 +197,7 @@ class ThreadedTkinterGui(ABC):
                         except tk.TclError:
                             pass
                         # Prevent __del__ from touching the (soon-dead) Tcl interp
-                        var._tk = None
+                        var._tk = None  # type: ignore[attr-defined]
                     self._values.clear()
                     self._enum_classes.clear()
                 self._root.quit()
@@ -359,32 +369,22 @@ class ThreadedTkinterGui(ABC):
                 pass
         return result
 
-    def save_to_config(self, config: Dict[str, Any]):
-        """Save current GUI values to a config dict.
-
-        Searches both top-level keys and nested sub-dicts for matching keys.
+    def save_to_config(self, config: SplatSimModeConfig) -> None:
+        """Save current GUI values to a SplatSimModeConfig dataclass.
 
         Args:
-            config: Config dict to update with current values
+            config: Config dataclass to update with current values
         """
+        config_fields = {f.name: f for f in dataclasses.fields(config)}
         values = self.get_values()
         for key, value in values.items():
-            # Search top-level keys first, then nested sub-dicts
-            if key in config:
-                config_type = type(config[key])
-                if config_type == bool:
-                    config[key] = bool(value)
-                else:
-                    config[key] = config_type(value)
+            if key not in config_fields:
+                continue
+            field_type = type(getattr(config, key))
+            if field_type == bool:
+                setattr(config, key, bool(value))
             else:
-                for _, sub_dict in config.items():
-                    if isinstance(sub_dict, dict) and key in sub_dict:
-                        config_type = type(sub_dict[key])
-                        if config_type == bool:
-                            sub_dict[key] = bool(value)
-                        else:
-                            sub_dict[key] = config_type(value)
-                        break
+                setattr(config, key, field_type(value))
 
 
 # =============================================================================
@@ -706,6 +706,10 @@ class TrajectoryGenModePanel(ModePanel):
             config.disable_camera_scoring_for_rrt
         )
         builder.add_bool_param(
+            BoolParam("verbose", "Verbose"),
+            config.verbose
+        )
+        builder.add_bool_param(
             BoolParam("debug_visualize", "Debug Visualize"),
             config.debug_visualize
         )
@@ -760,10 +764,11 @@ class SplatSimGui(ThreadedTkinterGui):
 
     # Key for debug mode dropdown
     DEBUG_MODE_KEY = "debug_mode"
+    BTN_RESET_ENV = "reset_env"
 
     def __init__(
         self,
-        config: Dict[str, Any],
+        config: SplatSimModeConfig,
         initial_mode: str = "interactive",
         debug_mode_enum: Optional[type] = None,
         initial_debug_mode: Any = None,
@@ -772,7 +777,7 @@ class SplatSimGui(ThreadedTkinterGui):
         """Initialize the GUI.
 
         Args:
-            config: Dictionary of config values passed to each panel's build()
+            config: SplatSimModeConfig instance passed to each panel's build()
             initial_mode: Initial mode string (e.g., "interactive")
             debug_mode_enum: The DEBUG_MODES enum class (optional)
             initial_debug_mode: Initial debug mode enum member (optional)
@@ -839,6 +844,7 @@ class SplatSimGui(ThreadedTkinterGui):
 
         # Trajectory progress status line
         self._status_var = tk.StringVar(value="")
+        self._values["_status_var"] = self._status_var
         status_label = ttk.Label(main_frame, textvariable=self._status_var)
         status_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 8))
         builder._row += 1
@@ -846,6 +852,11 @@ class SplatSimGui(ThreadedTkinterGui):
         # Mode selection buttons (one per panel)
         builder.add_button_row([
             ButtonConfig(p.name, p.button_key, "Mode.TButton") for p in self._panels
+        ])
+
+        # Environment reset button — always visible regardless of mode
+        builder.add_button_row([
+            ButtonConfig("Reset Env", self.BTN_RESET_ENV),
         ])
 
         # Debug mode dropdown (if enum provided)
