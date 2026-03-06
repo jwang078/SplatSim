@@ -1,6 +1,7 @@
 import enum
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
+import numpy as np
 
 
 class ImageResizeMode(enum.Enum):
@@ -37,12 +38,12 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     robot_update_rate: int = 20
     rrt_vis_fps: int = 10
     use_obstacles: bool = True
-    q_start: Optional[List[float]] = None
-    q_goal: Optional[List[float]] = None # ex: 7-dof-joint robot configuration goal
-    ee_pos_start: Optional[List[float]] = None   # [x, y, z] end-effector position start
-    ee_quat_start: Optional[List[float]] = None  # [x, y, z, w] end-effector quaternion start
-    ee_pos_goal: Optional[List[float]] = None    # [x, y, z] end-effector position goal
-    ee_quat_goal: Optional[List[float]] = None   # [x, y, z, w] end-effector quaternion goal
+    q_start: Optional[List[float] | np.ndarray] = None
+    q_goal: Optional[List[float] | np.ndarray] = None # ex: 7-dof-joint robot configuration goal
+    ee_pos_start: Optional[List[float] | np.ndarray] = None   # [x, y, z] end-effector position start
+    ee_quat_start: Optional[List[float] | np.ndarray] = None  # [x, y, z, w] end-effector quaternion start
+    ee_pos_goal: Optional[List[float] | np.ndarray] = None    # [x, y, z] end-effector position goal
+    ee_quat_goal: Optional[List[float] | np.ndarray] = None   # [x, y, z, w] end-effector quaternion goal
     num_ik_candidates: int = 8                    # number of IK solutions to try for EE goals
     cuboids_fn: Optional[str] = None
     render_images: bool = False

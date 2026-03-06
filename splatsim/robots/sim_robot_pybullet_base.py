@@ -293,7 +293,7 @@ class PybulletRobotServerBase:
     @property
     def serve_mode(self) -> 'PybulletRobotServerBase.SERVE_MODES':
         """Current serve mode. Reads from the GUI when available."""
-        if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+        if self._splatsim_gui is not None:
             return self.SERVE_MODES(self._splatsim_gui.mode)
         return self._serve_mode
 
@@ -301,7 +301,7 @@ class PybulletRobotServerBase:
     def serve_mode(self, value: 'PybulletRobotServerBase.SERVE_MODES'):
         """Set the serve mode. Updates the GUI when available."""
         self._serve_mode = value
-        if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+        if self._splatsim_gui is not None:
             self._splatsim_gui.set_mode(value.value)
 
     lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
@@ -325,6 +325,7 @@ class PybulletRobotServerBase:
         trajectory_gen_config: Optional[dict] = None,
         image_resize_modes: Optional[List[ImageResizeMode]] = None,
     ):
+        self._splatsim_gui = None
         self._serve_mode = serve_mode
         self.robot_name = robot_name
         self.camera_names = camera_names
@@ -334,6 +335,13 @@ class PybulletRobotServerBase:
         self.use_gripper = use_gripper
         self.splatsim_robot = None
         self.splatsim_background = None
+        self.scene_gaussian = None
+        self.base_camera = None
+        self.wrist_camera = None
+        self._lerobot_saver = None
+        self.pybullet_client = p
+        self.splatsim_objects = []
+
         if isinstance(debug_mode, str):
             debug_mode = self.DEBUG_MODES(debug_mode)
         assert debug_mode in self.DEBUG_MODES, f"debug_mode must be one of {list(self.DEBUG_MODES)}, got {debug_mode}"
@@ -369,7 +377,6 @@ class PybulletRobotServerBase:
 
         self.grasp_poses = {}
 
-        self.pybullet_client = p
         self.pybullet_client.connect(p.GUI)
         self.pybullet_client.setAdditionalSearchPath(
             str(SPLATSIM_ROOT.parent / "submodules" / "pybullet-playground-wrapper" / "pybullet_playground" / "urdf" / "pybullet_ur5_gripper" / "urdf")
@@ -409,7 +416,7 @@ class PybulletRobotServerBase:
         self.trajectory_generator = TrajectoryGenerator(
             pybullet_client=self.pybullet_client,
             robot_id=self.splatsim_robot.sim_id,
-            joint_indices=list(range(1, 7)), # excludes gripper
+            joint_indices=list(range(1, self.num_dofs() + 1)), # excludes gripper
             env_config_name=self.ENV_CONFIG.name,
             get_ee_link_fn=lambda: self._get_ee_link_index(),
             splatsim_objects=self.splatsim_objects,
@@ -419,40 +426,24 @@ class PybulletRobotServerBase:
 
         self._setup_interactive_gui()
 
-        if self.debug_mode == self.DEBUG_MODES.NO_BACKGROUND:
-            print("[Debug mode] no_background, using robot as background")
-            self.background_splat_name = self.robot_name
-            self.splatsim_background = self.splatsim_robot
-        else:
-            # The background uses the robot's full splat, but crops out the robot
-            if self.background_splat_name is None:
-                raise ValueError(f"background_splat_name has not been set for env {type(self)}")
-            self.splatsim_background: SplatSimObject = self.create_object(
-                SplatObjectConfig(
-                    name="background",
-                    splat_name=self.background_splat_name,
-                    keep_within_aabb=False,
-                    load_urdf=False,
-                    is_articulated=False,
-                    randomize_pose=False,
-                    rotation_range_z=(0, 0),
-                    position_range_x=(0, 0),
-                    position_range_y=(0, 0),
-                )
+        # The background uses the robot's full splat, but crops out the robot
+        if self.background_splat_name is None:
+            raise ValueError(f"background_splat_name has not been set for env {type(self)}")
+        self.splatsim_background: SplatSimObject = self.create_object(
+            SplatObjectConfig(
+                name="background",
+                splat_name=self.background_splat_name,
+                keep_within_aabb=False,
+                load_urdf=False,
+                is_articulated=False,
+                randomize_pose=False,
+                rotation_range_z=(0, 0),
+                position_range_x=(0, 0),
+                position_range_y=(0, 0),
             )
-        if self.debug_mode == self.DEBUG_MODES.ROTATE_BASE_CAM:
-            print(
-                "[Debug Mode] Setting base_rgb camera to be adjustable using pybullet GUI debug camera"
-            )
+        )
 
         self.skip_recording_first = 0
-
-        for i in range(self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id)):
-            info = self.pybullet_client.getJointInfo(self.splatsim_robot.sim_id, i)
-            joint_id = info[0]
-            joint_name = info[1].decode("utf-8")
-            if joint_name == "ee_fixed_joint":
-                self.ur5e_ee_id = joint_id
 
         for object_config in self.ENV_CONFIG.objects:
             # Already adds the splatsim_object to self.splatsim_objects
@@ -517,23 +508,13 @@ class PybulletRobotServerBase:
         self._episode_started = False
 
     def num_dofs(self) -> int:
-        return 7
+        return 6
     
     def _get_default_trajectory_gen_config(self) -> TrajectoryGenModeConfig:
         # Use all the default values
         return TrajectoryGenModeConfig()
 
     def get_joint_state(self) -> np.ndarray:
-        # return self._joint_state
-        joint_states = []
-        num_joints = self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id)
-        for i in range(1, num_joints):
-            joint_states.append(
-                self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
-            )
-        return np.array(joint_states)
-
-    def get_joint_state_dummy(self) -> np.ndarray:
         # return self._joint_state
         joint_states = []
         num_joints = self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id)
@@ -848,7 +829,7 @@ class PybulletRobotServerBase:
             )
 
     def teleport_joint_state(
-        self, splatsim_obj: SplatSimObject, joint_state: List[float]
+        self, splatsim_obj: SplatSimObject, joint_state: Tuple[float, ...]
     ) -> None:
         """Set the joint states of an articulated object in the simulation and hold position."""
         if not splatsim_obj.config.is_articulated:
@@ -889,8 +870,8 @@ class PybulletRobotServerBase:
             )
 
     def command_joint_state(self, joint_state: np.ndarray) -> None:
-        assert len(joint_state) == self.num_dofs(), (
-            f"Expected joint state of length {self.num_dofs()}, "
+        assert len(joint_state) == self.num_dofs() + 1, (
+            f"Expected joint state of length {self.num_dofs() + 1}, "
             f"got {len(joint_state)}."
         )
 
@@ -1474,11 +1455,10 @@ class PybulletRobotServerBase:
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         joint_positions = self.get_joint_state()
-        joint_positions_dummy = self.get_joint_state_dummy()
         joint_velocities = np.array(
             [
                 self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[1]
-                for i in range(7)
+                for i in range(self.num_dofs() + 1)
             ]
         )
 
@@ -1508,10 +1488,9 @@ class PybulletRobotServerBase:
         # Target object position and orientation
 
         observations = {
-            "joint_positions": joint_positions[:7],
+            "joint_positions": joint_positions[:self.num_dofs() + 1],
             "all_joint_positions": joint_positions,
             "joint_velocities": joint_velocities,
-            "joint_positions_dummy": joint_positions_dummy,
             "ee_pos_quat": dummy_ee_quat,
             "state": state,
             "action": action,
@@ -1573,7 +1552,7 @@ class PybulletRobotServerBase:
         Args:
             observations: Dictionary containing rendered images as torch tensors (C, H, W)
         """
-        if not hasattr(self, '_splatsim_gui') or self._splatsim_gui is None:
+        if self._splatsim_gui is None:
             return
 
         frames_to_display = {}
@@ -1702,11 +1681,13 @@ class PybulletRobotServerBase:
 
     def randomize_objects(self):
         collision = True
-        while collision:
+        able_to_solve = False
+        while collision or not able_to_solve:
             collision = False
+            able_to_solve = True
 
             # Avoid a failure case where the robot is blocking all possible object placements
-            self.randomize_robot_joint_positions()
+            self.randomize_ee_pose()
 
             for splatsim_obj in random.sample(self.splatsim_objects, len(self.splatsim_objects)):
                 # if splatsim_obj == self.splatsim_robot or splatsim_obj == self.splatsim_background:
@@ -1736,13 +1717,12 @@ class PybulletRobotServerBase:
                     collision = True
                     break
 
-    def randomize_robot_joint_positions(self):
-        """Randomize the robot's joint positions uniformly within joint limits."""
-        initial_joints = self.randomize_ee_pose()
-        self.teleport_joint_state(self.splatsim_robot, initial_joints)
-
-    def randomize_ee_pose(self, max_attempts=100):
+            # Check that it's possible to complete the task in this env
+            able_to_solve = self.trajectory_generator.check_able_to_solve(q_start=self.get_joint_state())
+    
+    def randomize_ee_pose(self, max_attempts=100) -> Optional[Tuple[float, ...]]:
         # generating random initial joint state using random end effector position and orientation
+        initial_joint_positions: Optional[Tuple[float, ...]] = None
         for attempt in range(max_attempts):
             random_ee_pos, random_ee_quat = self.get_random_ee_pose()
 
@@ -1775,14 +1755,12 @@ class PybulletRobotServerBase:
             if not self.is_robot_in_collision():
                 # TODO possibly randomize gripper state here, too
                 # Though that might have to edit initial_joint_positions
+                self.teleport_joint_state(self.splatsim_robot, initial_joint_positions)
                 return initial_joint_positions
 
         # If we exhausted all attempts, return the last configuration with a warning
-        print(f"Warning: Could not find collision-free EE pose after {max_attempts} attempts")
+        print(f"Warning: Could not find collision-free EE pose after {max_attempts} attempts")        
         return initial_joint_positions
-    
-    def get_skip_pairs(self) -> set:
-        return self._skip_pairs
 
     def _recompute_skip_pairs(self):
         self._skip_pairs = {
@@ -1793,13 +1771,13 @@ class PybulletRobotServerBase:
         }
 
     def is_robot_in_collision(self):
-        joint_indices = list(range(1, 7))
+        joint_indices = list(range(1, self.num_dofs() + 1))
         obstacle_ids = [
             obj.sim_id for obj in self.splatsim_objects
             if obj.sim_id is not None and obj != self.splatsim_robot
         ]
         return rrt_path_utils.check_links_in_collision(
-            self.splatsim_robot.sim_id, joint_indices, q=None, obstacle_ids=obstacle_ids, skip_pairs=self.get_skip_pairs()
+            self.splatsim_robot.sim_id, joint_indices, q=None, obstacle_ids=obstacle_ids, skip_pairs=self._skip_pairs
         )
 
     def get_random_ee_pose(self):
@@ -1988,7 +1966,7 @@ class PybulletRobotServerBase:
                 },
                 "observation.state": {
                     "dtype": "float32",
-                    "shape": (7,),
+                    "shape": (self.num_dofs() + 1,),
                     "names": [
                         "joint_1", "joint_2", "joint_3",
                         "joint_4", "joint_5", "joint_6", "gripper",
@@ -1996,7 +1974,7 @@ class PybulletRobotServerBase:
                 },
                 "action": {
                     "dtype": "float32",
-                    "shape": (7,),
+                    "shape": (self.num_dofs() + 1,),
                     "names": [
                         "joint_1", "joint_2", "joint_3",
                         "joint_4", "joint_5", "joint_6", "gripper",
@@ -2033,7 +2011,7 @@ class PybulletRobotServerBase:
 
     def _finalize_lerobot_dataset(self):
         """Finalize and optionally push the LeRobot dataset."""
-        if not hasattr(self, '_lerobot_saver') or self._lerobot_saver is None:
+        if self._lerobot_saver is None:
             return
 
         print("[LeRobot] Finalizing dataset...")
@@ -2192,7 +2170,7 @@ class PybulletRobotServerBase:
             q = joint_trajectory[step_idx]
 
             # Build a 7-DOF command (6 joints + gripper open = 0)
-            action_7 = np.zeros(7, dtype=np.float32)
+            action_7 = np.zeros(self.num_dofs() + 1, dtype=np.float32)
             action_7[:len(q)] = q
 
             # Command the robot and step the physics simulation
@@ -2205,12 +2183,12 @@ class PybulletRobotServerBase:
             actual_joints = obs["joint_positions"]  # raw PyBullet readback, length >= 7
 
             # Pad to 7 DOF (6 joints + gripper)
-            state_7 = np.zeros(7, dtype=np.float32)
+            state_7 = np.zeros(self.num_dofs() + 1, dtype=np.float32)
             state_7[:6] = actual_joints[:6]
             state_7[6] = obs.get("gripper_position", [0.0])[0]
 
             # Save to LeRobot dataset
-            if hasattr(self, '_lerobot_saver') and self._lerobot_saver is not None:
+            if self._lerobot_saver is not None:
                 frame = {
                     "observation.state": state_7,
                     "action": action_7,
@@ -2235,7 +2213,7 @@ class PybulletRobotServerBase:
                         image_buffers[key].append(img)
 
         # Save episode to LeRobot (skip partial episodes from early stop)
-        if not stopped_early and hasattr(self, '_lerobot_saver') and self._lerobot_saver is not None:
+        if not stopped_early and self._lerobot_saver is not None:
             self._lerobot_saver.save_episode()
 
         # Save images to Zarr (save even if partial — zarr is more forgiving)
@@ -2311,12 +2289,12 @@ class PybulletRobotServerBase:
                 tgen = self.trajectory_generator
                 total = tgen.config.num_base_trajectories
                 done = tgen.trajectory_count
-                if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+                if self._splatsim_gui is not None:
                     self._splatsim_gui.set_status(f"Trajectory: {done} / {total}")
 
                 if self.trajectory_generator.is_complete():
                     print(f"[GUI] Completed trajectory generation. Switching to idle mode.")
-                    if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+                    if self._splatsim_gui is not None:
                         self._splatsim_gui.set_status(f"Done: {done} / {total} trajectories")
                     self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
             else:
@@ -2345,7 +2323,7 @@ class PybulletRobotServerBase:
 
         # Clean up GUI if it exists — must happen before pybullet disconnect
         # so the Tk thread can shut down gracefully
-        if hasattr(self, '_splatsim_gui') and self._splatsim_gui is not None:
+        if self._splatsim_gui is not None:
             self._splatsim_gui.stop()
             self._splatsim_gui = None
 
@@ -2353,7 +2331,7 @@ class PybulletRobotServerBase:
         self._cleanup_gpu_resources()
 
         # Disconnect pybullet
-        if hasattr(self, 'pybullet_client') and self.pybullet_client is not None:
+        if self.pybullet_client is not None:
             try:
                 self.pybullet_client.disconnect()
             except Exception:
@@ -2364,45 +2342,38 @@ class PybulletRobotServerBase:
         import gc
 
         # Clear gaussian splat models from splatsim objects
-        if hasattr(self, 'splatsim_objects'):
-            for obj in self.splatsim_objects:
-                if hasattr(obj, 'gaussians') and obj.gaussians is not None:
-                    del obj.gaussians
-                    obj.gaussians = None
-                if hasattr(obj, '_cache'):
-                    obj._cache.clear()
-            self.splatsim_objects.clear()
+        for obj in self.splatsim_objects:
+            if obj.gaussians is not None:
+                del obj.gaussians
+                obj.gaussians = None
+            obj._cache.clear()
+        self.splatsim_objects.clear()
 
         # Clear the background splat
-        if hasattr(self, 'splatsim_background'):
-            if hasattr(self.splatsim_background, 'gaussians'):
-                del self.splatsim_background.gaussians
-            self.splatsim_background = None
+        if self.splatsim_background is not None:
+            del self.splatsim_background.gaussians
+        self.splatsim_background = None
 
         # Clear the robot splat
-        if hasattr(self, 'splatsim_robot'):
-            if hasattr(self.splatsim_robot, 'gaussians'):
-                del self.splatsim_robot.gaussians
-            self.splatsim_robot = None
+        if self.splatsim_robot is not None:
+            del self.splatsim_robot.gaussians
+        self.splatsim_robot = None
 
         # Clear scene gaussian and labels
-        if hasattr(self, 'scene_gaussian'):
-            del self.scene_gaussian
-            self.scene_gaussian = None
-        if hasattr(self, 'robot_labels'):
-            del self.robot_labels
-            self.robot_labels = None
+        del self.scene_gaussian
+        self.scene_gaussian = None
+        del self.robot_labels
+        self.robot_labels = None
 
         # Clear camera resources
-        for cam_attr in ('base_camera', 'wrist_camera'):
-            if hasattr(self, cam_attr):
-                cam = getattr(self, cam_attr)
-                if cam is not None:
-                    if hasattr(cam, 'background') and cam.background is not None:
-                        del cam.background
-                    if hasattr(cam, 'camera') and cam.camera is not None:
-                        del cam.camera
-                setattr(self, cam_attr, None)
+        for cam in (self.base_camera, self.wrist_camera):
+            if cam is not None:
+                if cam.background is not None:
+                    del cam.background
+                if cam.camera is not None:
+                    del cam.camera
+        self.base_camera = None
+        self.wrist_camera = None
 
         # Force garbage collection and release CUDA cache
         gc.collect()
@@ -2807,7 +2778,7 @@ class PybulletRobotServerBase:
         obs_dict = {
             "agent_pos": spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(7,), dtype=np.float32
+                shape=(self.num_dofs() + 1,), dtype=np.float32
             ),
             "pixels": spaces.Dict(pixels_dict)
         }
@@ -2886,7 +2857,7 @@ class PybulletRobotServerBase:
                 key = f"{camera_name}_{mode.value}"
                 img = raw_obs.get(key)
                 if img is not None:
-                    if hasattr(img, 'cpu'):
+                    if isinstance(img, torch.Tensor):
                         img = img.cpu().numpy()
                     # Convert from (C, H, W) float32 to (H, W, C) uint8 for LeRobot
                     if img.ndim == 3 and img.shape[0] == 3:

@@ -156,19 +156,36 @@ class TrajectoryGenerator:
     def is_complete(self) -> bool:
         """Check if we've generated all requested trajectories."""
         return self.trajectory_count >= self.config.num_base_trajectories
+    
+    def check_able_to_solve(self, q_start: Optional[List[float] | np.ndarray]) -> bool:
+        """Check if we can solve for at least one valid start/goal configuration."""
+        curr_q_start = self.config.q_start
+        curr_ee_pos_start = self.config.ee_pos_start
+        curr_ee_quat_start = self.config.ee_quat_start
 
-    def generate_trajectory_batch(self):
-        """Generate one base trajectory with multiple obstacle configurations.
+        curr_joint_positions = [s[0] for s in self.pb.getJointStates(self.robot_id, self.joint_indices)]
 
-        Returns:
-            Optional[List[dict]]: List of episode dicts, each containing:
-                - "joint_positions": np.ndarray of shape (N, DOF)
-                - "obstacle_info": dict with obstacle metadata (e.g. {"obstacles": [...]})
-                - "zarr_group": zarr.Group reference for saving images later
-            Returns None if planning failed.
+        self.config.q_start = q_start
+        self.config.ee_pos_start = None
+        self.config.ee_quat_start = None
+        q_start, q_goals = self._get_start_and_goal_qs()
+
+        self.config.q_start = curr_q_start
+        self.config.ee_pos_start = curr_ee_pos_start
+        self.config.ee_quat_start = curr_ee_quat_start
+
+        for idx, qi in zip(self.joint_indices, curr_joint_positions):
+            self.pb.resetJointState(self.robot_id, idx, qi)
+            self.pb.setJointMotorControl2(self.robot_id, idx, self.pb.POSITION_CONTROL, targetPosition=qi)
+
+        return q_start is not None and len(q_goals) > 0
+
+    def _get_start_and_goal_qs(self) -> Tuple[Optional[np.ndarray], List[np.ndarray]]:
         """
-        self._init_zarr_storage()
+        Get collision free start and goal joint configurations, resolving EE pose goals to joint space via IK if needed.
 
+        TODO make this function and the later functions able to handle multiple q_starts
+        """
         # 1. Get start/goal configurations
         q_start = self.config.q_start
         has_ee_start = (
@@ -182,7 +199,7 @@ class TrajectoryGenerator:
                 self.config.ee_pos_start, self.config.ee_quat_start, label="start"
             )
             if len(all_q_starts) == 0:
-                return None
+                return None, []
         else:
             all_q_starts = [self._get_random_collision_free_q()]
 
@@ -198,7 +215,7 @@ class TrajectoryGenerator:
             # Resolve EE goal to joint-space candidates via IK
             q_goal_candidates = self._resolve_ee_goal_to_q_goals()
             if len(q_goal_candidates) == 0:
-                return None  # Failed, will retry next iteration
+                return None, []
             q_goal = q_goal_candidates[0]
             q_goal_fallbacks = q_goal_candidates[1:]
         elif q_goal is None:
@@ -218,6 +235,24 @@ class TrajectoryGenerator:
             for i, qg in enumerate(all_q_goals):
                 rrt_path_utils.show_joint_config_in_gui(self.robot_id, self.joint_indices, qg)
                 input(f"[debug_visualize] q_goal candidate {i+1}/{len(all_q_goals)}. Press Enter for next...")
+        return q_start, all_q_goals
+
+    def generate_trajectory_batch(self):
+        """Generate one base trajectory with multiple obstacle configurations.
+
+        Returns:
+            Optional[List[dict]]: List of episode dicts, each containing:
+                - "joint_positions": np.ndarray of shape (N, DOF)
+                - "obstacle_info": dict with obstacle metadata (e.g. {"obstacles": [...]})
+                - "zarr_group": zarr.Group reference for saving images later
+            Returns None if planning failed.
+        """
+        self._init_zarr_storage()
+
+        q_start, all_q_goals = self._get_start_and_goal_qs()
+        if q_start is None or len(all_q_goals) == 0:
+            print("[TrajectoryGenerator] Failed to get valid start/goal configurations. Skipping this trajectory.")
+            return None
 
         result = self._plan_with_fallback_goals(q_start, all_q_goals)
         if result is None:

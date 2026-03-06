@@ -50,6 +50,7 @@ class Args:
 
     gello_port: Optional[str] = None
     mock: bool = False
+    async_mode: bool = False
     use_save_interface: bool = False
     data_dir: str = "~/data/bc_data"
     bimanual: bool = False
@@ -294,89 +295,94 @@ def main(args):
 
     # going to start position
     print("Going to start position")
-    obs = env.get_obs()
-    if query_new_joints_per_startup_step:
-        start_pos = agent.act(obs)
-    else:
-        start_pos = obs["joint_positions"]
-    joints = obs["joint_positions"]
-    
-    if not isinstance(joints, np.ndarray):
-        joints = np.array(joints)
-    
-    #if start pose is of dimension 7 and joints is of dimension 6, then add last element to joints
-    if start_pos.shape[0] == 7 and joints.shape[0] == 6:
-        joints = np.append(joints, start_pos[-1])
-
-    
-    print('start_pos:', start_pos)
-    print('joints:', joints)
-
-    abs_deltas = np.abs(start_pos - joints)
-    id_max_joint_delta = np.argmax(abs_deltas)
-
-    # max_joint_delta = 0.8
-    # if abs_deltas[id_max_joint_delta] > max_joint_delta:
-    #     id_mask = abs_deltas > max_joint_delta
-    #     print()
-    #     ids = np.arange(len(id_mask))[id_mask]
-    #     for i, delta, joint, current_j in zip(
-    #         ids,
-    #         abs_deltas[id_mask],
-    #         start_pos[id_mask],
-    #         joints[id_mask],
-    #     ):
-    #         print(
-    #             f"joint[{i}]: \t delta: {delta:4.3f} , leader: \t{joint:4.3f} , follower: \t{current_j:4.3f}"
-    #         )
-    #     return
-
-    print(f"Start pos: {len(start_pos)}", f"Joints: {len(joints)}")
-    assert len(start_pos) == len(
-        joints
-    ), f"agent output dim = {len(start_pos)}, but env dim = {len(joints)}"
-
-    max_delta = 0.05
-    command_joints = start_pos
-    for _ in range(startup_steps):
-        obs = env.get_obs()
+    obs = getattr(env, "last_obs", None) if args.async_mode else env.get_obs()
+    flag = False
+    if obs is not None:
         if query_new_joints_per_startup_step:
-            command_joints = agent.act(obs)
-        current_joints = obs["joint_positions"]
-        if not isinstance(current_joints, np.ndarray):
-            current_joints = np.array(current_joints)
+            start_pos = agent.act(obs)
+        else:
+            start_pos = obs["joint_positions"]
+        joints = obs["joint_positions"]
         
-        flag = False
-        if command_joints.shape[0] == 7 and current_joints.shape[0] == 6:
-            current_joints = np.append(current_joints, command_joints[-1])
-            flag = True
+        if not isinstance(joints, np.ndarray):
+            joints = np.array(joints)
         
-        delta = command_joints - current_joints
-        max_joint_delta = np.abs(delta).max()
-        if max_joint_delta > max_delta:
-            delta = delta / max_joint_delta * max_delta
-        print("command:", command_joints)
-        print("current:", current_joints)
-        print("delta:", delta)
-        print("")
+        #if start pose is of dimension 7 and joints is of dimension 6, then add last element to joints
+        if start_pos.shape[0] == 7 and joints.shape[0] == 6:
+            joints = np.append(joints, start_pos[-1])
+
         
+        print('start_pos:', start_pos)
+        print('joints:', joints)
+
+        abs_deltas = np.abs(start_pos - joints)
+        id_max_joint_delta = np.argmax(abs_deltas)
+
+        # max_joint_delta = 0.8
+        # if abs_deltas[id_max_joint_delta] > max_joint_delta:
+        #     id_mask = abs_deltas > max_joint_delta
+        #     print()
+        #     ids = np.arange(len(id_mask))[id_mask]
+        #     for i, delta, joint, current_j in zip(
+        #         ids,
+        #         abs_deltas[id_mask],
+        #         start_pos[id_mask],
+        #         joints[id_mask],
+        #     ):
+        #         print(
+        #             f"joint[{i}]: \t delta: {delta:4.3f} , leader: \t{joint:4.3f} , follower: \t{current_j:4.3f}"
+        #         )
+        #     return
+
+        print(f"Start pos: {len(start_pos)}", f"Joints: {len(joints)}")
+        assert len(start_pos) == len(
+            joints
+        ), f"agent output dim = {len(start_pos)}, but env dim = {len(joints)}"
+
+        max_delta = 0.05
+        command_joints = start_pos
+        
+        for _ in range(startup_steps):
+            obs = getattr(env, "last_obs", None) if args.async_mode else env.get_obs()
+            if query_new_joints_per_startup_step:
+                command_joints = agent.act(obs)
+            current_joints = obs["joint_positions"]
+            if not isinstance(current_joints, np.ndarray):
+                current_joints = np.array(current_joints)
             
-        if flag:
-            delta = delta[:-1]
-            current_joints = current_joints[:-1]
-        env.step(current_joints + delta) # ------------------------------
+            if command_joints.shape[0] == 7 and current_joints.shape[0] == 6:
+                current_joints = np.append(current_joints, command_joints[-1])
+                flag = True
+            else:
+                flag = False
+            
+            delta = command_joints - current_joints
+            max_joint_delta = np.abs(delta).max()
+            if max_joint_delta > max_delta:
+                delta = delta / max_joint_delta * max_delta
+            print("command:", command_joints)
+            print("current:", current_joints)
+            print("delta:", delta)
+            print("")
+            
+                
+            if flag:
+                delta = delta[:-1]
+                current_joints = current_joints[:-1]
+            env.step(current_joints + delta) # ------------------------------
 
 
-    obs = env.get_obs()
-    joints = obs["joint_positions"]
-    if not isinstance(joints, np.ndarray):
-        joints = np.array(joints)
-    
-    action = agent.act(obs)
-    
-    if action.shape[0] == 7 and joints.shape[0] == 6:
-        joints = np.append(joints, action[-1])
-    
+    obs = getattr(env, "last_obs", None) if args.async_mode else env.get_obs()
+    if obs is not None:
+        joints = obs["joint_positions"]
+        if not isinstance(joints, np.ndarray):
+            joints = np.array(joints)
+        
+        action = agent.act(obs)
+        
+        if action.shape[0] == 7 and joints.shape[0] == 6:
+            joints = np.append(joints, action[-1])
+        
     
     # if (action - joints > 0.5).any():
     #     print("Action is too big")
@@ -407,30 +413,6 @@ def main(args):
             lerobot_saver = LeRobotDataset(dataset_repo_id) #, root=local_dir)
         else:
             print(f"Creating new LeRobot dataset at {local_dir}")
-            # https://huggingface.co/docs/lerobot/en/lerobot-dataset-v3#available-transform-types
-            custom_transforms_config = ImageTransformsConfig(
-                enable=True,
-                max_num_transforms=2,
-                random_order=True,
-                tfs={
-                    "brightness": ImageTransformConfig(
-                        weight=1.0,
-                        type="ColorJitter",
-                        kwargs={"brightness": (0.7, 1.3)}  # Adjust brightness range
-                    ),
-                    "contrast": ImageTransformConfig(
-                        weight=2.0,  # Higher weight = more likely to be selected
-                        type="ColorJitter",
-                        kwargs={"contrast": (0.8, 1.2)}
-                    ),
-                    "sharpness": ImageTransformConfig(
-                        weight=0.5,  # Lower weight = less likely to be selected
-                        type="SharpnessJitter",
-                        kwargs={"sharpness": (0.3, 2.0)}
-                    ),
-                }
-            )
-
             lerobot_saver = LeRobotDataset.create(
                 repo_id=dataset_repo_id,
                 fps=50,
@@ -477,12 +459,19 @@ def main(args):
 
     print_color("\nStart 🚀🚀🚀", color="green", attrs=("bold",))
 
+    # In async mode, obs comes from env.last_obs (set by external process); we never call get_obs/step in the loop.
+    if args.async_mode:
+        obs = getattr(env, "last_obs", None)
+
     save_path = None
     start_time = time.time()
     started_executing_traj = False
     try:
         while True:
             loop_start = time.time()
+
+            if args.async_mode:
+                obs = getattr(env, "last_obs", None)
 
             num = time.time() - start_time
             message = f"\rTime passed: {round(num, 2)}          "
@@ -498,7 +487,7 @@ def main(args):
             if getattr(agent, 'state', AGENT_STATE.UNKNOWN) == AGENT_STATE.EXECUTING_TRAJ:
                 started_executing_traj = True
 
-            if getattr(agent, 'state', AGENT_STATE.EXECUTING_TRAJ) == AGENT_STATE.EXECUTING_TRAJ and args.save_lerobot_dataset:
+            if getattr(agent, 'state', AGENT_STATE.EXECUTING_TRAJ) == AGENT_STATE.EXECUTING_TRAJ and args.save_lerobot_dataset and obs is not None:
                 # We save the obs and the action that was generated from it
                 lerobot_saver.add_frame({
                     # images are (c, h, w) format
@@ -529,7 +518,7 @@ def main(args):
                 elif state == "save":
                     assert save_path is not None, "something went wrong"
                     #check whether each element of dict is not None
-                    if all(value is not None for value in obs.values()):
+                    if obs is not None and all(value is not None for value in obs.values()):
                         save_frame(save_path, dt, obs, action)
                         print('success')
         
@@ -540,7 +529,12 @@ def main(args):
                 
             if flag:
                 action = action[:-1]
-            obs = env.step(action)
+
+            # Sync mode (default): backwards-compatible — step() sends command and returns next obs
+            if not args.async_mode or not hasattr(env, "queue_action"):
+                obs = env.step(action)
+            else:
+                env.queue_action(action)
 
             loop_end = time.time()
             loop_duration = loop_end - loop_start

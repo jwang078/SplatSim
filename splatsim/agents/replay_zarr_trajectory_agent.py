@@ -174,7 +174,7 @@ class ReplayZarrTrajectoryAgent(Agent):
             print("No more trajectory steps available.")
             return self.last_action
         else:
-            if self.save_images:
+            if obs is not None and self.save_images:
                 for image_name in [image_name for image_name in obs.keys() if image_name.endswith("_rgb") and obs[image_name] is not None]:
                     frame = obs[image_name]
                     frame = np.transpose(frame.detach().cpu().numpy(), (1, 2, 0))  # CxHxW -> HxWxC
