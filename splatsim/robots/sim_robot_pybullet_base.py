@@ -143,6 +143,8 @@ class ZMQRobotServer:
         addr = f"tcp://{host}:{port}"
         self._socket.bind(addr)
         self._stop_event = threading.Event()
+        self._policy_guidance_action = None
+        self._policy_guidance_lock = threading.Lock()
 
     def serve(self) -> None:
         """Serve the robot state and commands over ZMQ."""
@@ -165,6 +167,10 @@ class ZMQRobotServer:
                     result = self._robot.get_current_ee_pose()
                 elif method == "command_joint_state":
                     result = self._robot.command_joint_state(**args)
+                elif method == "set_policy_guidance_action":
+                    with self._policy_guidance_lock:
+                        self._policy_guidance_action = args["joint_state"]
+                    result = None
                 elif method == "teleport_joint_state":
                     result = self._robot.teleport_joint_state(
                         self._robot.splatsim_robot, **args
@@ -173,6 +179,9 @@ class ZMQRobotServer:
                     result = self._robot.set_object_pose(**args)
                 elif method == "get_observations":
                     result = self._robot.get_observations()
+                    with self._policy_guidance_lock:
+                        if self._policy_guidance_action is not None:
+                            result["policy_guidance_action"] = self._policy_guidance_action.copy()
                 elif method == "create_object":
                     splatsim_object = self._robot.create_object(**args)
                     result = None
@@ -184,6 +193,8 @@ class ZMQRobotServer:
                     result = self._robot.disable_rendering()
                 elif method == "enable_rendering":
                     result = self._robot.enable_rendering()
+                elif method == "reset":
+                    result = self._robot.reset(**args)
                 else:
                     result = {"error": "Invalid method"}
                     print(result)
@@ -1686,14 +1697,14 @@ class PybulletRobotServerBase:
             collision = False
             able_to_solve = True
 
-            # Avoid a failure case where the robot is blocking all possible object placements
-            self.randomize_ee_pose()
-
             for splatsim_obj in random.sample(self.splatsim_objects, len(self.splatsim_objects)):
                 # if splatsim_obj == self.splatsim_robot or splatsim_obj == self.splatsim_background:
                 #     continue
                 self.randomize_object_scale(splatsim_obj)
                 self.randomize_object_pose(splatsim_obj)
+
+            # TODO the better solution is to make this randomize all articulated joints of any splatsim object (this just does the robot rn)
+            self.randomize_ee_pose()
 
             # Gather candidate object pairs (unique, skipping table and un-fixable pairs)
             candidates = []
@@ -2784,93 +2795,16 @@ class PybulletRobotServerBase:
         }
         return spaces.Dict(obs_dict)
 
-    def step(self, action: np.ndarray) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
-        """Execute one control step in the environment.
-
-        Args:
-            action: Joint positions array of shape (7,) - 6 joints + gripper
-
-        Returns:
-            observation: Dict with state and images
-            reward: Float reward signal
-            terminated: True if episode ended due to success/failure condition
-            truncated: True if episode ended due to time limit
-            info: Dict with 'is_success' key
-        """
+    def _physics_step(self, action: np.ndarray) -> None:
+        """Apply action and advance the physics simulation by one control step."""
         assert self._episode_started, "Must call reset() before step()"
 
-        # Apply action via existing method
         self.command_joint_state(action)
 
-        # Step physics simulation (multiple substeps for stability)
         for _ in range(self._physics_steps_per_action):
             self.pybullet_client.stepSimulation()
 
         self._step_count += 1
-
-        # Get new observation
-        observation = self._get_gym_observation()
-
-        # Compute reward, termination, success
-        reward = self.compute_reward()
-        is_success = self.check_success()
-        terminated = self.check_terminated()
-        truncated = self._step_count >= self._max_episode_steps
-
-        metrics = self.check_metrics()
-
-        info = {
-            "is_success": is_success,
-            "step_count": self._step_count,
-            **metrics
-        }
-
-        return observation, reward, terminated, truncated, info
-
-    def _get_gym_observation(self) -> Dict[str, Any]:
-        """Get observation in Gym-compatible format.
-
-        Returns:
-            Dict with:
-                - 'state': np.ndarray of joint positions + gripper (7,)
-                - camera images by name (e.g., 'base_rgb', 'wrist_rgb')
-        """
-        raw_obs = self.get_observations()
-
-        # Joint state (6 joints + gripper)
-        joint_positions = raw_obs["joint_positions"][:6]
-        gripper_state = raw_obs.get("gripper_position", [0.0])
-        if isinstance(gripper_state, (list, np.ndarray)):
-            gripper_state = gripper_state[0] if len(gripper_state) > 0 else 0.0
-
-        # Use "agent_pos" key for LeRobot compatibility
-        gym_obs = {
-            "agent_pos": np.concatenate([joint_positions, [gripper_state]]).astype(np.float32)
-        }
-
-        # Images - use "pixels" dict format for LeRobot compatibility.
-        # Keys are "{camera_name}_{mode}" (e.g. "base_rgb_letterbox") to match the
-        # rename_map convention used in LeRobot training/eval configs.
-        pixels = {}
-        for camera_name in self.camera_names:
-            for mode in self.image_resize_modes:
-                key = f"{camera_name}_{mode.value}"
-                img = raw_obs.get(key)
-                if img is not None:
-                    if isinstance(img, torch.Tensor):
-                        img = img.cpu().numpy()
-                    # Convert from (C, H, W) float32 to (H, W, C) uint8 for LeRobot
-                    if img.ndim == 3 and img.shape[0] == 3:
-                        img = np.transpose(img, (1, 2, 0))  # -> (H, W, C)
-                    img = (img * 255).clip(0, 255).astype(np.uint8)
-                    pixels[key] = img
-                else:
-                    pixels[key] = np.zeros((224, 224, 3), dtype=np.uint8)
-
-        # Use dict format for pixels (LeRobot expects this for multi-camera)
-        gym_obs["pixels"] = pixels
-
-        return gym_obs
 
     def check_truncated(self) -> bool:
         """Check if episode should be truncated due to time limit.

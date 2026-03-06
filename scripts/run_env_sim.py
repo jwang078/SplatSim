@@ -50,7 +50,7 @@ class Args:
 
     gello_port: Optional[str] = None
     mock: bool = False
-    async_mode: bool = False
+    policy_guidance_mode: bool = False
     use_save_interface: bool = False
     data_dir: str = "~/data/bc_data"
     bimanual: bool = False
@@ -295,7 +295,7 @@ def main(args):
 
     # going to start position
     print("Going to start position")
-    obs = getattr(env, "last_obs", None) if args.async_mode else env.get_obs()
+    obs = env.get_obs()
     flag = False
     if obs is not None:
         if query_new_joints_per_startup_step:
@@ -343,7 +343,7 @@ def main(args):
         command_joints = start_pos
         
         for _ in range(startup_steps):
-            obs = getattr(env, "last_obs", None) if args.async_mode else env.get_obs()
+            obs = env.get_obs()
             if query_new_joints_per_startup_step:
                 command_joints = agent.act(obs)
             current_joints = obs["joint_positions"]
@@ -372,7 +372,7 @@ def main(args):
             env.step(current_joints + delta) # ------------------------------
 
 
-    obs = getattr(env, "last_obs", None) if args.async_mode else env.get_obs()
+    obs = env.get_obs()
     if obs is not None:
         joints = obs["joint_positions"]
         if not isinstance(joints, np.ndarray):
@@ -459,19 +459,12 @@ def main(args):
 
     print_color("\nStart 🚀🚀🚀", color="green", attrs=("bold",))
 
-    # In async mode, obs comes from env.last_obs (set by external process); we never call get_obs/step in the loop.
-    if args.async_mode:
-        obs = getattr(env, "last_obs", None)
-
     save_path = None
     start_time = time.time()
     started_executing_traj = False
     try:
         while True:
             loop_start = time.time()
-
-            if args.async_mode:
-                obs = getattr(env, "last_obs", None)
 
             num = time.time() - start_time
             message = f"\rTime passed: {round(num, 2)}          "
@@ -530,11 +523,10 @@ def main(args):
             if flag:
                 action = action[:-1]
 
-            # Sync mode (default): backwards-compatible — step() sends command and returns next obs
-            if not args.async_mode or not hasattr(env, "queue_action"):
-                obs = env.step(action)
+            if args.policy_guidance_mode:
+                env.queue_policy_guidance_action(action)
             else:
-                env.queue_action(action)
+                obs = env.step(action)
 
             loop_end = time.time()
             loop_duration = loop_end - loop_start

@@ -1,14 +1,47 @@
 """Gymnasium wrapper for SplatSim environments."""
 
 import threading
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import gymnasium as gym
 from gymnasium import spaces
 from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
 import numpy as np
+import torch
 
 from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
+
+
+def _raw_obs_to_gym_obs(raw_obs: Dict[str, Any], num_dofs: int, camera_names: list, image_resize_modes: list) -> Dict[str, Any]:
+    """Convert raw robot observations to gym format (agent_pos + pixels dict).
+
+    Works with both SplatSim and real robot servers — any source that returns
+    joint_positions, gripper_position, and {cam}_{mode} image keys.
+    """
+    joint_positions = np.array(raw_obs["joint_positions"][:num_dofs], dtype=np.float32)
+    gripper = raw_obs.get("gripper_position", [0.0])
+    if isinstance(gripper, (list, np.ndarray)):
+        gripper = float(gripper[0]) if len(gripper) > 0 else 0.0
+
+    agent_pos = np.concatenate([joint_positions, [gripper]]).astype(np.float32)
+
+    pixels = {}
+    for camera_name in camera_names:
+        for mode in image_resize_modes:
+            mode_str = mode.value if hasattr(mode, "value") else str(mode)
+            key = f"{camera_name}_{mode_str}"
+            img = raw_obs.get(key)
+            if img is not None:
+                if isinstance(img, torch.Tensor):
+                    img = img.cpu().numpy()
+                if img.ndim == 3 and img.shape[0] == 3:
+                    img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
+                img = (img * 255).clip(0, 255).astype(np.uint8)
+                pixels[key] = img
+            else:
+                pixels[key] = np.zeros((224, 224, 3), dtype=np.uint8)
+
+    return {"agent_pos": agent_pos, "pixels": pixels}
 
 
 # Thread-safe counter for assigning unique ports to each environment instance
@@ -45,14 +78,48 @@ class SplatSimGymEnv(gym.Env):
         self.observation_space = robot_server.observation_space
         self._max_episode_steps = robot_server._max_episode_steps
 
+    def _to_gym_obs(self, raw_obs):
+        gym_obs = _raw_obs_to_gym_obs(
+            raw_obs,
+            num_dofs=self.robot_server.num_dofs(),
+            camera_names=self.robot_server.camera_names,
+            image_resize_modes=self.robot_server.image_resize_modes,
+        )
+        # Remap pixels to match observation_space keys exactly.
+        # PybulletRobotServerBase uses "{cam}_{mode}" keys; _ZMQBackend uses bare "{cam}" keys.
+        declared_keys = set(self.observation_space["pixels"].spaces.keys())
+        if declared_keys != set(gym_obs["pixels"].keys()):
+            # Build a map from declared key -> best matching converted key
+            remap = {}
+            for dk in declared_keys:
+                if dk in gym_obs["pixels"]:
+                    remap[dk] = gym_obs["pixels"][dk]
+                else:
+                    # declared key is bare cam name; find matching "{cam}_{mode}" key
+                    for ck, v in gym_obs["pixels"].items():
+                        if ck.startswith(dk + "_"):
+                            remap[dk] = v
+                            break
+            gym_obs["pixels"] = remap
+        return gym_obs
+
     def step(self, action: np.ndarray):
         """Execute one step in the environment."""
-        return self.robot_server.step(action)
+        self.robot_server._physics_step(action)
+        raw_obs = self.robot_server.get_observations()
+        reward = self.robot_server.compute_reward()
+        is_success = self.robot_server.check_success()
+        terminated = self.robot_server.check_terminated()
+        truncated = self.robot_server._step_count >= self.robot_server._max_episode_steps
+        metrics = self.robot_server.check_metrics()
+        info = {"is_success": is_success, "step_count": self.robot_server._step_count, **metrics}
+        return self._to_gym_obs(raw_obs), reward, terminated, truncated, info
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         """Reset the environment."""
         super().reset(seed=seed)
-        return self.robot_server.reset(seed=seed, options=options)
+        raw_obs, info = self.robot_server.reset(seed=seed, options=options)
+        return self._to_gym_obs(raw_obs), info
 
     def render(self) -> Optional[np.ndarray]:
         """Render the environment.
@@ -289,6 +356,72 @@ def make_env(
         result[env_name] = {0: vec_env}
 
     return result
+
+
+class _ZMQBackend:
+    """Duck-typed adapter so ZMQSplatSimGymEnv can reuse SplatSimGymEnv unchanged."""
+
+    _max_episode_steps = 400
+
+    def __init__(self, client, camera_names, image_resize_modes, num_dofs, image_height, image_width):
+        self._client = client
+        self._num_dofs = num_dofs
+        self.camera_names = camera_names
+        self.image_resize_modes = image_resize_modes
+        self.action_space = spaces.Box(
+            low=np.array([-np.pi] * num_dofs + [0.0], dtype=np.float32),
+            high=np.array([np.pi] * num_dofs + [1.0], dtype=np.float32),
+        )
+        # observation_space uses bare camera names (no mode suffix) to match lerobot's features_map
+        self.observation_space = spaces.Dict({
+            "agent_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(num_dofs + 1,), dtype=np.float32),
+            "pixels": spaces.Dict({
+                cam: spaces.Box(low=0, high=255, shape=(image_height, image_width, 3), dtype=np.uint8)
+                for cam in camera_names
+            }),
+        })
+
+    def step(self, action):
+        self._client.command_joint_state(action)
+        raw_obs = self._client.get_observations()
+        # Reward/termination not available in async mode; return neutral values
+        return raw_obs, 0.0, False, False, {}
+
+    def reset(self, seed=None, options=None):
+        return self._client.reset(seed=seed, options=options)
+
+    def num_dofs(self):                return self._num_dofs
+    def get_observations(self):        return self._client.get_observations()
+    def get_task_description(self):    return ""
+    def stop(self):                    self._client.close()
+
+
+class ZMQSplatSimGymEnv(SplatSimGymEnv):
+    """SplatSimGymEnv backed by an already-running simulator connected via ZMQ.
+
+    Use via external_port in the lerobot config when the simulator is launched
+    separately (e.g. alongside gello for shared-autonomy eval).
+    """
+
+    def __init__(self, host, port, camera_names, image_resize_modes,
+                 num_dofs=6, image_height=224, image_width=224, render_mode=None):
+        from gello.zmq_core.robot_node import ZMQClientRobot
+
+        backend = _ZMQBackend(
+            ZMQClientRobot(port=port, host=host),
+            camera_names, image_resize_modes, num_dofs, image_height, image_width,
+        )
+        super().__init__(robot_server=backend, render_mode=render_mode)  # type: ignore[arg-type]
+
+    def step(self, action: np.ndarray):
+        """Send joint command and read back observations asynchronously."""
+        raw_obs, reward, terminated, truncated, info = self.robot_server.step(action)  # type: ignore[union-attr]
+        return self._to_gym_obs(raw_obs), reward, terminated, truncated, info
+
+    def reset(self, *, seed=None, options=None):
+        super(SplatSimGymEnv, self).reset(seed=seed)
+        raw_obs, info = self.robot_server.reset(seed=seed, options=options)  # type: ignore[union-attr]
+        return self._to_gym_obs(raw_obs), info
 
 
 def list_envs() -> list:

@@ -79,28 +79,23 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
         info = {"is_success": metrics['is_success'], **metrics}
 
-        return self._get_gym_observation(), info
+        return self.get_observations(), info
 
-    def step(self, action: np.ndarray) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
-        """Execute one control step, tracking action smoothness."""
-        # Track action delta (velocity) for smoothness metric
+    def _physics_step(self, action: np.ndarray) -> None:
+        """Track action smoothness metrics then advance physics."""
         if self._prev_action is not None:
             self._action_delta = np.linalg.norm(np.array(action) - self._prev_action)
         else:
             self._action_delta = 0.0
 
-        # Track action acceleration (delta in action_delta)
         self._action_accel = np.abs(self._action_delta - self._prev_action_delta)
-
-        # Track action jerk (delta in action_accel)
         self._action_jerk = np.abs(self._action_accel - self._prev_action_accel)
 
-        # Update previous values for next step
         self._prev_action = np.array(action)
         self._prev_action_delta = self._action_delta
         self._prev_action_accel = self._action_accel
 
-        return super().step(action)
+        super()._physics_step(action)
 
     def compute_reward(self) -> float:
         """Compute sparse reward based on success."""

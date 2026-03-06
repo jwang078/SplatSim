@@ -444,7 +444,7 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
         # Let simulation settle with robot in initial position
         self.teleport_joint_state(self.splatsim_robot, initial_joints)
 
-        return self._get_gym_observation(), {"is_success": False}
+        return self.get_observations(), {"is_success": False}
 
     def compute_reward(self) -> float:
         """Compute sparse reward based on success."""
