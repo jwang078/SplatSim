@@ -18,7 +18,7 @@ class TextInterfaceAgent(Agent):
             if user_input == "":
                 angles = self.last_action
             else:
-                angles = list(map(float, user_input.split()))
+                angles = [float(x) for x in user_input.replace(',', ' ').split()]
 
             if len(angles) != self.num_joints:
                 print(f"⚠️ Enter exactly {self.num_joints} values.")
