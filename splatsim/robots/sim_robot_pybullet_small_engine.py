@@ -97,13 +97,12 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
         super()._physics_step(action)
 
-    def compute_reward(self) -> float:
-        """Compute sparse reward based on success."""
+    def compute_reward_from_metrics(self, metrics: dict) -> float:
+        return 1.0 if metrics['is_success'] else 0.0
 
-        return 1.0 if self.check_success() else 0.0
-    
-    def check_success(self) -> bool:
-        metrics = self.check_metrics()
+    def check_terminated_from_metrics(self, metrics: dict) -> bool:
+        if self.ENV_CONFIG.terminate_on_collision:
+            return metrics['is_success'] or metrics['in_collision']
         return metrics['is_success']
 
     def check_metrics(self) -> dict:
@@ -125,8 +124,8 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
         # Check position distance
         pos_diff = np.linalg.norm(np.array(pos) - np.array(target_ee_pos))
-        # print(f"Current EE position: {pos}")
-        # print(f"Position difference: {pos_diff:.4f} m (tolerance: {pos_tolerance_m:.4f} m)")
+        print(f"Current EE position: {pos}")
+        print(f"Position difference: {pos_diff:.4f} m (tolerance: {pos_tolerance_m:.4f} m)")
         if pos_diff > pos_tolerance_m:
             success = False
 
@@ -139,8 +138,8 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         angle_rad = 2 * np.arccos(dot)
         angle_deg = np.degrees(angle_rad)
 
-        # print(f"Current EE orientation (quat): {quat}")
-        # print(f"Orientation difference: {angle_deg:.2f} deg (tolerance: {quat_tolerance_deg:.2f} deg)")
+        print(f"Current EE orientation (quat): {quat}")
+        print(f"Orientation difference: {angle_deg:.2f} deg (tolerance: {quat_tolerance_deg:.2f} deg)")
 
         if angle_deg > quat_tolerance_deg:
             success = False
@@ -150,7 +149,7 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         cam_forward = cam_rotation[:, 2]
         cam_looks_at_goal_score = compute_camera_alignment_score(cam_position, cam_forward, target_ee_pos)
 
-        in_collision = self.is_robot_in_collision()
+        in_collision = self.is_robot_in_collision(obstacle_clearance=0.0)
         if in_collision:
             success = False
 
@@ -167,10 +166,6 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
         return metrics
 
-    def check_terminated(self) -> bool:
-        """Check if episode should terminate."""
-        metrics = self.check_metrics()
-        return metrics['is_success']
 
 class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServer):
     # This new lab bench scene has the robot rotated 90 degrees because it was installed rotated D:

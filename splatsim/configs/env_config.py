@@ -211,6 +211,7 @@ class EnvConfig:
     objects: List[ObjectConfig] = field(default_factory=list)
     task_description: str = ""
     task: Optional[TaskConfig] = None
+    terminate_on_collision: bool = False
 
 @dataclass
 class SplatSimObject:
