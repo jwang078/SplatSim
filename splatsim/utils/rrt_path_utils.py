@@ -75,12 +75,12 @@ def contact_tuple_debug(pt):
 
 _COLLISION_CLEARANCE = 0.01  # 1 cm clearance for all collision checks
 
-def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, verbose=False, obstacle_names=None, self_collision_clearance=0.0, skip_pairs=None) -> bool:
+def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, verbose=False, obstacle_names=None, self_collision_clearance=0.0, skip_pairs=None, obstacle_clearance=None) -> bool:
     """
     Single source-of-truth collision checker.
 
     Checks the robot at configuration q (or the current state if q is None) against obstacles and itself.
-      1. Each link in link_indices_to_check against every obstacle (1 cm clearance).
+      1. Each link in link_indices_to_check against every obstacle (obstacle_clearance, default 1 cm).
       2. Self-collision between all non-adjacent link pairs in link_indices_to_check (0 clearance by default).
 
     Args:
@@ -95,10 +95,14 @@ def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indi
             Use 0.0 to avoid false positives when arm links are legitimately close (e.g. IK solutions).
         skip_pairs: Optional set of (robot_link_index, obstacle_body_id) tuples to skip.
             Used to exclude known always-touching pairs (e.g. shoulder_link vs table).
+        obstacle_clearance: Distance threshold for obstacle checks. Defaults to _COLLISION_CLEARANCE (1 cm).
+            Pass 0.0 to detect only actual penetration.
 
     Returns:
         True if any collision is detected, False otherwise.
     """
+    if obstacle_clearance is None:
+        obstacle_clearance = _COLLISION_CLEARANCE
     if q is not None:
         set_robot_joint_positions(robot_id, joint_indices, q)
         p.stepSimulation()
@@ -124,7 +128,7 @@ def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indi
         for obs in obstacle_ids:
             if skip_pairs and (link_i, obs) in skip_pairs:
                 continue
-            pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=_COLLISION_CLEARANCE,
+            pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=obstacle_clearance,
                                      linkIndexA=link_i)
             if len(pts) > 0:
                 if verbose:
