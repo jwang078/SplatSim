@@ -73,16 +73,15 @@ from splatsim.configs.env_config import (
 )
 from splatsim.configs.mode_config import TrajectoryGenModeConfig, ImageResizeMode
 from splatsim.utils import rrt_path_utils
+from splatsim.utils.rrt_path_utils import _COLLISION_CLEARANCE
 from collections import defaultdict
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.transforms import ImageTransformsConfig, ImageTransformConfig
 
-
 from pathlib import Path
 
-# Get the splatsim package root directory
-SPLATSIM_ROOT = Path(__file__).resolve().parent.parent.parent
+from splatsim.utils.paths import SPLATSIM_ROOT, resolve_splatsim_path  # noqa: F401
 
 
 def resize_image(img: np.ndarray, output_size: Tuple[int, int], mode: 'ImageResizeMode') -> np.ndarray:
@@ -107,18 +106,6 @@ def resize_image(img: np.ndarray, output_size: Tuple[int, int], mode: 'ImageResi
         return np.transpose(img_resized, (2, 0, 1))
     else:
         raise ValueError(f"Unknown image resize mode: {mode}.")
-
-
-def resolve_splatsim_path(path: str) -> str:
-    """Resolve a path, making relative paths relative to SPLATSIM_ROOT.
-
-    This allows configs to use relative paths like './splatsim/...' that work
-    regardless of the current working directory.
-    """
-    if os.path.isabs(path):
-        return path
-    resolved = SPLATSIM_ROOT / path
-    return str(resolved)
 
 
 class ZMQServerThread(threading.Thread):
@@ -178,7 +165,7 @@ class ZMQRobotServer:
                 elif method == "set_object_pose":
                     result = self._robot.set_object_pose(**args)
                 elif method == "get_observations":
-                    result = self._robot.get_observations()
+                    result = self._robot.get_observations(render_images=args.get("render_images", True))
                     with self._policy_guidance_lock:
                         if self._policy_guidance_action is not None:
                             result["policy_guidance_action"] = self._policy_guidance_action.copy()
@@ -194,7 +181,16 @@ class ZMQRobotServer:
                 elif method == "enable_rendering":
                     result = self._robot.enable_rendering()
                 elif method == "reset":
-                    result = self._robot.reset(**args)
+                    obs, info = self._robot.reset(**args)
+                    with self._policy_guidance_lock:
+                        if self._policy_guidance_action is not None:
+                            obs["policy_guidance_action"] = self._policy_guidance_action.copy()
+                    result = obs, info
+                elif method == "check_metrics":
+                    if hasattr(self._robot, "check_metrics"):
+                        result = self._robot.check_metrics()
+                    else:
+                        result = {"error": "check_metrics not supported"}
                 else:
                     result = {"error": "Invalid method"}
                     print(result)
@@ -1464,7 +1460,7 @@ class PybulletRobotServerBase:
     def get_task_description(self) -> str:
         return self.ENV_CONFIG.task_description
 
-    def get_observations(self) -> Dict[str, np.ndarray]:
+    def get_observations(self, render_images: bool = True) -> Dict[str, np.ndarray]:
         joint_positions = self.get_joint_state()
         joint_velocities = np.array(
             [
@@ -1522,7 +1518,7 @@ class PybulletRobotServerBase:
             observations[self.splatsim_objects[i].config.name + "_position"] = object_pos
             observations[self.splatsim_objects[i].config.name + "_orientation"] = object_quat
 
-        if self.do_render_from_splat and len(self.camera_names) > 0:
+        if render_images and self.do_render_from_splat and len(self.camera_names) > 0:
             # Capture link state snapshot for synchronized rendering
             cached_link_states = get_curr_link_states(
                 self.splatsim_robot.sim_id,
@@ -1781,14 +1777,15 @@ class PybulletRobotServerBase:
             for link_idx in (obj.config.skip_collision_robot_links or [])
         }
 
-    def is_robot_in_collision(self):
+    def is_robot_in_collision(self, obstacle_clearance=_COLLISION_CLEARANCE):
         joint_indices = list(range(1, self.num_dofs() + 1))
         obstacle_ids = [
             obj.sim_id for obj in self.splatsim_objects
             if obj.sim_id is not None and obj != self.splatsim_robot
         ]
         return rrt_path_utils.check_links_in_collision(
-            self.splatsim_robot.sim_id, joint_indices, q=None, obstacle_ids=obstacle_ids, skip_pairs=self._skip_pairs
+            self.splatsim_robot.sim_id, joint_indices, q=None, obstacle_ids=obstacle_ids, skip_pairs=self._skip_pairs,
+            obstacle_clearance=obstacle_clearance,
         )
 
     def get_random_ee_pose(self):
@@ -2880,6 +2877,12 @@ class PybulletRobotServerBase:
             NotImplementedError: Subclasses must implement this method
         """
         raise NotImplementedError("Subclasses must implement check_terminated()")
+
+    def compute_reward_from_metrics(self, metrics: Dict[str, Any]) -> float:
+        return self.compute_reward()
+
+    def check_terminated_from_metrics(self, metrics: Dict[str, Any]) -> bool:
+        return self.check_terminated()
 
     # =========================================================================
     # Mode-based GUI Controls
