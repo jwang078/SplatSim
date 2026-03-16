@@ -41,7 +41,12 @@ def _raw_obs_to_gym_obs(raw_obs: Dict[str, Any], num_dofs: int, camera_names: li
             else:
                 pixels[key] = np.zeros((224, 224, 3), dtype=np.uint8)
 
-    return {"agent_pos": agent_pos, "pixels": pixels}
+    gym_obs = {"agent_pos": agent_pos, "pixels": pixels}
+
+    if "policy_guidance_action" in raw_obs:
+        gym_obs["policy_guidance_action"] = np.array(raw_obs["policy_guidance_action"], dtype=np.float32)
+
+    return gym_obs
 
 
 # Thread-safe counter for assigning unique ports to each environment instance
@@ -107,11 +112,11 @@ class SplatSimGymEnv(gym.Env):
         """Execute one step in the environment."""
         self.robot_server._physics_step(action)
         raw_obs = self.robot_server.get_observations()
-        reward = self.robot_server.compute_reward()
-        is_success = self.robot_server.check_success()
-        terminated = self.robot_server.check_terminated()
-        truncated = self.robot_server._step_count >= self.robot_server._max_episode_steps
         metrics = self.robot_server.check_metrics()
+        is_success = metrics["is_success"]
+        reward = self.robot_server.compute_reward_from_metrics(metrics)
+        terminated = self.robot_server.check_terminated_from_metrics(metrics)
+        truncated = self.robot_server._step_count >= self.robot_server._max_episode_steps
         info = {"is_success": is_success, "step_count": self.robot_server._step_count, **metrics}
         return self._to_gym_obs(raw_obs), reward, terminated, truncated, info
 
@@ -372,23 +377,35 @@ class _ZMQBackend:
             low=np.array([-np.pi] * num_dofs + [0.0], dtype=np.float32),
             high=np.array([np.pi] * num_dofs + [1.0], dtype=np.float32),
         )
-        # observation_space uses bare camera names (no mode suffix) to match lerobot's features_map
+        # observation_space uses bare camera names (no mode suffix) to match lerobot's features_map.
+        # policy_guidance_action is always declared; NaN when no guidance process is active.
         self.observation_space = spaces.Dict({
             "agent_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(num_dofs + 1,), dtype=np.float32),
             "pixels": spaces.Dict({
                 cam: spaces.Box(low=0, high=255, shape=(image_height, image_width, 3), dtype=np.uint8)
                 for cam in camera_names
             }),
+            "policy_guidance_action": spaces.Box(low=-np.inf, high=np.inf, shape=(num_dofs + 1,), dtype=np.float32),
         })
+
+    def _get_policy_guidance(self, raw_obs):
+        pga = raw_obs.get("policy_guidance_action")
+        if pga is not None:
+            return np.array(pga, dtype=np.float32)
+        return np.full(self._num_dofs + 1, np.nan, dtype=np.float32)
 
     def step(self, action):
         self._client.command_joint_state(action)
         raw_obs = self._client.get_observations()
-        # Reward/termination not available in async mode; return neutral values
-        return raw_obs, 0.0, False, False, {}
+        raw_obs["policy_guidance_action"] = self._get_policy_guidance(raw_obs)
+        metrics = self._client.get_metrics() if hasattr(self._client, "get_metrics") else {"is_success": False}
+        terminated = metrics.get("is_success", False)
+        return raw_obs, float(terminated), terminated, False, metrics
 
     def reset(self, seed=None, options=None):
-        return self._client.reset(seed=seed, options=options)
+        raw_obs, info = self._client.reset(seed=seed, options=options)
+        raw_obs["policy_guidance_action"] = self._get_policy_guidance(raw_obs)
+        return raw_obs, info
 
     def num_dofs(self):                return self._num_dofs
     def get_observations(self):        return self._client.get_observations()
