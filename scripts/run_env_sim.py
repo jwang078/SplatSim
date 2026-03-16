@@ -217,6 +217,24 @@ def main(args):
             agent = SliderInterfaceAgent()
             startup_steps = 2
             query_new_joints_per_startup_step = False
+        elif args.agent == "joystick_interface":
+            from splatsim.agents.joystick_interface_agent import JoystickInterfaceAgent
+            kwargs = {}
+            if args.robot_type is not None:
+                kwargs["robot_name"] = args.robot_type
+            agent = JoystickInterfaceAgent(**kwargs)
+            startup_steps = 2
+            query_new_joints_per_startup_step = False
+        elif args.agent == "keyboard_interface":
+            from splatsim.agents.keyboard_interface_agent import KeyboardInterfaceAgent
+            kwargs = {}
+            if args.robot_type is not None:
+                kwargs["robot_name"] = args.robot_type
+            if args.policy_guidance_mode:
+                kwargs["delta_mode"] = True
+            agent = KeyboardInterfaceAgent(**kwargs)
+            startup_steps = 2
+            query_new_joints_per_startup_step = False
         elif args.agent == "replay_trajectory":
             from splatsim.agents.replay_trajectory_agent import ReplayTrajectoryAgent
             with open("configs/folder_configs.yaml", "r") as file:
@@ -520,12 +538,20 @@ def main(args):
                 else:
                     raise ValueError(f"Invalid state {state}")
                 
-            if flag:
-                action = action[:-1]
-
             if args.policy_guidance_mode:
-                env.queue_policy_guidance_action(action)
+                # action is (7,) delta or all-NaN when no keys are held
+                if action is not None and not np.all(np.isnan(action)):
+                    guidance = action
+                else:
+                    guidance = None
+                env.queue_policy_guidance_action(guidance)
+                # Refresh obs without rendering so the keyboard agent has
+                # up-to-date joint positions for IK seeding, without contending
+                # with the lerobot eval loop's image renders on the sim server.
+                obs = env.get_obs(render_images=False)
             else:
+                if flag:
+                    action = action[:-1]
                 obs = env.step(action)
 
             loop_end = time.time()
