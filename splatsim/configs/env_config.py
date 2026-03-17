@@ -81,11 +81,16 @@ class ObjectConfig(ABC):
     use_aabb_collision: Optional[bool] = Default(False)  # If True, use fast AABB overlap test instead of PyBullet pairwise_collision for object-object checks.
 
     rotation_range_z: Tuple[float, float] = Default((0.0, 0.0))
-    
+
     # Defaults to TABLE_LIMITS if not specified, otherwise uses the provided range for randomization
     position_range_x: Optional[Tuple[float, float]] = Default(None)
     position_range_y: Optional[Tuple[float, float]] = Default(None)
     position_range_z: Optional[Tuple[float, float]] = Default(None)
+
+    # Live state — kept in sync with PyBullet each observation step
+    current_position: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    current_quat: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 1.0])
+    current_scale: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
 
 
     _YAML_CACHE: Optional[Dict[str, Any]] = None
@@ -229,4 +234,3 @@ class SplatSimObject:
     # is_articulated: bool = False # For example, the robot has is_articulated=True. An object with is_articulated should have articulation_config
     # articulation_config: Optional[ArticulationConfig] = None
     _cache: dict = field(default_factory=dict)  # Cache for GPU tensors to avoid recreating each step
-    current_scale: Any = field(default_factory=lambda: np.array([1.0, 1.0, 1.0]))  # Currently applied per-axis scale

@@ -14,12 +14,11 @@ import shutil
 import yaml
 from argparse import ArgumentParser
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 import numpy as np
 import quaternion
 import threading
-from e3nn import o3
-
+import json
 
 import torch
 import numpy as np
@@ -1517,6 +1516,9 @@ class PybulletRobotServerBase:
             )
             observations[self.splatsim_objects[i].config.name + "_position"] = object_pos
             observations[self.splatsim_objects[i].config.name + "_orientation"] = object_quat
+            # Keep config pose fields in sync with PyBullet state
+            self.splatsim_objects[i].config.current_position = list(object_pos)
+            self.splatsim_objects[i].config.current_quat = list(object_quat)
 
         if render_images and self.do_render_from_splat and len(self.camera_names) > 0:
             # Capture link state snapshot for synchronized rendering
@@ -1633,21 +1635,21 @@ class PybulletRobotServerBase:
         cfg = splatsim_obj.config
 
         in_range = np.all(
-            splatsim_obj.current_scale >= np.array([cfg.scaling_range_x[0], cfg.scaling_range_y[0], cfg.scaling_range_z[0]])) and np.all(
-            splatsim_obj.current_scale <= np.array([cfg.scaling_range_x[1], cfg.scaling_range_y[1], cfg.scaling_range_z[1]])
+            np.array(cfg.current_scale) >= np.array([cfg.scaling_range_x[0], cfg.scaling_range_y[0], cfg.scaling_range_z[0]])) and np.all(
+            np.array(cfg.current_scale) <= np.array([cfg.scaling_range_x[1], cfg.scaling_range_y[1], cfg.scaling_range_z[1]])
         )
         if not (splatsim_obj.config.randomize_scale or (not splatsim_obj.config.randomize_scale and not in_range)):
             return  # No change in scale, skip
-        
+
         new_sx = random.uniform(*cfg.scaling_range_x)
         new_sy = random.uniform(*cfg.scaling_range_y)
         new_sz = random.uniform(*cfg.scaling_range_z)
         new_scale = np.array([new_sx, new_sy, new_sz])
 
-        if np.allclose(new_scale, splatsim_obj.current_scale):
+        if np.allclose(new_scale, np.array(cfg.current_scale)):
             return  # No change in scale, skip
 
-        old_scale = splatsim_obj.current_scale 
+        old_scale = np.array(cfg.current_scale)
         ratio = new_scale / old_scale
 
         device = splatsim_obj.gaussians._xyz.device
@@ -1658,7 +1660,7 @@ class PybulletRobotServerBase:
             np.log(ratio), device=splatsim_obj.gaussians._scaling.device, dtype=splatsim_obj.gaussians._scaling.dtype
         )
 
-        splatsim_obj.current_scale = new_scale
+        splatsim_obj.config.current_scale = new_scale.tolist()
 
         # Reload URDF at new scale (PyBullet only supports globalScaling at load time)
         # Save and restore current pose so scale doesn't reset position/orientation
@@ -1727,6 +1729,72 @@ class PybulletRobotServerBase:
             # Check that it's possible to complete the task in this env
             able_to_solve = self.trajectory_generator.check_able_to_solve(q_start=self.get_joint_state())
     
+    def restore_episode_scenario(self, episode_index: int) -> None:
+        """Restore the environment to the exact state recorded at the start of a LeRobot episode.
+
+        Reads the splatsim_robot_config, splatsim_object_configs, and splatsim_background_config
+        fields saved in the episode metadata and applies the recorded current_position,
+        current_quat, and current_scale to each matching live object.
+
+        For the robot, the saved initial_joint_positions from the articulation_config are
+        teleported directly. For scene objects, the recorded pose is set via PyBullet and the
+        scale is restored by adjusting the Gaussian splat and reloading the URDF.
+
+        Args:
+            episode_index: The episode whose saved scenario should be restored.
+        """
+        if self._lerobot_saver is None:
+            raise RuntimeError("No LeRobot dataset loaded. Call _init_lerobot_dataset() first.")
+
+        ep = self._lerobot_saver.meta.episodes[episode_index]
+
+        # Restore robot joint positions
+        robot_cfg = ep["splatsim_robot_config"]
+        if robot_cfg is not None:
+            initial_joints = robot_cfg["articulation_config"]["initial_joint_positions"]
+            self.teleport_joint_state(self.splatsim_robot, initial_joints)
+
+        # Build a name→object lookup for the live scene objects
+        obj_by_name = {obj.config.name: obj for obj in self.splatsim_objects}
+
+        # Restore each non-robot, non-background object
+        for obj_cfg_dict in (ep["splatsim_object_configs"] or []):
+            name = obj_cfg_dict["name"]
+            splatsim_obj = obj_by_name.get(name)
+            if splatsim_obj is None:
+                print(f"[restore_episode_scenario] Object '{name}' not found in live scene, skipping.")
+                continue
+            if splatsim_obj.sim_id is None:
+                continue
+
+            pos = obj_cfg_dict["current_position"]
+            quat = obj_cfg_dict["current_quat"]
+            scale = obj_cfg_dict["current_scale"]
+
+            # Restore scale first (reloads URDF, so must happen before pose set)
+            target_scale = np.array(scale)
+            if not np.allclose(target_scale, np.array(splatsim_obj.config.current_scale)):
+                old_scale = np.array(splatsim_obj.config.current_scale)
+                ratio = target_scale / old_scale
+                device = splatsim_obj.gaussians._xyz.device
+                dtype = splatsim_obj.gaussians._xyz.dtype
+                splatsim_obj.gaussians._xyz = splatsim_obj.gaussians._xyz * torch.tensor(ratio, device=device, dtype=dtype)
+                splatsim_obj.gaussians._scaling = splatsim_obj.gaussians._scaling + torch.tensor(
+                    np.log(ratio), device=splatsim_obj.gaussians._scaling.device, dtype=splatsim_obj.gaussians._scaling.dtype
+                )
+                splatsim_obj.config.current_scale = target_scale.tolist()
+                physics_scale = float(np.cbrt(np.prod(target_scale)))
+                saved_pos, saved_quat = self.pybullet_client.getBasePositionAndOrientation(splatsim_obj.sim_id)
+                self.pybullet_client.removeBody(splatsim_obj.sim_id)
+                splatsim_obj.sim_id = None
+                self.load_urdf(splatsim_obj, physics_scale=physics_scale)
+                self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, saved_pos, saved_quat)
+
+            # Restore pose
+            self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, pos, quat)
+            splatsim_obj.config.current_position = list(pos)
+            splatsim_obj.config.current_quat = list(quat)
+
     def randomize_ee_pose(self, max_attempts=100) -> Optional[Tuple[float, ...]]:
         # generating random initial joint state using random end effector position and orientation
         initial_joint_positions: Optional[Tuple[float, ...]] = None
@@ -2222,7 +2290,20 @@ class PybulletRobotServerBase:
 
         # Save episode to LeRobot (skip partial episodes from early stop)
         if not stopped_early and self._lerobot_saver is not None:
-            self._lerobot_saver.save_episode()
+            def _config_to_dict(cfg):
+                """Serialize an ObjectConfig to a JSON-safe dict, converting numpy arrays to lists."""
+                d = asdict(cfg)
+                return json.loads(json.dumps(d, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
+
+            splatsim_metadata = {
+                "splatsim_robot_config": _config_to_dict(self.splatsim_robot.config),
+                "splatsim_background_config": _config_to_dict(self.splatsim_background.config) if self.splatsim_background is not None else None,
+                "splatsim_object_configs": [
+                    _config_to_dict(obj.config) for obj in self.splatsim_objects
+                    if obj is not self.splatsim_robot and obj is not self.splatsim_background
+                ],
+            }
+            self._lerobot_saver.save_episode(episode_metadata=splatsim_metadata)
 
         # Save images to Zarr (save even if partial — zarr is more forgiving)
         if zarr_group is not None:

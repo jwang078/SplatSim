@@ -92,9 +92,9 @@ class KeyboardInterfaceAgent(Agent):
     def __init__(
         self,
         robot_name: str = "robot_iphone_w_engine_new",
-        pos_sensitivity: float = 0.01,
-        rot_sensitivity: float = 0.05,
-        max_joint_delta: float = 0.02,
+        pos_sensitivity: float = 0.05,
+        rot_sensitivity: float = 0.2,
+        max_joint_delta: float = 0.1,
         num_dofs: int = 6,
         delta_mode: bool = False,
     ):
@@ -342,10 +342,11 @@ class KeyboardInterfaceAgent(Agent):
         q_ik = np.array(joint_poses[: self.num_dofs])
         # Reject IK solutions that require a large jump — these indicate the
         # solver converged to a far configuration branch or singularity.
-        if np.max(np.abs(q_ik - q)) > 0.15:
-            return q
-        delta_q = np.clip(q_ik - q, -self.max_joint_delta, self.max_joint_delta)
-        return q + delta_q
+        # if np.max(np.abs(q_ik - q)) > 0.15:
+        #     return q
+        # delta_q = np.clip(q_ik - q, -self.max_joint_delta, self.max_joint_delta)
+        # return q + delta_
+        return q_ik
 
     # ---- Agent interface --------------------------------------------------- #
 
