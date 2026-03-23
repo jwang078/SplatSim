@@ -16,20 +16,48 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
+from lerobot_parquet_utils import parse_episodes
+
 # Label bar height in pixels drawn above each image tile
 _LABEL_H = 24
 
 
-def load_parquet_dataset(parquet_folder: str) -> pd.DataFrame:
-    """Load all parquet files from a folder into a single DataFrame."""
+def load_parquet_dataset(parquet_folder: str, episodes: list[int] | None = None) -> pd.DataFrame:
+    """Load parquet files from a folder, optionally filtering to specific episodes.
+
+    Uses parquet predicate pushdown so only matching row groups are read into memory.
+    """
     print(f"Loading parquet files from {parquet_folder}...")
     parquet_files = sorted(glob.glob(os.path.join(parquet_folder, "*.parquet")))
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found in {parquet_folder}")
     print(f"Found {len(parquet_files)} parquet files")
-    df = pd.concat([pd.read_parquet(f) for f in parquet_files], ignore_index=True)
-    print(f"Loaded {len(df)} total frames")
+
+    filters = [("episode_index", "in", episodes)] if episodes is not None else None
+    dfs = []
+    for f in parquet_files:
+        chunk = pd.read_parquet(f, filters=filters)
+        if not chunk.empty:
+            dfs.append(chunk)
+    if not dfs:
+        raise ValueError(f"No frames found for episodes {episodes}")
+    df = pd.concat(dfs, ignore_index=True)
+    print(f"Loaded {len(df)} frames")
     return df
+
+
+def load_parquet_episode_index(parquet_folder: str) -> list[int]:
+    """Return sorted unique episode indices without loading image data."""
+    import pyarrow.parquet as pq
+
+    parquet_files = sorted(glob.glob(os.path.join(parquet_folder, "*.parquet")))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in {parquet_folder}")
+    episodes: set[int] = set()
+    for f in parquet_files:
+        table = pq.read_table(f, columns=["episode_index"])
+        episodes.update(table.column("episode_index").to_pylist())
+    return sorted(episodes)
 
 
 def decode_image(image_data: dict) -> np.ndarray:
@@ -113,18 +141,6 @@ def generate_output_path(parquet_folder: str, episode_str: str | None) -> str:
     output_filename = f"{dataset_name}_{chunk_name}_{ep_str}.mp4"
     return os.path.join(output_dir, output_filename)
 
-
-def parse_episodes(episode_str: str) -> list[int]:
-    """Parse episode argument into a list of ints. Supports '3', '0-5', '0,2,4', '0-3,7,9-11'."""
-    indices = []
-    for part in episode_str.split(","):
-        part = part.strip()
-        if "-" in part:
-            start, end = part.split("-", 1)
-            indices.extend(range(int(start), int(end) + 1))
-        else:
-            indices.append(int(part))
-    return indices
 
 
 def _prepare_df(df: pd.DataFrame, episodes: list[int] | None = None) -> pd.DataFrame:
@@ -252,16 +268,50 @@ def play_video(df: pd.DataFrame, episodes: list[int] | None = None, fps: int = 3
     cv2.destroyAllWindows()
 
 
-def list_episodes(df: pd.DataFrame):
-    """List available episodes in the dataset."""
-    if "episode_index" in df.columns:
-        episodes = df["episode_index"].unique()
-        print(f"Available episodes: {sorted(episodes)}")
-        for ep in sorted(episodes):
-            ep_df = df[df["episode_index"] == ep]
-            print(f"  Episode {ep}: {len(ep_df)} frames")
-    else:
-        print("No episode_index column found")
+def episode_lengths(parquet_folder: str, subset: list[int] | None = None):
+    """Print average episode length across all episodes and optionally a subset."""
+    import pyarrow.parquet as pq
+
+    parquet_files = sorted(glob.glob(os.path.join(parquet_folder, "*.parquet")))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in {parquet_folder}")
+
+    ep_counts: dict[int, int] = {}
+    for f in parquet_files:
+        table = pq.read_table(f, columns=["episode_index"])
+        for ep in table.column("episode_index").to_pylist():
+            ep_counts[ep] = ep_counts.get(ep, 0) + 1
+
+    all_lengths = [ep_counts[ep] for ep in sorted(ep_counts)]
+    print(f"Total episodes: {len(all_lengths)}")
+    print(f"Avg episode length (all): {np.mean(all_lengths):.1f} frames  (min={min(all_lengths)}, max={max(all_lengths)})")
+
+    if subset is not None:
+        missing = [ep for ep in subset if ep not in ep_counts]
+        if missing:
+            print(f"Warning: episodes not found in dataset: {missing}")
+        subset_lengths = [ep_counts[ep] for ep in subset if ep in ep_counts]
+        if subset_lengths:
+            print(f"Avg episode length (subset of {len(subset_lengths)} episodes): {np.mean(subset_lengths):.1f} frames  (min={min(subset_lengths)}, max={max(subset_lengths)})")
+
+
+def list_episodes(parquet_folder: str):
+    """List available episodes without loading image data."""
+    import pyarrow.parquet as pq
+
+    parquet_files = sorted(glob.glob(os.path.join(parquet_folder, "*.parquet")))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in {parquet_folder}")
+
+    ep_counts: dict[int, int] = {}
+    for f in parquet_files:
+        table = pq.read_table(f, columns=["episode_index"])
+        for ep in table.column("episode_index").to_pylist():
+            ep_counts[ep] = ep_counts.get(ep, 0) + 1
+
+    print(f"Available episodes: {sorted(ep_counts)}")
+    for ep in sorted(ep_counts):
+        print(f"  Episode {ep}: {ep_counts[ep]} frames")
 
 
 def main():
@@ -291,6 +341,11 @@ def main():
         help="List available episodes and exit",
     )
     parser.add_argument(
+        "--episode-lengths",
+        action="store_true",
+        help="Print average episode length for all episodes and optionally --episode subset, then exit",
+    )
+    parser.add_argument(
         "--save_video",
         action="store_true",
         help="Save video to file instead of displaying interactively",
@@ -298,13 +353,17 @@ def main():
 
     args = parser.parse_args()
 
+    if args.list_episodes:
+        list_episodes(args.parquet_folder)
+        return
+
     episodes = parse_episodes(args.episode) if args.episode is not None else None
 
-    df = load_parquet_dataset(args.parquet_folder)
-
-    if args.list_episodes:
-        list_episodes(df)
+    if args.episode_lengths:
+        episode_lengths(args.parquet_folder, subset=episodes)
         return
+
+    df = load_parquet_dataset(args.parquet_folder, episodes)
 
     if args.save_video:
         output_path = generate_output_path(args.parquet_folder, args.episode)
