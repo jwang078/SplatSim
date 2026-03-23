@@ -639,25 +639,11 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, rob
         max_smooth_iterations=50,
     )
 
-    # Ruckig handles geometry directly from sparse waypoints — no pre-resampling needed.
-    time_parametrized_path = ruckig_parametrize_path(
-        smoothed_path,
-        max_joint_vel=max_joint_vel,
-        max_joint_acc=max_joint_acc,
-        max_joint_jerk=max_joint_jerk,
-        control_hz=robot_update_rate,
-    )
-
     # Visualize in GUI if requested
     if use_gui:
-        # show_joint_config_in_gui(robot_id, joint_indices, q_start)
-        # input("Showing start pose. Press Enter to continue...")
-        # show_joint_config_in_gui(robot_id, joint_indices, q_goal)
-        # input("Showing goal pose. Press Enter to continue...")
         playback_path_in_gui(resample_path_by_distance(smoothed_path, n_points=140), robot_id, joint_indices, path_name="Joint Dist Sampled", fps=robot_update_rate, playback_speed=1.0)
-        playback_path_in_gui(time_parametrized_path, robot_id, joint_indices, path_name="Smoothed then Time-Parametrized", fps=robot_update_rate, playback_speed=1.0)
 
-    return time_parametrized_path
+    return smoothed_path
 
 def playback_path_in_gui(path, robot_id, joint_indices, path_name, fps=240, playback_speed=1.0):
     if not p.isConnected():

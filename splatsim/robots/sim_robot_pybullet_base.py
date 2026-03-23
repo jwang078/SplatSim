@@ -12,6 +12,7 @@ import os
 import pickle
 import shutil
 import yaml
+import shutil
 from argparse import ArgumentParser
 
 from dataclasses import dataclass, field, asdict
@@ -293,6 +294,9 @@ class PybulletRobotServerBase:
         GENERATE_TRAJECTORIES = "generate_trajectories"
         GENERATE_TRAJECTORIES_IDLE = "generate_trajectories_idle"
 
+        EVAL_BENCHMARK = "eval_benchmark"
+        EVAL_BENCHMARK_IDLE = "eval_benchmark_idle"
+
     # Alias to the shared DebugModes enum for backwards compatibility
     DEBUG_MODES = DebugModes
 
@@ -328,11 +332,14 @@ class PybulletRobotServerBase:
         image_width: int = 640,
         image_height: Optional[int] = None,
         debug_mode: DEBUG_MODES = DEBUG_MODES.OFF,
-        trajectory_gen_config: Optional[dict] = None,
         image_resize_modes: Optional[List[ImageResizeMode]] = None,
+        eval_benchmark_repo_id: Optional[str] = None,
+        eval_benchmark_subset: Optional[List[int]] = None,
     ):
         self._splatsim_gui = None
         self._serve_mode = serve_mode
+        self._eval_benchmark_repo_id = eval_benchmark_repo_id or ""
+        self._eval_benchmark_subset: Optional[List[int]] = eval_benchmark_subset
         self.robot_name = robot_name
         self.camera_names = camera_names
         self.cam_i = cam_i
@@ -345,6 +352,7 @@ class PybulletRobotServerBase:
         self.base_camera = None
         self.wrist_camera = None
         self._lerobot_saver = None
+        self._eval_benchmark_episode_index = -1
         self.pybullet_client = p
         self.splatsim_objects = []
 
@@ -1516,7 +1524,7 @@ class PybulletRobotServerBase:
             )
             observations[self.splatsim_objects[i].config.name + "_position"] = object_pos
             observations[self.splatsim_objects[i].config.name + "_orientation"] = object_quat
-            # Keep config pose fields in sync with PyBullet state
+            # Keep current pose fields in sync with PyBullet state
             self.splatsim_objects[i].config.current_position = list(object_pos)
             self.splatsim_objects[i].config.current_quat = list(object_quat)
 
@@ -1630,6 +1638,8 @@ class PybulletRobotServerBase:
         quat = [quat.w, quat.x, quat.y, quat.z]
         
         self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, pos, quat)
+        splatsim_obj.config.initial_position = list(pos)
+        splatsim_obj.config.initial_quat = list(quat)
 
     def randomize_object_scale(self, splatsim_obj: SplatSimObject):
         cfg = splatsim_obj.config
@@ -1661,6 +1671,7 @@ class PybulletRobotServerBase:
         )
 
         splatsim_obj.config.current_scale = new_scale.tolist()
+        splatsim_obj.config.initial_scale = new_scale.tolist()
 
         # Reload URDF at new scale (PyBullet only supports globalScaling at load time)
         # Save and restore current pose so scale doesn't reset position/orientation
@@ -1733,8 +1744,8 @@ class PybulletRobotServerBase:
         """Restore the environment to the exact state recorded at the start of a LeRobot episode.
 
         Reads the splatsim_robot_config, splatsim_object_configs, and splatsim_background_config
-        fields saved in the episode metadata and applies the recorded current_position,
-        current_quat, and current_scale to each matching live object.
+        fields saved in the episode metadata and applies the recorded initial_position,
+        initial_quat, and initial_scale to each matching live object.
 
         For the robot, the saved initial_joint_positions from the articulation_config are
         teleported directly. For scene objects, the recorded pose is set via PyBullet and the
@@ -1748,8 +1759,14 @@ class PybulletRobotServerBase:
 
         ep = self._lerobot_saver.meta.episodes[episode_index]
 
+        def _parse_ep_field(val):
+            """Parquet stores these as JSON strings; parse back to dict/list if needed."""
+            if isinstance(val, str):
+                return json.loads(val)
+            return val
+
         # Restore robot joint positions
-        robot_cfg = ep["splatsim_robot_config"]
+        robot_cfg = _parse_ep_field(ep.get("splatsim_robot_config"))
         if robot_cfg is not None:
             initial_joints = robot_cfg["articulation_config"]["initial_joint_positions"]
             self.teleport_joint_state(self.splatsim_robot, initial_joints)
@@ -1758,7 +1775,11 @@ class PybulletRobotServerBase:
         obj_by_name = {obj.config.name: obj for obj in self.splatsim_objects}
 
         # Restore each non-robot, non-background object
-        for obj_cfg_dict in (ep["splatsim_object_configs"] or []):
+        object_configs = _parse_ep_field(ep.get("splatsim_object_configs")) or []
+
+        if robot_cfg is None and len(object_configs) == 0:
+            raise ValueError(f"No robot config or object configs found for episode {episode_index}")
+        for obj_cfg_dict in object_configs:
             name = obj_cfg_dict["name"]
             splatsim_obj = obj_by_name.get(name)
             if splatsim_obj is None:
@@ -1767,9 +1788,9 @@ class PybulletRobotServerBase:
             if splatsim_obj.sim_id is None:
                 continue
 
-            pos = obj_cfg_dict["current_position"]
-            quat = obj_cfg_dict["current_quat"]
-            scale = obj_cfg_dict["current_scale"]
+            pos = obj_cfg_dict["initial_position"]
+            quat = obj_cfg_dict["initial_quat"]
+            scale = obj_cfg_dict["initial_scale"]
 
             # Restore scale first (reloads URDF, so must happen before pose set)
             target_scale = np.array(scale)
@@ -1783,6 +1804,7 @@ class PybulletRobotServerBase:
                     np.log(ratio), device=splatsim_obj.gaussians._scaling.device, dtype=splatsim_obj.gaussians._scaling.dtype
                 )
                 splatsim_obj.config.current_scale = target_scale.tolist()
+                splatsim_obj.config.initial_scale = target_scale.tolist()
                 physics_scale = float(np.cbrt(np.prod(target_scale)))
                 saved_pos, saved_quat = self.pybullet_client.getBasePositionAndOrientation(splatsim_obj.sim_id)
                 self.pybullet_client.removeBody(splatsim_obj.sim_id)
@@ -1794,6 +1816,8 @@ class PybulletRobotServerBase:
             self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, pos, quat)
             splatsim_obj.config.current_position = list(pos)
             splatsim_obj.config.current_quat = list(quat)
+            splatsim_obj.config.initial_position = list(pos)
+            splatsim_obj.config.initial_quat = list(quat)
 
     def randomize_ee_pose(self, max_attempts=100) -> Optional[Tuple[float, ...]]:
         # generating random initial joint state using random end effector position and orientation
@@ -1831,10 +1855,14 @@ class PybulletRobotServerBase:
                 # TODO possibly randomize gripper state here, too
                 # Though that might have to edit initial_joint_positions
                 self.teleport_joint_state(self.splatsim_robot, initial_joint_positions)
+                if self.splatsim_robot.config.articulation_config is not None:
+                    self.splatsim_robot.config.articulation_config.initial_joint_positions = list(initial_joint_positions)
                 return initial_joint_positions
 
         # If we exhausted all attempts, return the last configuration with a warning
-        print(f"Warning: Could not find collision-free EE pose after {max_attempts} attempts")        
+        print(f"Warning: Could not find collision-free EE pose after {max_attempts} attempts")
+        if initial_joint_positions is not None and self.splatsim_robot.config.articulation_config is not None:
+            self.splatsim_robot.config.articulation_config.initial_joint_positions = list(initial_joint_positions)
         return initial_joint_positions
 
     def _recompute_skip_pairs(self):
@@ -2011,12 +2039,104 @@ class PybulletRobotServerBase:
                 active_modes.append(ImageResizeMode.STRETCH)
             if active_modes:
                 self.image_resize_modes = active_modes
-            self._init_lerobot_dataset()
+            self._init_lerobot_dataset(traj_config.lerobot_repo_id)
+            # Resume trajectory_count from existing dataset so we don't restart at 0
+            if self._lerobot_saver is not None:
+                self.trajectory_generator.trajectory_count = self._lerobot_saver.meta.total_episodes
+                print(f"[LeRobot] Resuming trajectory generation at index {self.trajectory_generator.trajectory_count}")
+        elif mode == self.SERVE_MODES.EVAL_BENCHMARK:
+            if self._splatsim_gui is not None:
+                self._splatsim_gui.save_to_config(self._splatsim_gui._eval_config, prefix="eval_benchmark")
+            gui_repo_id = self._splatsim_gui._eval_config.lerobot_repo_id if self._splatsim_gui is not None else None
+            repo_id = gui_repo_id if self._eval_benchmark_repo_id is None or len(self._eval_benchmark_repo_id) == 0 else self._eval_benchmark_repo_id
+            if repo_id is None:
+                raise ValueError(f"Could not find repo id for eval benchmark mode out of {gui_repo_id} and {self._eval_benchmark_repo_id}")
+            self._eval_benchmark_episode_index = -1
+            self._init_lerobot_dataset(repo_id)
+            if self._lerobot_saver is not None:
+                total = self._lerobot_saver.meta.total_episodes
+                if self._eval_benchmark_subset is None:
+                    self._eval_benchmark_subset = list(range(total))
+                if self._splatsim_gui is not None:
+                    self._splatsim_gui.set_status(f"Loaded {total} episodes")
+                    self._splatsim_gui.set_eval_episode_options(self._eval_benchmark_subset)
+            else:
+                raise ValueError(f"self._lerobot_saver failed in initialization")
+        elif mode == self.SERVE_MODES.EVAL_BENCHMARK_IDLE:
+            self._eval_benchmark_episode_index = -1
+            self._lerobot_saver = None
 
     def _exit_mode(self, mode: 'PybulletRobotServerBase.SERVE_MODES'):
         """Called when exiting a serve mode. Override in subclasses for custom behavior."""
         if mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
             self._finalize_lerobot_dataset()
+        elif mode == self.SERVE_MODES.EVAL_BENCHMARK:
+            self._lerobot_saver = None
+            self._eval_benchmark_episode_index = -1
+            if self._splatsim_gui is not None:
+                self._splatsim_gui.set_status("")
+
+    # =========================================================================
+    # Eval Benchmark Episode Navigation
+    # =========================================================================
+
+    def _eval_benchmark_next_episode(self):
+        """Advance to the next episode in the benchmark dataset and restore its scenario.
+
+        Called by _handle_reset() when in EVAL_BENCHMARK mode, so both the GUI Reset Env
+        button and external policy reset() calls always advance to the next episode.
+        No-ops if already at the last episode.
+        """
+        if self._lerobot_saver is None:
+            print("[EvalBenchmark] No dataset loaded.")
+            return self.reset()
+        self._eval_benchmark_episode_index += 1
+        if self._eval_benchmark_episode_index >= len(self._eval_benchmark_subset):
+            print(f"[EvalBenchmark] Reached end of sequence ({len(self._eval_benchmark_subset)} episodes), wrapping around.")
+            self._eval_benchmark_episode_index = 0
+        episode_index = self._eval_benchmark_subset[self._eval_benchmark_episode_index]
+        self.restore_episode_scenario(episode_index)
+        if hasattr(self, "_reset_episode_state"):
+            self._reset_episode_state()
+        if self._splatsim_gui is not None:
+            self._splatsim_gui.set_status(
+                f"Episode: {self._eval_benchmark_episode_index + 1} / {len(self._eval_benchmark_subset)}"
+            )
+            self._splatsim_gui.set_eval_episode_index(episode_index)
+        metrics = self.check_metrics() if hasattr(self, "check_metrics") else {}
+        info = {"is_success": metrics.get("is_success", False), **metrics}
+        return self.get_observations(), info
+
+    def _eval_benchmark_prev_episode(self):
+        """Go back to the previous episode and restore its scenario (GUI Prev button only)."""
+        if self._lerobot_saver is None or self._eval_benchmark_episode_index <= 0:
+            return
+        self._eval_benchmark_episode_index -= 1
+        episode_id = self._eval_benchmark_subset[self._eval_benchmark_episode_index]
+        self.restore_episode_scenario(episode_id)
+        if self._splatsim_gui is not None:
+            self._splatsim_gui.set_status(
+                f"Episode: {self._eval_benchmark_episode_index + 1} / {len(self._eval_benchmark_subset)}"
+            )
+            self._splatsim_gui.set_eval_episode_index(episode_id)
+        return self.get_observations()
+
+    def _eval_benchmark_goto_episode(self, subset_pos: int):
+        """Jump to a position in the eval subset and restore its scenario (GUI dropdown)."""
+        if self._lerobot_saver is None:
+            return
+        if not (0 <= subset_pos < len(self._eval_benchmark_subset)):
+            print(f"[EvalBenchmark] Subset position {subset_pos} out of range [0, {len(self._eval_benchmark_subset)}).")
+            return
+        self._eval_benchmark_episode_index = subset_pos
+        episode_id = self._eval_benchmark_subset[subset_pos]
+        self.restore_episode_scenario(episode_id)
+        if self._splatsim_gui is not None:
+            self._splatsim_gui.set_status(
+                f"Episode: {subset_pos + 1} / {len(self._eval_benchmark_subset)}"
+            )
+            self._splatsim_gui.set_eval_episode_index(episode_id)
+        return self.get_observations()
 
     # =========================================================================
     # LeRobot Dataset Lifecycle
@@ -2059,16 +2179,13 @@ class PybulletRobotServerBase:
             },
         )
 
-    def _init_lerobot_dataset(self):
-        """Initialize LeRobot dataset for trajectory generation with rendering."""
-        traj_config = self.trajectory_generator.config
-        repo_id = traj_config.lerobot_repo_id
+    def _init_lerobot_dataset(self, repo_id: str):
+        """Initialize or load a LeRobot dataset by repo_id."""
         if not repo_id:
             print("[LeRobot] No lerobot_repo_id configured, skipping LeRobot dataset creation.")
             self._lerobot_saver = None
             return
 
-        import shutil
         local_dir = os.path.expanduser(f"~/.cache/huggingface/lerobot/{repo_id}")
 
         if os.path.exists(local_dir):
@@ -2076,13 +2193,22 @@ class PybulletRobotServerBase:
             try:
                 self._lerobot_saver = LeRobotDataset(repo_id)
                 print(f"[LeRobot] Successfully loaded existing dataset ({self._lerobot_saver.meta.total_episodes} episodes).")
+                return
             except Exception as e:
                 print(f"[LeRobot] WARNING: Failed to load existing dataset: {e}")
-                print(f"[LeRobot] Removing corrupt local cache at {local_dir} and creating fresh dataset.")
+                print(f"[LeRobot] Removing corrupt local cache at {local_dir}.")
                 shutil.rmtree(local_dir)
-                self._lerobot_saver = self._create_lerobot_dataset(repo_id)
-        else:
-            print(f"[LeRobot] Creating new dataset at {local_dir}")
+
+        # Try loading from hub (will download if available), otherwise create fresh
+        print(f"[LeRobot] Attempting to load dataset from hub: {repo_id}")
+        try:
+            self._lerobot_saver = LeRobotDataset(repo_id)
+            print(f"[LeRobot] Successfully loaded dataset from hub ({self._lerobot_saver.meta.total_episodes} episodes).")
+        except Exception as e:
+            print(f"[LeRobot] Dataset not found on hub ({e}), creating fresh dataset.")
+            # LeRobotDataset() may have partially created the local dir before failing — clean it up
+            if os.path.exists(local_dir):
+                shutil.rmtree(local_dir)
             self._lerobot_saver = self._create_lerobot_dataset(repo_id)
 
     def _finalize_lerobot_dataset(self):
@@ -2091,6 +2217,11 @@ class PybulletRobotServerBase:
             return
 
         print("[LeRobot] Finalizing dataset...")
+        # Discard any partial episode that was in-progress at crash time
+        try:
+            self._lerobot_saver.clear_episode_buffer()
+        except Exception:
+            pass
         self._lerobot_saver.finalize()
 
         traj_config = self.trajectory_generator.config
@@ -2318,6 +2449,19 @@ class PybulletRobotServerBase:
         for obstacle_name in loaded_obstacle_names:
             self.delete_object(obstacle_name)
 
+    def _handle_reset(self):
+        """Unified reset entry point for serve() loop and ZMQ server.
+
+        In EVAL_BENCHMARK mode, advances to the next episode instead of calling
+        the subclass reset(), so external policies that call reset() always get
+        the next deterministic scenario without needing to know the serve mode.
+        In all other modes, delegates to the subclass reset().
+        """
+        if self.serve_mode == self.SERVE_MODES.EVAL_BENCHMARK:
+            return self._eval_benchmark_next_episode()
+        else:
+            return self.reset()
+
     def serve(self) -> None:
         self.reset()
 
@@ -2329,67 +2473,97 @@ class PybulletRobotServerBase:
         self._lerobot_saver = None
         _prev_serve_mode = self.serve_mode
 
-        while True:
-            # Let the GUI handle all mode/button transitions
-            self._splatsim_gui.process_mode_transitions()
+        try:
+            while True:
+                # Let the GUI handle all mode/button transitions
+                self._splatsim_gui.process_mode_transitions()
 
-            # Reset env button — available in all modes
-            if self._splatsim_gui.check_button(SplatSimGui.BTN_RESET_ENV):
-                print("[GUI] Reset Env pressed — resetting environment.")
-                self.reset()
+                # Reset env button — available in all modes
+                if self._splatsim_gui.check_button(SplatSimGui.BTN_RESET_ENV):
+                    print("[GUI] Reset Env pressed — resetting environment.")
+                    self._handle_reset()
 
-            # Check debug mode dropdown for changes
-            self._check_debug_mode()
+                # Check debug mode dropdown for changes
+                self._check_debug_mode()
 
-            # Detect and handle mode transitions
-            current_mode = self.serve_mode
-            if _prev_serve_mode != current_mode:
-                self._exit_mode(_prev_serve_mode)
-                self._enter_mode(current_mode)
-                _prev_serve_mode = current_mode
+                # Detect and handle mode transitions
+                current_mode = self.serve_mode
+                if _prev_serve_mode != current_mode:
+                    self._exit_mode(_prev_serve_mode)
+                    self._enter_mode(current_mode)
+                    _prev_serve_mode = current_mode
 
-            if current_mode == self.SERVE_MODES.INTERACTIVE:
-                self.pybullet_client.stepSimulation()
-                time.sleep(1 / 240)
-            elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
-                # Idle mode - just step simulation while user configures settings
-                self.pybullet_client.stepSimulation()
-                time.sleep(1 / 240)
-            elif current_mode == self.SERVE_MODES.GENERATE_DEMOS:
-                raise NotImplementedError()
-                initial_joint_positions = self.randomize_ee_pose()
+                if current_mode == self.SERVE_MODES.INTERACTIVE:
+                    self.pybullet_client.stepSimulation()
+                    time.sleep(1 / 240)
+                elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
+                    # Idle mode - just step simulation while user configures settings
+                    self.pybullet_client.stepSimulation()
+                    time.sleep(1 / 240)
+                elif current_mode == self.SERVE_MODES.GENERATE_DEMOS:
+                    raise NotImplementedError()
+                    initial_joint_positions = self.randomize_ee_pose()
 
-                success = self.plan_execute_record_trajectory(
-                    initial_joint_positions, self.splatsim_robot.articulation_config.joint_signs
-                )
-                if success:
-                    self.trajectory_count += 1
-
-                if self.trajectory_count > self.MAX_TRAJECTORY_COUNT:
-                    print(
-                        f"Exiting record_demos mode because max trajectory count of {self.MAX_TRAJECTORY_COUNT} was reached in folder {self.path}"
+                    success = self.plan_execute_record_trajectory(
+                        initial_joint_positions, self.splatsim_robot.articulation_config.joint_signs
                     )
-                    self.serve_mode = self.SERVE_MODES.INTERACTIVE
-            elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-                # Generate trajectories, render images, and save to LeRobot + Zarr
-                self._generate_and_render_one_episode()
+                    if success:
+                        self.trajectory_count += 1
 
-                # Update GUI status with current progress
-                tgen = self.trajectory_generator
-                total = tgen.config.num_base_trajectories
-                done = tgen.trajectory_count
-                if self._splatsim_gui is not None:
-                    self._splatsim_gui.set_status(f"Trajectory: {done} / {total}")
+                    if self.trajectory_count > self.MAX_TRAJECTORY_COUNT:
+                        print(
+                            f"Exiting record_demos mode because max trajectory count of {self.MAX_TRAJECTORY_COUNT} was reached in folder {self.path}"
+                        )
+                        self.serve_mode = self.SERVE_MODES.INTERACTIVE
+                elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+                    # Generate trajectories, render images, and save to LeRobot + Zarr
+                    self._generate_and_render_one_episode()
 
-                if self.trajectory_generator.is_complete():
-                    print(f"[GUI] Completed trajectory generation. Switching to idle mode.")
+                    # Update GUI status with current progress
+                    tgen = self.trajectory_generator
+                    total = tgen.config.num_base_trajectories
+                    done = tgen.trajectory_count
                     if self._splatsim_gui is not None:
-                        self._splatsim_gui.set_status(f"Done: {done} / {total} trajectories")
-                    self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
-            else:
-                raise ValueError(f"Unknown serve mode {current_mode}. ")
+                        self._splatsim_gui.set_status(f"Trajectory: {done} / {total}")
 
-            self.serve_loop()
+                    if self.trajectory_generator.is_complete():
+                        print(f"[GUI] Completed trajectory generation. Switching to idle mode.")
+                        if self._splatsim_gui is not None:
+                            self._splatsim_gui.set_status(f"Done: {done} / {total} trajectories")
+                        self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
+                elif current_mode == self.SERVE_MODES.EVAL_BENCHMARK_IDLE:
+                    self.pybullet_client.stepSimulation()
+                    time.sleep(1 / 240)
+                elif current_mode == self.SERVE_MODES.EVAL_BENCHMARK:
+                    self.pybullet_client.stepSimulation()
+                    time.sleep(1 / 240)
+                    # Handle Next/Prev/dropdown buttons from the eval benchmark panel
+                    from splatsim.utils.splatsim_gui import EvalBenchmarkModePanel
+                    if self._splatsim_gui.check_button(EvalBenchmarkModePanel.BTN_NEXT):
+                        self._eval_benchmark_next_episode()
+                    if self._splatsim_gui.check_button(EvalBenchmarkModePanel.BTN_PREV):
+                        self._eval_benchmark_prev_episode()
+                    selected = self._splatsim_gui.get_value(EvalBenchmarkModePanel.EPISODE_SELECT_KEY)
+                    if selected is not None and selected != "—":
+                        try:
+                            episode_id = int(selected)
+                            if episode_id in self._eval_benchmark_subset:
+                                subset_pos = self._eval_benchmark_subset.index(episode_id)
+                                if subset_pos != self._eval_benchmark_episode_index:
+                                    self._eval_benchmark_goto_episode(subset_pos)
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    raise ValueError(f"Unknown serve mode {current_mode}. ")
+
+                self.serve_loop()
+        except Exception as e:
+            import traceback
+            print(f"[serve] ERROR: {e}")
+            traceback.print_exc()
+            raise
+        finally:
+            self._finalize_lerobot_dataset()
 
     def serve_loop(self):
         raise NotImplementedError()
@@ -2980,6 +3154,9 @@ class PybulletRobotServerBase:
         """
         # Initialize the Tkinter GUI (runs in separate thread)
         config = self.trajectory_generator.config
+
+        # TODO add some env configs to the gui on startup like self._eval_benchmark_repo_id
+
         initial_mode = self.serve_mode.value  # Use the enum's string value
         self._splatsim_gui: SplatSimGui = SplatSimGui(
             config,

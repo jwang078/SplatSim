@@ -37,6 +37,16 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     # Gym Environment Interface
     # =========================================================================
 
+    def _reset_episode_state(self):
+        self._step_count = 0
+        self._episode_started = True
+        self._prev_action = None
+        self._action_delta = 0.0
+        self._prev_action_delta = 0.0
+        self._action_accel = 0.0
+        self._prev_action_accel = 0.0
+        self._action_jerk = 0.0
+
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Reset the environment to an initial state.
 
@@ -52,16 +62,7 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
             np.random.seed(seed)
             random.seed(seed)
 
-        self._step_count = 0
-        self._episode_started = True
-
-        # Smoothness tracking
-        self._prev_action = None
-        self._action_delta = 0.0
-        self._prev_action_delta = 0.0
-        self._action_accel = 0.0
-        self._prev_action_accel = 0.0
-        self._action_jerk = 0.0
+        self._reset_episode_state()
 
         # This now also randomizes the robot's joints
         self.randomize_objects()
@@ -124,8 +125,7 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
         # Check position distance
         pos_diff = np.linalg.norm(np.array(pos) - np.array(target_ee_pos))
-        print(f"Current EE position: {pos}")
-        print(f"Position difference: {pos_diff:.4f} m (tolerance: {pos_tolerance_m:.4f} m)")
+        # print(f"Position difference: {pos_diff:.4f} m (tolerance: {pos_tolerance_m:.4f} m)")
         if pos_diff > pos_tolerance_m:
             success = False
 
@@ -138,8 +138,7 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         angle_rad = 2 * np.arccos(dot)
         angle_deg = np.degrees(angle_rad)
 
-        print(f"Current EE orientation (quat): {quat}")
-        print(f"Orientation difference: {angle_deg:.2f} deg (tolerance: {quat_tolerance_deg:.2f} deg)")
+        # print(f"Orientation difference: {angle_deg:.2f} deg (tolerance: {quat_tolerance_deg:.2f} deg)")
 
         if angle_deg > quat_tolerance_deg:
             success = False

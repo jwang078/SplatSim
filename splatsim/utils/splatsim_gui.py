@@ -14,7 +14,7 @@ import dataclasses
 
 import numpy as np
 from PIL import Image, ImageTk
-from splatsim.configs.mode_config import ImageResizeMode, SplatSimModeConfig, TrajectoryGenModeConfig
+from splatsim.configs.mode_config import EvalBenchmarkModeConfig, ImageResizeMode, SplatSimModeConfig, TrajectoryGenModeConfig
 
 
 # =============================================================================
@@ -333,6 +333,15 @@ class ThreadedTkinterGui(ABC):
         except tk.TclError:
             return None
 
+    def set_value(self, key: str, value: Any) -> None:
+        """Set a GUI value by key. Thread-safe."""
+        if key not in self._values:
+            return
+        try:
+            self._values[key].set(value)
+        except tk.TclError:
+            pass
+
     def get_enum_value(self, key: str) -> Any:
         """Get an enum value from the GUI.
 
@@ -369,22 +378,32 @@ class ThreadedTkinterGui(ABC):
                 pass
         return result
 
-    def save_to_config(self, config: SplatSimModeConfig) -> None:
+    def save_to_config(self, config: SplatSimModeConfig, prefix: str = "") -> None:
         """Save current GUI values to a SplatSimModeConfig dataclass.
 
         Args:
             config: Config dataclass to update with current values
+            prefix: Optional namespace prefix (e.g. "traj_gen"). When given, only
+                    keys of the form "<prefix>.<field>" are considered, and the
+                    prefix is stripped before matching against config fields.
         """
         config_fields = {f.name: f for f in dataclasses.fields(config)}
         values = self.get_values()
         for key, value in values.items():
-            if key not in config_fields:
-                continue
-            field_type = type(getattr(config, key))
-            if field_type == bool:
-                setattr(config, key, bool(value))
+            if prefix:
+                ns = prefix + "."
+                if not key.startswith(ns):
+                    continue
+                field_name = key[len(ns):]
             else:
-                setattr(config, key, field_type(value))
+                field_name = key
+            if field_name not in config_fields:
+                continue
+            field_type = type(getattr(config, field_name))
+            if field_type == bool:
+                setattr(config, field_name, bool(value))
+            else:
+                setattr(config, field_name, field_type(value))
 
 
 # =============================================================================
@@ -682,51 +701,52 @@ class TrajectoryGenModePanel(ModePanel):
         assert isinstance(config, TrajectoryGenModeConfig), "Expected TrajectoryGenModeConfig for TrajectoryGenModePanel"
         builder = GuiBuilder(parent, gui, style)
 
+        NS = "traj_gen"
         int_params = [
-            IntParam("num_base_trajectories", "Num Trajectories", 1, 1000),
-            IntParam("obstacles_per_base_trajectory", "Obstacles/Traj", 0, 10),
-            IntParam("paths_per_obstacle", "Paths/Obstacle", 1, 5),
-            IntParam("min_obstacles", "Min Obstacles", 0, 5),
-            IntParam("max_obstacles", "Max Obstacles", 1, 10),
-            IntParam("num_path_candidates", "Path Candidates", 1, 20),
+            IntParam(f"{NS}.num_base_trajectories", "Num Trajectories", 1, 1000),
+            IntParam(f"{NS}.obstacles_per_base_trajectory", "Obstacles/Traj", 0, 10),
+            IntParam(f"{NS}.paths_per_obstacle", "Paths/Obstacle", 1, 5),
+            IntParam(f"{NS}.min_obstacles", "Min Obstacles", 0, 5),
+            IntParam(f"{NS}.max_obstacles", "Max Obstacles", 1, 10),
+            IntParam(f"{NS}.num_path_candidates", "Path Candidates", 1, 20),
         ]
         for param in int_params:
-            builder.add_int_param(param, getattr(config, param.key))
+            builder.add_int_param(param, getattr(config, param.key.split(".", 1)[1]))
 
         float_params = [
-            FloatParam("k_exp", "k_exp", 0.1, 20.0),
-            FloatParam("k_sig", "k_sig", 0.1, 30.0),
-            FloatParam("threshold", "threshold", 0.0, 1.0),
+            FloatParam(f"{NS}.k_exp", "k_exp", 0.1, 20.0),
+            FloatParam(f"{NS}.k_sig", "k_sig", 0.1, 30.0),
+            FloatParam(f"{NS}.threshold", "threshold", 0.0, 1.0),
         ]
         for param in float_params:
-            builder.add_float_param(param, getattr(config, param.key))
+            builder.add_float_param(param, getattr(config, param.key.split(".", 1)[1]))
 
         builder.add_bool_param(
-            BoolParam("disable_camera_scoring_for_rrt", "Disable Cam Score"),
+            BoolParam(f"{NS}.disable_camera_scoring_for_rrt", "Disable Cam Score"),
             config.disable_camera_scoring_for_rrt
         )
         builder.add_bool_param(
-            BoolParam("verbose", "Verbose"),
+            BoolParam(f"{NS}.verbose", "Verbose"),
             config.verbose
         )
         builder.add_bool_param(
-            BoolParam("debug_visualize", "Debug Visualize"),
+            BoolParam(f"{NS}.debug_visualize", "Debug Visualize"),
             config.debug_visualize
         )
 
         builder.add_str_param(
-            StrParam("lerobot_repo_id", "LeRobot Repo ID (user/name)", "", width=25),
+            StrParam(f"{NS}.lerobot_repo_id", "LeRobot Repo ID (user/name)", "", width=25),
             config.lerobot_repo_id
         )
         builder.add_bool_param(
-            BoolParam("push_to_hub", "Push to Hub"),
+            BoolParam(f"{NS}.push_to_hub", "Push to Hub"),
             config.push_to_hub
         )
         for mode in ImageResizeMode:
-            key = f"render_{mode.value}"
+            key = f"{NS}.render_{mode.value}"
             builder.add_bool_param(
                 BoolParam(key, f"Render {mode.value.capitalize()}"),
-                getattr(config, key, True)
+                getattr(config, f"render_{mode.value}", True)
             )
 
         builder.add_button_row([
@@ -739,7 +759,7 @@ class TrajectoryGenModePanel(ModePanel):
         stop = gui.check_button(self.BTN_STOP)
 
         if start and gui.mode == "generate_trajectories_idle":
-            gui.save_to_config(gui._config)
+            gui.save_to_config(gui._config, prefix="traj_gen")
             gui.set_mode("generate_trajectories")
             print(f"[GUI] Started trajectory generation with config: {gui._config}")
 
@@ -748,6 +768,75 @@ class TrajectoryGenModePanel(ModePanel):
                 gui.set_mode("generate_trajectories_idle")
             elif gui.mode == "generate_trajectories_idle":
                 gui.set_mode("interactive")
+
+
+class EvalBenchmarkModePanel(ModePanel):
+    """Eval benchmark mode — step through a saved LeRobot dataset episode by episode."""
+
+    name = "Eval Benchmark"
+    mode_values = {"eval_benchmark", "eval_benchmark_idle"}
+    button_key = "eval_benchmark_mode"
+    default_mode = "eval_benchmark_idle"
+
+    BTN_LOAD = "eval_load_dataset"
+    BTN_NEXT = "eval_next_episode"
+    BTN_PREV = "eval_prev_episode"
+    EPISODE_SELECT_KEY = "eval_episode_select"
+
+    def __init__(self):
+        super().__init__()
+        self._episode_var: Optional[tk.StringVar] = None
+        self._episode_menu: Optional[ttk.Combobox] = None
+
+    def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
+              style: GuiStyle, config: SplatSimModeConfig) -> None:
+        assert isinstance(config, EvalBenchmarkModeConfig), \
+            "Expected EvalBenchmarkModeConfig for EvalBenchmarkModePanel"
+        builder = GuiBuilder(parent, gui, style)
+
+        builder.add_str_param(
+            StrParam("eval_benchmark.lerobot_repo_id", "LeRobot Repo ID (user/name)", "", width=25),
+            config.lerobot_repo_id
+        )
+        builder.add_button_row([ButtonConfig("Load Dataset", self.BTN_LOAD)])
+        builder.add_button_row([
+            ButtonConfig("Prev Episode", self.BTN_PREV),
+            ButtonConfig("Next Episode", self.BTN_NEXT),
+        ])
+
+        # Episode combobox — starts empty, repopulated after dataset loads
+        row = builder.current_row
+        ep_label = ttk.Label(parent, text="Jump to Episode:")
+        ep_label.grid(row=row, column=0, sticky="w", pady=2)
+        self._episode_var = tk.StringVar(value="—")
+        self._episode_menu = ttk.Combobox(
+            parent, textvariable=self._episode_var, values=["—"], state="readonly"
+        )
+        self._episode_menu.grid(row=row, column=1, sticky="ew", pady=2)
+        gui._values[self.EPISODE_SELECT_KEY] = self._episode_var
+        builder._row += 1
+
+    def repopulate_episode_dropdown(self, episodes: List[int]) -> None:
+        """Rebuild the episode combobox with the given episode IDs. Called after dataset loads."""
+        if self._episode_menu is None or self._episode_var is None:
+            return
+        values = ["—"] + [str(ep) for ep in episodes]
+        self._episode_menu["values"] = values
+        self._episode_var.set("—")
+
+    def set_current_episode(self, episode_id: int) -> None:
+        """Update the combobox to show the current episode ID."""
+        if self._episode_var is not None:
+            self._episode_var.set(str(episode_id))
+
+    def process_buttons(self, gui: 'SplatSimGui') -> None:
+        load = gui.check_button(self.BTN_LOAD)
+        if load:
+            gui.save_to_config(gui._eval_config, prefix="eval_benchmark")
+            if gui.mode == "eval_benchmark":
+                # Already in eval mode — force a reload by bouncing through idle
+                gui.set_mode("eval_benchmark_idle")
+            gui.set_mode("eval_benchmark")
 
 
 # =============================================================================
@@ -786,6 +875,7 @@ class SplatSimGui(ThreadedTkinterGui):
         """
         super().__init__(title="SplatSim Controls")
         self._config = config
+        self._eval_config = EvalBenchmarkModeConfig()
         self._initial_mode = initial_mode
         self._mode_var: Optional[tk.StringVar] = None
         self._debug_mode_enum = debug_mode_enum
@@ -793,6 +883,7 @@ class SplatSimGui(ThreadedTkinterGui):
         self._panels = panels if panels is not None else [
             InteractiveModePanel(),
             TrajectoryGenModePanel(),
+            EvalBenchmarkModePanel(),
         ]
 
         # Mode state (thread-safe — written by GUI thread, read by main thread)
@@ -879,7 +970,8 @@ class SplatSimGui(ThreadedTkinterGui):
             panel.frame.configure(height=40)
             panel.frame.grid_propagate(False)
             builder._row += 1
-            panel.build(panel.frame, self, self._style, self._config)
+            panel_config = self._eval_config if isinstance(panel, EvalBenchmarkModePanel) else self._config
+            panel.build(panel.frame, self, self._style, panel_config)
             # Re-enable propagation if build() added widgets, so the frame
             # grows to fit them. If still empty, the minimum height holds.
             if panel.frame.winfo_children():
@@ -970,6 +1062,32 @@ class SplatSimGui(ThreadedTkinterGui):
             The DEBUG_MODES enum member, or None if not available.
         """
         return self.get_enum_value(self.DEBUG_MODE_KEY)
+
+    def set_eval_episode_options(self, episodes: List[int]) -> None:
+        """Repopulate the eval benchmark episode combobox after a dataset is loaded.
+
+        Thread-safe — can be called from any thread.
+
+        Args:
+            episodes: List of episode IDs to show (e.g. the eval subset).
+        """
+        for panel in self._panels:
+            if isinstance(panel, EvalBenchmarkModePanel):
+                try:
+                    panel.repopulate_episode_dropdown(episodes)
+                except tk.TclError:
+                    pass
+                break
+
+    def set_eval_episode_index(self, idx: int) -> None:
+        """Update the episode dropdown to reflect the current episode index."""
+        for panel in self._panels:
+            if isinstance(panel, EvalBenchmarkModePanel):
+                try:
+                    panel.set_current_episode(idx)
+                except tk.TclError:
+                    pass
+                break
 
     # ------------------------------------------------------------------
     # Camera image display

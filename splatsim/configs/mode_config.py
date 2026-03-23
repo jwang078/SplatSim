@@ -54,6 +54,7 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     k_exp: float = 5.0
     k_sig: float = 15.0
     threshold: float = 0.4
+    save_zarr: bool = False
     lerobot_repo_id: str = ""
     push_to_hub: bool = True
     render_letterbox: bool = True
@@ -83,3 +84,9 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
             raise ValueError(f"ee_pos_goal must be length 3 (x, y, z), got {len(self.ee_pos_goal)}")
         if self.ee_quat_goal is not None and len(self.ee_quat_goal) != 4:
             raise ValueError(f"ee_quat_goal must be length 4 (x, y, z, w), got {len(self.ee_quat_goal)}")
+
+
+@dataclass
+class EvalBenchmarkModeConfig(SplatSimModeConfig):
+    """Configuration for eval benchmark mode."""
+    lerobot_repo_id: str = ""

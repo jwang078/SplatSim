@@ -117,13 +117,22 @@ class SplatSimGymEnv(gym.Env):
         reward = self.robot_server.compute_reward_from_metrics(metrics)
         terminated = self.robot_server.check_terminated_from_metrics(metrics)
         truncated = self.robot_server._step_count >= self.robot_server._max_episode_steps
-        info = {"is_success": is_success, "step_count": self.robot_server._step_count, **metrics}
+        # Cast numpy scalars to Python scalars so SyncVectorEnv stacks them as shape (n_envs,)
+        # rather than (n_envs, 1). Without this, 0-d numpy values get double-wrapped.
+        info = {
+            k: v.item() if isinstance(v, np.generic) else v
+            for k, v in {"is_success": is_success, "step_count": self.robot_server._step_count, **metrics}.items()
+        }
         return self._to_gym_obs(raw_obs), reward, terminated, truncated, info
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
-        """Reset the environment."""
+        """Reset the environment.
+
+        In EVAL_BENCHMARK mode, advances to the next pre-recorded episode scenario
+        instead of performing a random reset.
+        """
         super().reset(seed=seed)
-        raw_obs, info = self.robot_server.reset(seed=seed, options=options)
+        raw_obs, info = self.robot_server._handle_reset()
         return self._to_gym_obs(raw_obs), info
 
     def render(self) -> Optional[np.ndarray]:
@@ -263,6 +272,7 @@ def make_single_env(
     cfg: Optional[Dict[str, Any]] = None,
     render_mode: Optional[str] = None,
     port: Optional[int] = None,
+    serve_mode: Optional['PybulletRobotServerBase.SERVE_MODES'] = None,
 ) -> SplatSimGymEnv:
     """Create a single SplatSim Gym environment.
 
@@ -271,6 +281,9 @@ def make_single_env(
         cfg: Configuration dict passed to robot server constructor.
         render_mode: 'rgb_array' or None
         port: ZMQ server port. If None, auto-assigns a unique port.
+        serve_mode: The serve mode to start the robot server in. Defaults to INTERACTIVE.
+            Pass EVAL_BENCHMARK to run headless eval against a pre-recorded dataset
+            (set cfg["eval_benchmark_repo_id"] to specify the LeRobot dataset repo).
 
     Returns:
         SplatSimGymEnv instance
@@ -292,10 +305,22 @@ def make_single_env(
     if port is None:
         cfg["port"] = _get_next_port()
 
+    if serve_mode is None:
+        if cfg.get("eval_benchmark_repo_id"):
+            serve_mode = PybulletRobotServerBase.SERVE_MODES.EVAL_BENCHMARK
+        else:
+            serve_mode = PybulletRobotServerBase.SERVE_MODES.INTERACTIVE
+
     robot_server = robot_server_cls(
-        serve_mode=PybulletRobotServerBase.SERVE_MODES.INTERACTIVE,
+        serve_mode=serve_mode,
         **cfg
     )
+
+    # For modes that require initialization (e.g. loading a dataset), trigger _enter_mode
+    # explicitly since the serve() loop (which normally detects mode transitions) isn't used
+    # when running headless via the gym interface.
+    if serve_mode == PybulletRobotServerBase.SERVE_MODES.EVAL_BENCHMARK:
+        robot_server._enter_mode(serve_mode)
 
     # Wrap in Gym interface
     return SplatSimGymEnv(robot_server, render_mode=render_mode)
@@ -356,7 +381,10 @@ def make_env(
             env_idx += 1
 
         # Create vectorized environment
-        vec_env = VecEnvCls(env_fns)
+        # Disable auto-reset so Gymnasium doesn't reset on the step after termination.
+        # The eval loop (lerobot) calls env.reset() explicitly between episodes.
+        vec_env_kwargs = {"autoreset_mode": "Disabled"} if not use_async_envs else {}
+        vec_env = VecEnvCls(env_fns, **vec_env_kwargs)
 
         result[env_name] = {0: vec_env}
 

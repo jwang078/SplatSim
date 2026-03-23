@@ -92,6 +92,11 @@ class ObjectConfig(ABC):
     current_quat: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 1.0])
     current_scale: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
 
+    # Initial state — snapshotted at episode start after randomization
+    initial_position: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    initial_quat: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 1.0])
+    initial_scale: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
+
 
     _YAML_CACHE: Optional[Dict[str, Any]] = None
     _OBJECT_CONFIG_PATH: Path = _SPLATSIM_ROOT / "configs/object_configs/objects.yaml"

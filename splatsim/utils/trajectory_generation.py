@@ -1,6 +1,7 @@
 import numpy as np
 import zarr
 import os
+import time
 import re
 import json
 from typing import Optional, Tuple, List
@@ -247,7 +248,8 @@ class TrajectoryGenerator:
                 - "zarr_group": zarr.Group reference for saving images later
             Returns None if planning failed.
         """
-        self._init_zarr_storage()
+        if self.config.save_zarr:
+            self._init_zarr_storage()
 
         q_start, all_q_goals = self._get_start_and_goal_qs()
         if q_start is None or len(all_q_goals) == 0:
@@ -258,6 +260,28 @@ class TrajectoryGenerator:
         if result is None:
             return None  # Failed, will retry next iteration
         base_traj, q_goal = result
+
+        # Apply ruckig time-parametrization once on the final trajectory.
+        dof = len(self.joint_indices)
+        tries = 0
+        max_tries = 5
+        while tries < max_tries:
+            try:
+                base_traj = rrt_path_utils.ruckig_parametrize_path(
+                    base_traj,
+                    max_joint_vel=np.full(dof, 0.5),
+                    max_joint_acc=np.full(dof, 1.0),
+                    max_joint_jerk=np.full(dof, 10.0),
+                    control_hz=self.config.robot_update_rate,
+                )
+                break
+            except Exception as e:
+                tries += 1
+                print(f"Ruckig path smoothing failed with exception {e}")
+                print(f"Retry {tries} / {max_tries}")
+                if tries >= max_tries:
+                    raise RuntimeError(f"Ruckig path smoothing failed after {max_tries} attempts: {e}")
+                time.sleep(10)
 
         # Debug visualization: show the chosen start/goal then play back the trajectory
         if self.config.debug_visualize:
@@ -287,7 +311,7 @@ class TrajectoryGenerator:
             obstacle_info = {"obstacles": []}
             zarr_group = self._save_trajectory_zarr(
                 base_traj, self.trajectory_count, 0, 0, obstacle_info
-            )
+            ) if self.config.save_zarr else None
             results.append({
                 "joint_positions": base_traj,
                 "obstacle_info": obstacle_info,
@@ -325,7 +349,7 @@ class TrajectoryGenerator:
                             obstacle_i,
                             path_i,
                             obstacle_info,
-                        )
+                        ) if self.config.save_zarr else None
                         results.append({
                             "joint_positions": modified_traj,
                             "obstacle_info": obstacle_info,
