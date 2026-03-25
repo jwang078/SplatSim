@@ -82,6 +82,14 @@ from lerobot.datasets.transforms import ImageTransformsConfig, ImageTransformCon
 from pathlib import Path
 
 from splatsim.utils.paths import SPLATSIM_ROOT, resolve_splatsim_path  # noqa: F401
+from splatsim.utils.lerobot_utils import (
+    build_lerobot_features,
+    build_lerobot_frame,
+    create_lerobot_dataset,
+    finalize_lerobot_dataset,
+    load_lerobot_dataset,
+    push_lerobot_to_hub,
+)
 
 
 def resize_image(img: np.ndarray, output_size: Tuple[int, int], mode: 'ImageResizeMode') -> np.ndarray:
@@ -153,7 +161,7 @@ class ZMQRobotServer:
                 elif method == "get_ee_pos":
                     result = self._robot.get_current_ee_pose()
                 elif method == "command_joint_state":
-                    result = self._robot.command_joint_state(**args)
+                    result = self._robot.command_joint_state(self._robot.splatsim_robot, **args)
                 elif method == "set_policy_guidance_action":
                     with self._policy_guidance_lock:
                         self._policy_guidance_action = args["joint_state"]
@@ -181,7 +189,8 @@ class ZMQRobotServer:
                 elif method == "enable_rendering":
                     result = self._robot.enable_rendering()
                 elif method == "reset":
-                    obs, info = self._robot.reset(**args)
+                    # TODO rename stuff so that this handle reset is truly just reset
+                    obs, info = self._robot._handle_reset(**args)
                     with self._policy_guidance_lock:
                         if self._policy_guidance_action is not None:
                             obs["policy_guidance_action"] = self._policy_guidance_action.copy()
@@ -405,7 +414,6 @@ class PybulletRobotServerBase:
 
         # For plane.urdf
         self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
-
 
         # TODO this mock class fails for the apple on plate task, etc
         class MockModelsLib:
@@ -882,16 +890,12 @@ class PybulletRobotServerBase:
                 force=150,
                 maxVelocity=3.14,
             )
+        self.command_joint_state(splatsim_obj, np.array(joint_state))
 
-    def command_joint_state(self, joint_state: np.ndarray) -> None:
-        assert len(joint_state) == self.num_dofs() + 1, (
-            f"Expected joint state of length {self.num_dofs() + 1}, "
-            f"got {len(joint_state)}."
-        )
-
-        for i in range(0, self.num_dofs()):
+    def command_joint_state(self, splatsim_obj: SplatSimObject, joint_state: np.ndarray) -> None:
+        for i in range(0, len(joint_state)):
             self.pybullet_client.setJointMotorControl2(
-                self.splatsim_robot.sim_id,
+                splatsim_obj.sim_id,
                 i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
                 p.POSITION_CONTROL,
                 targetPosition=joint_state[i],
@@ -900,9 +904,9 @@ class PybulletRobotServerBase:
                 maxVelocity=3.14,
             )
 
-        if self.use_gripper:
-            self.move_gripper((1 - joint_state[-1]) * 0.085)
-            self.current_gripper_action = joint_state[-1]
+        if splatsim_obj.config.name == "robot" and self.use_gripper:
+            self.move_gripper((1 - joint_state[self.num_dofs()]) * 0.085)
+            self.current_gripper_action = joint_state[self.num_dofs()]
 
     def freedrive_enabled(self) -> bool:
         return True
@@ -1770,6 +1774,7 @@ class PybulletRobotServerBase:
         if robot_cfg is not None:
             initial_joints = robot_cfg["articulation_config"]["initial_joint_positions"]
             self.teleport_joint_state(self.splatsim_robot, initial_joints)
+            # self.command_joint_state(self.splatsim_robot, np.concatenate([initial_joints[:self.num_dofs()], [0]]))
 
         # Build a name→object lookup for the live scene objects
         obj_by_name = {obj.config.name: obj for obj in self.splatsim_objects}
@@ -1818,6 +1823,13 @@ class PybulletRobotServerBase:
             splatsim_obj.config.current_quat = list(quat)
             splatsim_obj.config.initial_position = list(pos)
             splatsim_obj.config.initial_quat = list(quat)
+
+        # print("restored state. now doing step simulation")
+        # # TODO does this help
+        # for _ in range(100000):
+        #     self.pybullet_client.stepSimulation()
+        # print("step simulation done")
+        
 
     def randomize_ee_pose(self, max_attempts=100) -> Optional[Tuple[float, ...]]:
         # generating random initial joint state using random end effector position and orientation
@@ -2052,6 +2064,7 @@ class PybulletRobotServerBase:
             if repo_id is None:
                 raise ValueError(f"Could not find repo id for eval benchmark mode out of {gui_repo_id} and {self._eval_benchmark_repo_id}")
             self._eval_benchmark_episode_index = -1
+            self._splatsim_gui.set_status(f"Loading repo_id {repo_id}")
             self._init_lerobot_dataset(repo_id)
             if self._lerobot_saver is not None:
                 total = self._lerobot_saver.meta.total_episodes
@@ -2069,7 +2082,8 @@ class PybulletRobotServerBase:
     def _exit_mode(self, mode: 'PybulletRobotServerBase.SERVE_MODES'):
         """Called when exiting a serve mode. Override in subclasses for custom behavior."""
         if mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
-            self._finalize_lerobot_dataset()
+            traj_config = self.trajectory_generator.config
+            self._finalize_lerobot_dataset(push_to_hub=traj_config.push_to_hub)
         elif mode == self.SERVE_MODES.EVAL_BENCHMARK:
             self._lerobot_saver = None
             self._eval_benchmark_episode_index = -1
@@ -2105,7 +2119,8 @@ class PybulletRobotServerBase:
             self._splatsim_gui.set_eval_episode_index(episode_index)
         metrics = self.check_metrics() if hasattr(self, "check_metrics") else {}
         info = {"is_success": metrics.get("is_success", False), **metrics}
-        return self.get_observations(), info
+        obs = self.get_observations()
+        return obs, info
 
     def _eval_benchmark_prev_episode(self):
         """Go back to the previous episode and restore its scenario (GUI Prev button only)."""
@@ -2142,42 +2157,22 @@ class PybulletRobotServerBase:
     # LeRobot Dataset Lifecycle
     # =========================================================================
 
-    def _create_lerobot_dataset(self, repo_id: str) -> LeRobotDataset:
-        """Create a fresh LeRobot dataset with the standard features."""
-        traj_config = self.trajectory_generator.config
-        return LeRobotDataset.create(
-            repo_id=repo_id,
-            fps=traj_config.robot_update_rate,
-            robot_type="lerobot_splatsim",
-            use_videos=True,
-            features={
-                **{
-                    f"observation.images.{cam}_{mode.value}": {
-                        "dtype": "image",
-                        "shape": (3, 224, 224),
-                        "names": ["channels", "height", "width"],
-                    }
-                    for cam in self.camera_names
-                    for mode in self.image_resize_modes
-                },
-                "observation.state": {
-                    "dtype": "float32",
-                    "shape": (self.num_dofs() + 1,),
-                    "names": [
-                        "joint_1", "joint_2", "joint_3",
-                        "joint_4", "joint_5", "joint_6", "gripper",
-                    ],
-                },
-                "action": {
-                    "dtype": "float32",
-                    "shape": (self.num_dofs() + 1,),
-                    "names": [
-                        "joint_1", "joint_2", "joint_3",
-                        "joint_4", "joint_5", "joint_6", "gripper",
-                    ],
-                },
-            },
-        )
+    def _create_lerobot_dataset(
+        self,
+        repo_id: str,
+        fps: Optional[int] = None,
+        image_keys: Optional[List[str]] = None,
+    ) -> LeRobotDataset:
+        """Create a fresh LeRobot dataset, defaulting fps/image_keys from instance config."""
+        if fps is None:
+            fps = self.trajectory_generator.config.robot_update_rate
+        if image_keys is None:
+            image_keys = [
+                f"{cam}_{mode.value}"
+                for cam in self.camera_names
+                for mode in self.image_resize_modes
+            ]
+        return create_lerobot_dataset(repo_id, fps, image_keys, self.num_dofs())
 
     def _init_lerobot_dataset(self, repo_id: str):
         """Initialize or load a LeRobot dataset by repo_id."""
@@ -2186,73 +2181,21 @@ class PybulletRobotServerBase:
             self._lerobot_saver = None
             return
 
-        local_dir = os.path.expanduser(f"~/.cache/huggingface/lerobot/{repo_id}")
+        self._lerobot_saver = load_lerobot_dataset(repo_id)
 
-        if os.path.exists(local_dir):
-            print(f"[LeRobot] Found existing dataset at {local_dir}, attempting to load...")
-            try:
-                self._lerobot_saver = LeRobotDataset(repo_id)
-                print(f"[LeRobot] Successfully loaded existing dataset ({self._lerobot_saver.meta.total_episodes} episodes).")
-                return
-            except Exception as e:
-                print(f"[LeRobot] WARNING: Failed to load existing dataset: {e}")
-                print(f"[LeRobot] Removing corrupt local cache at {local_dir}.")
-                shutil.rmtree(local_dir)
-
-        # Try loading from hub (will download if available), otherwise create fresh
-        print(f"[LeRobot] Attempting to load dataset from hub: {repo_id}")
-        try:
-            self._lerobot_saver = LeRobotDataset(repo_id)
-            print(f"[LeRobot] Successfully loaded dataset from hub ({self._lerobot_saver.meta.total_episodes} episodes).")
-        except Exception as e:
-            print(f"[LeRobot] Dataset not found on hub ({e}), creating fresh dataset.")
-            # LeRobotDataset() may have partially created the local dir before failing — clean it up
-            if os.path.exists(local_dir):
-                shutil.rmtree(local_dir)
+        if self._lerobot_saver is None:
+            print(f"[LeRobot] Creating fresh dataset for {repo_id}")
             self._lerobot_saver = self._create_lerobot_dataset(repo_id)
 
-    def _finalize_lerobot_dataset(self):
+    def _finalize_lerobot_dataset(self, push_to_hub: bool = False):
         """Finalize and optionally push the LeRobot dataset."""
         if self._lerobot_saver is None:
             return
-
         print("[LeRobot] Finalizing dataset...")
-        # Discard any partial episode that was in-progress at crash time
-        try:
-            self._lerobot_saver.clear_episode_buffer()
-        except Exception:
-            pass
-        self._lerobot_saver.finalize()
-
-        traj_config = self.trajectory_generator.config
-        if traj_config.push_to_hub:
-            self._push_lerobot_to_hub()
-
+        finalize_lerobot_dataset(self._lerobot_saver)
+        if push_to_hub:
+            push_lerobot_to_hub(self._lerobot_saver)
         self._lerobot_saver = None
-
-    def _push_lerobot_to_hub(self):
-        """Push the LeRobot dataset to hub, retrying with user input on failure.
-
-        Loops until either:
-        - push_to_hub() succeeds
-        - the user enters an empty string to skip
-        """
-        while True:
-            repo_id = self._lerobot_saver.repo_id
-            print(f"[LeRobot] Pushing dataset to hub as '{repo_id}'...")
-            try:
-                self._lerobot_saver.push_to_hub()
-                print(f"[LeRobot] Successfully pushed to hub as '{repo_id}'.")
-                return
-            except Exception as e:
-                print(f"[LeRobot] ERROR: Failed to push to hub: {e}")
-                print("[LeRobot] Repo ID should be in 'username/dataset_name' format.")
-                print("[LeRobot] Make sure you are authenticated with `huggingface-cli login`.")
-                new_repo_id = input("[LeRobot] Enter a new repo_id to retry (or press Enter to skip): ").strip()
-                if not new_repo_id:
-                    print("[LeRobot] Skipping push to hub. Dataset is saved locally.")
-                    return
-                self._lerobot_saver.repo_id = new_repo_id
 
     # =========================================================================
     # Scene State Save / Restore
@@ -2321,6 +2264,28 @@ class PybulletRobotServerBase:
             self._restore_scene_state(scene_state)
             self._render_and_save_episode(episode)
 
+    def _get_splatsim_episode_metadata(self) -> dict:
+        """Build the splatsim-specific episode metadata dict for LeRobot save_episode().
+
+        Contains JSON-serialisable configs for the robot, background, and all
+        non-robot/non-background objects currently in the scene.
+        """
+        def _config_to_dict(cfg):
+            d = asdict(cfg)
+            return json.loads(json.dumps(d, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
+
+        return {
+            "splatsim_robot_config": _config_to_dict(self.splatsim_robot.config),
+            "splatsim_background_config": (
+                _config_to_dict(self.splatsim_background.config)
+                if self.splatsim_background is not None else None
+            ),
+            "splatsim_object_configs": [
+                _config_to_dict(obj.config) for obj in self.splatsim_objects
+                if obj is not self.splatsim_robot and obj is not self.splatsim_background
+            ],
+        }
+
     def _render_and_save_episode(self, episode: dict):
         """Step through a trajectory using motor control, render images, save frames to LeRobot + Zarr.
 
@@ -2381,32 +2346,23 @@ class PybulletRobotServerBase:
             action_7[:len(q)] = q
 
             # Command the robot and step the physics simulation
-            self.command_joint_state(action_7)
+            self.command_joint_state(self.splatsim_robot, action_7)
             for _ in range(self._physics_steps_per_action):
                 self.pybullet_client.stepSimulation()
 
             # Read back the actual post-physics joint state
             obs = self.get_observations()
-            actual_joints = obs["joint_positions"]  # raw PyBullet readback, length >= 7
-
-            # Pad to 7 DOF (6 joints + gripper)
-            state_7 = np.zeros(self.num_dofs() + 1, dtype=np.float32)
-            state_7[:6] = actual_joints[:6]
-            state_7[6] = obs.get("gripper_position", [0.0])[0]
 
             # Save to LeRobot dataset
             if self._lerobot_saver is not None:
-                frame = {
-                    "observation.state": state_7,
-                    "action": action_7,
-                    "task": self.get_task_description(),
-                }
-                for cam in self.camera_names:
-                    for mode in self.image_resize_modes:
-                        key = f"{cam}_{mode.value}"
-                        if obs.get(key) is not None:
-                            frame[f"observation.images.{key}"] = obs[key]
-                self._lerobot_saver.add_frame(frame)
+                image_keys = [
+                    f"{cam}_{mode.value}"
+                    for cam in self.camera_names
+                    for mode in self.image_resize_modes
+                ]
+                self._lerobot_saver.add_frame(
+                    build_lerobot_frame(action_7, obs, image_keys, task=self.get_task_description())
+                )
 
             # Collect images for Zarr saving
             for cam in self.camera_names:
@@ -2421,20 +2377,7 @@ class PybulletRobotServerBase:
 
         # Save episode to LeRobot (skip partial episodes from early stop)
         if not stopped_early and self._lerobot_saver is not None:
-            def _config_to_dict(cfg):
-                """Serialize an ObjectConfig to a JSON-safe dict, converting numpy arrays to lists."""
-                d = asdict(cfg)
-                return json.loads(json.dumps(d, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
-
-            splatsim_metadata = {
-                "splatsim_robot_config": _config_to_dict(self.splatsim_robot.config),
-                "splatsim_background_config": _config_to_dict(self.splatsim_background.config) if self.splatsim_background is not None else None,
-                "splatsim_object_configs": [
-                    _config_to_dict(obj.config) for obj in self.splatsim_objects
-                    if obj is not self.splatsim_robot and obj is not self.splatsim_background
-                ],
-            }
-            self._lerobot_saver.save_episode(episode_metadata=splatsim_metadata)
+            self._lerobot_saver.save_episode(episode_metadata=self._get_splatsim_episode_metadata())
 
         # Save images to Zarr (save even if partial — zarr is more forgiving)
         if zarr_group is not None:
@@ -2449,7 +2392,7 @@ class PybulletRobotServerBase:
         for obstacle_name in loaded_obstacle_names:
             self.delete_object(obstacle_name)
 
-    def _handle_reset(self):
+    def _handle_reset(self, seed=None, options=None):
         """Unified reset entry point for serve() loop and ZMQ server.
 
         In EVAL_BENCHMARK mode, advances to the next episode instead of calling
@@ -2460,7 +2403,7 @@ class PybulletRobotServerBase:
         if self.serve_mode == self.SERVE_MODES.EVAL_BENCHMARK:
             return self._eval_benchmark_next_episode()
         else:
-            return self.reset()
+            return self.reset(seed=seed, options=options)
 
     def serve(self) -> None:
         self.reset()
@@ -2543,8 +2486,14 @@ class PybulletRobotServerBase:
                         self._eval_benchmark_next_episode()
                     if self._splatsim_gui.check_button(EvalBenchmarkModePanel.BTN_PREV):
                         self._eval_benchmark_prev_episode()
+                    # Read and immediately consume the dropdown value. We must
+                    # reset it to "—" after reading so that programmatic updates
+                    # from set_eval_episode_index() (called by _eval_benchmark_next_episode
+                    # and _eval_benchmark_goto_episode) don't get re-read by this
+                    # loop as a new user selection, causing duplicate restore calls.
                     selected = self._splatsim_gui.get_value(EvalBenchmarkModePanel.EPISODE_SELECT_KEY)
                     if selected is not None and selected != "—":
+                        self._splatsim_gui.set_value(EvalBenchmarkModePanel.EPISODE_SELECT_KEY, "—")
                         try:
                             episode_id = int(selected)
                             if episode_id in self._eval_benchmark_subset:
@@ -3051,7 +3000,7 @@ class PybulletRobotServerBase:
         """Apply action and advance the physics simulation by one control step."""
         assert self._episode_started, "Must call reset() before step()"
 
-        self.command_joint_state(action)
+        self.command_joint_state(self.splatsim_robot, action)
 
         for _ in range(self._physics_steps_per_action):
             self.pybullet_client.stepSimulation()

@@ -9,9 +9,14 @@ import numpy as np
 import tyro
 import termcolor
 
-import os
 
-from splatsim.utils.image_utils import letterbox
+from splatsim.utils.lerobot_utils import (
+    build_lerobot_frame,
+    create_lerobot_dataset,
+    finalize_lerobot_dataset,
+    load_lerobot_dataset,
+    push_lerobot_to_hub,
+)
 
 
 from splatsim.agents.agent import BimanualAgent, DummyAgent
@@ -22,7 +27,6 @@ from splatsim.robots.robot import PrintRobot
 from gello.zmq_core.robot_node import ZMQClientRobot
 from gello.zmq_core.camera_node import ZMQClientCamera
 from splatsim.utils.agent_state_utils import AGENT_STATE
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig, ImageTransformConfig
 
 
@@ -58,6 +62,7 @@ class Args:
 
     save_lerobot_dataset: bool = False
     lerobot_dataset_repo_id_base: str = "JennyWWW/splatsim_lerobot_dataset"
+    save_lerobot_dataset_on_interrupt: bool = False
 
 
 def main(args):
@@ -415,69 +420,26 @@ def main(args):
     if args.use_save_interface:
         kb_interface = KBReset()
 
+    lerobot_saver = None
     if args.save_lerobot_dataset:
-        # Get *_rgb keys from obs
-        image_keys = [key for key in obs.keys() if key.endswith("_rgb")]
+        # Detect image keys from obs: any 3-D numpy array (C, H, W).
+        # Sim obs already has pre-resized keys like "base_rgb_letterbox";
+        # real-robot wrappers may expose "base_rgb" (raw) — both work here.
+        image_keys = [k for k, v in obs.items() if isinstance(v, np.ndarray) and v.ndim == 3]
         print(f"Saving {len(image_keys)} image keys in observation to lerobot dataset:", image_keys)
 
         dataset_repo_id = f"{args.lerobot_dataset_repo_id_base}"
         print(f"Saving to LeRobot dataset with repo ID: {dataset_repo_id}")
 
-        # Standard LeRobot cache path
-        local_dir = os.path.expanduser(f"~/.cache/huggingface/lerobot/{dataset_repo_id}")
-
-        if os.path.exists(local_dir):
-            print(f"Appending to existing LeRobot dataset at {local_dir}")
-            lerobot_saver = LeRobotDataset(dataset_repo_id) #, root=local_dir)
-        else:
-            print(f"Creating new LeRobot dataset at {local_dir}")
-            lerobot_saver = LeRobotDataset.create(
-                repo_id=dataset_repo_id,
-                fps=50,
-                robot_type="lerobot_splatsim",
-                use_videos=True,
-                features={
-                     # All images are resized + letterboxed to 224x224 for the VLM in PI05
-                    **{
-                        f"observation.images.{key}": {
-                            "dtype": "image",
-                            "shape": (3, 224, 224),
-                            "names": ["channels", "height", "width"],
-                        }
-                        for key in image_keys
-                    },
-                    "observation.state": {
-                        "dtype": "float32",
-                        "shape": (7,),
-                        "names": [
-                            "joint_1",
-                            "joint_2",
-                            "joint_3",
-                            "joint_4",
-                            "joint_5",
-                            "joint_6",
-                            "gripper",
-                        ],
-                    },
-                    "action": {
-                        "dtype": "float32",
-                        "shape": (7,),
-                        "names": [
-                            "joint_1",
-                            "joint_2",
-                            "joint_3",
-                            "joint_4",
-                            "joint_5",
-                            "joint_6",
-                            "gripper",
-                        ],
-                    },
-                },
-            )
+        lerobot_saver = load_lerobot_dataset(dataset_repo_id)
+        if lerobot_saver is None:
+            print(f"Creating new LeRobot dataset: {dataset_repo_id}")
+            lerobot_saver = create_lerobot_dataset(dataset_repo_id, fps=30, image_keys=image_keys, num_dofs=6)
 
     print_color("\nStart 🚀🚀🚀", color="green", attrs=("bold",))
 
     save_path = None
+    interrupted = False
     start_time = time.time()
     started_executing_traj = False
     try:
@@ -498,18 +460,8 @@ def main(args):
             if getattr(agent, 'state', AGENT_STATE.UNKNOWN) == AGENT_STATE.EXECUTING_TRAJ:
                 started_executing_traj = True
 
-            if getattr(agent, 'state', AGENT_STATE.EXECUTING_TRAJ) == AGENT_STATE.EXECUTING_TRAJ and args.save_lerobot_dataset and obs is not None:
-                # We save the obs and the action that was generated from it
-                lerobot_saver.add_frame({
-                    # images are (c, h, w) format
-                    **{f"observation.images.{key}": letterbox(obs[key], (224, 224)) for key in image_keys},
-                    "observation.state": obs["joint_positions"].astype(np.float32),
-                    "action": action.astype(np.float32),
-                    "task": "", # TODO this is probably more necessary if there are multiple tasks
-                })
-
             if getattr(agent, 'state', AGENT_STATE.UNKNOWN) == AGENT_STATE.SETTLING and started_executing_traj:
-                if args.save_lerobot_dataset:
+                if lerobot_saver is not None:
                     lerobot_saver.save_episode()
                     print("In run env sim saving episode")
                 started_executing_traj = False
@@ -553,23 +505,33 @@ def main(args):
                 if flag:
                     action = action[:-1]
                 obs = env.step(action)
+                # Save frame after step: state = post-physics obs (matches traj-gen convention)
+                if getattr(agent, 'state', AGENT_STATE.UNKNOWN) == AGENT_STATE.EXECUTING_TRAJ and lerobot_saver is not None and action is not None:
+                    try:
+                        task = robot_client.get_task_description()
+                    except Exception:
+                        task = ""
+                    lerobot_saver.add_frame(build_lerobot_frame(action, obs, image_keys, task=task))
 
             loop_end = time.time()
             loop_duration = loop_end - loop_start
             # Keep the time locked at a fixed rate
-            sleep_time = max(0, (1 / 50) - (loop_duration))
+            sleep_time = max(0, (1 / 30) - (loop_duration))
             if sleep_time > 0:
                 time.sleep(sleep_time)
     except KeyboardInterrupt:
+        interrupted = True
         print_color("\nStopping run_env_sim.py", color="red", attrs=("bold",))
     finally:
-        if args.save_lerobot_dataset:
-            # TODO it's possible the last episode of a successful replay isn't saved
-            print("Finalizing lerobot_saver...")
-            lerobot_saver.finalize()
-            print("Pushing to hub...")
-            lerobot_saver.push_to_hub()
-            print("Done!")
+        if lerobot_saver is not None:
+            if started_executing_traj and args.save_lerobot_dataset_on_interrupt:
+                print("Saving in-progress episode...")
+                lerobot_saver.save_episode()
+            finalize_lerobot_dataset(lerobot_saver)
+            if args.save_lerobot_dataset_on_interrupt:
+                push_lerobot_to_hub(lerobot_saver)
+        else:
+            print("lerobot_saver is not initialized, so not pushing to hub")
 
 
 if __name__ == "__main__":

@@ -255,6 +255,11 @@ def play_video(df: pd.DataFrame, episodes: list[int] | None = None, fps: int = 3
             frame_idx += 1
             frame_pbar.update(1)
             continue
+        elif key == ord('b') and paused and frame_idx > 0:
+            frame_idx -= 1
+            frame_pbar.n = max(frame_pbar.n - 1, 0)
+            frame_pbar.refresh()
+            continue
 
         if not paused:
             frame_idx += 1
