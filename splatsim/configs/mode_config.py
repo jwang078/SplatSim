@@ -35,7 +35,7 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     max_fails: int = 2
     max_obstacle_fails_per_base_traj: int = 20
     time_per_traj: float = 6.0
-    robot_update_rate: int = 20
+    robot_update_rate: int = 30
     rrt_vis_fps: int = 10
     use_obstacles: bool = True
     q_start: Optional[List[float] | np.ndarray] = None
@@ -90,3 +90,4 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
 class EvalBenchmarkModeConfig(SplatSimModeConfig):
     """Configuration for eval benchmark mode."""
     lerobot_repo_id: str = ""
+    episode_subset_str: str = ""  # Comma-separated episode indices, e.g. "3,8,23" or "[3,8,23]". Blank = all.

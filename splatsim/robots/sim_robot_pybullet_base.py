@@ -262,6 +262,10 @@ class SplatSimCamera:
     pipeline: Optional[PipelineParams]
     background: Optional[torch.tensor]
     tracked_link_index: Optional[str] = None
+    # Fisheye rendering via gsplat
+    camera_model: str = "pinhole"  # "pinhole" or "fisheye"
+    intrinsic_matrix: Optional[torch.Tensor] = None  # [3,3] fisheye K on CUDA
+    radial_coeffs: Optional[torch.Tensor] = None  # [4] (k1,k2,k3,k4) on CUDA
 
 
 class PybulletRobotServerBase:
@@ -293,6 +297,13 @@ class PybulletRobotServerBase:
 
     # This is the default splat name. Overwrite it in a child class of PybulletRobotServerBase
     background_splat_name = None
+
+    # COLMAP PINHOLE (undistorted sparse), camera_id=3 — intrinsics only; no wrist splat folder needed.
+    wrist_colmap_camera_id = 3
+    wrist_colmap_width = 943
+    wrist_colmap_height = 530
+    wrist_colmap_fx = 509.5795213749339
+    wrist_colmap_fy = 509.5795213749339
 
     # Enum for serve modes
     class SERVE_MODES(enum.Enum):
@@ -490,10 +501,11 @@ class PybulletRobotServerBase:
         )
 
         if "wrist_rgb" in self.camera_names:
-            # TODO Hardcoding a splat dataset / recovered camera from a GoPro
-            self.wrist_camera = self.setup_camera_from_dataset(
-                SplatObjectConfig(name="wrist_cam_load", splat_name="bwa_open_space"),
-                cam_i=3, use_train=True
+            # Intrinsics from COLMAP cameras.txt (PINHOLE id=3); pose comes from get_wrist_camera().
+            self.wrist_camera = SplatSimCamera(
+                camera=None,
+                pipeline=self.base_camera.pipeline,
+                background=self.base_camera.background,
             )
         else:
             # Make a dummy camera
@@ -957,22 +969,42 @@ class PybulletRobotServerBase:
 
         T_wc = -R_cw.T @ T_cw
 
-        # TODO is this needed?
         resolution = (
             self.base_camera.camera.image_width,
-            self.base_camera.camera.image_height,
+            self.base_camera.camera.image_height
         )
 
-        colmap_id = 0
+        # w0 = self.wrist_colmap_width
+        # h0 = self.wrist_colmap_height
+        # if self.image_width is None:
+        #     if self.image_height is None:
+        #         image_width = w0
+        #         image_height = h0
+        #     else:
+        #         image_width = int(w0 * self.image_height / h0)
+        #         image_height = self.image_height
+        # else:
+        #     if self.image_height is None:
+        #         image_width = self.image_width
+        #         image_height = int(h0 * self.image_width / w0)
+        #     else:
+        #         image_width = self.image_width
+        #         image_height = self.image_height
+
+        # resolution = (image_width, image_height)
+        # fx = self.wrist_colmap_fx * (image_width / w0)
+        # fy = self.wrist_colmap_fy * (image_height / h0)
+        # fovx = 2 * math.atan(image_width / (2 * fx))
+        # fovy = 2 * math.atan(image_height / (2 * fy))
+        fovx = self.base_camera.camera.FoVx
+        fovy = 2 * np.atan(np.tan(self.base_camera.camera.FoVy / 2))
+
+        colmap_id = self.wrist_colmap_camera_id
         uid = 0
         depth_params = None
         invdepthmap = None
         image_name = "wrist_camera"
         image = torch.zeros((3, resolution[0], resolution[1]), dtype=torch.float32)
-
-        fov_scale_x = 1
-        fovx = self.base_camera.camera.FoVx * fov_scale_x
-        fovy = 2 * np.atan(np.tan(self.base_camera.camera.FoVy / 2) * fov_scale_x)
 
         camera = Camera(
             resolution,
@@ -989,10 +1021,26 @@ class PybulletRobotServerBase:
             scale=1,  # scale
         )
 
+        # TODO calibrate fisheye camera for wrist cam
+        # # Nominal GoPro fisheye intrinsics (replace with real calibration values)
+        # W = self.base_camera.camera.image_width
+        # H = self.base_camera.camera.image_height
+        # fisheye_K = torch.tensor([
+        #     [600.0,   0.0, W / 2.0],
+        #     [  0.0, 600.0, H / 2.0],
+        #     [  0.0,   0.0,     1.0],
+        # ], dtype=torch.float32, device="cuda")
+        # fisheye_D = torch.tensor(
+        #     [0.0, 0.0, 0.0, 0.0], dtype=torch.float32, device="cuda"
+        # )
+
         splatsim_camera = SplatSimCamera(
             camera=camera,
             pipeline=self.base_camera.pipeline,
             background=self.base_camera.background,
+            camera_model="pinhole", #"fisheye",
+            # intrinsic_matrix=fisheye_K,
+            # radial_coeffs=fisheye_D,
         )
 
         return splatsim_camera
@@ -1249,9 +1297,15 @@ class PybulletRobotServerBase:
         else:
             raise ValueError(f"Unknown camera name {camera_name}")
 
-        rendering = render(
-            camera.camera, self.scene_gaussian, camera.pipeline, camera.background
-        )["render"].cpu().numpy()
+        if camera.camera_model == "fisheye":
+            from splatsim.rendering.gsplat_renderer import render_gsplat
+            rendering = render_gsplat(
+                camera, self.scene_gaussian
+            )["render"].cpu().numpy()
+        else:
+            rendering = render(
+                camera.camera, self.scene_gaussian, camera.pipeline, camera.background
+            )["render"].cpu().numpy()
         # If you index "depth" instead of "render", you get the depth image
 
         # save the image (always as numpy array)
@@ -1681,11 +1735,11 @@ class PybulletRobotServerBase:
         # Save and restore current pose so scale doesn't reset position/orientation
         if splatsim_obj.sim_id is not None:
             pos, quat = self.pybullet_client.getBasePositionAndOrientation(splatsim_obj.sim_id)
-            self.pybullet_client.removeBody(splatsim_obj.sim_id)
-            splatsim_obj.sim_id = None
+            old_sim_id = splatsim_obj.sim_id
             physics_scale = float(np.cbrt(np.prod(new_scale)))  # geometric mean for uniform physics approximation
             self.load_urdf(splatsim_obj, physics_scale=physics_scale)
             self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, pos, quat)
+            self.pybullet_client.removeBody(old_sim_id)
 
     def _objects_collide(self, obj_i: SplatSimObject, obj_j: SplatSimObject) -> bool:
         """Check collision between two objects.
@@ -1812,10 +1866,10 @@ class PybulletRobotServerBase:
                 splatsim_obj.config.initial_scale = target_scale.tolist()
                 physics_scale = float(np.cbrt(np.prod(target_scale)))
                 saved_pos, saved_quat = self.pybullet_client.getBasePositionAndOrientation(splatsim_obj.sim_id)
-                self.pybullet_client.removeBody(splatsim_obj.sim_id)
-                splatsim_obj.sim_id = None
+                old_sim_id = splatsim_obj.sim_id
                 self.load_urdf(splatsim_obj, physics_scale=physics_scale)
                 self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, saved_pos, saved_quat)
+                self.pybullet_client.removeBody(old_sim_id)
 
             # Restore pose
             self.pybullet_client.resetBasePositionAndOrientation(splatsim_obj.sim_id, pos, quat)
@@ -2066,12 +2120,19 @@ class PybulletRobotServerBase:
             self._eval_benchmark_episode_index = -1
             self._splatsim_gui.set_status(f"Loading repo_id {repo_id}")
             self._init_lerobot_dataset(repo_id)
+            # Parse episode subset from GUI config string (e.g. "3,8,23" or "[3,8,23]")
+            subset_str = ""
+            if self._splatsim_gui is not None:
+                subset_str = self._splatsim_gui._eval_config.episode_subset_str.strip()
+            if subset_str:
+                cleaned = subset_str.strip("[]")
+                self._eval_benchmark_subset = [int(x.strip()) for x in cleaned.split(",") if x.strip()]
             if self._lerobot_saver is not None:
                 total = self._lerobot_saver.meta.total_episodes
                 if self._eval_benchmark_subset is None:
                     self._eval_benchmark_subset = list(range(total))
                 if self._splatsim_gui is not None:
-                    self._splatsim_gui.set_status(f"Loaded {total} episodes")
+                    self._splatsim_gui.set_status(f"Loaded {len(self._eval_benchmark_subset)} / {total} episodes — ready (reset to start at episode 1)")
                     self._splatsim_gui.set_eval_episode_options(self._eval_benchmark_subset)
             else:
                 raise ValueError(f"self._lerobot_saver failed in initialization")
@@ -2123,10 +2184,20 @@ class PybulletRobotServerBase:
         return obs, info
 
     def _eval_benchmark_prev_episode(self):
-        """Go back to the previous episode and restore its scenario (GUI Prev button only)."""
-        if self._lerobot_saver is None or self._eval_benchmark_episode_index <= 0:
+        """Go back to the previous episode and restore its scenario (GUI Prev button only).
+
+        Allows stepping back to index -1 (the uninitialized state before episode 1),
+        so that the next reset() call will land on episode 1 rather than episode 2.
+        """
+        if self._lerobot_saver is None or self._eval_benchmark_episode_index < 0:
             return
         self._eval_benchmark_episode_index -= 1
+        if self._eval_benchmark_episode_index == -1:
+            if self._splatsim_gui is not None:
+                self._splatsim_gui.set_status(
+                    f"Ready — reset to start at episode 1 / {len(self._eval_benchmark_subset)}"
+                )
+            return
         episode_id = self._eval_benchmark_subset[self._eval_benchmark_episode_index]
         self.restore_episode_scenario(episode_id)
         if self._splatsim_gui is not None:

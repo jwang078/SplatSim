@@ -781,22 +781,36 @@ class EvalBenchmarkModePanel(ModePanel):
     BTN_LOAD = "eval_load_dataset"
     BTN_NEXT = "eval_next_episode"
     BTN_PREV = "eval_prev_episode"
+    BTN_SAVE_PRESET = "eval_save_preset"
     EPISODE_SELECT_KEY = "eval_episode_select"
+    PRESET_SELECT_KEY = "eval_preset_select"
+    PRESET_NAME_KEY = "eval_preset_name"
 
     def __init__(self):
         super().__init__()
         self._episode_var: Optional[tk.StringVar] = None
         self._episode_menu: Optional[ttk.Combobox] = None
+        self._preset_var: Optional[tk.StringVar] = None
+        self._preset_menu: Optional[ttk.Combobox] = None
+        self._preset_name_var: Optional[tk.StringVar] = None
+        # Cached presets so we can look up fields when user selects one
+        self._presets: list = []
 
     def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
               style: GuiStyle, config: SplatSimModeConfig) -> None:
+        from splatsim.utils.eval_benchmark_presets import load_presets
         assert isinstance(config, EvalBenchmarkModeConfig), \
             "Expected EvalBenchmarkModeConfig for EvalBenchmarkModePanel"
         builder = GuiBuilder(parent, gui, style)
 
+        # ── Dataset config ────────────────────────────────────────────────
         builder.add_str_param(
             StrParam("eval_benchmark.lerobot_repo_id", "LeRobot Repo ID (user/name)", "", width=25),
             config.lerobot_repo_id
+        )
+        builder.add_str_param(
+            StrParam("eval_benchmark.episode_subset_str", "Episode Subset (blank=all)", "", width=25),
+            config.episode_subset_str
         )
         builder.add_button_row([ButtonConfig("Load Dataset", self.BTN_LOAD)])
         builder.add_button_row([
@@ -816,6 +830,57 @@ class EvalBenchmarkModePanel(ModePanel):
         gui._values[self.EPISODE_SELECT_KEY] = self._episode_var
         builder._row += 1
 
+        # ── Preset section ────────────────────────────────────────────────
+        ttk.Separator(parent, orient="horizontal").grid(
+            row=builder.current_row, column=0, columnspan=2, sticky="ew", pady=6
+        )
+        builder._row += 1
+
+        ttk.Label(parent, text="── Presets ──").grid(
+            row=builder.current_row, column=0, columnspan=2, pady=2
+        )
+        builder._row += 1
+
+        # Load-preset dropdown
+        row = builder.current_row
+        ttk.Label(parent, text="Load Preset:").grid(row=row, column=0, sticky="w", pady=2)
+        self._presets = load_presets()
+        preset_names = ["—"] + [p.name for p in self._presets]
+        self._preset_var = tk.StringVar(value="—")
+        self._preset_menu = ttk.Combobox(
+            parent, textvariable=self._preset_var, values=preset_names, state="readonly", width=23
+        )
+        self._preset_menu.grid(row=row, column=1, sticky="ew", pady=2)
+        gui._values[self.PRESET_SELECT_KEY] = self._preset_var
+
+        preset_var = self._preset_var
+        def _on_preset_selected(event=None, _var=preset_var):
+            selected = _var.get()
+            if selected == "—":
+                return
+            preset = next((p for p in self._presets if p.name == selected), None)
+            if preset is None:
+                return
+            gui.set_value("eval_benchmark.lerobot_repo_id", preset.lerobot_repo_id)
+            gui.set_value("eval_benchmark.episode_subset_str", preset.episode_subset_str)
+            gui.set_value(self.PRESET_NAME_KEY, preset.name)
+
+        self._preset_menu.bind("<<ComboboxSelected>>", _on_preset_selected)
+        builder._row += 1
+
+        # Save-preset name field + button
+        row = builder.current_row
+        ttk.Label(parent, text="Preset Name:").grid(row=row, column=0, sticky="w", pady=2)
+        self._preset_name_var = tk.StringVar(value="")
+        font = (style.font_family, style.font_size)
+        ttk.Entry(parent, textvariable=self._preset_name_var, width=25, font=font).grid(
+            row=row, column=1, sticky="e", pady=2
+        )
+        gui._values[self.PRESET_NAME_KEY] = self._preset_name_var
+        builder._row += 1
+
+        builder.add_button_row([ButtonConfig("Save Preset", self.BTN_SAVE_PRESET)])
+
     def repopulate_episode_dropdown(self, episodes: List[int]) -> None:
         """Rebuild the episode combobox with the given episode IDs. Called after dataset loads."""
         if self._episode_menu is None or self._episode_var is None:
@@ -829,7 +894,15 @@ class EvalBenchmarkModePanel(ModePanel):
         if self._episode_var is not None:
             self._episode_var.set(str(episode_id))
 
+    def _refresh_preset_dropdown(self) -> None:
+        """Reload presets from disk and update the dropdown values."""
+        from splatsim.utils.eval_benchmark_presets import load_presets
+        self._presets = load_presets()
+        if self._preset_menu is not None:
+            self._preset_menu["values"] = ["—"] + [p.name for p in self._presets]
+
     def process_buttons(self, gui: 'SplatSimGui') -> None:
+        from splatsim.utils.eval_benchmark_presets import EvalBenchmarkPreset, save_preset
         load = gui.check_button(self.BTN_LOAD)
         if load:
             gui.save_to_config(gui._eval_config, prefix="eval_benchmark")
@@ -837,6 +910,18 @@ class EvalBenchmarkModePanel(ModePanel):
                 # Already in eval mode — force a reload by bouncing through idle
                 gui.set_mode("eval_benchmark_idle")
             gui.set_mode("eval_benchmark")
+
+        save = gui.check_button(self.BTN_SAVE_PRESET)
+        if save:
+            name = (gui.get_value(self.PRESET_NAME_KEY) or "").strip()
+            if not name:
+                gui.set_status("Preset name is empty — enter a name before saving.")
+                return
+            repo_id = gui.get_value("eval_benchmark.lerobot_repo_id") or ""
+            subset_str = gui.get_value("eval_benchmark.episode_subset_str") or ""
+            save_preset(EvalBenchmarkPreset(name=name, lerobot_repo_id=repo_id, episode_subset_str=subset_str))
+            self._refresh_preset_dropdown()
+            gui.set_status(f"Preset '{name}' saved.")
 
 
 # =============================================================================

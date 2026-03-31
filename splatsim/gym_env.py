@@ -394,10 +394,10 @@ def make_env(
 class _ZMQBackend:
     """Duck-typed adapter so ZMQSplatSimGymEnv can reuse SplatSimGymEnv unchanged."""
 
-    _max_episode_steps = 400
-
-    def __init__(self, client, camera_names, image_resize_modes, num_dofs, image_height, image_width):
+    def __init__(self, client, camera_names, image_resize_modes, num_dofs, image_height, image_width,
+                 max_episode_steps=400):
         self._client = client
+        self._max_episode_steps = max_episode_steps
         self._num_dofs = num_dofs
         self.camera_names = camera_names
         self.image_resize_modes = image_resize_modes
@@ -449,12 +449,13 @@ class ZMQSplatSimGymEnv(SplatSimGymEnv):
     """
 
     def __init__(self, host, port, camera_names, image_resize_modes,
-                 num_dofs=6, image_height=224, image_width=224, render_mode=None):
+                 num_dofs=6, image_height=224, image_width=224, render_mode=None, **kwargs):
         from gello.zmq_core.robot_node import ZMQClientRobot
 
         backend = _ZMQBackend(
             ZMQClientRobot(port=port, host=host),
             camera_names, image_resize_modes, num_dofs, image_height, image_width,
+            **kwargs,
         )
         super().__init__(robot_server=backend, render_mode=render_mode)  # type: ignore[arg-type]
 
