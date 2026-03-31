@@ -317,6 +317,190 @@ def list_episodes(parquet_folder: str):
     print(f"Available episodes: {sorted(ep_counts)}")
     for ep in sorted(ep_counts):
         print(f"  Episode {ep}: {ep_counts[ep]} frames")
+    print(f"Total frames: {sum(ep_counts.values())}")
+
+
+def state_stats(parquet_folder: str):
+    """Print per-dimension statistics for observation.state, including mean absolute velocity, acceleration, and jerk."""
+    import pyarrow.parquet as pq
+
+    parquet_files = sorted(glob.glob(os.path.join(parquet_folder, "*.parquet")))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in {parquet_folder}")
+
+    # Check if observation.state exists
+    sample = pq.read_table(parquet_files[0], columns=None).schema
+    col_names = [field.name for field in sample]
+    if "observation.state" not in col_names:
+        print("No 'observation.state' column found in dataset.")
+        return
+
+    all_states = []
+    all_episodes = []
+    all_frames = []
+    for f in parquet_files:
+        cols = ["episode_index", "frame_index", "observation.state"]
+        cols = [c for c in cols if c in col_names]
+        table = pq.read_table(f, columns=cols)
+        df_chunk = table.to_pandas()
+        all_states.append(np.stack(df_chunk["observation.state"].to_numpy()))
+        if "episode_index" in df_chunk.columns:
+            all_episodes.append(df_chunk["episode_index"].to_numpy())
+        if "frame_index" in df_chunk.columns:
+            all_frames.append(df_chunk["frame_index"].to_numpy())
+
+    states = np.concatenate(all_states, axis=0)  # (N, D)
+    n_dims = states.shape[1]
+
+    # Compute per-episode derivatives to avoid cross-episode transitions
+    nan = np.full(n_dims, float("nan"))
+    if all_episodes:
+        episodes = np.concatenate(all_episodes, axis=0)
+        frames = np.concatenate(all_frames, axis=0) if all_frames else None
+        abs_vels,   vel_eps   = [], []
+        abs_accels, accel_eps = [], []
+        abs_jerks,  jerk_eps  = [], []
+        for ep in np.unique(episodes):
+            mask = episodes == ep
+            ep_states = states[mask]
+            if frames is not None:
+                order = np.argsort(frames[mask])
+                ep_states = ep_states[order]
+            n = len(ep_states)
+            if n > 1:
+                abs_vels.append(np.abs(np.diff(ep_states, axis=0)))
+                vel_eps.append(np.full(n - 1, ep))
+            if n > 2:
+                abs_accels.append(np.abs(np.diff(ep_states, n=2, axis=0)))
+                accel_eps.append(np.full(n - 2, ep))
+            if n > 3:
+                abs_jerks.append(np.abs(np.diff(ep_states, n=3, axis=0)))
+                jerk_eps.append(np.full(n - 3, ep))
+
+        all_abs_vel   = np.concatenate(abs_vels,   axis=0) if abs_vels   else None
+        all_abs_accel = np.concatenate(abs_accels, axis=0) if abs_accels else None
+        all_abs_jerk  = np.concatenate(abs_jerks,  axis=0) if abs_jerks  else None
+        vel_ep_arr   = np.concatenate(vel_eps)   if vel_eps   else None
+        accel_ep_arr = np.concatenate(accel_eps) if accel_eps else None
+        jerk_ep_arr  = np.concatenate(jerk_eps)  if jerk_eps  else None
+
+        mean_abs_vel   = all_abs_vel.mean(axis=0)   if all_abs_vel   is not None else nan
+        mean_abs_accel = all_abs_accel.mean(axis=0) if all_abs_accel is not None else nan
+        mean_abs_jerk  = all_abs_jerk.mean(axis=0)  if all_abs_jerk  is not None else nan
+
+        def ep_of_nz_min(arr, ep_arr):
+            if arr is None:
+                return [None] * n_dims
+            result = []
+            for d in range(n_dims):
+                col = arr[:, d]
+                nz = np.flatnonzero(col)
+                idx = nz[np.argmin(col[nz])] if len(nz) else np.argmin(col)
+                result.append(int(ep_arr[idx]))
+            return result
+
+        def ep_of_max(arr, ep_arr):
+            return [int(ep_arr[np.argmax(arr[:, d])]) for d in range(n_dims)] if arr is not None else [None] * n_dims
+
+        state_min_ep = [int(episodes[np.argmin(states[:, d])]) for d in range(n_dims)]
+        state_max_ep = [int(episodes[np.argmax(states[:, d])]) for d in range(n_dims)]
+        vel_min_ep   = ep_of_nz_min(all_abs_vel,   vel_ep_arr)
+        vel_max_ep   = ep_of_max(all_abs_vel,   vel_ep_arr)
+        accel_min_ep = ep_of_nz_min(all_abs_accel, accel_ep_arr)
+        accel_max_ep = ep_of_max(all_abs_accel, accel_ep_arr)
+        jerk_min_ep  = ep_of_nz_min(all_abs_jerk,  jerk_ep_arr)
+        jerk_max_ep  = ep_of_max(all_abs_jerk,  jerk_ep_arr)
+        n_episodes = len(np.unique(episodes))
+    else:
+        mean_abs_vel   = np.mean(np.abs(np.diff(states, n=1, axis=0)), axis=0)
+        mean_abs_accel = np.mean(np.abs(np.diff(states, n=2, axis=0)), axis=0)
+        mean_abs_jerk  = np.mean(np.abs(np.diff(states, n=3, axis=0)), axis=0)
+        episodes = None
+        state_min_ep = state_max_ep = [None] * n_dims
+        vel_min_ep = vel_max_ep = accel_min_ep = accel_max_ep = jerk_min_ep = jerk_max_ep = [None] * n_dims
+        all_abs_vel = all_abs_accel = all_abs_jerk = None
+        vel_ep_arr = accel_ep_arr = jerk_ep_arr = None
+        n_episodes = "?"
+
+    print(f"\n=== observation.state statistics ({states.shape[0]} frames, {n_episodes} episodes, {n_dims} dims) ===\n")
+
+    def fv(val, ep):
+        """Format a value+episode as '0.1234[42]' left-padded to width 16."""
+        ep_str = f"[{ep}]" if ep is not None else ""
+        return f"{val:.4f}{ep_str}"
+
+    col_w = 16
+    S = " | "  # group separator
+    header = (
+        f"{'Dim':<5}{S}{'Mean':>10}  {'Std':>10}  {'Min[ep]':>{col_w}}  {'Max[ep]':>{col_w}}"
+        f"{S}{'Mean|v|':>10}  {'Min|v|[ep]':>{col_w}}  {'Max|v|[ep]':>{col_w}}"
+        f"{S}{'Mean|a|':>10}  {'Min|a|[ep]':>{col_w}}  {'Max|a|[ep]':>{col_w}}"
+        f"{S}{'Mean|j|':>10}  {'Min|j|[ep]':>{col_w}}  {'Max|j|[ep]':>{col_w}}"
+    )
+    print(header)
+
+    def nz_min(col):
+        nz = col[col != 0]
+        return nz.min() if len(nz) else float("nan")
+
+    for d in range(n_dims):
+        v_min = nz_min(all_abs_vel[:, d])   if all_abs_vel   is not None else float("nan")
+        v_max = all_abs_vel[:, d].max()      if all_abs_vel   is not None else float("nan")
+        a_min = nz_min(all_abs_accel[:, d]) if all_abs_accel is not None else float("nan")
+        a_max = all_abs_accel[:, d].max()   if all_abs_accel is not None else float("nan")
+        j_min = nz_min(all_abs_jerk[:, d])  if all_abs_jerk  is not None else float("nan")
+        j_max = all_abs_jerk[:, d].max()    if all_abs_jerk  is not None else float("nan")
+        print(
+            f"{d:<5}{S}{states[:, d].mean():>10.4f}  {states[:, d].std():>10.4f}  "
+            f"{fv(states[:, d].min(), state_min_ep[d]):>{col_w}}  {fv(states[:, d].max(), state_max_ep[d]):>{col_w}}"
+            f"{S}{mean_abs_vel[d]:>10.6f}  {fv(v_min, vel_min_ep[d]):>{col_w}}  {fv(v_max, vel_max_ep[d]):>{col_w}}"
+            f"{S}{mean_abs_accel[d]:>10.6f}  {fv(a_min, accel_min_ep[d]):>{col_w}}  {fv(a_max, accel_max_ep[d]):>{col_w}}"
+            f"{S}{mean_abs_jerk[d]:>10.6f}  {fv(j_min, jerk_min_ep[d]):>{col_w}}  {fv(j_max, jerk_max_ep[d]):>{col_w}}"
+        )
+
+    # Global min/max across all dims for derivatives
+    def global_nz_min_ep(arr, ep_arr):
+        if arr is None:
+            return float("nan"), None
+        flat_nz = np.flatnonzero(arr)
+        if len(flat_nz) == 0:
+            return float("nan"), None
+        idx = flat_nz[np.argmin(arr.ravel()[flat_nz])]
+        r, _ = np.unravel_index(idx, arr.shape)
+        return arr.ravel()[idx], int(ep_arr[r])
+
+    def global_max_ep(arr, ep_arr):
+        if arr is None:
+            return float("nan"), None
+        idx = np.argmax(arr)
+        r, _ = np.unravel_index(idx, arr.shape)
+        return arr.max(), int(ep_arr[r])
+
+    state_global_min_idx = np.argmin(states)
+    state_global_max_idx = np.argmax(states)
+    state_global_min_r, _ = np.unravel_index(state_global_min_idx, states.shape)
+    state_global_max_r, _ = np.unravel_index(state_global_max_idx, states.shape)
+    state_global_min_ep = int(episodes[state_global_min_r]) if episodes is not None else None
+    state_global_max_ep = int(episodes[state_global_max_r]) if episodes is not None else None
+
+    v_global_min, v_global_min_ep = global_nz_min_ep(all_abs_vel,   vel_ep_arr)
+    v_global_max, v_global_max_ep = global_max_ep(all_abs_vel,     vel_ep_arr)
+    a_global_min, a_global_min_ep = global_nz_min_ep(all_abs_accel, accel_ep_arr)
+    a_global_max, a_global_max_ep = global_max_ep(all_abs_accel,    accel_ep_arr)
+    j_global_min, j_global_min_ep = global_nz_min_ep(all_abs_jerk,  jerk_ep_arr)
+    j_global_max, j_global_max_ep = global_max_ep(all_abs_jerk,     jerk_ep_arr)
+
+    sep = "-" * len(header)
+    print(sep)
+    print(
+        f"{'all':<5}{S}{states.mean():>10.4f}  {states.std():>10.4f}  "
+        f"{fv(states.min(), state_global_min_ep):>{col_w}}  {fv(states.max(), state_global_max_ep):>{col_w}}"
+        f"{S}{mean_abs_vel.mean():>10.6f}  {fv(v_global_min, v_global_min_ep):>{col_w}}  {fv(v_global_max, v_global_max_ep):>{col_w}}"
+        f"{S}{mean_abs_accel.mean():>10.6f}  {fv(a_global_min, a_global_min_ep):>{col_w}}  {fv(a_global_max, a_global_max_ep):>{col_w}}"
+        f"{S}{mean_abs_jerk.mean():>10.6f}  {fv(j_global_min, j_global_min_ep):>{col_w}}  {fv(j_global_max, j_global_max_ep):>{col_w}}"
+    )
+    print("  * Min|v|, Min|a|, Min|j| are the minimum nonzero absolute values.")
+    print()
 
 
 def main():
@@ -351,6 +535,11 @@ def main():
         help="Print average episode length for all episodes and optionally --episode subset, then exit",
     )
     parser.add_argument(
+        "--state-stats",
+        action="store_true",
+        help="Print per-dimension statistics (mean, std, min, max, mean absolute velocity) for observation.state and exit",
+    )
+    parser.add_argument(
         "--save_video",
         action="store_true",
         help="Save video to file instead of displaying interactively",
@@ -360,6 +549,10 @@ def main():
 
     if args.list_episodes:
         list_episodes(args.parquet_folder)
+        return
+
+    if args.state_stats:
+        state_stats(args.parquet_folder)
         return
 
     episodes = parse_episodes(args.episode) if args.episode is not None else None
