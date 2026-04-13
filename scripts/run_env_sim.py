@@ -491,9 +491,10 @@ def main(args):
                     raise ValueError(f"Invalid state {state}")
                 
             if args.policy_guidance_mode:
-                # action is (7,) delta or all-NaN when no keys are held
+                # action is (7,) delta or all-NaN when no keys are held.
+                # Send as [1, 1, 7] so the wrapper receives it with a batch and time dimension.
                 if action is not None and not np.all(np.isnan(action)):
-                    guidance = action
+                    guidance = action.reshape(1, 1, -1)  # [1, 1, 7]
                 else:
                     guidance = None
                 env.queue_policy_guidance_action(guidance)
