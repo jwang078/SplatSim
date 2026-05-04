@@ -208,6 +208,10 @@ class TaskConfig:
 
     target_ee_pos: Tuple[float, float, float]
     target_ee_quat: Tuple[float, float, float, float]
+    # Optional 6-DOF canonical goal joint config. When set, the trajectory
+    # generator seeds IK from this config so demos converge to a shared joint
+    # configuration when feasible (falling back to random-seed IK if blocked).
+    q_goal_bias: Optional[Tuple[float, ...]] = None
     pos_tolerance_m: float = 0.03
     quat_tolerance_deg: float = 10.0
     task_description: str = ""

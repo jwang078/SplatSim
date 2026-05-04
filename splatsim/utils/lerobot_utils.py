@@ -6,7 +6,6 @@ Used by both the sim server's _render_and_save_episode and by run_env_sim.py
 (which may be running against the real UR robot instead of the simulator).
 """
 
-import os
 import shutil
 from typing import List, Optional
 
@@ -47,12 +46,12 @@ def build_lerobot_features(image_keys: List[str], num_dofs: int = 6) -> dict:
 
 
 def load_lerobot_dataset(repo_id: str) -> Optional["LeRobotDataset"]:
-    """Load an existing LeRobot dataset, preferring local cache over the hub.
+    """Load an existing LeRobot dataset for appending new episodes.
 
-    ``LeRobotDataset(repo_id)`` without ``root`` always hits the hub to
-    validate the repo, failing with ``RepositoryNotFoundError`` for datasets
-    that were only saved locally and never pushed.  This function passes
-    ``root=local_dir`` to load from local cache without a hub request.
+    Always uses the flat write-mode layout (``$HF_LEROBOT_HOME/{repo_id}``)
+    — never the revision-safe Hub snapshot cache, because ``resume()``
+    creates a ``DatasetWriter`` and upstream rejects ``root=None`` to avoid
+    corrupting the shared snapshot cache.
 
     When a local dir exists but is partially initialized (e.g. only info.json,
     no tasks.parquet — can happen after a crash before the first episode was
@@ -64,33 +63,34 @@ def load_lerobot_dataset(repo_id: str) -> Optional["LeRobotDataset"]:
     """
     from huggingface_hub.errors import RepositoryNotFoundError as HubNotFoundError
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.utils.constants import HF_LEROBOT_HOME
 
-    local_dir = os.path.expanduser(f"~/.cache/huggingface/lerobot/{repo_id}")
-    local_info = os.path.join(local_dir, "meta", "info.json")
+    flat_root = HF_LEROBOT_HOME / repo_id
+    local_info = flat_root / "meta" / "info.json"
 
-    if os.path.exists(local_info):
+    if local_info.exists():
         try:
-            dataset = LeRobotDataset(repo_id, root=local_dir)
+            dataset = LeRobotDataset.resume(repo_id, root=flat_root)
             print(f"[LeRobot] Loaded existing dataset from local cache ({dataset.meta.total_episodes} episodes).")
             return dataset
         except HubNotFoundError:
             # Local dataset is incomplete (triggered hub fallback) and hub also 404s.
             # Clean up so the caller can create fresh.
-            print(f"[LeRobot] Local dataset at {local_dir} is incomplete and not on hub; will create fresh.")
-            shutil.rmtree(local_dir)
+            print(f"[LeRobot] Local dataset at {flat_root} is incomplete and not on hub; will create fresh.")
+            shutil.rmtree(flat_root)
             return None
         except Exception as e:
             print(f"[LeRobot] WARNING: Failed to load local dataset: {e}")
 
     try:
-        dataset = LeRobotDataset(repo_id)
+        dataset = LeRobotDataset.resume(repo_id, root=flat_root)
         print(f"[LeRobot] Loaded dataset from hub ({dataset.meta.total_episodes} episodes).")
         return dataset
     except Exception as e:
         print(f"[LeRobot] Dataset not found locally or on hub: {e}")
         # Clean up any partial dir left by the failed load attempt.
-        if os.path.exists(local_dir):
-            shutil.rmtree(local_dir)
+        if flat_root.exists():
+            shutil.rmtree(flat_root)
         return None
 
 

@@ -44,6 +44,11 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     ee_quat_start: Optional[List[float] | np.ndarray] = None  # [x, y, z, w] end-effector quaternion start
     ee_pos_goal: Optional[List[float] | np.ndarray] = None    # [x, y, z] end-effector position goal
     ee_quat_goal: Optional[List[float] | np.ndarray] = None   # [x, y, z, w] end-effector quaternion goal
+    # Canonical 6-DOF joint config to prefer as the goal IK solution. If set and
+    # collision-free for the current scene, it is used as the primary q_goal so
+    # demos converge to a shared joint configuration. If it's in collision (e.g.
+    # a randomized obstacle blocks it), the planner falls back to random-seed IK.
+    q_goal_bias: Optional[List[float] | np.ndarray] = None
     num_ik_candidates: int = 8                    # number of IK solutions to try for EE goals
     cuboids_fn: Optional[str] = None
     render_images: bool = False
