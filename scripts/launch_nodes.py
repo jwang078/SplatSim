@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, List
 
 import torch
 import tyro
@@ -22,6 +23,13 @@ class Args:
 
     # Debug mode for PyBullet visualization
     debug_mode: DebugModes = DebugModes.OFF
+
+    # When set, the server starts in EVAL_BENCHMARK serve mode and cycles
+    # through the pre-recorded scenarios from this LeRobot dataset on each
+    # env.reset(). Leave None to use the robot variant's default serve mode.
+    eval_benchmark_repo_id: Optional[str] = None
+    # Optional subset of episode indices (e.g. [3, 8, 23]). None = all episodes.
+    eval_benchmark_subset: Optional[List[int]] = None
 
 
 def launch_robot_server(args: Args):
@@ -135,17 +143,40 @@ def launch_robot_server(args: Args):
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive":
         from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEngineNewPybulletRobotServer
 
+        # Auto-switch to EVAL_BENCHMARK mode when an eval-benchmark dataset is
+        # provided so the server cycles through its scenarios on each reset.
+        serve_mode = (
+            UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.EVAL_BENCHMARK
+            if args.eval_benchmark_repo_id is not None
+            else UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.INTERACTIVE
+        )
         server = UprightRobotSmallEngineNewPybulletRobotServer(
-           port=port, host=args.hostname, serve_mode=UprightRobotSmallEngineNewPybulletRobotServer.SERVE_MODES.INTERACTIVE,
-        #    camera_names=[], robot_name=args.robot_name, use_gripper=use_gripper,
-
-        #    camera_names=["base_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
-
+           port=port, host=args.hostname, serve_mode=serve_mode,
            camera_names=["base_rgb", "wrist_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
            image_resize_modes=['letterbox', 'stretch'],
-        #    camera_names=camera_names, robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
-        #    image_width=224, image_height=224
-           debug_mode=args.debug_mode
+           debug_mode=args.debug_mode,
+           eval_benchmark_repo_id=args.eval_benchmark_repo_id,
+           eval_benchmark_subset=args.eval_benchmark_subset,
+        )
+
+    elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_strict":
+        # Tighter success-tolerance variant for DAgger-style intervention
+        # recording: the loose eval-time threshold (3 cm / 10 deg) cuts off
+        # precise RRT corrections before they reach the exact goal pose.
+        from splatsim.robots.sim_robot_pybullet_small_engine import UprightRobotSmallEngineNewStrictPybulletRobotServer
+
+        serve_mode = (
+            UprightRobotSmallEngineNewStrictPybulletRobotServer.SERVE_MODES.EVAL_BENCHMARK
+            if args.eval_benchmark_repo_id is not None
+            else UprightRobotSmallEngineNewStrictPybulletRobotServer.SERVE_MODES.INTERACTIVE
+        )
+        server = UprightRobotSmallEngineNewStrictPybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=serve_mode,
+           camera_names=["base_rgb", "wrist_rgb"], robot_name=args.robot_name, cam_i=3, use_gripper=use_gripper,
+           image_resize_modes=['letterbox', 'stretch'],
+           debug_mode=args.debug_mode,
+           eval_benchmark_repo_id=args.eval_benchmark_repo_id,
+           eval_benchmark_subset=args.eval_benchmark_subset,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_stretchimg":

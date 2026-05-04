@@ -27,6 +27,7 @@ import mujoco
 import mujoco.viewer
 import zmq
 from splatsim.robots.robot import Robot
+from splatsim.rendering.gsplat_renderer import render_gsplat
 
 import cv2
 from torchvision.transforms.functional import to_pil_image
@@ -77,7 +78,7 @@ from splatsim.utils.rrt_path_utils import _COLLISION_CLEARANCE
 from collections import defaultdict
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.transforms import ImageTransformsConfig, ImageTransformConfig
+from lerobot.transforms.transforms import ImageTransformConfig, ImageTransformsConfig
 
 from pathlib import Path
 
@@ -176,7 +177,7 @@ class ZMQRobotServer:
                     result = self._robot.get_observations(render_images=args.get("render_images", True))
                     with self._policy_guidance_lock:
                         if self._policy_guidance_action is not None:
-                            result["policy_guidance_action"] = self._policy_guidance_action.copy()
+                            result["policy_guidance_chunk"] = self._policy_guidance_action.copy()
                 elif method == "create_object":
                     splatsim_object = self._robot.create_object(**args)
                     result = None
@@ -193,13 +194,15 @@ class ZMQRobotServer:
                     obs, info = self._robot._handle_reset(**args)
                     with self._policy_guidance_lock:
                         if self._policy_guidance_action is not None:
-                            obs["policy_guidance_action"] = self._policy_guidance_action.copy()
+                            obs["policy_guidance_chunk"] = self._policy_guidance_action.copy()
                     result = obs, info
                 elif method == "check_metrics":
                     if hasattr(self._robot, "check_metrics"):
                         result = self._robot.check_metrics()
                     else:
                         result = {"error": "check_metrics not supported"}
+                elif method == "get_env_config":
+                    result = self._robot.get_env_config()
                 else:
                     result = {"error": "Invalid method"}
                     print(result)
@@ -355,6 +358,7 @@ class PybulletRobotServerBase:
         image_resize_modes: Optional[List[ImageResizeMode]] = None,
         eval_benchmark_repo_id: Optional[str] = None,
         eval_benchmark_subset: Optional[List[int]] = None,
+        use_gsplat: bool = True,
     ):
         self._splatsim_gui = None
         self._serve_mode = serve_mode
@@ -366,6 +370,7 @@ class PybulletRobotServerBase:
         self.image_width = image_width
         self.image_height = image_height
         self.use_gripper = use_gripper
+        self.use_gsplat = use_gsplat
         self.splatsim_robot = None
         self.splatsim_background = None
         self.scene_gaussian = None
@@ -411,7 +416,12 @@ class PybulletRobotServerBase:
 
         self.grasp_poses = {}
 
-        self.pybullet_client.connect(p.GUI)
+        self._pb_client_id = self.pybullet_client.connect(p.GUI)
+        # Tell rrt_path_utils which physicsClient our subsequent calls target,
+        # so its existing call sites that don't thread `physics_client_id=` keep
+        # working when more than one PyBullet server is connected in this
+        # process (e.g. lerobot's shared autonomy wrapper running alongside us).
+        rrt_path_utils.set_default_client_id(self._pb_client_id)
         self.pybullet_client.setAdditionalSearchPath(
             str(SPLATSIM_ROOT.parent / "submodules" / "pybullet-playground-wrapper" / "pybullet_playground" / "urdf" / "pybullet_ur5_gripper" / "urdf")
         )
@@ -566,7 +576,11 @@ class PybulletRobotServerBase:
         base_position = splatsim_obj.config.base_position
 
         if is_articulated:
-            flags = self.pybullet_client.URDF_USE_IMPLICIT_CYLINDER
+            flags = (
+                self.pybullet_client.URDF_USE_IMPLICIT_CYLINDER
+                | self.pybullet_client.URDF_USE_SELF_COLLISION
+                | self.pybullet_client.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT
+            )
         else:
             flags = 0
 
@@ -969,33 +983,17 @@ class PybulletRobotServerBase:
 
         T_wc = -R_cw.T @ T_cw
 
-        resolution = (
-            self.base_camera.camera.image_width,
-            self.base_camera.camera.image_height
-        )
+        # Fisheye calibration (from scripts/calibrate_camera_intrinsics.py);
+        # preserve the wrist camera's native aspect ratio (CAL_W : CAL_H)
+        # rather than conforming to the base camera's aspect.
+        CAL_W, CAL_H = 2704, 2028
+        CAL_FX, CAL_FY = 775.5615, 778.0103
+        CAL_CX, CAL_CY = 1343.6974, 1005.3416
 
-        # w0 = self.wrist_colmap_width
-        # h0 = self.wrist_colmap_height
-        # if self.image_width is None:
-        #     if self.image_height is None:
-        #         image_width = w0
-        #         image_height = h0
-        #     else:
-        #         image_width = int(w0 * self.image_height / h0)
-        #         image_height = self.image_height
-        # else:
-        #     if self.image_height is None:
-        #         image_width = self.image_width
-        #         image_height = int(h0 * self.image_width / w0)
-        #     else:
-        #         image_width = self.image_width
-        #         image_height = self.image_height
+        H = self.base_camera.camera.image_height
+        W = int(round(H * CAL_W / CAL_H))
+        resolution = (W, H)
 
-        # resolution = (image_width, image_height)
-        # fx = self.wrist_colmap_fx * (image_width / w0)
-        # fy = self.wrist_colmap_fy * (image_height / h0)
-        # fovx = 2 * math.atan(image_width / (2 * fx))
-        # fovy = 2 * math.atan(image_height / (2 * fy))
         fovx = self.base_camera.camera.FoVx
         fovy = 2 * np.atan(np.tan(self.base_camera.camera.FoVy / 2))
 
@@ -1021,26 +1019,26 @@ class PybulletRobotServerBase:
             scale=1,  # scale
         )
 
-        # TODO calibrate fisheye camera for wrist cam
-        # # Nominal GoPro fisheye intrinsics (replace with real calibration values)
-        # W = self.base_camera.camera.image_width
-        # H = self.base_camera.camera.image_height
-        # fisheye_K = torch.tensor([
-        #     [600.0,   0.0, W / 2.0],
-        #     [  0.0, 600.0, H / 2.0],
-        #     [  0.0,   0.0,     1.0],
-        # ], dtype=torch.float32, device="cuda")
-        # fisheye_D = torch.tensor(
-        #     [0.0, 0.0, 0.0, 0.0], dtype=torch.float32, device="cuda"
-        # )
+        # Aspect ratio is preserved, so sx == sy; scale K uniformly.
+        scale = H / CAL_H
+        fisheye_K = torch.tensor([
+            [CAL_FX * scale, 0.0,            CAL_CX * scale],
+            [0.0,            CAL_FY * scale, CAL_CY * scale],
+            [0.0,            0.0,            1.0],
+        ], dtype=torch.float32, device="cuda")
+        # Distortion coefficients are resolution-independent.
+        fisheye_D = torch.tensor(
+            [-0.0232652411, -0.0160767049, 0.0, 0.0],
+            dtype=torch.float32, device="cuda",
+        )
 
         splatsim_camera = SplatSimCamera(
             camera=camera,
             pipeline=self.base_camera.pipeline,
             background=self.base_camera.background,
-            camera_model="pinhole", #"fisheye",
-            # intrinsic_matrix=fisheye_K,
-            # radial_coeffs=fisheye_D,
+            camera_model="fisheye",
+            intrinsic_matrix=fisheye_K,
+            radial_coeffs=fisheye_D,
         )
 
         return splatsim_camera
@@ -1297,8 +1295,7 @@ class PybulletRobotServerBase:
         else:
             raise ValueError(f"Unknown camera name {camera_name}")
 
-        if camera.camera_model == "fisheye":
-            from splatsim.rendering.gsplat_renderer import render_gsplat
+        if camera.camera_model == "fisheye" or self.use_gsplat:
             rendering = render_gsplat(
                 camera, self.scene_gaussian
             )["render"].cpu().numpy()
@@ -1308,8 +1305,50 @@ class PybulletRobotServerBase:
             )["render"].cpu().numpy()
         # If you index "depth" instead of "render", you get the depth image
 
+        # Preprocess fisheye renders to an equivalent pinhole view so datasets
+        # (lerobot, zarr) and policy inputs are always rectified.
+        if camera.camera_model == "fisheye":
+            # import pdb; pdb.set_trace()
+            rendering = self._rectify_fisheye_image(rendering, camera)
+
         # save the image (always as numpy array)
         return rendering
+
+    def _rectify_fisheye_image(self, img: np.ndarray, camera: SplatSimCamera) -> np.ndarray:
+        """Undistort a fisheye-rendered image to a pinhole view at the same
+        intrinsics K, so straight lines in the scene are straight again.
+        Fisheye content outside the pinhole's FOV is cropped.
+
+        Args:
+            img: (C, H, W) float32 in [0, 1]
+            camera: SplatSimCamera with camera_model="fisheye", intrinsic_matrix, radial_coeffs
+
+        Returns:
+            Rectified (C, H, W) float32 in [0, 1].
+        """
+        _, H, W = img.shape
+        K = camera.intrinsic_matrix.detach().cpu().numpy().astype(np.float64)
+        D = camera.radial_coeffs.detach().cpu().numpy().astype(np.float64).reshape(4, 1)
+
+        # CREATE A NEW K FOR THE OUTPUT
+        # A multiplier of 2.0 or 2.5 is likely what you need to match VLA data
+        # Want to rectify to regular wide view. the wrist cam calibration rn is for ultra wide view
+        # TODO this is hardcoding
+        zoom_factor = 2.2
+        K_target = K.copy()
+        K_target[0, 0] *= zoom_factor # fx
+        K_target[1, 1] *= zoom_factor # fy
+
+        map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+            K, D, np.eye(3), K_target, (W, H), cv2.CV_16SC2,
+        )
+        img_hwc = np.transpose(img, (1, 2, 0))
+        rectified = cv2.remap(
+            img_hwc, map1, map2,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+        )
+        return np.transpose(rectified, (2, 0, 1))
 
     def setup_camera_from_dataset(
         self, splatsim_obj_object_config: SplatObjectConfig, cam_i, use_train=True
@@ -1524,6 +1563,54 @@ class PybulletRobotServerBase:
 
     def get_task_description(self) -> str:
         return self.ENV_CONFIG.task_description
+
+    def get_env_config(self) -> Dict[str, Any]:
+        """Serialize ENV_CONFIG into a pickle-safe dict.
+
+        Used by remote clients (e.g. lerobot's shared autonomy wrapper) to fetch
+        obstacle geometry and task goal info for RRT planning. Numpy arrays and
+        nested dataclasses are converted to plain Python via dataclasses.asdict.
+        """
+        from dataclasses import asdict
+
+        def _to_jsonable(obj):
+            # Convert numpy arrays / scalars to plain Python so the result pickles
+            # cleanly across processes and runs.
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, np.generic):
+                return obj.item()
+            if isinstance(obj, dict):
+                return {k: _to_jsonable(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_to_jsonable(v) for v in obj]
+            return obj
+
+        cfg = self.ENV_CONFIG
+        objects = []
+        for o in cfg.objects:
+            d = asdict(o)
+            # Tag the concrete type so downstream consumers can dispatch without
+            # re-importing the dataclasses (they may not be available client-side).
+            d["__type__"] = type(o).__name__
+            objects.append(_to_jsonable(d))
+
+        task = _to_jsonable(asdict(cfg.task)) if cfg.task is not None else None
+
+        # Robot config (URDF path + base position) for the planner to load
+        # the same arm into its private pybullet client.
+        robot_obj = self.splatsim_robot
+        robot_cfg_dict = _to_jsonable(asdict(robot_obj.config))
+        robot_cfg_dict["__type__"] = type(robot_obj.config).__name__
+        # Base position is stored on the live SplatSimObject — copy current state too.
+        return {
+            "name": cfg.name,
+            "task": task,
+            "task_description": cfg.task_description,
+            "terminate_on_collision": cfg.terminate_on_collision,
+            "objects": objects,
+            "robot": robot_cfg_dict,
+        }
 
     def get_observations(self, render_images: bool = True) -> Dict[str, np.ndarray]:
         joint_positions = self.get_joint_state()
@@ -2469,9 +2556,23 @@ class PybulletRobotServerBase:
         In EVAL_BENCHMARK mode, advances to the next episode instead of calling
         the subclass reset(), so external policies that call reset() always get
         the next deterministic scenario without needing to know the serve mode.
+
+        When ``seed`` is provided in EVAL_BENCHMARK mode, it pins the next
+        scenario to ``subset[seed % len(subset)]`` (overriding the default
+        increment-from-where-we-left-off behavior). This lets lerobot-train run
+        a deterministic eval batch every ``eval_freq`` steps: ``eval_policy``
+        starts each batch with seed = cfg.seed + batch_offset, so each eval
+        phase starts at the same scenario index regardless of how many
+        scenarios prior eval phases consumed.
+
         In all other modes, delegates to the subclass reset().
         """
         if self.serve_mode == self.SERVE_MODES.EVAL_BENCHMARK:
+            if seed is not None and self._eval_benchmark_subset:
+                # Set the index so the next _eval_benchmark_next_episode()
+                # increment lands on subset[seed % len(subset)].
+                n = len(self._eval_benchmark_subset)
+                self._eval_benchmark_episode_index = (int(seed) % n) - 1
             return self._eval_benchmark_next_episode()
         else:
             return self.reset(seed=seed, options=options)
@@ -2482,10 +2583,16 @@ class PybulletRobotServerBase:
         # start the zmq server
         self._zmq_server_thread.start()
 
-        print("Ready to serve.")
-
         self._lerobot_saver = None
         _prev_serve_mode = self.serve_mode
+        # The mode-transition detector below only fires when serve_mode CHANGES,
+        # so a mode set by the constructor (e.g. EVAL_BENCHMARK from
+        # launch_nodes.py --eval_benchmark_repo_id=...) would never go through
+        # _enter_mode and the LeRobot dataset / GUI status would never be
+        # initialized. Explicitly enter the initial mode here.
+        self._enter_mode(self.serve_mode)
+
+        print("Ready to serve.")
 
         try:
             while True:
@@ -2774,9 +2881,12 @@ class PybulletRobotServerBase:
         if not self.use_gripper:
             return
         # open_length = np.clip(open_length, *self.gripper_range)
-        open_angle = 0.715 - math.asin(
-            (open_length - 0.010) / 0.1143
-        )  # angle calculation
+        # Don't throw an error when out of range
+        open_angle = 0.715 - math.asin(np.clip(
+            (open_length - 0.010) / 0.1143,
+            -1,
+            1
+        ))  # angle calculation
         # Control the mimic gripper joint(s)
         p.setJointMotorControl2(
             self.splatsim_robot.sim_id,
@@ -3077,6 +3187,31 @@ class PybulletRobotServerBase:
             self.pybullet_client.stepSimulation()
 
         self._step_count += 1
+
+    def step(self, action: np.ndarray):
+        """Single env step returning the **raw** observation dict (gym signature).
+
+        Single source of truth for what a step does on a local server: apply
+        action, fetch raw observations, compute reward/termination, build info.
+        ``SplatSimGymEnv.step`` wraps this and applies ``_to_gym_obs`` for the
+        gym observation space; the recording wrapper
+        (``TeleopRecordingWrapper._step_raw``) calls this directly to get the
+        unconverted dict — which has ``{cam}_{mode}`` keys for every resize
+        mode. The signature matches ``_ZMQBackend.step`` so callers don't
+        branch on backend type.
+        """
+        self._physics_step(action)
+        raw_obs = self.get_observations()
+        metrics = self.check_metrics()
+        is_success = metrics.get("is_success", False)
+        reward = self.compute_reward_from_metrics(metrics)
+        terminated = self.check_terminated_from_metrics(metrics)
+        truncated = self._step_count >= self._max_episode_steps
+        info = {
+            k: v.item() if isinstance(v, np.generic) else v
+            for k, v in {"is_success": is_success, "step_count": self._step_count, **metrics}.items()
+        }
+        return raw_obs, reward, terminated, truncated, info
 
     def check_truncated(self) -> bool:
         """Check if episode should be truncated due to time limit.

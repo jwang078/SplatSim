@@ -1,3 +1,4 @@
+import dataclasses
 import random
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -175,9 +176,10 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
         task=TaskConfig(
             task_description="<control_mode> joint <control_mode>",
 
-            # Approach lever
-            # q_goal=[1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029]
-            # Ran self.get_current_ee_pose()
+            # Approach lever — canonical goal joint config (6-DOF, no gripper).
+            # Used to seed IK so demos converge to a shared joint configuration.
+            q_goal_bias=(1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029),
+            # target_ee_{pos,quat} were captured from self.get_current_ee_pose() at this q_goal_bias.
             target_ee_pos=(-0.10123532289544344, 0.5484031509107826, 0.26692192875731213),
             target_ee_quat=(0.8074376258351692, 0.1106042613918073, -0.5450490313370774, 0.19680632913133583),
             
@@ -291,5 +293,30 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
         return TrajectoryGenModeConfig(
             ee_pos_goal=list(self.ENV_CONFIG.task.target_ee_pos),
             ee_quat_goal=list(self.ENV_CONFIG.task.target_ee_quat),
+            q_goal_bias=(
+                list(self.ENV_CONFIG.task.q_goal_bias)
+                if self.ENV_CONFIG.task.q_goal_bias is not None else None
+            ),
             debug_visualize=False
         )
+
+
+class UprightRobotSmallEngineNewStrictPybulletRobotServer(UprightRobotSmallEngineNewPybulletRobotServer):
+    """Tighter success-tolerance variant of the upright_small_engine_new task.
+
+    Used for DAgger-style intervention recording (`my_scripts/intervention_record.py`)
+    so the loose eval-time success threshold doesn't cut off precise RRT
+    corrections before they reach the exact goal pose. The goal pose itself
+    (q_goal_bias / target_ee_pos / target_ee_quat) is unchanged; only the
+    `is_success` thresholds are tightened.
+    """
+
+    assert UprightRobotSmallEngineNewPybulletRobotServer.ENV_CONFIG.task is not None
+    ENV_CONFIG = dataclasses.replace(
+        UprightRobotSmallEngineNewPybulletRobotServer.ENV_CONFIG,
+        task=dataclasses.replace(
+            UprightRobotSmallEngineNewPybulletRobotServer.ENV_CONFIG.task,
+            pos_tolerance_m=0.005,    # 5 mm (vs. 30 mm)
+            quat_tolerance_deg=2.0,   # 2 deg (vs. 10 deg)
+        ),
+    )

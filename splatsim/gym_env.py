@@ -43,8 +43,8 @@ def _raw_obs_to_gym_obs(raw_obs: Dict[str, Any], num_dofs: int, camera_names: li
 
     gym_obs = {"agent_pos": agent_pos, "pixels": pixels}
 
-    if "policy_guidance_action" in raw_obs:
-        gym_obs["policy_guidance_action"] = np.array(raw_obs["policy_guidance_action"], dtype=np.float32)
+    if "policy_guidance_chunk" in raw_obs:
+        gym_obs["policy_guidance_chunk"] = np.array(raw_obs["policy_guidance_chunk"], dtype=np.float32)
 
     return gym_obs
 
@@ -109,30 +109,28 @@ class SplatSimGymEnv(gym.Env):
         return gym_obs
 
     def step(self, action: np.ndarray):
-        """Execute one step in the environment."""
-        self.robot_server._physics_step(action)
-        raw_obs = self.robot_server.get_observations()
-        metrics = self.robot_server.check_metrics()
-        is_success = metrics["is_success"]
-        reward = self.robot_server.compute_reward_from_metrics(metrics)
-        terminated = self.robot_server.check_terminated_from_metrics(metrics)
-        truncated = self.robot_server._step_count >= self.robot_server._max_episode_steps
-        # Cast numpy scalars to Python scalars so SyncVectorEnv stacks them as shape (n_envs,)
-        # rather than (n_envs, 1). Without this, 0-d numpy values get double-wrapped.
-        info = {
-            k: v.item() if isinstance(v, np.generic) else v
-            for k, v in {"is_success": is_success, "step_count": self.robot_server._step_count, **metrics}.items()
-        }
+        """Execute one step in the environment.
+
+        Delegates the actual step to ``robot_server.step`` (which returns raw
+        observations + reward/term/trunc/info) and applies ``_to_gym_obs`` to
+        produce the gym observation. ``robot_server.step`` is the single source
+        of truth for step semantics, shared with callers like the recording
+        wrapper that need raw observations.
+        """
+        assert self.robot_server is not None, "step() called after close()"
+        raw_obs, reward, terminated, truncated, info = self.robot_server.step(action)
         return self._to_gym_obs(raw_obs), reward, terminated, truncated, info
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         """Reset the environment.
 
         In EVAL_BENCHMARK mode, advances to the next pre-recorded episode scenario
-        instead of performing a random reset.
+        instead of performing a random reset. The ``seed`` is forwarded so the
+        robot server can pin scenario selection in EVAL_BENCHMARK mode (see
+        PybulletRobotServerBase._handle_reset).
         """
         super().reset(seed=seed)
-        raw_obs, info = self.robot_server._handle_reset()
+        raw_obs, info = self.robot_server._handle_reset(seed=seed, options=options)
         return self._to_gym_obs(raw_obs), info
 
     def render(self) -> Optional[np.ndarray]:
@@ -204,6 +202,19 @@ class SplatSimGymEnv(gym.Env):
         """
         return self.robot_server.get_task_description()
 
+    def get_env_config(self) -> Optional[Dict[str, Any]]:
+        """Return the underlying robot server's serialized ENV_CONFIG, or None.
+
+        Used by lerobot's shared autonomy wrapper for RRT-to-Goal mode (obstacle
+        geometry + task goal). Local-mode envs always have a real robot_server
+        with the method; ZMQSplatSimGymEnv overrides this with a cached ZMQ fetch.
+        """
+        fn = getattr(self.robot_server, "get_env_config", None)
+        if not callable(fn):
+            return None
+        result: Optional[Dict[str, Any]] = fn()
+        return result
+
     @property
     def unwrapped(self) -> PybulletRobotServerBase:
         """Return the underlying robot server."""
@@ -224,6 +235,7 @@ def _populate_registry():
     from splatsim.robots.sim_robot_pybullet_small_engine import (
         SmallEnginePybulletRobotServer,
         UprightRobotSmallEngineNewPybulletRobotServer,
+        UprightRobotSmallEngineNewStrictPybulletRobotServer,
     )
     from splatsim.robots.sim_robot_pybullet_object_on_plate import (
         ObjectOnPlatePybulletRobotServer,
@@ -238,6 +250,7 @@ def _populate_registry():
 
     register_env("small_engine", SmallEnginePybulletRobotServer)
     register_env("upright_small_engine_new", UprightRobotSmallEngineNewPybulletRobotServer)
+    register_env("upright_small_engine_new_strict", UprightRobotSmallEngineNewStrictPybulletRobotServer)
     register_env("object_on_plate", ObjectOnPlatePybulletRobotServer)
     register_env("apple_on_plate", AppleOnPlatePybulletRobotServer)
     register_env("banana_on_plate", BananaOnPlatePybulletRobotServer)
@@ -394,6 +407,8 @@ def make_env(
 class _ZMQBackend:
     """Duck-typed adapter so ZMQSplatSimGymEnv can reuse SplatSimGymEnv unchanged."""
 
+    PLACEHOLDER_TIME_DIM = 1
+
     def __init__(self, client, camera_names, image_resize_modes, num_dofs, image_height, image_width,
                  max_episode_steps=400):
         self._client = client
@@ -406,33 +421,40 @@ class _ZMQBackend:
             high=np.array([np.pi] * num_dofs + [1.0], dtype=np.float32),
         )
         # observation_space uses bare camera names (no mode suffix) to match lerobot's features_map.
-        # policy_guidance_action is always declared; NaN when no guidance process is active.
+        # policy_guidance_chunk is always declared; NaN when no guidance process is active.
         self.observation_space = spaces.Dict({
             "agent_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(num_dofs + 1,), dtype=np.float32),
             "pixels": spaces.Dict({
                 cam: spaces.Box(low=0, high=255, shape=(image_height, image_width, 3), dtype=np.uint8)
                 for cam in camera_names
             }),
-            "policy_guidance_action": spaces.Box(low=-np.inf, high=np.inf, shape=(num_dofs + 1,), dtype=np.float32),
+            # TODO what if the policy_guidance_chunk has a variable time dimension (e.g. N, 7)? We could declare it as shape=(None, num_dofs + 1) but Gym doesn't support None dimensions.
+            "policy_guidance_chunk": spaces.Box(low=-np.inf, high=np.inf, shape=(self.PLACEHOLDER_TIME_DIM, num_dofs + 1), dtype=np.float32),
         })
 
     def _get_policy_guidance(self, raw_obs):
-        pga = raw_obs.get("policy_guidance_action")
+        pga = raw_obs.get("policy_guidance_chunk")
         if pga is not None:
-            return np.array(pga, dtype=np.float32)
-        return np.full(self._num_dofs + 1, np.nan, dtype=np.float32)
+            arr = np.array(pga, dtype=np.float32)
+            # Server stores [batch, time, action_dim]; strip the batch dim so the
+            # per-env obs matches the declared space shape (time, action_dim) = (1, 7).
+            # SyncVectorEnv.stack will re-add the batch dim.
+            if arr.ndim == 3:
+                arr = arr[0]  # [time, action_dim]
+            return arr
+        return np.full((self.PLACEHOLDER_TIME_DIM, self._num_dofs + 1), np.nan, dtype=np.float32)
 
     def step(self, action):
         self._client.command_joint_state(action)
         raw_obs = self._client.get_observations()
-        raw_obs["policy_guidance_action"] = self._get_policy_guidance(raw_obs)
+        raw_obs["policy_guidance_chunk"] = self._get_policy_guidance(raw_obs)
         metrics = self._client.get_metrics() if hasattr(self._client, "get_metrics") else {"is_success": False}
         terminated = metrics.get("is_success", False)
         return raw_obs, float(terminated), terminated, False, metrics
 
     def reset(self, seed=None, options=None):
         raw_obs, info = self._client.reset(seed=seed, options=options)
-        raw_obs["policy_guidance_action"] = self._get_policy_guidance(raw_obs)
+        raw_obs["policy_guidance_chunk"] = self._get_policy_guidance(raw_obs)
         return raw_obs, info
 
     def num_dofs(self):                return self._num_dofs
@@ -449,15 +471,35 @@ class ZMQSplatSimGymEnv(SplatSimGymEnv):
     """
 
     def __init__(self, host, port, camera_names, image_resize_modes,
-                 num_dofs=6, image_height=224, image_width=224, render_mode=None, **kwargs):
+                 num_dofs=6, image_height=224, image_width=224, render_mode=None,
+                 include_oracle_info: bool = False, **kwargs):
         from gello.zmq_core.robot_node import ZMQClientRobot
 
+        client = ZMQClientRobot(port=port, host=host)
         backend = _ZMQBackend(
-            ZMQClientRobot(port=port, host=host),
+            client,
             camera_names, image_resize_modes, num_dofs, image_height, image_width,
             **kwargs,
         )
         super().__init__(robot_server=backend, render_mode=render_mode)  # type: ignore[arg-type]
+        # Oracle env config is fetched once from the server and cached locally;
+        # the wrapper compares hashes to detect changes (e.g. eval_benchmark mode
+        # switches the goal between resets).
+        self._include_oracle_info = include_oracle_info
+        self._oracle_env_config: Optional[Dict[str, Any]] = None
+        self._zmq_client = client
+
+    def get_env_config(self) -> Optional[Dict[str, Any]]:
+        """Return the server's ENV_CONFIG (objects + task goal).
+
+        Returns None when include_oracle_info=False on the env config. Cached after
+        the first successful fetch so per-step calls are cheap.
+        """
+        if not self._include_oracle_info:
+            return None
+        if self._oracle_env_config is None:
+            self._oracle_env_config = self._zmq_client.get_env_config()
+        return self._oracle_env_config
 
     def step(self, action: np.ndarray):
         """Send joint command and read back observations asynchronously."""
@@ -467,6 +509,9 @@ class ZMQSplatSimGymEnv(SplatSimGymEnv):
     def reset(self, *, seed=None, options=None):
         super(SplatSimGymEnv, self).reset(seed=seed)
         raw_obs, info = self.robot_server.reset(seed=seed, options=options)  # type: ignore[union-attr]
+        # Re-fetch oracle config on reset in case the server's task changed
+        # (e.g. eval_benchmark mode cycles through different scenarios).
+        self._oracle_env_config = None
         return self._to_gym_obs(raw_obs), info
 
 
