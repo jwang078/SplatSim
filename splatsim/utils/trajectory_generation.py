@@ -295,6 +295,9 @@ class TrajectoryGenerator:
                 fps=self.config.robot_update_rate,
             )
 
+        # Append gripper state (hardcoded 0 = open) as the last column of each q.
+        base_traj = np.hstack([base_traj, np.zeros((base_traj.shape[0], 1), dtype=base_traj.dtype)])
+
         # 2b. Extend the path so that it stays at the last position for a second
         num_extra_steps = int(1 * self.config.robot_update_rate)
         last_q = base_traj[-1]
@@ -380,9 +383,20 @@ class TrajectoryGenerator:
     # =========================================================================
 
     def _resolve_ee_goal_to_q_goals(self) -> List[np.ndarray]:
-        """Resolve end-effector pose goal(s) to joint-space goal candidates via IK."""
+        """Resolve end-effector pose goal(s) to joint-space goal candidates via IK.
+
+        If ``q_goal_bias`` is configured, the first IK attempt is seeded at the
+        bias (so demos converge to a shared joint configuration when feasible);
+        the remaining attempts use random seeds as fallbacks for cases where
+        the bias is blocked.
+        """
+        seed_q_bias = (
+            np.array(self.config.q_goal_bias, dtype=np.float64)
+            if self.config.q_goal_bias is not None else None
+        )
         return self._resolve_ee_pose_to_q_candidates(
-            self.config.ee_pos_goal, self.config.ee_quat_goal, label="goal"
+            self.config.ee_pos_goal, self.config.ee_quat_goal,
+            label="goal", seed_q_bias=seed_q_bias,
         )
 
     def _resolve_ee_pose_to_q_candidates(
@@ -390,6 +404,7 @@ class TrajectoryGenerator:
         ee_pos: Optional[List[float]],
         ee_quat: Optional[List[float]],
         label: str = "pose",
+        seed_q_bias: Optional[np.ndarray] = None,
     ) -> List[np.ndarray]:
         """Resolve an end-effector pose to joint-space candidates via IK.
 
@@ -397,6 +412,10 @@ class TrajectoryGenerator:
         1. ee_pos + ee_quat: Full pose. Run IK from multiple random seeds.
         2. ee_pos only: Sample multiple orientations, run IK for each.
         3. ee_quat only: Sample multiple positions via FK, run IK for each.
+
+        If ``seed_q_bias`` is provided, the first IK attempt is seeded at the
+        bias so the canonical solution is preferred when feasible. The
+        remaining attempts use random seeds as fallbacks.
 
         Returns:
             List of collision-free q candidates (may be empty if all IK attempts fail).
@@ -407,22 +426,25 @@ class TrajectoryGenerator:
         candidates = []
 
         if ee_pos is not None and ee_quat is not None:
-            for _ in range(num_candidates):
-                q = self._solve_ik(ee_pos, ee_quat, ee_link_index)
+            for i in range(num_candidates):
+                seed_q = seed_q_bias if (i == 0 and seed_q_bias is not None) else None
+                q = self._solve_ik(ee_pos, ee_quat, ee_link_index, seed_q=seed_q)
                 if q is not None:
                     candidates.append(q)
 
         elif ee_pos is not None:
-            for _ in range(num_candidates):
+            for i in range(num_candidates):
                 sampled_quat = self._sample_random_quaternion()
-                q = self._solve_ik(ee_pos, sampled_quat, ee_link_index)
+                seed_q = seed_q_bias if (i == 0 and seed_q_bias is not None) else None
+                q = self._solve_ik(ee_pos, sampled_quat, ee_link_index, seed_q=seed_q)
                 if q is not None:
                     candidates.append(q)
 
         elif ee_quat is not None:
-            for _ in range(num_candidates):
+            for i in range(num_candidates):
                 sampled_pos = self._sample_reachable_position()
-                q = self._solve_ik(sampled_pos, ee_quat, ee_link_index)
+                seed_q = seed_q_bias if (i == 0 and seed_q_bias is not None) else None
+                q = self._solve_ik(sampled_pos, ee_quat, ee_link_index, seed_q=seed_q)
                 if q is not None:
                     candidates.append(q)
 
@@ -442,13 +464,27 @@ class TrajectoryGenerator:
         ee_pos: List[float],
         ee_quat: List[float],
         ee_link_index: int,
+        seed_q: Optional[np.ndarray] = None,
     ) -> Optional[np.ndarray]:
-        """Solve IK for a given EE pose. Returns collision-free joint config or None."""
-        # Seed robot at random joint config for diverse IK solutions
-        seed_q = self._get_random_q_within_limits()
+        """Solve IK for a given EE pose. Returns collision-free joint config or None.
+
+        Args:
+            seed_q: Optional joint config to use as the IK seed (and rest pose).
+                When provided, PyBullet's damped-least-squares solver converges to
+                the IK branch nearest to ``seed_q``. If None, a random seed is
+                used (gives diverse solutions across calls).
+        """
+        is_biased = seed_q is not None
+        if seed_q is None:
+            seed_q = self._get_random_q_within_limits()
         for idx, qi in zip(self.joint_indices, seed_q):
             self.pb.resetJointState(self.robot_id, idx, qi)
 
+        # Pass jointRanges (= upper - lower) so PyBullet activates null-space IK
+        # and actually uses restPoses to bias the solution toward seed_q. Without
+        # jointRanges, restPoses is silently ignored and only the joint-state
+        # seed weakly influences the converged branch.
+        joint_ranges = (self.upper_limits - self.lower_limits).tolist()
         q_solution = self.pb.calculateInverseKinematics(
             self.robot_id,
             ee_link_index,
@@ -458,6 +494,8 @@ class TrajectoryGenerator:
             residualThreshold=1e-10,
             lowerLimits=self.lower_limits.tolist(),
             upperLimits=self.upper_limits.tolist(),
+            jointRanges=joint_ranges,
+            restPoses=list(seed_q),
         )
 
         # Extract only the joints we control
@@ -469,6 +507,23 @@ class TrajectoryGenerator:
         # Check joint limits
         if np.any(q_solution < self.lower_limits) or np.any(q_solution > self.upper_limits):
             return None
+
+        # If we explicitly seeded with a bias, reject IK results that wandered
+        # too far from it — null-space IK on a 6-DOF arm can still flip branches
+        # when the residual is small, and the caller will retry with random seeds.
+        if is_biased:
+            seed_arr = np.asarray(seed_q)
+            wrapped_diff = ((q_solution - seed_arr + np.pi) % (2 * np.pi)) - np.pi
+            max_drift = float(np.max(np.abs(wrapped_diff)))
+            if max_drift > np.pi / 3:  # 60° per-joint tolerance
+                if self.config.verbose:
+                    print(f"[TrajectoryGenerator] IK seeded with q_goal_bias drifted "
+                          f"{np.degrees(max_drift):.1f}° from seed; rejecting and "
+                          f"falling back to random-seed IK.")
+                return None
+            if self.config.verbose:
+                print(f"[TrajectoryGenerator] IK seeded with q_goal_bias converged "
+                      f"within {np.degrees(max_drift):.2f}° of seed.")
 
         in_col = rrt_path_utils.check_links_in_collision(
             self.robot_id, self.joint_indices, q_solution,

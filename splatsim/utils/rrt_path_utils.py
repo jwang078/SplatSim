@@ -75,7 +75,40 @@ def contact_tuple_debug(pt):
 
 _COLLISION_CLEARANCE = 0.01  # 1 cm clearance for all collision checks
 
-def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, verbose=False, obstacle_names=None, self_collision_clearance=0.0, skip_pairs=None, obstacle_clearance=None) -> bool:
+
+# ---------------------------------------------------------------------------
+# Multi-client support
+# ---------------------------------------------------------------------------
+#
+# All PyBullet calls in this module need a `physicsClientId`. Historically the
+# functions used the implicit default (client 0), which is fine when only one
+# server is connected — but breaks down in setups where two PyBullet clients
+# coexist (for example, lerobot's shared autonomy wrapper running in the same
+# process as a local SplatSim simulator). To keep older callers working, we
+# accept an optional `physics_client_id=` kwarg on every function and resolve
+# it via `_resolve_client_id`. Modules that own a single client (e.g. the
+# SplatSim server) call `set_default_client_id(...)` once at startup so their
+# subsequent calls don't have to thread the id; cross-client callers
+# (e.g. the wrapper) pass `physics_client_id=` explicitly.
+
+_DEFAULT_CLIENT_ID: int = 0  # PyBullet's implicit default client
+
+
+def set_default_client_id(client_id: int) -> None:
+    """Set the default ``physicsClientId`` used by this module.
+
+    Called once by long-lived single-client setups (SplatSim's
+    PybulletRobotServerBase). Cross-client callers should pass
+    ``physics_client_id=`` to each function instead.
+    """
+    global _DEFAULT_CLIENT_ID
+    _DEFAULT_CLIENT_ID = int(client_id)
+
+
+def _resolve_client_id(physics_client_id):
+    return _DEFAULT_CLIENT_ID if physics_client_id is None else int(physics_client_id)
+
+def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, verbose=False, obstacle_names=None, self_collision_clearance=0.0, skip_pairs=None, obstacle_clearance=None, physics_client_id=None) -> bool:
     """
     Single source-of-truth collision checker.
 
@@ -101,19 +134,20 @@ def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indi
     Returns:
         True if any collision is detected, False otherwise.
     """
+    cid = _resolve_client_id(physics_client_id)
     if obstacle_clearance is None:
         obstacle_clearance = _COLLISION_CLEARANCE
     if q is not None:
-        set_robot_joint_positions(robot_id, joint_indices, q)
-        p.stepSimulation()
+        set_robot_joint_positions(robot_id, joint_indices, q, physics_client_id=cid)
+        p.stepSimulation(physicsClientId=cid)
 
     if link_indices_to_check is None:
-        link_indices_to_check = list(range(-1, p.getNumJoints(robot_id)))
+        link_indices_to_check = list(range(-1, p.getNumJoints(robot_id, physicsClientId=cid)))
 
     def _robot_link_name(link_i):
         if link_i == -1:
             return "base_link(-1)"
-        info = p.getJointInfo(robot_id, link_i)
+        info = p.getJointInfo(robot_id, link_i, physicsClientId=cid)
         return f"{info[12].decode('utf-8')}({link_i})"
 
     def _obs_name(obs):
@@ -129,7 +163,7 @@ def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indi
             if skip_pairs and (link_i, obs) in skip_pairs:
                 continue
             pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=obstacle_clearance,
-                                     linkIndexA=link_i)
+                                     linkIndexA=link_i, physicsClientId=cid)
             if len(pts) > 0:
                 if verbose:
                     print(f"Collision: robot {_robot_link_name(link_i)} vs obstacle {_obs_name(obs)}")
@@ -137,8 +171,8 @@ def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indi
 
     # Check self-collisions between non-adjacent link pairs
     for a, b in itertools.combinations(link_indices_to_check, 2):
-        if not are_adjacent_links(robot_id, a, b):
-            if len(p.getClosestPoints(robot_id, robot_id, self_collision_clearance, linkIndexA=a, linkIndexB=b)) > 0:
+        if not are_adjacent_links(robot_id, a, b, physics_client_id=cid):
+            if len(p.getClosestPoints(robot_id, robot_id, self_collision_clearance, linkIndexA=a, linkIndexB=b, physicsClientId=cid)) > 0:
                 if verbose:
                     print(f"Self-collision: robot {_robot_link_name(a)} vs {_robot_link_name(b)}")
                 return True
@@ -182,17 +216,19 @@ def get_joint_limits(robot_id, joint_indices):
         uppers.append(upper)
     return np.array(lowers), np.array(uppers)
 
-def set_robot_joint_positions(robot_id, joint_indices, q, hold=True):
+def set_robot_joint_positions(robot_id, joint_indices, q, hold=True, physics_client_id=None):
+    cid = _resolve_client_id(physics_client_id)
     for idx, qi in zip(joint_indices, q):
-        p.resetJointState(robot_id, idx, qi)
+        p.resetJointState(robot_id, idx, qi, physicsClientId=cid)
         if hold:
             p.setJointMotorControl2(
                 robot_id, idx, p.POSITION_CONTROL,
                 targetPosition=qi, force=150, maxVelocity=3.14,
+                physicsClientId=cid,
             )
     # Always assume that the robot gripper is open in these demos
-    open_gripper(robot_id)
-    p.stepSimulation()
+    open_gripper(robot_id, physics_client_id=cid)
+    p.stepSimulation(physicsClientId=cid)
 
 def min_distance_to_obstacles(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, max_dist=5.0):
     """Return minimum distance between robot (at q) and the set of obstacles (useful for soft cost)."""
@@ -331,7 +367,7 @@ def check_self_collision(robot_id, joint_indices, distance=0.0):
 
 _GRIPPER_LINK_START = 7  # Links 7+ are gripper links; arm links are 0-6 inclusive
 
-def are_adjacent_links(robot_id, linkA, linkB):
+def are_adjacent_links(robot_id, linkA, linkB, physics_client_id=None):
     """
     Returns True if the link pair should be skipped for self-collision checking.
     Two cases:
@@ -339,31 +375,91 @@ def are_adjacent_links(robot_id, linkA, linkB):
       2. Both links are gripper links (joint index >= 7) — gripper geometry
          overlaps by design so any intra-gripper pair is excluded.
     """
+    cid = _resolve_client_id(physics_client_id)
     # Both gripper links: always skip
     if linkA >= _GRIPPER_LINK_START and linkB >= _GRIPPER_LINK_START:
         return True
     if linkA == -1 or linkB == -1:
         return False
-    parentA = p.getJointInfo(robot_id, linkA)[16]
-    parentB = p.getJointInfo(robot_id, linkB)[16]
+    parentA = p.getJointInfo(robot_id, linkA, physicsClientId=cid)[16]
+    parentB = p.getJointInfo(robot_id, linkB, physicsClientId=cid)[16]
     return parentA == linkB or parentB == linkA
 
-def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal, verbose=True, obstacle_names=None, skip_pairs=None):
+def _make_uniform_sample_fn(lower_limits, upper_limits):
+    """Self-contained sample_fn that doesn't query PyBullet (so it doesn't
+    care which client is the default). Returns uniform random configurations
+    within the supplied limits."""
+    lower = np.asarray(lower_limits, dtype=np.float64)
+    upper = np.asarray(upper_limits, dtype=np.float64)
+
+    def fn():
+        return tuple(np.random.uniform(lower, upper))
+    return fn
+
+
+def _make_l2_distance_fn():
+    """Self-contained distance_fn (Euclidean in joint space)."""
+    def fn(q1, q2):
+        return float(np.linalg.norm(np.asarray(q2) - np.asarray(q1)))
+    return fn
+
+
+def _make_linear_extend_fn(resolutions):
+    """Self-contained extend_fn that linearly interpolates between two configs
+    at the supplied per-joint resolutions. No PyBullet calls (so client-id
+    agnostic). Yields intermediate configurations."""
+    resolutions = np.asarray(resolutions, dtype=np.float64)
+
+    def fn(q1, q2):
+        q1a = np.asarray(q1, dtype=np.float64)
+        q2a = np.asarray(q2, dtype=np.float64)
+        diff = q2a - q1a
+        n_steps = max(int(np.ceil(np.max(np.abs(diff) / resolutions))), 1)
+        for i in range(1, n_steps + 1):
+            yield tuple(q1a + diff * (i / n_steps))
+    return fn
+
+
+def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal,
+                 lower_limits=None, upper_limits=None, resolutions=None,
+                 verbose=True, obstacle_names=None, skip_pairs=None,
+                 physics_client_id=None):
+    """Plan a joint-space path from q_start to q_goal with bidirectional RRT.
+
+    `physics_client_id` controls which PyBullet server every call goes to,
+    so this works correctly even when multiple clients are connected (e.g.
+    SplatSim's GUI server + lerobot's wrapper's DIRECT client).
+
+    `lower_limits`/`upper_limits`/`resolutions` let callers provide joint
+    bounds and step sizes directly so we don't need pybullet_planning's
+    helpers (which would query the *default* client and might see a
+    different body at the same id). When omitted we fall back to those
+    helpers — fine when only one client is connected.
+    """
+    cid = _resolve_client_id(physics_client_id)
     if verbose:
         print("Planning with pybullet planning...")
-    set_robot_joint_positions(robot_id, joint_indices, q_start)
+    set_robot_joint_positions(robot_id, joint_indices, q_start, physics_client_id=cid)
 
-    sample_fn = get_sample_fn(robot_id, joint_indices)
-    distance_fn = get_distance_fn(robot_id, joint_indices)
-    extend_fn = get_extend_fn(robot_id, joint_indices)
+    if lower_limits is not None and upper_limits is not None:
+        sample_fn = _make_uniform_sample_fn(lower_limits, upper_limits)
+        distance_fn = _make_l2_distance_fn()
+        extend_fn = _make_linear_extend_fn(
+            resolutions if resolutions is not None else [0.05] * len(joint_indices)
+        )
+    else:
+        sample_fn = get_sample_fn(robot_id, joint_indices)
+        distance_fn = get_distance_fn(robot_id, joint_indices)
+        extend_fn = get_extend_fn(robot_id, joint_indices)
 
     def collision_fn(q):
-        return check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, skip_pairs=skip_pairs)
+        return check_links_in_collision(robot_id, joint_indices, q, obstacle_ids,
+                                         skip_pairs=skip_pairs, physics_client_id=cid)
 
     path = birrt(q_start, q_goal, distance_fn, sample_fn, extend_fn, collision_fn)
     if path is None:
-        start_in_col = check_links_in_collision(robot_id, joint_indices, q_start, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs)
-        goal_in_col = check_links_in_collision(robot_id, joint_indices, q_goal, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs)
+        start_in_col = check_links_in_collision(robot_id, joint_indices, q_start, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid)
+        goal_in_col = check_links_in_collision(robot_id, joint_indices, q_goal, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid)
         if start_in_col and goal_in_col:
             print("PyBullet planning failed: both q_start and q_goal are in collision.")
         elif start_in_col:
@@ -373,7 +469,7 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal, verbose
         else:
             print("PyBullet planning failed: start and goal are collision-free individually, but no path was found (environment may be too constrained or max iterations exhausted).")
         return None
-    
+
     path = np.array(path)
 
     # Sometimes, the plan is from end to start
@@ -472,8 +568,9 @@ def _ruckig_run_segment(
         raise RuntimeError(f"Ruckig trajectory calculation failed with result: {result}")
 
     duration = traj.duration
-    n_points = max(int(np.ceil(duration * control_hz)), 2)
-    ts = np.linspace(0, duration, n_points)
+    dt = 1.0 / control_hz
+    ts = np.arange(0, duration, dt)
+    ts = np.append(ts, duration)
     samples = np.array([traj.at_time(t)[0] for t in ts])
     final_vel = np.array(traj.at_time(duration)[1])
     final_acc = np.array(traj.at_time(duration)[2])
@@ -594,15 +691,17 @@ def resample_path(path: np.ndarray, n_points: int) -> np.ndarray:
         
     return resampled_path
 
-def open_gripper(robot_id):
+def open_gripper(robot_id, physics_client_id=None):
+    cid = _resolve_client_id(physics_client_id)
     # A very hardcoded and temporary solution
-    for idx in range(7, p.getNumJoints(robot_id)):
-        p.resetJointState(robot_id, idx, 0.0)
-    p.stepSimulation()
+    for idx in range(7, p.getNumJoints(robot_id, physicsClientId=cid)):
+        p.resetJointState(robot_id, idx, 0.0, physicsClientId=cid)
+    p.stepSimulation(physicsClientId=cid)
 
 
 
-def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, robot_update_rate, use_gui=False, verbose=True, max_joint_vel=None, max_joint_acc=None, max_joint_jerk=None, obstacle_names=None, skip_pairs=None):
+def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, robot_update_rate, use_gui=False, verbose=True, max_joint_vel=None, max_joint_acc=None, max_joint_jerk=None, obstacle_names=None, skip_pairs=None, physics_client_id=None):
+    cid = _resolve_client_id(physics_client_id)
     dof = len(joint_indices)
     if max_joint_vel is None:
         max_joint_vel = np.full(dof, 0.5)   # rad/s
@@ -611,26 +710,30 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, rob
     if max_joint_jerk is None:
         max_joint_jerk = np.full(dof, 10.0)  # rad/s^3, ~10x max_acc
     # Set joints to q_start
-    set_robot_joint_positions(robot_id, joint_indices, q_start)
+    set_robot_joint_positions(robot_id, joint_indices, q_start, physics_client_id=cid)
 
     # movable_joints = get_movable_joints(robot_id)
 
-    # RRT-Connect planner
-    rrt_path = get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal, verbose=verbose, obstacle_names=obstacle_names, skip_pairs=skip_pairs)
+    # 0.05 radians per joint, used both for RRT extension and path smoothing.
+    resolutions = [0.05] * len(joint_indices)
+
+    # RRT-Connect planner — pass joint limits + resolutions so its sample/extend
+    # functions don't query PyBullet (which would target the default client).
+    rrt_path = get_rrt_plan(
+        robot_id, joint_indices, obstacle_ids, q_start, q_goal,
+        lower_limits=ll, upper_limits=ul, resolutions=resolutions,
+        verbose=verbose, obstacle_names=obstacle_names, skip_pairs=skip_pairs,
+        physics_client_id=cid,
+    )
     if rrt_path is None:
         return None
 
 
     def collision_fn(q):
-        return check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, skip_pairs=skip_pairs)
+        return check_links_in_collision(robot_id, joint_indices, q, obstacle_ids,
+                                         skip_pairs=skip_pairs, physics_client_id=cid)
 
-    # 0.05 radians
-    resolutions = [0.05] * len(joint_indices)
-    extend_fn = get_extend_fn(
-        robot_id, 
-        joint_indices, 
-        resolutions=resolutions
-    )
+    extend_fn = _make_linear_extend_fn(resolutions)
 
     smoothed_path = smooth_path(
         rrt_path.tolist(),
