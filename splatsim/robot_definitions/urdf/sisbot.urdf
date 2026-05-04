@@ -622,7 +622,9 @@
     <parent link="robotiq_arg2f_base_link"/>
     <child link="wrist_camera_link"/>
     <!-- the cam is tilted down by about 18 degrees to see the gripper (0.31 rad) -->
-    <origin xyz="-0.1 0 -0.0" rpy="-0.3141 0 -1.57"/>
+    <!-- <origin xyz="-0.1 0 -0.0" rpy="-0.3141 0 -1.57"/> -->
+    <!-- Untilted -->
+    <origin xyz="-0.1 0 -0.0" rpy="0 0 -1.57"/>
     <!-- <origin xyz="-0.1 0 -0.05" rpy="-0.3141 0 -1.57"/> -->
   </joint>
 

@@ -92,8 +92,8 @@ class KeyboardInterfaceAgent(Agent):
     def __init__(
         self,
         robot_name: str = "robot_iphone_w_engine_new",
-        pos_sensitivity: float = 0.02, # 0.05,
-        rot_sensitivity: float = 0.05, # 0.2,
+        pos_sensitivity: float = 0.02, #0.02, # 0.05,
+        rot_sensitivity: float = 0.05, #0.05, # 0.2,
         max_joint_delta: float = 0.1,
         num_dofs: int = 6,
         delta_mode: bool = False,

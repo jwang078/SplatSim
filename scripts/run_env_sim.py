@@ -27,7 +27,7 @@ from splatsim.robots.robot import PrintRobot
 from gello.zmq_core.robot_node import ZMQClientRobot
 from gello.zmq_core.camera_node import ZMQClientCamera
 from splatsim.utils.agent_state_utils import AGENT_STATE
-from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig, ImageTransformConfig
+from lerobot.transforms.transforms import ImageTransforms, ImageTransformsConfig, ImageTransformConfig
 
 
 

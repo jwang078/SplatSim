@@ -271,19 +271,33 @@ def calibrate_fisheye(
         detected_frames = [x for x, v in zip(detected_frames, valid) if v]
 
     w, h = image_size
+    print("image size:", image_size)
 
+    # Initial guess scaled from a similar camera/lens at 960x540:
+    #   f=435.45, cx=479.12, cy=274.46, D=[0.05, 0.07, -0.11, 0.05]
+    # Scale: fx/fy by (target/source) per axis; cx/cy by same; D is dimensionless.
+    # Initial guess scaled from a similar camera/lens at 960x540:
+    #   f=435.45, cx=479.12, cy=274.46, D=[0.05, 0.07, -0.11, 0.05]
+    # fx=fy (square pixels; use width scale factor: 2704/960 ≈ 2.817).
+    # cx/cy scaled per axis. D is dimensionless — no scaling needed.
     K = np.array([
-        [776.8190, 0.0000, 1349.3899],
-        [0.0000, 779.5234, 999.4292],
+        [776.0756, 0.0000, 1343.6819],
+        [0.0000, 778.6178, 1006.0610],
         [0.0000, 0.0000, 1.0000],
     ], dtype=np.float64)
-    D = np.array([0, 0, 0, 0], dtype=np.float64)
+    D = np.array([-0.0228169664, -0.0162816270, 0.0000000000, 0.0000000000], dtype=np.float64)
+    K_init = K.copy()
+    D_init = D.copy()
 
     calibration_flags = (
         cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
         # + cv2.fisheye.CALIB_CHECK_COND
         + cv2.fisheye.CALIB_FIX_SKEW
         + cv2.fisheye.CALIB_USE_INTRINSIC_GUESS
+        # Fix k3/k4 to prevent overfitting when frame count is low.
+        # Remove these once you have 40+ well-distributed frames.
+        + cv2.fisheye.CALIB_FIX_K3
+        + cv2.fisheye.CALIB_FIX_K4
     )
 
     # Save pre-filtered copies — the while loop mutates these lists,
@@ -322,8 +336,8 @@ def calibrate_fisheye(
                 scaled_obj.pop(bad_idx)
                 img_points.pop(bad_idx)
                 detected_frames.pop(bad_idx)
-                K = np.zeros((3, 3))
-                D = np.zeros((4, 1))
+                K = K_init.copy()
+                D = D_init.copy()
             elif "InitExtrinsics" in msg or "norm_u1" in msg:
                 init_extrinsics_drops += 1
                 if init_extrinsics_drops > max_init_extrinsics_drops:
@@ -334,43 +348,59 @@ def calibrate_fisheye(
                 scaled_obj.pop(-1)
                 img_points.pop(-1)
                 detected_frames.pop(-1)
-                K = np.zeros((3, 3))
-                D = np.zeros((4, 1))
+                K = K_init.copy()
+                D = D_init.copy()
             else:
                 raise
 
     if not calibration_succeeded:
         raise RuntimeError("Fisheye calibration failed after filtering frames. Try checking the video quality.")
 
-    # Compute per-frame reprojection error
+    # Compute per-frame mean reprojection error (mean Euclidean distance per point)
     per_frame_errors = []
     for i in range(len(scaled_obj)):
         if used_standard_fallback:
             std_obj_i = scaled_obj[i].reshape(-1, 3).astype(np.float32)
             projected, _ = cv2.projectPoints(std_obj_i, rvecs[i], tvecs[i], K, dist_std)
-            pts = img_points[i].reshape(-1, 1, 2).astype(np.float32)
+            pts = img_points[i].reshape(-1, 2).astype(np.float32)
         else:
             projected, _ = cv2.fisheye.projectPoints(
                 scaled_obj[i].reshape(1, -1, 3), rvecs[i], tvecs[i], K, D,
             )
-            pts = img_points[i].astype(projected.dtype)
-        err = cv2.norm(pts, projected, cv2.NORM_L2) / projected.shape[0]
+            pts = img_points[i].reshape(-1, 2).astype(projected.dtype)
+        proj_flat = projected.reshape(-1, 2)
+        err = float(np.linalg.norm(pts - proj_flat, axis=1).mean())
         per_frame_errors.append(err)
+
+    sorted_frame_errors = sorted(enumerate(per_frame_errors), key=lambda x: -x[1])
 
     print(f"\nFisheye calibration complete!")
     print(f"  RMS reprojection error: {ret:.4f} px")
     print(f"  Mean per-frame error:   {np.mean(per_frame_errors):.4f} px")
     print(f"  Max per-frame error:    {np.max(per_frame_errors):.4f} px")
+    print(f"  Per-frame errors (worst first):")
+    for frame_i, frame_err in sorted_frame_errors:
+        print(f"    frame {frame_i:3d}: {frame_err:.3f} px")
     print(f"  Image size: {w}x{h}")
     print(f"\nFisheye camera matrix K:\n{K}")
     print(f"\nFisheye distortion D (k1,k2,k3,k4): {D.ravel()}")
 
-    # Compute optimal undistorted camera matrix (balance=0 keeps all valid pixels,
-    # balance=1 keeps all source pixels). balance=0 is best for SplatSim since
-    # it avoids black borders.
+    # Compute optimal undistorted camera matrix (balance=0 crops to valid pixels only,
+    # balance=1 keeps all source pixels with black borders).
+    # balance=0 can return NaN when distortion coefficients are large/unstable;
+    # fall back to balance=1 in that case.
     new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
         K, D, image_size, np.eye(3), balance=0.0,
     )
+    # Sanity check: fx should be in the same ballpark as the fisheye focal length.
+    # With near-zero or negative-only D, the function can return a degenerate result
+    # (fx << 1) without triggering NaN. Fall back to the fisheye K in that case,
+    # which is valid because distortion is negligible.
+    if np.any(np.isnan(new_K)) or new_K[0, 0] < K[0, 0] * 0.1:
+        print("  WARNING: estimateNewCameraMatrixForUndistortRectify returned a degenerate result "
+              f"(fx={new_K[0,0]:.4f}). Falling back to fisheye K as undistorted K "
+              "(valid: distortion coefficients are near-zero).")
+        new_K = K.copy()
 
     fx_undist = new_K[0, 0]
     fy_undist = new_K[1, 1]

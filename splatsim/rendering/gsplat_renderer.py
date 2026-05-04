@@ -1,3 +1,5 @@
+import math
+
 import torch
 from gsplat.rendering import rasterization
 
@@ -19,7 +21,18 @@ def render_gsplat(splatsim_camera, pc):
     # Undo column-major transpose (cameras.py stores .transpose(0,1) for OpenGL)
     viewmats = camera.world_view_transform.T.unsqueeze(0)  # [1, 4, 4]
 
-    Ks = splatsim_camera.intrinsic_matrix.unsqueeze(0)  # [1, 3, 3]
+    if splatsim_camera.intrinsic_matrix is not None:
+        Ks = splatsim_camera.intrinsic_matrix.unsqueeze(0)  # [1, 3, 3]
+    else:
+        # Derive pinhole K from FoV when not explicitly provided.
+        fx = (W / 2.0) / math.tan(camera.FoVx * 0.5)
+        fy = (H / 2.0) / math.tan(camera.FoVy * 0.5)
+        K = torch.tensor(
+            [[fx, 0.0, W / 2.0], [0.0, fy, H / 2.0], [0.0, 0.0, 1.0]],
+            device="cuda",
+            dtype=torch.float32,
+        )
+        Ks = K.unsqueeze(0)  # [1, 3, 3]
 
     radial_coeffs = None
     if splatsim_camera.radial_coeffs is not None:
@@ -49,6 +62,23 @@ def render_gsplat(splatsim_camera, pc):
 
     # gsplat output: [1, H, W, 3] → [3, H, W]
     rendered_image = render_colors[0].permute(2, 0, 1).clamp(0, 1)
+
+    # For fisheye cameras, gsplat rasterizes over the full W x H rectangle but
+    # real lenses only illuminate a circular image region — mask the outside to
+    # black to simulate the lens vignette. The image circle may extend past the
+    # far edges of the sensor (W - cx, H - cy), so we only bound the radius by
+    # the near edges (cx, cy).
+    if splatsim_camera.camera_model == "fisheye":
+        cx = Ks[0, 0, 2].item()
+        cy = Ks[0, 1, 2].item()
+        mask_radius = min(cx, cy, W - cx, H - cy) * 1.07
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device="cuda", dtype=torch.float32),
+            torch.arange(W, device="cuda", dtype=torch.float32),
+            indexing="ij",
+        )
+        inside = ((xs - cx) ** 2 + (ys - cy) ** 2) <= mask_radius ** 2
+        rendered_image = rendered_image * inside.unsqueeze(0)
 
     return {
         "render": rendered_image,
