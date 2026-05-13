@@ -266,16 +266,16 @@ class AppleOnPlatePybulletRobotServer(ObjectOnPlatePybulletRobotServer):
 
     ENV_CONFIG = {
         "objects": [
-            {
-                "object_name": "plastic_apple",
-                "splat_object_name": "plastic_apple",
-                "grasp_config": [PybulletRobotServerBase.GRASP_CONFIGS["apple"]],
-            },
-            {
-                "object_name": "plate",
-                "splat_object_name": "plate",
-                "grasp_config": [],
-            },
+            # {
+            #     "object_name": "plastic_apple",
+            #     "splat_object_name": "plastic_apple",
+            #     "grasp_config": [PybulletRobotServerBase.GRASP_CONFIGS["apple"]],
+            # },
+            # {
+            #     "object_name": "plate",
+            #     "splat_object_name": "plate",
+            #     "grasp_config": [],
+            # },
         ]
     }
 

@@ -31,7 +31,7 @@ from torchvision.transforms.functional import to_pil_image
 assert mujoco.viewer is mujoco.viewer
 from gaussian_splatting.scene.cameras import Camera
 from gaussian_renderer import render
-import urdf_models.models_data as md
+# import urdf_models.models_data as md
 import pybullet as p
 from pybullet_planning.interfaces.robots.collision import pairwise_collision
 import pybullet_data
@@ -242,6 +242,7 @@ class PybulletRobotServerBase:
         self.robot_labels = np.load(
             "./data/labels_path/" + self.robot_name + "_labels.npy"
         )
+
         self.robot_labels = torch.from_numpy(self.robot_labels).to(device="cuda").long()
         self.transformations_cache = None
 
@@ -313,7 +314,11 @@ class PybulletRobotServerBase:
         # random quaternion for the orientation of the object
         quat = self.pybullet_client.getQuaternionFromEuler([0, 0, 0])
 
-        models_lib = md.model_lib()
+        class MockModelsLib:
+            model_name_list = {}
+
+        models_lib = MockModelsLib
+        # models_lib = md.model_lib()
         self.object_name_list = list(
             map(
                 lambda object_cfg: object_cfg["object_name"],
@@ -372,11 +377,11 @@ class PybulletRobotServerBase:
             self.urdf_object_mass_list.append(mass)
 
         # reset the box position
-        self.pybullet_client.resetBasePositionAndOrientation(
-            self.urdf_object_list[-1],
-            [0.3, -0.5, 0.07],
-            p.getQuaternionFromEuler([0, 0, np.pi / 2]),
-        )
+        # self.pybullet_client.resetBasePositionAndOrientation(
+        #     self.urdf_object_list[-1],
+        #     [0.3, -0.5, 0.07],
+        #     p.getQuaternionFromEuler([0, 0, np.pi / 2]),
+        # )
 
         # set the drop location for the apple and banana
         self.drop_ee_pos = [0.3, -0.5, 0.3]
@@ -616,6 +621,7 @@ class PybulletRobotServerBase:
             f"Expected joint state of length {self.num_dofs()}, "
             f"got {len(joint_state)}."
         )
+        print('joint state command received', joint_state)
 
         for i in range(1, self.num_dofs()):
             self.pybullet_client.setJointMotorControl2(
