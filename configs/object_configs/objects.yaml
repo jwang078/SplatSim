@@ -24,6 +24,35 @@ robot_iphone:
   source_path: /home/jennyw2/data/test_data/robot_iphone
   model_path: /home/jennyw2/data/output/robot_iphone
   use_gripper: true
+robot_iphone_w_engine_new:
+  transformation:
+    matrix:
+    - [0.05964, 0.113288, -0.275157, 0.631604]
+    - [0.297564, -0.021757, 0.055539, 0.288505]
+    - [0.001006, -0.280704, -0.115354, 0.580824]
+    - [0.0, 0.0, 0.0, 1.0]
+  aabb:
+    bounding_box:
+    - [-0.0734, -0.11, 0.0082]
+    - [0.6085, 0.2044, 0.5867]
+    urdf_bbox_adjustment:
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+  urdf_path:
+  - ./splatsim/robot_definitions/urdf/sisbot.urdf
+  base_position:
+  - [0.0, 0.0, -0.088]
+  joint_states:
+  - [0, 0.0, -1.5707963267948966, 1.5707963267948966, -1.5707963267948966, -1.5707963267948966,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0]
+  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle/sfm_disk_disk+lightglue/undistorted
+  model_path: /home/jennyw2/code/gaussian-splatting/output/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle
+  use_gripper: true
+  is_articulated: true
+  use_fixed_base: true
+  wrist_camera_link_name: wrist_camera_link
 sim_franka:
   transformation:
     matrix:

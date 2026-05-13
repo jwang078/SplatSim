@@ -530,7 +530,7 @@
     <axis xyz="0 0 1"/>
   </joint>
 
-  <link name="dummy_center_indicator_link">
+  <!-- <link name="dummy_center_indicator_link"> -->
     <!-- <visual>
       <geometry>
         <box size="0.025 0.08 0.002"/>
@@ -545,7 +545,7 @@
         <color rgba="0.4 0.4 0.4 1"/>
       </material>
     </visual> -->
-    <inertial>
+    <!-- <inertial>
       <mass value="0.1" />
       <inertia ixx = "0" ixy = "0" ixz = "0"
                iyx = "0" iyy = "0" iyz = "0"
@@ -556,7 +556,7 @@
     <parent link="robotiq_arg2f_base_link"/>
     <child link="dummy_center_indicator_link"/>
     <origin xyz="0 0 0.15"/>
-  </joint>
+  </joint> -->
 
  <gazebo reference="robotiq_arg2f_base_link">
     <selfCollide>true</selfCollide>
@@ -581,5 +581,106 @@
     <origin rpy="0.0 1.5708 1.5708" xyz="0.0 0.09435 0.0"/>
   </joint>
 
-</robot>
+  <!-- <link name="gripper_center_link">
+  <visual>
+    <geometry>
+      <sphere radius="0.01"/>
+    </geometry>
+    <material name="yellow">
+      <color rgba="0 1 0 1"/>
+    </material>
+  </visual>
+</link> -->
 
+<!-- <joint name="gripper_center_fixed_joint" type="fixed">
+  <parent link="robotiq_arg2f_base_link"/>
+  <child link="gripper_center_link"/>
+  <origin xyz="0 0 0.2" rpy="0 0 0"/>
+</joint> -->
+
+
+
+  <!-- Virtual wrist camera -->
+  <link name="wrist_camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.072 0.051 0.034"/>
+      </geometry>
+      <material name="dark_grey">
+        <color rgba="0.2 0.2 0.2 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.072 0.051 0.034"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="wrist_camera_vis_joint" type="fixed">
+    <parent link="robotiq_arg2f_base_link"/>
+    <child link="wrist_camera_link"/>
+    <!-- the cam is tilted down by about 18 degrees to see the gripper (0.31 rad) -->
+    <!-- <origin xyz="-0.1 0 -0.0" rpy="-0.3141 0 -1.57"/> -->
+    <!-- Untilted -->
+    <origin xyz="-0.1 0 -0.0" rpy="0 0 -1.57"/>
+    <!-- <origin xyz="-0.1 0 -0.05" rpy="-0.3141 0 -1.57"/> -->
+  </joint>
+
+  <!-- make a virtual link to define a virtual camera -->
+  <link name="wrist_camera_vis_x_link">
+  <!-- X axis (Red) -->
+  <visual>
+    <origin xyz="0.05 0 0" rpy="0 -1.57 0"/>
+    <geometry>
+      <cylinder radius="0.005" length="0.1"/>
+    </geometry>
+    <material name="red_color">
+      <color rgba="1 0 0 1"/>
+    </material>
+  </visual>
+  </link>
+  <joint name="wrist_camera_vis_x_joint" type="fixed">
+    <parent link="wrist_camera_link"/>
+    <child link="wrist_camera_vis_x_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="wrist_camera_vis_y_link">
+  <!-- Y axis (Green) -->
+  <visual>
+    <origin xyz="0 0.05 0" rpy="-1.57 0 0"/> <!-- Rotate cylinder to point along Y -->
+    <geometry>
+      <cylinder radius="0.005" length="0.1"/>
+    </geometry>
+    <material name="green_color">
+      <color rgba="0 1 0 1"/>
+    </material>
+  </visual>
+  </link>
+  <joint name="wrist_camera_vis_y_joint" type="fixed">
+    <parent link="wrist_camera_link"/>
+    <child link="wrist_camera_vis_y_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="wrist_camera_vis_z_link">
+  <!-- Z axis (Blue) -->
+  <visual>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/> <!-- Rotate cylinder to point along Z -->
+    <geometry>
+      <cylinder radius="0.005" length="0.1"/>
+    </geometry>
+    <material name="blue_color">
+      <color rgba="0 0 1 1"/>
+    </material>
+  </visual>
+  </link>
+  <joint name="wrist_camera_vis_z_joint" type="fixed">
+    <parent link="wrist_camera_link"/>
+    <child link="wrist_camera_vis_z_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+</robot>

@@ -28,10 +28,13 @@ def get_curr_link_states(robot_uid, use_link_centers=True):
     return link_states
 
 
-def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=True):
+def get_transfomration_list(robot_uid, initial_link_states, use_link_centers=True, cached_link_states=None):
     num_joints = p.getNumJoints(robot_uid)
 
-    new_joints = get_curr_link_states(robot_uid, use_link_centers=use_link_centers)
+    if cached_link_states is not None:
+        new_joints = cached_link_states
+    else:
+        new_joints = get_curr_link_states(robot_uid, use_link_centers=use_link_centers)
 
     if len(initial_link_states) != num_joints or len(new_joints) != num_joints:
         print(f"Error: Number of joints mismatch. Initial: {len(initial_link_states)}, New: {len(new_joints)}, Expected: {num_joints}")
