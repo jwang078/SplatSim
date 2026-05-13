@@ -663,7 +663,7 @@ class PybulletRobotServerBase:
             "inv_transformation_scale": object_transformation_inv_scale,
         }
 
-    def get_wrist_camera(self):
+    def get_wrist_camera(self, cached_link_states=None):
         if self.wrist_camera_link_index is None:
             print("WARNING: No wrist camera index found")
             return None
@@ -671,12 +671,16 @@ class PybulletRobotServerBase:
         uid = 0
         colmap_id = 1
 
-        # Get the pose of the wrist_camera_link
-        link_state = p.getLinkState(
-            self.dummy_robot,
-            self.wrist_camera_link_index,
-            computeForwardKinematics=True,
-        )
+        link_idx = int(self.wrist_camera_link_index)
+        if cached_link_states is not None and link_idx < len(cached_link_states):
+            cached_state = cached_link_states[link_idx]
+            link_state = (cached_state["pos"], cached_state["q"])
+        else:
+            link_state = p.getLinkState(
+                self.dummy_robot,
+                link_idx,
+                computeForwardKinematics=True,
+            )
 
         # robot_transformation = np.array(
         #     self.object_config[self.robot_name]["transformation"]["matrix"]
@@ -758,10 +762,10 @@ class PybulletRobotServerBase:
 
         return camera
 
-    def prep_image_rendering(self, data) -> Dict[str, np.ndarray]:
+    def prep_image_rendering(self, data, cached_link_states=None) -> Dict[str, np.ndarray]:
         # Gets transformations for all links of the robot based on the current simulation
         transformations_list = get_transfomration_list(
-            self.dummy_robot, self.initial_link_states
+            self.dummy_robot, self.initial_link_states, cached_link_states=cached_link_states
         )
 
         # TODO does this need to be done every time?
@@ -867,12 +871,12 @@ class PybulletRobotServerBase:
                 dim=0,
             )
 
-    def render_image(self, camera_name):
+    def render_image(self, camera_name, cached_link_states=None):
         # TODO to save compute, you only need to create the splat once, then it can be rendered w/ different cameras
         if camera_name == "base_rgb":
             camera = self.base_camera
         elif camera_name == "wrist_rgb":
-            camera = self.get_wrist_camera()
+            camera = self.get_wrist_camera(cached_link_states=cached_link_states)
             if camera is None:
                 return None
         else:
@@ -972,9 +976,14 @@ class PybulletRobotServerBase:
             observations[self.splat_object_name_list[i] + "_orientation"] = object_quat
 
         if len(self.camera_names) > 0:
-            self.prep_image_rendering(data=observations)
+            cached_link_states = get_curr_link_states(
+                self.dummy_robot, self.use_link_centers
+            )
+            self.prep_image_rendering(data=observations, cached_link_states=cached_link_states)
             for camera_name in self.camera_names:
-                observations[camera_name] = self.render_image(camera_name=camera_name)
+                observations[camera_name] = self.render_image(
+                    camera_name=camera_name, cached_link_states=cached_link_states
+                )
         for camera_name in ["base_rgb", "wrist_rgb"]:
             if camera_name not in observations:
                 observations[camera_name] = None
