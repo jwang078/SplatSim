@@ -193,6 +193,20 @@ class SplatSimGymEnv(gym.Env):
             self.robot_server.stop()
             self.robot_server = None
 
+    def get_observations(self):
+        """Return the raw obs dict from the underlying robot server.
+
+        Unlike ``step`` / ``reset`` (which run the result through
+        ``_to_gym_obs`` and squash multi-resize-mode images into the single
+        declared ``pixels.{cam}`` slot), this returns the un-converted dict
+        with ``{cam}_{mode}`` image keys for every resize mode the server
+        produces. Callers writing dataset frames that need every mode
+        (e.g. dataset augmentation, intervention recording) use this. Works
+        both for local backends (``PybulletRobotServerBase``) and the ZMQ
+        backend (``_ZMQBackend``) since both expose ``get_observations``.
+        """
+        return self.robot_server.get_observations()
+
     @property
     def task_description(self) -> str:
         """Return the task description for LeRobot compatibility.
@@ -461,6 +475,22 @@ class _ZMQBackend:
     def get_observations(self):        return self._client.get_observations()
     def get_task_description(self):    return ""
     def stop(self):                    self._client.close()
+
+    # Stub object so callers (e.g. ``seed_splatsim_env_to_state``) can do
+    # ``robot_server.teleport_joint_state(robot_server.splatsim_robot, ...)``
+    # against either the local PybulletRobotServerBase or this ZMQ backend
+    # uniformly. The value is a sentinel — the actual splat object lives in
+    # the simulator subprocess.
+    splatsim_robot = object()
+
+    def teleport_joint_state(self, splatsim_robot, joint_state) -> None:
+        """Forward a teleport request over ZMQ. Mirrors the local
+        ``PybulletRobotServerBase.teleport_joint_state`` signature so the
+        seeding helper can call either backend the same way; the
+        ``splatsim_robot`` arg is ignored (the simulator owns its own).
+        """
+        del splatsim_robot  # unused — server side picks self._robot.splatsim_robot
+        self._client.teleport_joint_state(joint_state)
 
 
 class ZMQSplatSimGymEnv(SplatSimGymEnv):
