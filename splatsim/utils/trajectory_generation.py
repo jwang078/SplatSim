@@ -267,11 +267,16 @@ class TrajectoryGenerator:
         max_tries = 5
         while tries < max_tries:
             try:
+                # Limits are tuned to produce more bursty, D7-like motion: faster
+                # peak velocity, much higher acceleration and jerk so the robot
+                # ramps up and down sharply (instead of constant-velocity glide).
+                # Pre-fix values were vel=0.5, acc=1.0, jerk=10.0 which produced
+                # smooth slow motion with weak "stop" signals at terminal frames.
                 base_traj = rrt_path_utils.ruckig_parametrize_path(
                     base_traj,
-                    max_joint_vel=np.full(dof, 0.5),
-                    max_joint_acc=np.full(dof, 1.0),
-                    max_joint_jerk=np.full(dof, 10.0),
+                    max_joint_vel=np.full(dof, 1.0),
+                    max_joint_acc=np.full(dof, 4.0),
+                    max_joint_jerk=np.full(dof, 50.0),
                     control_hz=self.config.robot_update_rate,
                 )
                 break
