@@ -1710,10 +1710,14 @@ class PybulletRobotServerBase:
         # print the euler angles and the reconstructed quaternion
         if self.use_gripper:
             self.current_gripper_state = self.get_current_gripper_state() / 0.8
-            # Snap the gripper state to 0 or 1 if they're very close
-            if self.current_gripper_state > 0.95:
+            # Snap the gripper state to 0 or 1 if they're reasonably close.
+            # The wider thresholds (0.2 / 0.8 instead of 0.05 / 0.95) account
+            # for residual rest-position drift after physics settling — e.g.
+            # in some scene configurations the open gripper rests at ~0.05
+            # rather than exactly 0, which a tighter threshold misses.
+            if self.current_gripper_state > 0.8:
                 self.current_gripper_state = 1.0
-            elif self.current_gripper_state < 0.05:
+            elif self.current_gripper_state < 0.2:
                 self.current_gripper_state = 0.0
         else:
             self.current_gripper_state = 0.0
