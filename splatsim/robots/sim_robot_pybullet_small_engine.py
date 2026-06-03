@@ -181,8 +181,11 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
             q_goal_bias=(1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029),
             # target_ee_{pos,quat} were captured from self.get_current_ee_pose() at this q_goal_bias.
             target_ee_pos=(-0.10123532289544344, 0.5484031509107826, 0.26692192875731213),
+            # If camera is tilted 18 degrees down
             target_ee_quat=(0.8074376258351692, 0.1106042613918073, -0.5450490313370774, 0.19680632913133583),
-            
+            # If camera is level with the horizon
+            # target_ee_quat=(0.8282820040827756, 0.02399455087684049, -0.5556401809874196, 0.06809678783251895),
+
             pos_tolerance_m=0.03,  # 3 centimeters
             quat_tolerance_deg=10.0,  # 10 degrees
         ),
