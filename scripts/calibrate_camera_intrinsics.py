@@ -293,11 +293,11 @@ def calibrate_fisheye(
         cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
         # + cv2.fisheye.CALIB_CHECK_COND
         + cv2.fisheye.CALIB_FIX_SKEW
-        + cv2.fisheye.CALIB_USE_INTRINSIC_GUESS
+        # + cv2.fisheye.CALIB_USE_INTRINSIC_GUESS
         # Fix k3/k4 to prevent overfitting when frame count is low.
         # Remove these once you have 40+ well-distributed frames.
-        + cv2.fisheye.CALIB_FIX_K3
-        + cv2.fisheye.CALIB_FIX_K4
+        # + cv2.fisheye.CALIB_FIX_K3
+        # + cv2.fisheye.CALIB_FIX_K4
     )
 
     # Save pre-filtered copies — the while loop mutates these lists,
@@ -510,21 +510,35 @@ FoVy = {results['FoVy']:.10f}  # {math.degrees(results['FoVy']):.2f} deg
 """)
 
 
-def show_undistorted_comparison(frame: np.ndarray, results: dict, save_path: str | None = None):
-    """Show a side-by-side of original vs undistorted for a middle frame."""
+def show_undistorted_comparison(frames: list[np.ndarray], results: dict, save_path: str | None = None):
+    """Show a grid of (original | undistorted) pairs, one row per frame."""
+    if not frames:
+        return
 
-    undistorted = undistort_frame(frame, results)
+    pair_h = 320  # display height per row
+    pairs = []
+    for frame in frames:
+        undistorted = undistort_frame(frame, results)
+        scale = pair_h / frame.shape[0]
+        orig_small = cv2.resize(frame, None, fx=scale, fy=scale)
+        undist_small = cv2.resize(undistorted, None, fx=scale, fy=scale)
+        # Match widths so hstack works even if undistort changes aspect slightly
+        target_w = min(orig_small.shape[1], undist_small.shape[1])
+        orig_small = orig_small[:, :target_w]
+        undist_small = undist_small[:, :target_w]
+        cv2.putText(orig_small, "ORIG", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(undist_small, "UNDIST", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        pairs.append(np.hstack([orig_small, undist_small]))
 
-    # Scale down for display
-    scale = 0.35
-    orig_small = cv2.resize(frame, None, fx=scale, fy=scale)
-    undist_small = cv2.resize(undistorted, None, fx=scale, fy=scale)
+    grid = _resize_to_fit(np.vstack(pairs))
 
-    show_frame_grid(
-        [orig_small, undist_small],
-        title="Original (left) vs Undistorted (right) - press any key",
-        save_path=save_path,
-    )
+    if save_path is not None:
+        cv2.imwrite(save_path, grid)
+        print(f"  Saved undistorted comparison to {save_path}")
+
+    cv2.imshow(f"Original (left) vs Undistorted (right) - {len(frames)} frames - press any key", grid)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
 
 def main():
@@ -541,6 +555,8 @@ def main():
                         help="Number of candidate frames to sample (default: 40)")
     parser.add_argument("--output", default="calibration.json",
                         help="Output JSON path (default: calibration.json)")
+    parser.add_argument("--num-compare-frames", type=int, default=6,
+                        help="How many frames to show in the final undistorted comparison grid (default: 6)")
     args = parser.parse_args()
 
     if not args.video and not args.image_folder:
@@ -628,33 +644,37 @@ def main():
     save_results(results, args.output)
     print_splatsim_snippet(results)
 
-    print("\nShowing undistorted comparison (press any key to close)...")
-    # Get a middle frame for undistortion comparison
+    print(f"\nShowing undistorted comparison for {args.num_compare_frames} frames (press any key to close)...")
+    compare_frames: list[np.ndarray] = []
     if video_path:
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        mid_frame_idx = total_frames // 2
-        cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame_idx)
-        ret, frame = cap.read()
+        n = min(args.num_compare_frames, total_frames)
+        indices = np.linspace(0, total_frames - 1, n, dtype=int)
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ret, frame = cap.read()
+            if ret:
+                compare_frames.append(frame)
         cap.release()
-        if not ret:
-            print(f"Failed to read frame {mid_frame_idx} from video for undistortion comparison")
-            return
     elif image_folder:
-        # Pick an image from the image folder (e.g. the middle one) for undistortion comparison
         image_paths = sorted(Path(image_folder).glob("*"))
         if not image_paths:
             print(f"No valid images found in {image_folder} for undistortion comparison")
             return
-        mid_image_path = image_paths[len(image_paths) // 2]
-        frame = cv2.imread(str(mid_image_path))
-        if frame is None:
-            print(f"Failed to read image {mid_image_path} for undistortion comparison")
-            return
+        n = min(args.num_compare_frames, len(image_paths))
+        indices = np.linspace(0, len(image_paths) - 1, n, dtype=int)
+        for idx in indices:
+            img = cv2.imread(str(image_paths[int(idx)]))
+            if img is not None:
+                compare_frames.append(img)
     else:
         print("Unexpected error: no video or image folder provided for undistortion comparison")
         return
-    show_undistorted_comparison(frame, results, save_path=str(cache_dir / "undistorted_comparison.png"))
+    if not compare_frames:
+        print("No frames available for undistortion comparison")
+        return
+    show_undistorted_comparison(compare_frames, results, save_path=str(cache_dir / "undistorted_comparison.png"))
 
 
 if __name__ == "__main__":
