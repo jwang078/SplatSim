@@ -14,10 +14,13 @@ Usage:
 """
 
 import argparse
+import glob
 import os
 
 import matplotlib.pyplot as plt
+from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir
 import numpy as np
+import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
 from scipy.ndimage import gaussian_filter, uniform_filter
 
@@ -47,10 +50,41 @@ SISBOT_ARM_JOINT_INDICES = [1, 2, 3, 4, 5, 6]  # shoulder_pan .. wrist_3
 SISBOT_EE_LINK_INDEX = 7  # ee_link
 
 
-def compute_ee_positions(rows: list[dict]) -> np.ndarray:
+def _load_first_frame_states(dataset_root: str, episode_indices: list[int]) -> dict[int, np.ndarray]:
+    """Load observation.state from the first frame of each requested episode.
+
+    Returns {episode_index: state_array}. Episodes not found are omitted.
+    """
+    parquet_files = sorted(glob.glob(os.path.join(dataset_root, "data", "chunk-*", "*.parquet")))
+    if not parquet_files:
+        return {}
+    wanted = set(episode_indices)
+    result: dict[int, np.ndarray] = {}
+    for f in parquet_files:
+        try:
+            df = pd.read_parquet(f, columns=["episode_index", "frame_index", "observation.state"])
+        except Exception:
+            continue
+        df = df[df["episode_index"].isin(wanted)]
+        if df.empty:
+            continue
+        first_frames = df.sort_values("frame_index").groupby("episode_index").first()
+        for ep_idx, row in first_frames.iterrows():
+            if ep_idx not in result:
+                result[int(ep_idx)] = np.asarray(row["observation.state"])
+        if wanted.issubset(result):
+            break
+    return result
+
+
+def compute_ee_positions(rows: list[dict], dataset_root: str | None = None) -> np.ndarray:
     """Return (N, 2) array of EE XY positions computed via pybullet FK (headless).
 
-    Loads the URDF once, then teleports joints for each episode and reads ee_link.
+    Primary source: splatsim_robot_config.articulation_config.initial_joint_positions.
+    Fallback: observation.state from the first data frame of each episode (requires
+    dataset_root so the data parquet files can be found).
+
+    Episodes where neither source is available are skipped with a warning.
     """
     import json
     import pybullet as p
@@ -59,21 +93,50 @@ def compute_ee_positions(rows: list[dict]) -> np.ndarray:
     robot = p.loadURDF(SISBOT_URDF, basePosition=SISBOT_BASE_POS,
                        useFixedBase=True, physicsClientId=client)
 
+    # Pre-load first-frame states for any episode that might need the fallback.
+    needs_fallback: list[int] = [
+        int(r["episode_index"])
+        for r in rows
+        if r.get("splatsim_robot_config") is None and r.get("episode_index") is not None
+    ]
+    fallback_states: dict[int, np.ndarray] = {}
+    if needs_fallback and dataset_root is not None:
+        print(f"  Falling back to observation.state for {len(needs_fallback)} episode(s) missing splatsim_robot_config")
+        fallback_states = _load_first_frame_states(dataset_root, needs_fallback)
+    elif needs_fallback:
+        print(f"  Warning: {len(needs_fallback)} episode(s) missing splatsim_robot_config and no dataset_root provided; those episodes will be skipped")
+
     xy = []
+    skipped = 0
     for row in rows:
         cfg = row.get("splatsim_robot_config")
         if isinstance(cfg, str):
             cfg = json.loads(cfg)
-        if cfg is None:
-            continue
-        joints = cfg["articulation_config"]["initial_joint_positions"][:6]
+
+        joints: list[float] | None = None
+        if cfg is not None:
+            joints = cfg["articulation_config"]["initial_joint_positions"][:6]
+        else:
+            ep_idx = row.get("episode_index")
+            state = fallback_states.get(ep_idx) if ep_idx is not None else None
+            if state is not None:
+                joints = state[:6].tolist()
+            else:
+                if ep_idx is not None:
+                    print(f"  Warning: episode {ep_idx} has no robot config or state data; skipping EE position")
+                skipped += 1
+                continue
+
+        assert joints is not None
         for ji, jval in zip(SISBOT_ARM_JOINT_INDICES, joints):
             p.resetJointState(robot, ji, jval, physicsClientId=client)
         pos = p.getLinkState(robot, SISBOT_EE_LINK_INDEX, physicsClientId=client)[0]
         xy.append((pos[0], pos[1]))
 
     p.disconnect(client)
-    return np.array(xy)
+    if skipped:
+        print(f"  Skipped {skipped} episode(s) with no joint data")
+    return np.array(xy) if xy else np.empty((0, 2))
 
 
 def build_position_map(rows: list[dict], skip: set[str], skip_static: bool = True) -> dict[str, np.ndarray]:
@@ -83,8 +146,13 @@ def build_position_map(rows: list[dict], skip: set[str], skip_static: bool = Tru
     episodes are automatically excluded (e.g. table, wall).
     """
     positions: dict[str, list[tuple[float, float]]] = {}
+    missing_count = 0
     for row in rows:
-        for obj in parse_object_configs(row.get("splatsim_object_configs")):
+        raw = row.get("splatsim_object_configs")
+        if raw is None:
+            missing_count += 1
+            continue
+        for obj in parse_object_configs(raw):
             name = obj.get("name", "unknown")
             if name in skip:
                 continue
@@ -93,6 +161,9 @@ def build_position_map(rows: list[dict], skip: set[str], skip_static: bool = Tru
                 continue
             x, y = float(pos[0]), float(pos[1])
             positions.setdefault(name, []).append((x, y))
+
+    if missing_count:
+        print(f"  Warning: {missing_count} episode(s) have no splatsim_object_configs; skipped from object position map")
 
     result = {}
     for name, pts in positions.items():
@@ -279,8 +350,13 @@ def main():
     parser = argparse.ArgumentParser(description="Heatmap of initial object XY positions across episodes")
     parser.add_argument(
         "--dataset",
-        default="/home/jennyw2/.cache/huggingface/lerobot/JennyWWW/eval_splatsim_approach_lever_benchmark_1000",
-        help="Root of the LeRobot dataset cache directory",
+        default="JennyWWW/splatsim_approach_lever_11_50failsrrtpi05",
+        help="Repo ID (e.g. 'JennyWWW/my-dataset') or absolute path to the dataset root",
+    )
+    parser.add_argument(
+        "--dataset_dir",
+        default=None,
+        help="Explicit path to the dataset's data/ directory, bypassing auto-resolution",
     )
     parser.add_argument(
         "--episode",
@@ -320,7 +396,10 @@ def main():
     )
     args = parser.parse_args()
 
-    meta_dir = os.path.join(args.dataset, "meta", "episodes")
+    # Resolve repo ID or path → dataset root (resolve_dataset_dir returns data/,
+    # so go up one level to get the root that contains meta/ and data/).
+    dataset_root = str(resolve_dataset_dir(args.dataset, args.dataset_dir).parent)
+    meta_dir = os.path.join(dataset_root, "meta", "episodes")
     episode_indices = parse_episodes(args.episode) if args.episode else None
 
     print(f"Loading episode metadata from {meta_dir}...")
@@ -342,7 +421,7 @@ def main():
     robot_ee_pts = None
     if args.robot_ee:
         print("Computing robot EE positions via FK...")
-        robot_ee_pts = compute_ee_positions(rows)
+        robot_ee_pts = compute_ee_positions(rows, dataset_root=dataset_root)
         print(f"  robot EE: {len(robot_ee_pts)} positions")
 
     # Build output path
