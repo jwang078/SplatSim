@@ -1662,7 +1662,24 @@ class PybulletRobotServerBase:
         robot_obj = self.splatsim_robot
         robot_cfg_dict = _to_jsonable(asdict(robot_obj.config))
         robot_cfg_dict["__type__"] = type(robot_obj.config).__name__
-        # Base position is stored on the live SplatSimObject — copy current state too.
+
+        # Splatsim scene metadata (mirrors _get_splatsim_episode_metadata).
+        # Included here so callers (e.g. intervention_record.py) can fetch
+        # everything they need in one ZMQ call rather than adding a new method.
+        splatsim_meta = self._get_splatsim_episode_metadata()
+
+        # Current (live) end-effector pose at the time of this call. Used by
+        # lerobot's last-mile-debug wrapper to trigger EE-space override
+        # without having to re-implement FK client-side. Cheap: get_env_config
+        # is called once per env step and FK is just a pybullet link lookup.
+        try:
+            cur_ee_pos, cur_ee_quat = self.get_current_ee_pose()
+            current_ee_pos = list(cur_ee_pos) if cur_ee_pos is not None else None
+            current_ee_quat = list(cur_ee_quat) if cur_ee_quat is not None else None
+        except Exception:
+            current_ee_pos = None
+            current_ee_quat = None
+
         return {
             "name": cfg.name,
             "task": task,
@@ -1670,6 +1687,11 @@ class PybulletRobotServerBase:
             "terminate_on_collision": cfg.terminate_on_collision,
             "objects": objects,
             "robot": robot_cfg_dict,
+            "splatsim_robot_config": splatsim_meta["splatsim_robot_config"],
+            "splatsim_background_config": splatsim_meta["splatsim_background_config"],
+            "splatsim_object_configs": splatsim_meta["splatsim_object_configs"],
+            "current_ee_pos": current_ee_pos,
+            "current_ee_quat": current_ee_quat,
         }
 
     def get_observations(self, render_images: bool = True) -> Dict[str, np.ndarray]:
