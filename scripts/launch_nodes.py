@@ -38,6 +38,13 @@ class Args:
     #   2 = fisheye, recalibrated 1920x1080 GoPro calibration
     wrist_cam_ver: int = 1
 
+    # When True, connect pybullet in DIRECT (no GUI) mode. Skips OpenGL
+    # context creation entirely → no display required, ~3-5x faster for
+    # physics-only workloads. Gaussian splat rendering is unavailable in
+    # this mode. Intended for fast batch operations like trajectory
+    # replay + collision-check filtering.
+    headless: bool = False
+
 
 def launch_robot_server(args: Args):
     # Match lerobot's precision settings so dataset collection
@@ -165,6 +172,7 @@ def launch_robot_server(args: Args):
            eval_benchmark_repo_id=args.eval_benchmark_repo_id,
            eval_benchmark_subset=args.eval_benchmark_subset,
            wrist_cam_ver=args.wrist_cam_ver,
+           headless=args.headless,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_strict":

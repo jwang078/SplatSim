@@ -379,11 +379,17 @@ class PybulletRobotServerBase:
         eval_benchmark_subset: Optional[List[int]] = None,
         use_gsplat: bool = True,
         wrist_cam_ver: int = 1,
+        headless: bool = False,
     ):
         self._splatsim_gui = None
         self._serve_mode = serve_mode
         self._eval_benchmark_repo_id = eval_benchmark_repo_id or ""
         self._eval_benchmark_subset: Optional[List[int]] = eval_benchmark_subset
+        # Headless mode: connect pybullet in DIRECT (no GUI) for fast
+        # physics-only use cases like trajectory replay + collision filtering.
+        # Splat rendering and any GUI-dependent features are unavailable;
+        # callers needing those should leave this False.
+        self._headless = headless
         self.robot_name = robot_name
         self.camera_names = camera_names
         self.cam_i = cam_i
@@ -449,7 +455,14 @@ class PybulletRobotServerBase:
 
         self.grasp_poses = {}
 
-        self._pb_client_id = self.pybullet_client.connect(p.GUI)
+        # GUI connection by default; DIRECT (headless) when `headless=True`.
+        # DIRECT skips OpenGL context creation entirely, so the process can run
+        # without a display and physics-only operations (collision queries,
+        # joint state teleport) are unaffected. Splat rendering won't work in
+        # this mode.
+        self._pb_client_id = self.pybullet_client.connect(
+            p.DIRECT if self._headless else p.GUI
+        )
         # Tell rrt_path_utils which physicsClient our subsequent calls target,
         # so its existing call sites that don't thread `physics_client_id=` keep
         # working when more than one PyBullet server is connected in this
@@ -3353,6 +3366,14 @@ class PybulletRobotServerBase:
         - Debug mode dropdown
         - Trajectory generation parameters
         - Start/Stop trajectory generation buttons
+
+        In headless mode (``self._headless == True``), the SplatSimGui object
+        is still constructed (so every ``self._splatsim_gui.X`` reference
+        elsewhere in this file resolves), but ``.start()`` is NOT called —
+        no Tkinter root, no thread, no "SplatSim Controls" window.
+        SplatSimGui's read methods fall back to ``dict.get(key, default)``
+        and its write methods iterate empty/none Tk state, so calls from
+        the main loop become safe no-ops.
         """
         # Initialize the Tkinter GUI (runs in separate thread)
         config = self.trajectory_generator.config
@@ -3366,6 +3387,12 @@ class PybulletRobotServerBase:
             debug_mode_enum=self.DEBUG_MODES,
             initial_debug_mode=self.debug_mode,
         )
+        if self._headless:
+            # Skip the Tkinter mainloop entirely. The GUI object's
+            # initialization is pure Python (no Tk widgets created until
+            # _build_ui runs inside the thread), so it's safe to leave it
+            # in this "constructed but not started" state.
+            return
         self._splatsim_gui.start()
 
     def _check_debug_mode(self):
