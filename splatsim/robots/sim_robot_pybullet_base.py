@@ -2666,9 +2666,6 @@ class PybulletRobotServerBase:
     def serve(self) -> None:
         self.reset()
 
-        # start the zmq server
-        self._zmq_server_thread.start()
-
         self._lerobot_saver = None
         _prev_serve_mode = self.serve_mode
         # The mode-transition detector below only fires when serve_mode CHANGES,
@@ -2676,7 +2673,21 @@ class PybulletRobotServerBase:
         # launch_nodes.py --eval_benchmark_repo_id=...) would never go through
         # _enter_mode and the LeRobot dataset / GUI status would never be
         # initialized. Explicitly enter the initial mode here.
+        #
+        # CRITICAL: this MUST happen BEFORE the ZMQ thread starts. If ZMQ
+        # accepts a reset() request from an external policy (e.g. lerobot-eval)
+        # before _enter_mode finishes initializing EVAL_BENCHMARK state, the
+        # _handle_reset → _eval_benchmark_next_episode path sees subset=None
+        # and _lerobot_saver=None and falls through to a random self.reset()
+        # — so the policy records its first "scenario 0" against a random
+        # scenario, and the next reset (whose seed pin then works) skips
+        # subset[0] straight to subset[1]. Letting _enter_mode complete first
+        # guarantees the first external reset hits a fully-initialized
+        # benchmark state.
         self._enter_mode(self.serve_mode)
+
+        # start the zmq server only after benchmark state is ready
+        self._zmq_server_thread.start()
 
         print("Ready to serve.")
 
