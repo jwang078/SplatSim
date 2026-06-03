@@ -271,6 +271,25 @@ class SplatSimCamera:
     radial_coeffs: Optional[torch.Tensor] = None  # [4] (k1,k2,k3,k4) on CUDA
 
 
+# Wrist camera fisheye calibrations indexed by wrist_cam_ver. Version 0 is
+# pinhole (no entry here). New calibrations from
+# scripts/calibrate_camera_intrinsics.py should be appended with the next id.
+WRIST_CAM_FISHEYE_CALIBRATIONS: Dict[int, Dict[str, Any]] = {
+    1: {
+        "CAL_W": 2704, "CAL_H": 2028,
+        "CAL_FX": 775.5615, "CAL_FY": 778.0103,
+        "CAL_CX": 1343.6974, "CAL_CY": 1005.3416,
+        "D": [-0.0232652411, -0.0160767049, 0.0, 0.0],
+    },
+    2: {
+        "CAL_W": 1920, "CAL_H": 1080,
+        "CAL_FX": 777.86654216, "CAL_FY": 767.71982274,
+        "CAL_CX": 973.16480901, "CAL_CY": 524.25398954,
+        "D": [0.16369808, -0.15318689, 0.10608916, -0.02891525],
+    },
+}
+
+
 class PybulletRobotServerBase:
     MAX_TRAJECTORY_COUNT = 500
 
@@ -359,6 +378,7 @@ class PybulletRobotServerBase:
         eval_benchmark_repo_id: Optional[str] = None,
         eval_benchmark_subset: Optional[List[int]] = None,
         use_gsplat: bool = True,
+        wrist_cam_ver: int = 1,
     ):
         self._splatsim_gui = None
         self._serve_mode = serve_mode
@@ -371,6 +391,19 @@ class PybulletRobotServerBase:
         self.image_height = image_height
         self.use_gripper = use_gripper
         self.use_gsplat = use_gsplat
+        # Selects the wrist camera model used in get_wrist_camera (see
+        # WRIST_CAM_FISHEYE_CALIBRATIONS for fisheye versions):
+        #   0 = pinhole, using the base camera's intrinsics. Reproduces
+        #       pre-fisheye datasets and is useful for A/B-testing the
+        #       fisheye visual covariate shift.
+        #   1 = fisheye, original 2704x2028 GoPro calibration.
+        #   2 = fisheye, recalibrated 1920x1080 GoPro calibration.
+        if wrist_cam_ver != 0 and wrist_cam_ver not in WRIST_CAM_FISHEYE_CALIBRATIONS:
+            raise ValueError(
+                f"Unknown wrist_cam_ver={wrist_cam_ver}; expected 0 (pinhole) or one of "
+                f"{sorted(WRIST_CAM_FISHEYE_CALIBRATIONS.keys())} (fisheye)."
+            )
+        self.wrist_cam_ver = wrist_cam_ver
         self.splatsim_robot = None
         self.splatsim_background = None
         self.scene_gaussian = None
@@ -986,12 +1019,16 @@ class PybulletRobotServerBase:
         # Fisheye calibration (from scripts/calibrate_camera_intrinsics.py);
         # preserve the wrist camera's native aspect ratio (CAL_W : CAL_H)
         # rather than conforming to the base camera's aspect.
-        CAL_W, CAL_H = 2704, 2028
-        CAL_FX, CAL_FY = 775.5615, 778.0103
-        CAL_CX, CAL_CY = 1343.6974, 1005.3416
+        fisheye_cal = WRIST_CAM_FISHEYE_CALIBRATIONS.get(self.wrist_cam_ver)
 
         H = self.base_camera.camera.image_height
-        W = int(round(H * CAL_W / CAL_H))
+        if fisheye_cal is not None:
+            # Preserve the fisheye's native aspect (CAL_W : CAL_H).
+            W = int(round(H * fisheye_cal["CAL_W"] / fisheye_cal["CAL_H"]))
+        else:
+            # Pinhole: match base camera resolution exactly so both cameras
+            # produce identical-shape frames downstream.
+            W = self.base_camera.camera.image_width
         resolution = (W, H)
 
         fovx = self.base_camera.camera.FoVx
@@ -1019,27 +1056,37 @@ class PybulletRobotServerBase:
             scale=1,  # scale
         )
 
-        # Aspect ratio is preserved, so sx == sy; scale K uniformly.
-        scale = H / CAL_H
-        fisheye_K = torch.tensor([
-            [CAL_FX * scale, 0.0,            CAL_CX * scale],
-            [0.0,            CAL_FY * scale, CAL_CY * scale],
-            [0.0,            0.0,            1.0],
-        ], dtype=torch.float32, device="cuda")
-        # Distortion coefficients are resolution-independent.
-        fisheye_D = torch.tensor(
-            [-0.0232652411, -0.0160767049, 0.0, 0.0],
-            dtype=torch.float32, device="cuda",
-        )
+        if fisheye_cal is not None:
+            # Aspect ratio is preserved, so sx == sy; scale K uniformly.
+            scale = H / fisheye_cal["CAL_H"]
+            fisheye_K = torch.tensor([
+                [fisheye_cal["CAL_FX"] * scale, 0.0,                            fisheye_cal["CAL_CX"] * scale],
+                [0.0,                            fisheye_cal["CAL_FY"] * scale, fisheye_cal["CAL_CY"] * scale],
+                [0.0,                            0.0,                            1.0],
+            ], dtype=torch.float32, device="cuda")
+            # Distortion coefficients are resolution-independent.
+            fisheye_D = torch.tensor(
+                fisheye_cal["D"],
+                dtype=torch.float32, device="cuda",
+            )
 
-        splatsim_camera = SplatSimCamera(
-            camera=camera,
-            pipeline=self.base_camera.pipeline,
-            background=self.base_camera.background,
-            camera_model="fisheye",
-            intrinsic_matrix=fisheye_K,
-            radial_coeffs=fisheye_D,
-        )
+            splatsim_camera = SplatSimCamera(
+                camera=camera,
+                pipeline=self.base_camera.pipeline,
+                background=self.base_camera.background,
+                camera_model="fisheye",
+                intrinsic_matrix=fisheye_K,
+                radial_coeffs=fisheye_D,
+            )
+        else:
+            # Pinhole render using base camera's intrinsics (FoV inherited via the
+            # Camera object's fovx/fovy above). Matches the pre-a161cad6 default.
+            splatsim_camera = SplatSimCamera(
+                camera=camera,
+                pipeline=self.base_camera.pipeline,
+                background=self.base_camera.background,
+                camera_model="pinhole",
+            )
 
         return splatsim_camera
 

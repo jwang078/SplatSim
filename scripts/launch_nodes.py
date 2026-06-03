@@ -31,6 +31,13 @@ class Args:
     # Optional subset of episode indices (e.g. [3, 8, 23]). None = all episodes.
     eval_benchmark_subset: Optional[List[int]] = None
 
+    # Wrist camera model version (see WRIST_CAM_FISHEYE_CALIBRATIONS in
+    # splatsim/robots/sim_robot_pybullet_base.py):
+    #   0 = pinhole using base camera intrinsics (matches pre-fisheye datasets)
+    #   1 = fisheye, original 2704x2028 GoPro calibration (default)
+    #   2 = fisheye, recalibrated 1920x1080 GoPro calibration
+    wrist_cam_ver: int = 1
+
 
 def launch_robot_server(args: Args):
     # Match lerobot's precision settings so dataset collection
@@ -157,6 +164,7 @@ def launch_robot_server(args: Args):
            debug_mode=args.debug_mode,
            eval_benchmark_repo_id=args.eval_benchmark_repo_id,
            eval_benchmark_subset=args.eval_benchmark_subset,
+           wrist_cam_ver=args.wrist_cam_ver,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_strict":
@@ -177,6 +185,7 @@ def launch_robot_server(args: Args):
            debug_mode=args.debug_mode,
            eval_benchmark_repo_id=args.eval_benchmark_repo_id,
            eval_benchmark_subset=args.eval_benchmark_subset,
+           wrist_cam_ver=args.wrist_cam_ver,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_stretchimg":
