@@ -101,7 +101,7 @@ robot_iphone_w_engine_new:
   aabb:
     bounding_box:
     - [-0.2044, -0.11, 0.0082]
-    - [0.0734, 0.6925, 0.5867]
+    - [0.0734, 0.7145, 0.5867]
     urdf_bbox_adjustment:
     - [0.0, 0.0]
     - [0.0, 0.1]
@@ -157,6 +157,80 @@ robot_iphone_w_engine_new:
     - 1
   source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle/sfm_disk_disk+lightglue/undistorted
   model_path: /home/jennyw2/code/gaussian-splatting/output/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle
+  use_gripper: true
+  is_articulated: true
+  use_fixed_base: true
+  wrist_camera_link_name: wrist_camera_link
+robot_iphone_w_engine_curtain:
+  transformation:
+    matrix:
+    - [-0.231955, -0.002806, -0.002667, -0.299566]
+    - [0.001594, 0.076423, -0.219032, 0.764096]
+    - [0.003528, -0.219019, -0.076393, 0.550882]
+    - [0.0, 0.0, 0.0, 1.0]
+  aabb:
+    bounding_box:
+    - [-0.2044, -0.11, 0.0082]
+    - [0.0734, 0.7139, 0.5867]
+    urdf_bbox_adjustment:
+    - [0.0, 0.0]
+    - [0.0, 0.1]
+    - [0.0, 0.0]
+  urdf_path: ./splatsim/robot_definitions/urdf/sisbot.urdf
+  base_position:
+  - 0.0
+  - 0.0
+  - -0.088
+  articulation_config:
+    initial_joint_positions:
+    - 1.5707963267948966
+    - -1.5707963267948966
+    - 1.5707963267948966
+    - -1.5707963267948966
+    - -1.5707963267948966
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.3524144382886717
+    - 0.0
+    - -0.3524129579021227
+    - 0.0
+    - 0.3524147995863395
+    - 0.3524001421883213
+    - 0.0
+    - -0.35240854143885103
+    - 0.0
+    - 0.35241114733591894
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    joint_signs:
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/2026-07-06-small_engine_on_table_images_500_500match_540height_SIMPLE_RADIALcam/sfm_disk_disk+lightglue/undistorted
+  model_path: /home/jennyw2/code/gaussian-splatting/output/2026-07-06-small_engine_on_table_images_500_500match_540height_SIMPLE_RADIALcam
   use_gripper: true
   is_articulated: true
   use_fixed_base: true
