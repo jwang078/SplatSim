@@ -1,14 +1,15 @@
 import numpy as np
 import zarr
 import os
-import time
 import re
 import json
 from typing import Optional, Tuple, List
 from pybullet_planning import create_box, set_pose, Pose, RED, BLUE
 
 from splatsim.configs import TrajectoryGenModeConfig
+from splatsim.configs.mode_config import PathSelectionStrategy
 from splatsim.utils import rrt_path_utils
+from splatsim.utils.rrt_to_goal import RRTToGoalPlanner, RRTPlanningError
 from splatsim.configs.env_config import SplatSimObject
 
 class TrajectoryGenerator:
@@ -26,12 +27,16 @@ class TrajectoryGenerator:
         splatsim_objects: List[SplatSimObject],
         wrist_camera_link_name: Optional[str] = None,
         trajectory_gen_config: Optional[TrajectoryGenModeConfig] = None,
+        pb_client_id: int = 0,
     ):
         """
         Initialize trajectory generator.
 
         Args:
-            pybullet_client: PyBullet client instance
+            pybullet_client: PyBullet client instance (the pybullet module)
+            pb_client_id: Integer pybullet client id (used as physicsClientId=
+                by the shared RRTToGoalPlanner). Distinct from pybullet_client,
+                which is the module.
             robot_id: Robot body ID in PyBullet
             joint_indices: List of movable joint indices
             env_config_name: Environment name for output directory
@@ -41,6 +46,7 @@ class TrajectoryGenerator:
             trajectory_gen_config: Trajectory generation configuration (uses defaults if None)
         """
         self.pb = pybullet_client
+        self._pb_client_id = pb_client_id
         self.robot_id = robot_id
         self.joint_indices = joint_indices
 
@@ -71,6 +77,20 @@ class TrajectoryGenerator:
         self.lower_limits, self.upper_limits = rrt_path_utils.get_joint_limits(
             robot_id, joint_indices
         )
+
+        # Canonical shared planner. TrajectoryGenerator now DELEGATES all
+        # RRT/IK/path-scoring/ruckig work to RRTToGoalPlanner (the same planner
+        # the LeRobot DAgger/SA intervention side uses), so SplatSim
+        # trajectory-gen and intervention share ONE implementation. Obstacles
+        # are pushed into the planner via `_sync_planner_obstacles()` before
+        # each plan (we do NOT call planner.load_obstacles(), which would
+        # delete/recreate bodies in this shared sim client).
+        #
+        # Built LAZILY (on first `_sync_planner_obstacles`) rather than here:
+        # the constructor needs `self.get_ee_link_fn()`, which reads
+        # `self.wrist_camera` — and the parent robot server sets that up AFTER
+        # constructing this generator, so calling it now would AttributeError.
+        self._planner = None
 
         # Static obstacles from environment (walls, table, etc.)
         self.loaded_obstacle_ids = []
@@ -107,6 +127,50 @@ class TrajectoryGenerator:
                 for link_idx in obj.config.skip_collision_robot_links:
                     pairs.add((link_idx, obj.sim_id))
         return pairs
+
+    def _discover_gripper_finger_link_indices(self) -> list[int]:
+        """Enumerate URDF link indices whose name contains 'finger' or 'knuckle'.
+
+        Used by the IK collision filter when
+        `TrajectoryGenModeConfig.ik_skip_gripper_obstacle_pairs` is True.
+        Name-based detection covers the standard Robotiq 2F-85 subtree
+        (left/right outer_finger, inner_finger, inner_finger_pad,
+        outer_knuckle, inner_knuckle) without hard-coding indices.
+        Cached after first call.
+        """
+        if getattr(self, "_gripper_finger_link_indices_cache", None) is not None:
+            return self._gripper_finger_link_indices_cache
+        finger_links: list[int] = []
+        n_joints = self.pb.getNumJoints(self.robot_id)
+        for j in range(n_joints):
+            info = self.pb.getJointInfo(self.robot_id, j)
+            raw_name = info[12]
+            name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
+            lname = name.lower()
+            if "finger" in lname or "knuckle" in lname:
+                finger_links.append(j)
+        self._gripper_finger_link_indices_cache = finger_links
+        return finger_links
+
+    def _ik_augmented_skip_pairs(self) -> set:
+        """Skip-pair set used by the IK candidate filter in `_solve_ik`.
+
+        When `self.config.ik_skip_gripper_obstacle_pairs` is True, this
+        is `self.get_skip_pairs() ∪ {(finger_link, obs_id) for finger × obstacle}`.
+        Otherwise it's `self.get_skip_pairs()` unchanged. Called per-`_solve_ik`
+        so newly-registered obstacles are picked up automatically.
+        """
+        base = self.get_skip_pairs()
+        if not getattr(self.config, "ik_skip_gripper_obstacle_pairs", False):
+            return base
+        finger_links = self._discover_gripper_finger_link_indices()
+        if not finger_links:
+            return base
+        augmented = set(base)
+        for link in finger_links:
+            for obs_id in self.get_obstacle_ids():
+                augmented.add((link, obs_id))
+        return augmented
 
     def register_obstacle(self, sim_id: int):
         """Register an obstacle by its PyBullet body ID."""
@@ -238,6 +302,103 @@ class TrajectoryGenerator:
                 input(f"[debug_visualize] q_goal candidate {i+1}/{len(all_q_goals)}. Press Enter for next...")
         return q_start, all_q_goals
 
+    def _ensure_planner(self) -> "RRTToGoalPlanner":
+        """Build the shared RRTToGoalPlanner on first use (see the deferral
+        note in __init__ — `get_ee_link_fn()` isn't safe to call until the
+        parent robot server has finished setting up `self.wrist_camera`).
+        Cached after the first call. Ruckig limits are hardcoded 0.5/1.0/10.0
+        to match the conservative smoothing `generate_trajectory_batch`
+        historically applied."""
+        if self._planner is None:
+            self._planner = RRTToGoalPlanner(
+                pb_client=self._pb_client_id,
+                robot_id=self.robot_id,
+                joint_indices=list(self.joint_indices),
+                ee_link_index=self.get_ee_link_fn(),
+                num_dofs=len(self.joint_indices),
+                fps=self.config.robot_update_rate,
+                lower_limits=self.lower_limits,
+                upper_limits=self.upper_limits,
+                num_ik_candidates=self.config.num_ik_candidates,
+                max_joint_vel=0.5, max_joint_acc=1.0, max_joint_jerk=10.0,
+                # Ruckig only the FINAL trajectory (cheap linear-densify checks
+                # per candidate) so we don't hit the ruckig cloud API once per
+                # candidate — that overwhelmed it during batch trajectory-gen.
+                ruckig_per_candidate=False,
+                segment_at_sharp_corners=self.config.segment_at_sharp_corners,
+                path_selection=PathSelectionStrategy(self.config.path_selection),
+                # Config-driven (default "joint_distance"): pick the IK goal
+                # nearest q_start to avoid the far wrist-flipped branch that
+                # self-collides during execution. "none" falls back to scoring
+                # all IK candidates via path_selection. See TrajectoryGenModeConfig.
+                ik_goal_selection=self.config.ik_goal_selection,
+                num_path_candidates_per_ik=self.config.num_path_candidates,
+                max_path_attempts_per_ik=self.config.max_path_attempts,
+                path_perturbation_scale=self.config.path_perturbation_scale,
+                obstacle_clearance=self.config.obstacle_clearance,
+                self_collision_clearance=self.config.self_collision_clearance,
+                self_collision_skip_pairs=self.config.self_collision_skip_pairs,
+                # Match _solve_ik's IK collision filter: at grasp goals the
+                # gripper fingers are intentionally within mm of the target, so
+                # skip finger⟷obstacle pairs during IK candidate resolution.
+                # Without this the planner's goal-IK rejects every grasp pose
+                # that trajectory_generation._solve_ik accepts, yielding
+                # "No collision-free IK solution found" despite valid candidates.
+                ik_skip_gripper_obstacle_pairs=self.config.ik_skip_gripper_obstacle_pairs,
+                wrist_camera_link_index=self.camera_link_index,
+                camera_k_exp=self.config.k_exp,
+                camera_k_sig=self.config.k_sig,
+                camera_threshold=self.config.threshold,
+            )
+        return self._planner
+
+    def _sync_planner_obstacles(self, additional_obstacles=None):
+        """Push the current obstacle set into the shared planner.
+
+        We deliberately DO NOT call ``planner.load_obstacles()`` — that would
+        delete/recreate bodies in this shared sim client. Instead we set the
+        three attributes the planner reads (``_loaded_obstacle_ids``,
+        ``_obstacle_names``, ``_skip_pairs``) directly from the generator's
+        existing obstacle helpers.
+        """
+        self._ensure_planner()
+        ids = list(self.get_obstacle_ids())
+        if additional_obstacles:
+            ids += list(additional_obstacles)
+        self._planner._loaded_obstacle_ids = ids
+        self._planner._obstacle_names = self.get_obstacle_names()
+        # Use BASE skip pairs (per-obstacle skip_collision_robot_links from the
+        # env config) for the planner's global collision check. Path checks —
+        # RRT tree, linear densify, ruckig-smoothed, final gate — see the
+        # gripper's real collision mesh here so mid-trajectory gripper⟷obstacle
+        # contact is detected and rejected. Previously this line pushed
+        # `_ik_augmented_skip_pairs()` here, which added (finger, obstacle) for
+        # EVERY obstacle × EVERY finger — silently masking gripper-vs-engine /
+        # gripper-vs-any-obstacle collisions during traversal. The augmentation
+        # is still applied at `_solve_ik` (grasp goals need fingers within
+        # obstacle_clearance of the target); when a goal's LAST waypoint fails
+        # the path check because fingers sit inside the target's clearance
+        # buffer, the fix is to mark the target's env-config
+        # `skip_collision_robot_links` explicitly rather than universally
+        # blinding every check.
+        self._planner._skip_pairs = self.get_skip_pairs()
+
+    def _fk_ee_pose(self, q) -> Tuple[np.ndarray, np.ndarray]:
+        """Forward-kinematics a joint config ``q`` to an EE world pose.
+
+        Snaps the robot on the shared client to ``q`` and reads the EE link
+        state. Returns ``(pos(3,), quat(4,))``. Used to bridge the generator's
+        joint-space goal resolution (``_get_start_and_goal_qs``) into the
+        planner's EE-pose-based ``plan()`` API.
+        """
+        ee_link_index = self.get_ee_link_fn()
+        for idx, qi in zip(self.joint_indices, np.asarray(q).reshape(-1)):
+            self.pb.resetJointState(self.robot_id, idx, float(qi))
+        link_state = self.pb.getLinkState(
+            self.robot_id, ee_link_index, computeForwardKinematics=True
+        )
+        return np.asarray(link_state[0]), np.asarray(link_state[1])
+
     def generate_trajectory_batch(self):
         """Generate one base trajectory with multiple obstacle configurations.
 
@@ -256,37 +417,35 @@ class TrajectoryGenerator:
             print("[TrajectoryGenerator] Failed to get valid start/goal configurations. Skipping this trajectory.")
             return None
 
-        result = self._plan_with_fallback_goals(q_start, all_q_goals)
-        if result is None:
-            return None  # Failed, will retry next iteration
-        base_traj, q_goal = result
+        # Delegate RRT/IK/path-scoring/ruckig to the shared planner. We keep
+        # `_get_start_and_goal_qs()` for goal RESOLUTION (EE-goal vs direct-q
+        # vs random → joint config), then bridge into the planner's EE-pose
+        # API by FK'ing the chosen joint goal to an EE pose. `q_goal_bias` is
+        # seeded with that joint config so the planner's IK converges back to
+        # the same branch. The returned `base_traj` is ALREADY ruckig-smoothed
+        # (with the same conservative 0.5/1.0/10.0 limits configured on the
+        # planner), so no standalone ruckig pass runs here.
+        self._sync_planner_obstacles()
+        q_goal = all_q_goals[0]
 
-        # Apply ruckig time-parametrization once on the final trajectory.
-        dof = len(self.joint_indices)
-        tries = 0
-        max_tries = 5
-        while tries < max_tries:
-            try:
-                # Limits are tuned to produce more bursty, D7-like motion: faster
-                # peak velocity, much higher acceleration and jerk so the robot
-                # ramps up and down sharply (instead of constant-velocity glide).
-                # Pre-fix values were vel=0.5, acc=1.0, jerk=10.0 which produced
-                # smooth slow motion with weak "stop" signals at terminal frames.
-                base_traj = rrt_path_utils.ruckig_parametrize_path(
-                    base_traj,
-                    max_joint_vel=np.full(dof, 1.0),
-                    max_joint_acc=np.full(dof, 4.0),
-                    max_joint_jerk=np.full(dof, 50.0),
-                    control_hz=self.config.robot_update_rate,
-                )
-                break
-            except Exception as e:
-                tries += 1
-                print(f"Ruckig path smoothing failed with exception {e}")
-                print(f"Retry {tries} / {max_tries}")
-                if tries >= max_tries:
-                    raise RuntimeError(f"Ruckig path smoothing failed after {max_tries} attempts: {e}")
-                time.sleep(10)
+        # Prefer a user-specified EE-pose goal as the target for fidelity;
+        # otherwise FK the resolved joint goal to an EE pose.
+        if self.config.ee_pos_goal is not None and self.config.ee_quat_goal is not None:
+            target_ee_pos = np.asarray(self.config.ee_pos_goal, dtype=np.float64)
+            target_ee_quat = np.asarray(self.config.ee_quat_goal, dtype=np.float64)
+        else:
+            target_ee_pos, target_ee_quat = self._fk_ee_pose(q_goal)
+
+        try:
+            base_traj, _escape_end_q = self._planner.plan(
+                q_start,
+                target_ee_pos,
+                target_ee_quat,
+                q_goal_bias=q_goal,
+            )
+        except RRTPlanningError as e:
+            print(f"[TrajectoryGenerator] RRT planning failed: {e}. Skipping this trajectory (will retry next iteration).")
+            return None  # Failed, will retry next iteration
 
         # Debug visualization: show the chosen start/goal then play back the trajectory
         if self.config.debug_visualize:
@@ -338,11 +497,28 @@ class TrajectoryGenerator:
 
                 obstacle_info = {"obstacles": obstacle_infos}
 
+                # Plan the same start→goal with the extra obstacles loaded.
+                # Sync the planner's obstacle set to include the freshly-added
+                # random obstacles, then re-derive the EE-pose target for the
+                # goal (FK on the shared client) so the planner can solve IK.
+                self._sync_planner_obstacles(additional_obstacles=obstacle_ids)
+                if self.config.ee_pos_goal is not None and self.config.ee_quat_goal is not None:
+                    obs_target_ee_pos = np.asarray(self.config.ee_pos_goal, dtype=np.float64)
+                    obs_target_ee_quat = np.asarray(self.config.ee_quat_goal, dtype=np.float64)
+                else:
+                    obs_target_ee_pos, obs_target_ee_quat = self._fk_ee_pose(q_goal)
+
                 # Generate multiple paths per obstacle configuration
                 for path_i in range(self.config.paths_per_obstacle):
-                    modified_traj = self._plan_rrt_path(
-                        q_start, q_goal, additional_obstacles=obstacle_ids
-                    )
+                    try:
+                        modified_traj, _ = self._planner.plan(
+                            q_start,
+                            obs_target_ee_pos,
+                            obs_target_ee_quat,
+                            q_goal_bias=q_goal,
+                        )
+                    except RRTPlanningError:
+                        modified_traj = None
 
                     if modified_traj is not None:
                         # Extend the path so that it stays at the last position for a second
@@ -371,7 +547,19 @@ class TrajectoryGenerator:
         return results
 
     def _get_random_collision_free_q(self) -> np.ndarray:
-        """Generate random collision-free joint configuration."""
+        """Generate random collision-free joint configuration.
+
+        Must pass BOTH skip-pair sets so the collision check honors the
+        same contract the path-check downstream uses:
+          * ``skip_pairs`` — (robot_link, obstacle_body_id), from
+            per-obstacle ``skip_collision_robot_links`` config.
+          * ``self_collision_skip_pairs`` — non-adjacent robot-robot
+            pairs that are structurally close by URDF design (e.g. UR
+            base_link ⟷ upper_arm, Robotiq inner_finger ⟷ inner_knuckle
+            mesh overlap). Without these, `env.reset() → randomize_objects
+            → check_able_to_solve` at `self_collision_clearance > 0`
+            fails on every sample and the outer while-loop hangs.
+        """
         return rrt_path_utils.get_random_joint_angles_without_collision(
             self.robot_id,
             self.joint_indices,
@@ -381,6 +569,12 @@ class TrajectoryGenerator:
             max_tries=10000,
             verbose=self.config.verbose,
             skip_pairs=self.get_skip_pairs(),
+            # Match the path-check contract: BOTH threshold and skip list
+            # come from the same TrajectoryGenModeConfig so the sampler
+            # sees the same "what counts as a collision" definition the
+            # rest of the trajectory generator uses.
+            self_collision_clearance=self.config.self_collision_clearance,
+            self_collision_skip_pairs=self.config.self_collision_skip_pairs,
         )
 
     # =========================================================================
@@ -530,12 +724,28 @@ class TrajectoryGenerator:
                 print(f"[TrajectoryGenerator] IK seeded with q_goal_bias converged "
                       f"within {np.degrees(max_drift):.2f}° of seed.")
 
+        # `_ik_augmented_skip_pairs()` extends `get_skip_pairs()` with
+        # gripper-finger ⟷ obstacle pairs when
+        # `config.ik_skip_gripper_obstacle_pairs=True`. Grasp-goal IKs
+        # otherwise fail on legit finger-near-target proximity; the arm
+        # links are still checked normally, and RRT path search /
+        # runtime shield keep gripper vs obstacle strict.
+        #
+        # verbose=False: IK candidate acceptance is called in a hot loop
+        # (up to `num_ik_candidates` per goal × per env.reset sample),
+        # and each collision hit was firing a per-pair "Collision: ..."
+        # print that dominated the profile. Rejection is signalled by
+        # the return value; the diagnostic prints aren't needed here.
+        # Flip to True locally for one-off debugging.
         in_col = rrt_path_utils.check_links_in_collision(
             self.robot_id, self.joint_indices, q_solution,
             self.get_obstacle_ids(),
-            verbose=True,
+            verbose=False,
             obstacle_names=self.get_obstacle_names(),
-            skip_pairs=self.get_skip_pairs(),
+            skip_pairs=self._ik_augmented_skip_pairs(),
+            obstacle_clearance=self.config.obstacle_clearance,
+            self_collision_clearance=self.config.self_collision_clearance,
+            self_collision_skip_pairs=self.config.self_collision_skip_pairs,
         )
         if self.config.debug_visualize:
             rrt_path_utils.show_joint_config_in_gui(self.robot_id, self.joint_indices, q_solution)
@@ -602,92 +812,6 @@ class TrajectoryGenerator:
                 unique.append(candidate)
         return unique
 
-    # =========================================================================
-    # Multi-Candidate Planning (for EE goals with multiple IK solutions)
-    # =========================================================================
-
-    def _plan_with_fallback_goals(
-        self,
-        q_start: np.ndarray,
-        q_goal_candidates: List[np.ndarray],
-    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Try RRT planning with each goal candidate until one succeeds.
-
-        Returns:
-            Tuple of (trajectory, q_goal_used) or None if all candidates fail.
-        """
-        for i, q_goal in enumerate(q_goal_candidates):
-            if not self.config.disable_camera_scoring_for_rrt:
-                if self.camera_link_index is None:
-                    raise ValueError(
-                        "Camera scoring enabled but camera link not available. "
-                        f"Check that wrist_camera_link_name='{self.wrist_camera_link_name}' exists in robot URDF."
-                    )
-
-                num_candidates = self.config.num_path_candidates
-                max_attempts = self.config.max_path_attempts
-                candidate_paths = self._generate_multiple_path_candidates(
-                    q_start, q_goal, num_candidates, max_attempts
-                )
-
-                if len(candidate_paths) > 0:
-                    target_position, _ = self._get_camera_link_pose(q_goal)
-                    k_exp = self.config.k_exp
-                    k_sig = self.config.k_sig
-                    threshold = self.config.threshold
-
-                    scored_paths = []
-                    for j, path in enumerate(candidate_paths):
-                        score = self._compute_camera_score(path, target_position, k_exp, k_sig, threshold)
-                        scored_paths.append((score, j, path))
-
-                    scored_paths.sort(key=lambda x: x[0], reverse=True)
-                    best_score, best_idx, best_path = scored_paths[0]
-                    print(f"[TrajectoryGenerator] IK candidate {i}: best camera score = {best_score:.4f}")
-                    return best_path, q_goal
-            else:
-                base_traj = self._plan_rrt_path(q_start, q_goal)
-                if base_traj is not None:
-                    print(f"[TrajectoryGenerator] RRT succeeded with IK candidate {i}")
-                    return base_traj, q_goal
-
-        print(f"[TrajectoryGenerator] RRT planning failed for all {len(q_goal_candidates)} IK goal candidate(s). See per-candidate diagnostics above.")
-        return None
-
-    def _plan_rrt_path(
-        self,
-        q_start: np.ndarray,
-        q_goal: np.ndarray,
-        additional_obstacles: List[int] = None,
-    ) -> Optional[np.ndarray]:
-        """Plan collision-free path using RRT-Connect."""
-        obstacles = self.get_obstacle_ids()
-        if additional_obstacles:
-            obstacles.extend(additional_obstacles)
-
-        path = rrt_path_utils.get_path(
-            q_start,
-            q_goal,
-            self.robot_id,
-            self.joint_indices,
-            obstacles,
-            self.lower_limits,
-            self.upper_limits,
-            self.config.robot_update_rate,
-            use_gui=self.config.debug_visualize,
-            verbose=self.config.verbose,
-            obstacle_names=self.get_obstacle_names(),
-            skip_pairs=self.get_skip_pairs(),
-        )
-
-        # Snap endpoints to exact q_start/q_goal. Smoothing and resampling can
-        # introduce small drift that shifts EE orientation at the goal.
-        if path is not None:
-            path[0] = q_start
-            path[-1] = q_goal
-
-        return path
-
     def _get_ee_trajectory(self, joint_trajectory: np.ndarray) -> np.ndarray:
         """Compute end-effector positions for joint trajectory."""
         ee_link_index = self.get_ee_link_fn()
@@ -705,147 +829,6 @@ class TrajectoryGenerator:
             ee_positions.append(list(link_state[0]))
 
         return np.array(ee_positions)
-
-    def _get_camera_link_pose(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get camera link pose for a joint configuration.
-
-        Args:
-            q: Joint configuration (DOF,)
-
-        Returns:
-            position: Camera position in world frame (3,)
-            rotation_matrix: Camera orientation as 3x3 rotation matrix
-        """
-        # Set robot to configuration q
-        for idx, qi in zip(self.joint_indices, q):
-            self.pb.resetJointState(self.robot_id, idx, qi)
-
-        # Get camera link state
-        link_state = self.pb.getLinkState(
-            self.robot_id, self.camera_link_index, computeForwardKinematics=True
-        )
-
-        position = np.array(link_state[0])
-        orientation_quat = np.array(link_state[1])  # [x, y, z, w]
-
-        # Convert quaternion to rotation matrix
-        rotation_matrix = np.array(self.pb.getMatrixFromQuaternion(orientation_quat)).reshape(3, 3)
-
-        return position, rotation_matrix
-
-    def _compute_camera_score(
-        self,
-        path: np.ndarray,
-        target_position: np.ndarray,
-        k_exp: float,
-        k_sig: float,
-        threshold: float,
-    ) -> float:
-        """
-        Compute camera-aware score for a trajectory path.
-
-        Higher score = camera better aligned with target throughout path.
-        Combines exponential reward with sigmoid gating.
-
-        Args:
-            path: Trajectory (N_SAMPLES, DOF)
-            target_position: Target position in world frame (3,)
-            k_exp: Exponential sharpness (default: 5.0)
-            k_sig: Sigmoid sharpness (default: 15.0)
-            threshold: Alignment threshold (default: 0.4)
-
-        Returns:
-            Average score across sampled waypoints
-        """
-        if self.camera_link_index is None:
-            return 0.0  # Camera scoring unavailable
-
-        # Sample waypoints (use 10 points max to reduce computation)
-        num_samples = min(len(path), 10)
-        sample_indices = np.linspace(0, len(path) - 1, num_samples, dtype=int)
-
-        scores = []
-        for idx in sample_indices:
-            q = path[idx]
-
-            # Get camera pose
-            cam_position, cam_rotation = self._get_camera_link_pose(q)
-
-            # Camera forward direction (assumes +Z axis in local frame)
-            cam_forward = cam_rotation[:, 2]
-
-            # Use utility function for single-timestep score
-            waypoint_score = rrt_path_utils.compute_camera_alignment_score(
-                cam_position, cam_forward, target_position, k_exp, k_sig, threshold
-            )
-            scores.append(waypoint_score)
-
-        return float(np.mean(scores))
-
-    def _generate_multiple_path_candidates(
-        self,
-        q_start: np.ndarray,
-        q_goal: np.ndarray,
-        num_candidates: int,
-        max_attempts: int,
-        additional_obstacles: List[int] = None,
-    ) -> List[np.ndarray]:
-        """
-        Generate multiple candidate paths using RRT (adaptive approach).
-
-        Attempts to generate num_candidates valid paths, up to max_attempts tries.
-        Uses perturbations to start/goal configurations to ensure path diversity.
-
-        Args:
-            q_start: Start configuration
-            q_goal: Goal configuration
-            num_candidates: Target number of valid paths
-            max_attempts: Maximum planning attempts
-            additional_obstacles: Optional obstacle IDs
-
-        Returns:
-            List of valid paths (each: (N_SAMPLES, DOF))
-        """
-        paths = []
-        attempts = 0
-
-        # Perturbation magnitude (radians) - configurable via config
-        perturbation_scale = self.RRT_PERTURBATION_SCALE
-
-        while len(paths) < num_candidates and attempts < max_attempts:
-            attempts += 1
-
-            # First path uses exact start/goal, subsequent paths use perturbations
-            if len(paths) == 0 and attempts == 0:
-                plan_start = q_start
-                plan_goal = q_goal
-            else:
-                # Add small random perturbations to force RRT to explore different paths
-                start_perturbation = np.random.uniform(-perturbation_scale, perturbation_scale, size=q_start.shape)
-                goal_perturbation = np.random.uniform(-perturbation_scale, perturbation_scale, size=q_goal.shape)
-
-                # Clip to joint limits
-                plan_start = np.clip(q_start + start_perturbation, self.lower_limits, self.upper_limits)
-                plan_goal = np.clip(q_goal + goal_perturbation, self.lower_limits, self.upper_limits)
-
-            path = self._plan_rrt_path(plan_start, plan_goal, additional_obstacles)
-
-            if path is not None:
-                # Ensure exact goal is included at the end. This is because we perturbed goal to get multiple path candidates
-                if not np.allclose(path[-1], q_goal):
-                    path = np.vstack([path, q_goal])
-                paths.append(path)
-
-                if self.config.verbose:
-                    perturbation_info = "" if len(paths) == 1 else f", perturbed={perturbation_scale:.3f}"
-                    print(f"Generated path {len(paths)}/{num_candidates} (attempt {attempts}/{max_attempts}{perturbation_info})")
-                attempts = 0  # Reset attempts after a successful path
-
-        if self.config.verbose and len(paths) < num_candidates:
-            print(f"Warning: Only generated {len(paths)}/{num_candidates} valid paths after {max_attempts} attempts")
-
-        return paths
 
     def _add_random_obstacles(
         self, robot_qs_to_avoid: List[np.ndarray], base_ee_traj: np.ndarray

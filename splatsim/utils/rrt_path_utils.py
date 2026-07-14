@@ -108,7 +108,7 @@ def set_default_client_id(client_id: int) -> None:
 def _resolve_client_id(physics_client_id):
     return _DEFAULT_CLIENT_ID if physics_client_id is None else int(physics_client_id)
 
-def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, verbose=False, obstacle_names=None, self_collision_clearance=0.0, skip_pairs=None, obstacle_clearance=None, physics_client_id=None) -> bool:
+def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, verbose=False, obstacle_names=None, self_collision_clearance=0.0, skip_pairs=None, obstacle_clearance=None, physics_client_id=None, return_kind=False, self_collision_skip_pairs=None):
     """
     Single source-of-truth collision checker.
 
@@ -119,7 +119,12 @@ def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indi
     Args:
         robot_id: PyBullet body ID of the robot.
         joint_indices: Movable joint indices (used to set configuration).
-        q: Joint configuration to check. If None, uses the robot's current joint state (no teleport).
+        q: Joint configuration to check. If provided, the robot is moved to q for
+            the check and RESTORED to its prior state (position + velocity +
+            position-hold) on `joint_indices` before returning — the call is
+            side-effect-free on those joints (the gripper is left open, as
+            set_robot_joint_positions opens it for these demos). If None, uses
+            the robot's current joint state (no teleport, nothing to restore).
         obstacle_ids: List of PyBullet body IDs to treat as obstacles.
         link_indices_to_check: Links to check. None = all links (base link -1 + all joints).
         verbose: If True, print the first collision found.
@@ -128,56 +133,121 @@ def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indi
             Use 0.0 to avoid false positives when arm links are legitimately close (e.g. IK solutions).
         skip_pairs: Optional set of (robot_link_index, obstacle_body_id) tuples to skip.
             Used to exclude known always-touching pairs (e.g. shoulder_link vs table).
+        self_collision_skip_pairs: Optional iterable of (link_a, link_b) tuples to
+            skip in the SELF-collision check (independent of obstacles). Used to
+            exclude non-adjacent link pairs that the URDF geometry places
+            structurally close (e.g. UR robot's base_link(0) vs upper_arm_link(2),
+            naturally ~4 mm apart due to the shoulder bracket). Without this,
+            any non-zero `self_collision_clearance` falsely flags every valid
+            joint config. Pairs are compared in BOTH orders ((a,b) == (b,a))
+            so the caller doesn't need to canonicalize.
         obstacle_clearance: Distance threshold for obstacle checks. Defaults to _COLLISION_CLEARANCE (1 cm).
             Pass 0.0 to detect only actual penetration.
+        return_kind: If False (default), returns a bool — keeps backward-compat
+            with the ~9 existing RRT callers that use this as a truth test.
+            If True, returns `(in_collision: bool, kind: str | None)` where
+            `kind` is "obstacle" or "self" on hit, None otherwise. Used by
+            the eval-time env metrics dict to record WHY an episode terminated.
 
     Returns:
-        True if any collision is detected, False otherwise.
+        bool (default) or (bool, str | None) (when return_kind=True).
+        - bool: True if any collision detected.
+        - kind: "obstacle" for robot-vs-obstacle, "self" for self-collision,
+                None for no collision. Reports the FIRST match found; with
+                obstacles checked before self-collisions, "obstacle" takes
+                precedence when both happen on the same query.
     """
     cid = _resolve_client_id(physics_client_id)
     if obstacle_clearance is None:
         obstacle_clearance = _COLLISION_CLEARANCE
+
+    # When a configuration q is provided we mutate the robot to check it. Snapshot
+    # the joints being moved so the check is side-effect-free: this runs on the
+    # LIVE shared robot thousands of times per plan, and leaving it at the last
+    # checked q silently corrupts the robot for every subsequent caller (which is
+    # exactly the class of bug that bit randomize_ee_pose). q=None means "check
+    # the current state" — nothing to set or restore.
+    #
+    # Kinematic teleport ONLY: `getClosestPoints` reads link poses from the
+    # solver directly, so we don't need `stepSimulation` or motor control
+    # commands here. Previously this called `set_robot_joint_positions` which
+    # did `resetJointState` + `setJointMotorControl2` + `open_gripper` + a
+    # full `p.stepSimulation()`, then followed up with another stepSimulation
+    # here — two physics steps at 5-20 ms each per query, dominating the
+    # cost of `_get_random_collision_free_q`'s inner loop (env.reset spent
+    # seconds looking for a collision-free start config). Bare `resetJointState`
+    # is the same "snap kinematically" primitive that `teleport_joint_state`
+    # uses; matches its semantics without needing the SplatSimObject wrapping.
+    _saved_joint_states = None
     if q is not None:
-        set_robot_joint_positions(robot_id, joint_indices, q, physics_client_id=cid)
-        p.stepSimulation(physicsClientId=cid)
+        _saved_joint_states = p.getJointStates(robot_id, joint_indices, physicsClientId=cid)
+        for idx, qi in zip(joint_indices, q):
+            p.resetJointState(robot_id, idx, float(qi), physicsClientId=cid)
 
-    if link_indices_to_check is None:
-        link_indices_to_check = list(range(-1, p.getNumJoints(robot_id, physicsClientId=cid)))
+    try:
+        if link_indices_to_check is None:
+            link_indices_to_check = list(range(-1, p.getNumJoints(robot_id, physicsClientId=cid)))
 
-    def _robot_link_name(link_i):
-        if link_i == -1:
-            return "base_link(-1)"
-        info = p.getJointInfo(robot_id, link_i, physicsClientId=cid)
-        return f"{info[12].decode('utf-8')}({link_i})"
+        def _robot_link_name(link_i):
+            if link_i == -1:
+                return "base_link(-1)"
+            info = p.getJointInfo(robot_id, link_i, physicsClientId=cid)
+            return f"{info[12].decode('utf-8')}({link_i})"
 
-    def _obs_name(obs):
-        if obstacle_names and obs in obstacle_names:
-            return f"{obstacle_names[obs]}(id={obs})"
-        return str(obs)
+        def _obs_name(obs):
+            if obstacle_names and obs in obstacle_names:
+                return f"{obstacle_names[obs]}(id={obs})"
+            return str(obs)
 
-    # Check robot links against obstacles.
-    # linkIndexB is intentionally omitted so PyBullet checks all links of the obstacle body,
-    # not just its base link (-1). This matters for multi-link obstacle bodies (splat objects, boxes).
-    for link_i in link_indices_to_check:
-        for obs in obstacle_ids:
-            if skip_pairs and (link_i, obs) in skip_pairs:
+        # Check robot links against obstacles.
+        # linkIndexB is intentionally omitted so PyBullet checks all links of the obstacle body,
+        # not just its base link (-1). This matters for multi-link obstacle bodies (splat objects, boxes).
+        for link_i in link_indices_to_check:
+            for obs in obstacle_ids:
+                if skip_pairs and (link_i, obs) in skip_pairs:
+                    continue
+                pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=obstacle_clearance,
+                                         linkIndexA=link_i, physicsClientId=cid)
+                if len(pts) > 0:
+                    if verbose:
+                        print(f"Collision: robot {_robot_link_name(link_i)} vs obstacle {_obs_name(obs)}")
+                    return (True, "obstacle") if return_kind else True
+
+        # Pre-normalize the self-collision skip pairs into a frozenset of
+        # frozensets so (a,b) and (b,a) lookups both hit. Cheap (small N) and
+        # done once per call so the hot loop just does set membership.
+        _self_skip = None
+        if self_collision_skip_pairs:
+            _self_skip = {frozenset((int(a), int(b))) for a, b in self_collision_skip_pairs}
+
+        # Check self-collisions between non-adjacent link pairs
+        for a, b in itertools.combinations(link_indices_to_check, 2):
+            if _self_skip is not None and frozenset((a, b)) in _self_skip:
                 continue
-            pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs, distance=obstacle_clearance,
-                                     linkIndexA=link_i, physicsClientId=cid)
-            if len(pts) > 0:
-                if verbose:
-                    print(f"Collision: robot {_robot_link_name(link_i)} vs obstacle {_obs_name(obs)}")
-                return True
+            if not are_adjacent_links(robot_id, a, b, physics_client_id=cid):
+                if len(p.getClosestPoints(robot_id, robot_id, self_collision_clearance, linkIndexA=a, linkIndexB=b, physicsClientId=cid)) > 0:
+                    if verbose:
+                        print(f"Self-collision: robot {_robot_link_name(a)} vs {_robot_link_name(b)}")
+                    return (True, "self") if return_kind else True
 
-    # Check self-collisions between non-adjacent link pairs
-    for a, b in itertools.combinations(link_indices_to_check, 2):
-        if not are_adjacent_links(robot_id, a, b, physics_client_id=cid):
-            if len(p.getClosestPoints(robot_id, robot_id, self_collision_clearance, linkIndexA=a, linkIndexB=b, physicsClientId=cid)) > 0:
-                if verbose:
-                    print(f"Self-collision: robot {_robot_link_name(a)} vs {_robot_link_name(b)}")
-                return True
-
-    return False
+        return (False, None) if return_kind else False
+    finally:
+        # Restore the joints we moved to their pre-check state (position +
+        # velocity) and re-apply POSITION_CONTROL at the pre-check position
+        # so the robot ends this call exactly as it entered. Only the arm
+        # `joint_indices` are restored; the gripper is untouched by the
+        # kinematic-teleport path above. (Historically the pose-set used
+        # `set_robot_joint_positions` which forced the gripper open — that
+        # side-effect is intentionally gone now; the check reflects actual
+        # gripper state.)
+        if _saved_joint_states is not None:
+            for idx, st in zip(joint_indices, _saved_joint_states):
+                p.resetJointState(robot_id, idx, st[0], st[1], physicsClientId=cid)
+                p.setJointMotorControl2(
+                    robot_id, idx, p.POSITION_CONTROL,
+                    targetPosition=st[0], force=150, maxVelocity=3.14,
+                    physicsClientId=cid,
+                )
 
 
 def state_in_collision(robot_id, joint_indices, q, obstacle_ids, distance_threshold=None, link_indices_to_check=None, verbose=True):
@@ -339,11 +409,36 @@ def setup_env(args, robot_base_position, use_old_walls=False, use_obstacles=True
 
     return ll, ul, obstacle_ids, robot_id, joint_indices
 
-def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, max_tries=10000, verbose=True, link_indices_to_check=None, skip_pairs=None) -> np.ndarray:
+def get_random_joint_angles_without_collision(robot_id, joint_indices, obstacle_ids, lower_limits, upper_limits, max_tries=10000, verbose=True, link_indices_to_check=None, skip_pairs=None, self_collision_clearance=0.0, self_collision_skip_pairs=None) -> np.ndarray:
+    """Sample a random collision-free joint config.
+
+    Two-part collision contract mirroring `check_links_in_collision`:
+      * `skip_pairs` — (robot_link, obstacle_body_id) pairs to skip in
+        robot-vs-obstacle checks (per-obstacle skip list).
+      * `self_collision_skip_pairs` + `self_collision_clearance` —
+        non-adjacent robot-link pair skip list and near-contact
+        threshold for self-collision. When the caller uses a non-zero
+        threshold (e.g. env's reset-time `check_able_to_solve` under
+        the new `TrajectoryGenModeConfig.self_collision_clearance`),
+        the skip list MUST be forwarded — otherwise structurally-close
+        URDF pairs (Robotiq inner_finger/inner_knuckle mesh overlap,
+        UR base/upper_arm) trip on every sample and the caller hangs
+        after `max_tries` failures.
+    """
     sample_fn = get_sample_fn(robot_id, joint_indices)
     for _ in range(max_tries):
         q = sample_fn()
-        if not check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=link_indices_to_check, verbose=verbose, skip_pairs=skip_pairs):
+        if not check_links_in_collision(
+            robot_id,
+            joint_indices,
+            q,
+            obstacle_ids,
+            link_indices_to_check=link_indices_to_check,
+            verbose=verbose,
+            skip_pairs=skip_pairs,
+            self_collision_clearance=self_collision_clearance,
+            self_collision_skip_pairs=self_collision_skip_pairs,
+        ):
             return np.array(q)
     raise RuntimeError("Failed to find collision-free joint angles after many tries")
 
@@ -367,6 +462,20 @@ def check_self_collision(robot_id, joint_indices, distance=0.0):
 
 _GRIPPER_LINK_START = 7  # Links 7+ are gripper links; arm links are 0-6 inclusive
 
+# Cache: {(client_id, robot_id, min_link, max_link): is_adjacent_bool}.
+# URDF adjacency is a purely-topological property that doesn't change
+# with joint state — so a single per-(robot, client) lookup can be
+# reused across every collision check for the life of the process. The
+# uncached path was calling `p.getJointInfo` TWICE per non-adjacent
+# pair PER collision check, and `check_links_in_collision` iterates
+# ~190 non-adjacent pairs per query — that's 380 API round-trips per
+# query just to filter adjacency, which the audit script bypasses
+# entirely (it pre-filters by index enumeration). Caching turns 380
+# API calls per query into 190 dict hits after the first query fills
+# the cache.
+_ADJACENCY_CACHE: dict[tuple[int, int, int, int], bool] = {}
+
+
 def are_adjacent_links(robot_id, linkA, linkB, physics_client_id=None):
     """
     Returns True if the link pair should be skipped for self-collision checking.
@@ -374,16 +483,31 @@ def are_adjacent_links(robot_id, linkA, linkB, physics_client_id=None):
       1. Directly connected links (parent-child relationship).
       2. Both links are gripper links (joint index >= 7) — gripper geometry
          overlaps by design so any intra-gripper pair is excluded.
+
+    Result is cached in `_ADJACENCY_CACHE` after the first (cid, robot_id,
+    linkA, linkB) tuple is resolved. Adjacency is a URDF-topology property
+    that doesn't change while the robot body lives; a fresh `loadURDF`
+    call gets a fresh `robot_id` so cache staleness across robot reloads
+    is impossible by key construction.
     """
     cid = _resolve_client_id(physics_client_id)
-    # Both gripper links: always skip
+    # Both gripper links: always skip. Fast-path — no cache lookup needed
+    # since the check is O(1) integer comparison anyway.
     if linkA >= _GRIPPER_LINK_START and linkB >= _GRIPPER_LINK_START:
         return True
     if linkA == -1 or linkB == -1:
         return False
+    # Canonical (low, high) key so callers can pass either order.
+    a, b = (linkA, linkB) if linkA < linkB else (linkB, linkA)
+    key = (cid, robot_id, a, b)
+    cached = _ADJACENCY_CACHE.get(key)
+    if cached is not None:
+        return cached
     parentA = p.getJointInfo(robot_id, linkA, physicsClientId=cid)[16]
     parentB = p.getJointInfo(robot_id, linkB, physicsClientId=cid)[16]
-    return parentA == linkB or parentB == linkA
+    result = (parentA == linkB) or (parentB == linkA)
+    _ADJACENCY_CACHE[key] = result
+    return result
 
 def _make_uniform_sample_fn(lower_limits, upper_limits):
     """Self-contained sample_fn that doesn't query PyBullet (so it doesn't
@@ -423,7 +547,9 @@ def _make_linear_extend_fn(resolutions):
 def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal,
                  lower_limits=None, upper_limits=None, resolutions=None,
                  verbose=True, obstacle_names=None, skip_pairs=None,
-                 physics_client_id=None):
+                 physics_client_id=None,
+                 obstacle_clearance=None, self_collision_clearance=None,
+                 self_collision_skip_pairs=None):
     """Plan a joint-space path from q_start to q_goal with bidirectional RRT.
 
     `physics_client_id` controls which PyBullet server every call goes to,
@@ -452,14 +578,27 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal,
         distance_fn = get_distance_fn(robot_id, joint_indices)
         extend_fn = get_extend_fn(robot_id, joint_indices)
 
+    # Clearance kwargs forwarded into every collision check so RRT's
+    # sample/extend/smooth/start/goal checks all use the same configured
+    # margin. None falls through to check_links_in_collision's defaults
+    # (_COLLISION_CLEARANCE = 0.01 obstacle, self = 0.0).
+    _ccheck_kwargs = {}
+    if obstacle_clearance is not None:
+        _ccheck_kwargs["obstacle_clearance"] = obstacle_clearance
+    if self_collision_clearance is not None:
+        _ccheck_kwargs["self_collision_clearance"] = self_collision_clearance
+    if self_collision_skip_pairs:
+        _ccheck_kwargs["self_collision_skip_pairs"] = self_collision_skip_pairs
+
     def collision_fn(q):
         return check_links_in_collision(robot_id, joint_indices, q, obstacle_ids,
-                                         skip_pairs=skip_pairs, physics_client_id=cid)
+                                         skip_pairs=skip_pairs, physics_client_id=cid,
+                                         **_ccheck_kwargs)
 
     path = birrt(q_start, q_goal, distance_fn, sample_fn, extend_fn, collision_fn)
     if path is None:
-        start_in_col = check_links_in_collision(robot_id, joint_indices, q_start, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid)
-        goal_in_col = check_links_in_collision(robot_id, joint_indices, q_goal, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid)
+        start_in_col = check_links_in_collision(robot_id, joint_indices, q_start, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid, **_ccheck_kwargs)
+        goal_in_col = check_links_in_collision(robot_id, joint_indices, q_goal, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid, **_ccheck_kwargs)
         if start_in_col and goal_in_col:
             print("PyBullet planning failed: both q_start and q_goal are in collision.")
         elif start_in_col:
@@ -472,9 +611,15 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal,
 
     path = np.array(path)
 
-    # Sometimes, the plan is from end to start
-    if ((np.array(path[0]) - np.array(q_start))**2).sum() > ((np.array(path[0]) - np.array(q_goal))**2).sum():
-        path.reverse()
+    # Sometimes BiRRT returns the path from goal → start; flip to start → goal.
+    # `np.ndarray` doesn't have `.reverse()` (that's a list-only method) — must
+    # use numpy slicing. Pre-fix this errored as
+    # `AttributeError: 'numpy.ndarray' object has no attribute 'reverse'`
+    # whenever the wrong-direction branch fired, which under
+    # multi-candidate generation became common (each candidate is an
+    # independent BiRRT run).
+    if ((path[0] - q_start) ** 2).sum() > ((path[0] - q_goal) ** 2).sum():
+        path = path[::-1]
     if verbose:
         print("RRT raw path length:", len(path))
     return path
@@ -601,14 +746,34 @@ def ruckig_parametrize_path(
     max_joint_jerk: np.ndarray,
     control_hz: float,
     sharp_angle_threshold_deg: float = 45.0,
+    segment_at_sharp_corners: bool = True,
+    start_vel: np.ndarray | None = None,
+    start_acc: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Time-optimal path parametrization using Ruckig.
 
-    Splits the path at sharp-angle waypoints (angle > threshold) and runs
-    ruckig per-segment with zero velocity at sharp boundaries, allowing a brief
-    deceleration only where the geometry demands it. Gradual sections are handled
-    in a single ruckig call with free pass-through velocity.
+    Two modes, controlled by `segment_at_sharp_corners`:
+
+    * (default, True) — split the path at sharp-angle waypoints (angle >
+      threshold) and run ruckig per-segment. This matches the historical
+      behavior of this function: the robot decelerates to zero velocity at
+      each sharp corner before re-accelerating into the next segment. Safe
+      because the underlying RRT plans for typical manipulation tasks
+      don't have many sharp corners, so segmentation usually produces a
+      single segment anyway; only complex multi-obstacle plans see a
+      visible difference. Empirical comparison on lever-grasp interventions
+      (d5_fast_03dag vs d5jvm_g0_03dag, 2026-06-10) showed no observable
+      duration difference between the two modes, so True is the
+      conservative default.
+
+    * (False) — ONE ruckig call across the full path. Intermediate
+      waypoints are passed as `inp.intermediate_positions`; ruckig
+      optimizes cornering with no forced zero-velocity stops at internal
+      corners. Useful for paths with many sharp corners in joint space
+      where the per-segment stops produce visibly stuttering motion. For
+      the manipulation tasks we've tested this gives no measurable
+      speedup vs True, so it's opt-in.
 
     Args:
         waypoints: (N, DOF) joint-space waypoints.
@@ -616,8 +781,14 @@ def ruckig_parametrize_path(
         max_joint_acc: (DOF,) max joint accelerations in rad/s^2.
         max_joint_jerk: (DOF,) max joint jerks in rad/s^3.
         control_hz: Output sample rate in Hz.
-        sharp_angle_threshold_deg: Waypoints with turn angle above this (degrees)
-            become hard stop boundaries between segments.
+        sharp_angle_threshold_deg: Used only when segment_at_sharp_corners=True.
+        segment_at_sharp_corners: Per-corner zero-velocity-stop mode.
+            Default True (historical / safe). Pass False to use a single
+            ruckig call across the whole path with no internal forced stops.
+        start_vel: (DOF,) initial joint velocity at the FIRST sample. Use the
+            policy's last commanded velocity for a smooth handoff at
+            intervention trigger time. Default None = zeros (cold start).
+        start_acc: (DOF,) initial joint acceleration. Default None = zeros.
 
     Returns:
         (M, DOF) trajectory sampled at control_hz.
@@ -625,35 +796,61 @@ def ruckig_parametrize_path(
     waypoints = np.array(waypoints)
     dof = waypoints.shape[1]
     zeros = np.zeros(dof)
+    start_vel = zeros if start_vel is None else np.asarray(start_vel, dtype=np.float64)
+    start_acc = zeros if start_acc is None else np.asarray(start_acc, dtype=np.float64)
 
-    sharp_indices = _find_sharp_waypoint_indices(waypoints, sharp_angle_threshold_deg)
-
-    # Build segment boundaries: split at sharp waypoints (inclusive on both sides)
-    split_points = sorted(set([0] + sharp_indices + [len(waypoints) - 1]))
-    segments = []
-    for k in range(len(split_points) - 1):
-        segments.append(waypoints[split_points[k] : split_points[k + 1] + 1])
-
-    all_samples = []
-    for seg_idx, seg in enumerate(segments):
-        is_last = seg_idx == len(segments) - 1
-        end_vel = zeros if (is_last or split_points[seg_idx + 1] in sharp_indices) else zeros
+    if not segment_at_sharp_corners:
+        # Fast path: single ruckig call. `_ruckig_run_segment` already passes
+        # waypoints[1:-1] as intermediate_positions, so ruckig handles
+        # corner decel internally without zero-velocity stops.
         samples, _, _ = _ruckig_run_segment(
-            seg,
-            start_vel=zeros,
-            start_acc=zeros,
-            end_vel=end_vel,
+            waypoints,
+            start_vel=start_vel,
+            start_acc=start_acc,
+            end_vel=zeros,
             end_acc=zeros,
             max_joint_vel=max_joint_vel,
             max_joint_acc=max_joint_acc,
             max_joint_jerk=max_joint_jerk,
             control_hz=control_hz,
         )
-        # Drop the last point of each segment except the final one to avoid duplicates
+        return samples
+
+    # Legacy per-segment mode.
+    sharp_indices = _find_sharp_waypoint_indices(waypoints, sharp_angle_threshold_deg)
+    split_points = sorted(set([0] + sharp_indices + [len(waypoints) - 1]))
+    segments = [
+        waypoints[split_points[k]: split_points[k + 1] + 1]
+        for k in range(len(split_points) - 1)
+    ]
+    all_samples = []
+    prev_end_vel = start_vel
+    prev_end_acc = start_acc
+    for seg_idx, seg in enumerate(segments):
+        is_last = seg_idx == len(segments) - 1
+        # End at zero only when the next boundary is genuinely sharp or it's
+        # the trajectory's final point. At other boundaries, pass through.
+        is_next_sharp = (
+            not is_last and split_points[seg_idx + 1] in sharp_indices
+        )
+        seg_end_vel = zeros if (is_last or is_next_sharp) else zeros
+        seg_end_acc = zeros
+        samples, end_v, end_a = _ruckig_run_segment(
+            seg,
+            start_vel=prev_end_vel,
+            start_acc=prev_end_acc,
+            end_vel=seg_end_vel,
+            end_acc=seg_end_acc,
+            max_joint_vel=max_joint_vel,
+            max_joint_acc=max_joint_acc,
+            max_joint_jerk=max_joint_jerk,
+            control_hz=control_hz,
+        )
         if not is_last:
             samples = samples[:-1]
         all_samples.append(samples)
-
+        prev_end_vel = end_v
+        prev_end_acc = end_a
     return np.concatenate(all_samples, axis=0)
 
 
@@ -700,7 +897,7 @@ def open_gripper(robot_id, physics_client_id=None):
 
 
 
-def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, robot_update_rate, use_gui=False, verbose=True, max_joint_vel=None, max_joint_acc=None, max_joint_jerk=None, obstacle_names=None, skip_pairs=None, physics_client_id=None):
+def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, robot_update_rate, use_gui=False, verbose=True, max_joint_vel=None, max_joint_acc=None, max_joint_jerk=None, obstacle_names=None, skip_pairs=None, physics_client_id=None, obstacle_clearance=None, self_collision_clearance=None, self_collision_skip_pairs=None):
     cid = _resolve_client_id(physics_client_id)
     dof = len(joint_indices)
     if max_joint_vel is None:
@@ -717,6 +914,18 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, rob
     # 0.05 radians per joint, used both for RRT extension and path smoothing.
     resolutions = [0.05] * len(joint_indices)
 
+    # Forward the configured clearance to both the RRT sample/extend
+    # collision_fn AND the smooth_path post-processing collision_fn so the
+    # whole pipeline uses one consistent margin. See `get_rrt_plan` for the
+    # symmetric forwarding inside the BiRRT collision check.
+    _ccheck_kwargs = {}
+    if obstacle_clearance is not None:
+        _ccheck_kwargs["obstacle_clearance"] = obstacle_clearance
+    if self_collision_clearance is not None:
+        _ccheck_kwargs["self_collision_clearance"] = self_collision_clearance
+    if self_collision_skip_pairs:
+        _ccheck_kwargs["self_collision_skip_pairs"] = self_collision_skip_pairs
+
     # RRT-Connect planner — pass joint limits + resolutions so its sample/extend
     # functions don't query PyBullet (which would target the default client).
     rrt_path = get_rrt_plan(
@@ -724,6 +933,9 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, rob
         lower_limits=ll, upper_limits=ul, resolutions=resolutions,
         verbose=verbose, obstacle_names=obstacle_names, skip_pairs=skip_pairs,
         physics_client_id=cid,
+        obstacle_clearance=obstacle_clearance,
+        self_collision_clearance=self_collision_clearance,
+        self_collision_skip_pairs=self_collision_skip_pairs,
     )
     if rrt_path is None:
         return None
@@ -731,7 +943,8 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, rob
 
     def collision_fn(q):
         return check_links_in_collision(robot_id, joint_indices, q, obstacle_ids,
-                                         skip_pairs=skip_pairs, physics_client_id=cid)
+                                         skip_pairs=skip_pairs, physics_client_id=cid,
+                                         **_ccheck_kwargs)
 
     extend_fn = _make_linear_extend_fn(resolutions)
 
