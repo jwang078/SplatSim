@@ -24,8 +24,153 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
     ENV_CONFIG: EnvConfig
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    # UR URDF: base_link(0) and upper_arm_link(2) are non-adjacent (separated
+    # by shoulder_link(1)) but the shoulder bracket places upper_arm_link's
+    # lower face ~4 mm above base_link's top face. Any self_collision_clearance
+    # > 0.004 m flags this as a self-collision at every valid joint config,
+    # which breaks IK + RRT planning. Excluded here so callers can crank up
+    # the threshold without false positives.
+    #
+    # SINGLE SOURCE OF TRUTH: this class attribute is consumed by THREE
+    # downstream paths:
+    #   1. `is_robot_in_collision` (env-side termination check on collision).
+    #   2. `_get_default_trajectory_gen_config` → trajectory generator (GUI).
+    #   3. `get_env_config()` → dispatched to LeRobot SA wrapper over ZMQ
+    #      → SA wrapper's RRT planner.
+    # Changing this list updates all three; the user does not have to pass
+    # `--rrt_self_collision_skip_pairs` separately on the DAgger CLI.
+    #
+    # If you ever swap robots, audit this list against the new URDF's link
+    # adjacency + AABB layout. Other envs (object_on_plate, assembly, ...)
+    # inherit the base class's empty default — add their own override here
+    # if their URDF needs it.
+    # This list was PRUNED from 40 entries to 17 based on the audit at
+    # `my_scripts/audit_self_collision_skip_pairs.py` (10 000 uniform-random
+    # joint configs + 467 workload-representative configs from
+    # `splatsim_approach_lever_12_clean/data/chunk-000/file-000.parquet`,
+    # mimic-joint-aware sampling).
+    #
+    # The dropped 23 entries fell into two audit classes:
+    #   * CRITICAL_MUST_UNSKIP (3 pairs): (0,2), (3,5), (4,19). The comments
+    #     called these URDF-fixed but 22-35% of sampled configs actually had
+    #     the pair penetrating by 22-41 mm. The planner was silently
+    #     accepting configs where physics disagrees → runtime PyBullet
+    #     solver kicks the joint state to un-penetrate → recorded joint
+    #     spike (matched the `joint_spike` anomaly class flagged by
+    #     `dagger_detect_dataset_anomalies.py`).
+    #   * REDUNDANT_UNSKIP_OK (19 pairs): (4,7), (4,8), (4,12), (4,13),
+    #     (4,17), (4,18), (5,10), (5,11), (5,12), (5,15), (5,16), (5,17),
+    #     (5,19), (6,8), (6,10), (6,11), (6,12), (6,15), (6,16), (6,17).
+    #     All wrist_1/2/3 ↔ some-finger/knuckle-part pairs where the min
+    #     distance across every sampled config stays above 20 mm — they
+    #     never come near the runtime `self_collision_clearance` buffer,
+    #     so skipping them had no effect. Removed for clarity; behavior
+    #     unchanged.
+    #
+    # The 17 kept below are the STRUCTURAL_KEEP class (range < 1 mm across
+    # 10 467 configs) plus (4,6) which sits at a constant 11-13 mm — a
+    # BORDERLINE case that stays below 20 mm but has never penetrated.
+    #
+    # If you ever swap robots or change the URDF, re-run
+    # `my_scripts/audit_self_collision_skip_pairs.py --urdf <new.urdf>`
+    # and update this list from the audit output.
+    SELF_COLLISION_SKIP_PAIRS = [
+        # ---- UR wrist_1 vs wrist_3 URDF floor (~12 mm constant) ----
+        # BORDERLINE per audit: min 11.44 mm, range 1.18 mm, 0% penetrated.
+        # Compact UR wrist geometry pins these ~12 mm apart regardless of
+        # arm articulation. Keeping so runtime self_collision_clearance
+        # thresholds > 11 mm don't trip on every config.
+        (4, 6),
+        # ---- CRITICAL_MUST_UNSKIP pairs from the audit — re-added ----
+        # The audit flagged these as pairs that ACTUALLY penetrate in the
+        # sampled distribution (22-35% of workload configs, max 22-41 mm
+        # interpenetration per `getClosestPoints`). Kinematically that's a
+        # collision, but PyBullet's constraint solver tolerates the
+        # interpenetration without forces (URDF joint constraints hold, no
+        # observable solver kick). These are mesh-overlap artifacts, not
+        # dynamics events.
+        #
+        # SELF_COLLISION_SKIP_PAIRS is the SINGLE source of truth for THREE
+        # downstream paths (see the class-level comment above), and the
+        # env-side eval-terminate check `is_robot_in_collision` (called
+        # when --env.terminate_on_collision=true) reads this list too. When
+        # the audit removed these three pairs, the eval-terminate began
+        # firing on 60-70% of workload configs — the same URDF-artifact
+        # overlaps the physics engine ignores. Restored here so RRT
+        # planning AND eval-terminate share the same "this pair is a URDF
+        # artifact, ignore it" contract. Trade-off: RRT paths may pass
+        # through these penetrations, but that's what pre-audit behavior
+        # was and it never caused issues (the joint-spike case that
+        # motivated the audit was actually (3, 19) forearm ↔ wrist_camera,
+        # which was NEVER in the skip list and still isn't).
+        (0, 2),   # base_link vs upper_arm_link — mesh artifact at shoulder.
+                  # base has no dynamics that can be kicked; RRT tolerating this
+                  # penetration hasn't produced joint spikes.
+        (3, 5),   # forearm_link vs wrist_2_link — URDF mesh floor at
+                  # elbow-wrist junction (~12 mm). No solver kicks observed.
+        #
+        # NOT in STRICT list — see SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA
+        # below for the pairs eval-terminate silently accepts but RRT still
+        # rejects (wrist-camera / wrist_1 mesh overlaps that produce solver
+        # kicks in traj-gen paths).
+        # ---- Wrist camera rigidly downstream of wrist_3 ----
+        # Fixed sensor attachment via ee_link. Distances URDF-determined
+        # for these two pairs (audit: (6,19) 26.80 mm constant; (7,19)
+        # 65.76 mm constant).
+        (6, 19),  # wrist_3 vs wrist_camera_link
+        (7, 19),  # ee_link vs wrist_camera_link
+        # ---- Wrist_2 → ee_link / gripper_base (rigid via ee_link) ----
+        # Audit: constant 18.80 / 42.11 mm across all configs.
+        (5, 7),   # wrist_2 vs ee_link
+        (5, 8),   # wrist_2 vs robotiq_arg2f_base_link
+        # ---- Wrist_2 → inner/outer knuckles (rigid downstream) ----
+        # Audit: constant 91-100 mm across all configs.
+        (5, 9),   # wrist_2 vs left_outer_knuckle
+        (5, 13),  # wrist_2 vs left_inner_knuckle
+        (5, 14),  # wrist_2 vs right_outer_knuckle
+        (5, 18),  # wrist_2 vs right_inner_knuckle
+        # ---- Wrist_3 → inner/outer knuckles (rigid downstream) ----
+        # Audit: constant 57-66 mm across all configs.
+        (6, 9),   # wrist_3 vs left_outer_knuckle
+        (6, 13),  # wrist_3 vs left_inner_knuckle
+        (6, 14),  # wrist_3 vs right_outer_knuckle
+        (6, 18),  # wrist_3 vs right_inner_knuckle
+        # ---- Gripper-internal URDF mesh overlaps (Robotiq 2F-85 design) ----
+        # The parallel-jaw mimic mechanism has visual meshes that
+        # geometrically overlap at the pivot — URDF artifacts, not real
+        # collisions. Audit confirms constant penetration at −13.51 mm
+        # for finger↔knuckle and small oscillation around 0 mm for
+        # finger_pad↔knuckle across every sampled config. Kept so the
+        # planner doesn't reject every gripper-present pose.
+        (11, 13),  # left_inner_finger      ↔ left_inner_knuckle
+        (12, 13),  # left_inner_finger_pad  ↔ left_inner_knuckle
+        (16, 18),  # right_inner_finger     ↔ right_inner_knuckle
+        (17, 18),  # right_inner_finger_pad ↔ right_inner_knuckle
+    ]
+
+    # Additional pairs skipped ONLY by the env-side eval-terminate check
+    # (`is_robot_in_collision` called from `check_metrics`) — NOT by the RRT
+    # planner, trajectory generator, controller-side collision predicates,
+    # or the reset-time "find collision-free start pose" scan.
+    #
+    # Rationale: these three wrist-camera / wrist_1 mesh-overlap pairs
+    # kinematically penetrate at some workload configs (audit flags them
+    # CRITICAL_MUST_UNSKIP), AND PyBullet's constraint solver DOES kick them
+    # when RRT paths pass through those configs — producing the "teleport +
+    # trailing joint spike" pattern in trajectory-gen recordings. So the
+    # planner must reject them (kept out of SELF_COLLISION_SKIP_PAIRS
+    # above). But the ENV shouldn't terminate on them either — they're
+    # URDF-mesh artifacts, and if the physics happens to land on one
+    # briefly it shouldn't cost the episode.
+    #
+    # Consumed exclusively by `_eval_terminate_skip_pairs()` (base class),
+    # which unions this with SELF_COLLISION_SKIP_PAIRS. `check_metrics`
+    # below passes the union to `is_robot_in_collision`.
+    SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA = [
+        (2, 4),   # upper_arm ↔ wrist_1 — mesh overlap in extreme arm-curl configs
+        (3, 19),  # forearm ↔ wrist_camera_link — original joint-spike pair
+        (4, 19),  # wrist_1 ↔ wrist_camera_link — same wrist-cam mesh class
+    ]
 
     def plan_given_this_state(self, initial_joint_positions):
         all_paths = []
@@ -71,11 +216,27 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         # From GENERATE_DEMOS: randomize_ee_pose()
         # initial_joints = self.randomize_ee_pose()
         # self.teleport_joint_state(self.splatsim_robot, initial_joints)
-        # self.open_gripper()
+        # (open_gripper is now unconditional — see below.)
+
+        # Explicitly open the gripper on every reset. Constructor-time
+        # setup (`sim_robot_pybullet_base.py`, ~line 881) calls this once
+        # at env init, but nothing else in the reset flow touches the
+        # gripper joints — `randomize_objects` and `randomize_ee_pose`
+        # only reset arm joints (indices 1..num_dofs), and
+        # `is_robot_in_collision` calls check_links_in_collision(q=None)
+        # which doesn't invoke `set_robot_joint_positions`'s side-effect
+        # `open_gripper`. Without this call, whichever gripper state the
+        # PRIOR episode ended at (e.g. closed=1.0 after a grasp) bleeds
+        # into the next episode's frame 0 — then trajectory playback
+        # commands gripper=0 partway through, and the recorded state
+        # drifts 1.0 → 0.0 mid-episode. Manifests in
+        # dagger_detect_dataset_anomalies as GRIPPER_DRIFT with range
+        # [0.0000, 1.0000] on ~1/6 of episodes.
+        self.open_gripper()
 
         # # Let simulation settle
-        # for _ in range(100):
-        #     self.pybullet_client.stepSimulation()
+        for _ in range(1000):
+            self.pybullet_client.stepSimulation()
 
         metrics = self.check_metrics()
 
@@ -149,10 +310,54 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         cam_forward = cam_rotation[:, 2]
         cam_looks_at_goal_score = compute_camera_alignment_score(cam_position, cam_forward, target_ee_pos)
 
-        in_collision = self.is_robot_in_collision(obstacle_clearance=0.0)
+        # Capture both the bool AND the collision kind ("obstacle" / "self" /
+        # None) in one call so the metrics dict can surface the cause to
+        # downstream consumers (eval_info.json per-episode data → DAgger
+        # plots / failure-mode analysis). check_links_in_collision short-
+        # circuits on the first match, so the cost is the same as the
+        # bool-only path.
+        # Use the WIDER eval-terminate skip list (strict RRT list ∪
+        # SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA) — see the class
+        # attribute's docstring for the wrist-camera-mesh rationale.
+        # Cached once per call so both the initial + verbose re-check use
+        # the identical set.
+        _eval_terminate_skips = self._eval_terminate_skip_pairs()
+        in_collision, collision_kind = self.is_robot_in_collision(
+            obstacle_clearance=self._in_collision_obstacle_clearance,
+            self_collision_clearance=self._in_collision_self_collision_clearance,
+            self_collision_skip_pairs=_eval_terminate_skips,
+            return_kind=True,
+        )
         if in_collision:
             success = False
+            # Re-check with verbose=True so the per-step log ALSO records the
+            # specific link pair (the bool/kind tuple above doesn't carry
+            # the offending link names). Cheap: PyBullet's pairwise query is
+            # the same work as the initial check; we just print the first
+            # match this time. Note: check_metrics is called every physics
+            # step, so once a collision is detected (and the env terminates
+            # via check_terminated_from_metrics), this branch fires once at
+            # the moment of detection and then check_metrics stops being
+            # called for that episode — no per-step log spam.
+            self.is_robot_in_collision(
+                obstacle_clearance=self._in_collision_obstacle_clearance,
+                self_collision_clearance=self._in_collision_self_collision_clearance,
+                self_collision_skip_pairs=_eval_terminate_skips,
+                verbose=True,
+            )
 
+        # Numeric encoding of collision_kind so SyncVectorEnv can stack it
+        # into an ndarray of shape (num_envs,) and lerobot-eval's
+        # info-metrics aggregation (torch.from_numpy + reduce ops) can
+        # consume it. The string form below is for verbose logs / direct
+        # readers — gets silently filtered out by lerobot-eval's
+        # "skip non-numeric" guard so the numeric path is what reaches
+        # eval_info.json.
+        #   0 = no collision
+        #   1 = obstacle (robot link vs scene obstacle)
+        #   2 = self    (robot link vs robot link, non-adjacent pair)
+        _CK_CODE = {None: 0, "obstacle": 1, "self": 2}
+        collision_kind_code = _CK_CODE[collision_kind]
         metrics = {
             "is_success": success,
             "position_error_m": pos_diff,
@@ -162,6 +367,14 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
             "action_accel": self._action_accel,
             "action_jerk": self._action_jerk,
             "in_collision": in_collision,
+            # collision_kind is "obstacle" / "self" / None — informational
+            # string for direct callers (verbose log readers, custom
+            # scripts that load the metrics dict). The numeric *_code
+            # field below is what flows through lerobot-eval to
+            # eval_info.json (see the encoding comment above the
+            # _CK_CODE dict).
+            "collision_kind": collision_kind,
+            "collision_kind_code": collision_kind_code,
         }
 
         return metrics
@@ -169,22 +382,44 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
 class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServer):
     # This new lab bench scene has the robot rotated 90 degrees because it was installed rotated D:
-    background_splat_name = "robot_iphone_w_engine_new"
+    # background_splat_name = "robot_iphone_w_engine_new"
+    #
+    # DEFAULT_ROBOT_NAME is the SINGLE SOURCE OF TRUTH for this env's splat
+    # / URDF identifier. Both the SplatSim server (via `launch_nodes.py`'s
+    # class-default lookup) and LeRobot-side clients (which mirror this
+    # string in their own defaults or query it via `get_env_config()` over
+    # ZMQ) key off this one attribute. `background_splat_name` derives from
+    # it because for this env the robot + background come from the same
+    # Gaussian training session — one canonical splat, one coordinate
+    # frame, no risk of the pair drifting apart in defaults.
+    DEFAULT_ROBOT_NAME = "robot_iphone_w_engine_curtain"
+    background_splat_name = DEFAULT_ROBOT_NAME
+    # base_camera_splat_name = "robot_iphone_w_engine_new"
 
     ENV_CONFIG = EnvConfig(
-        name="upright_robot_small_engine_new",
+        # name="upright_robot_small_engine_new",
+        name="upright_robot_small_engine_curtain",
         task=TaskConfig(
             task_description="<control_mode> joint <control_mode>",
 
             # Approach lever — canonical goal joint config (6-DOF, no gripper).
+            # # Used to seed IK so demos converge to a shared joint configuration.
+            # q_goal_bias=(1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029),
+            # # target_ee_{pos,quat} were captured from self.get_current_ee_pose() at this q_goal_bias.
+            # target_ee_pos=(-0.10123532289544344, 0.5484031509107826, 0.26692192875731213),
+            # # If camera is tilted 18 degrees down
+            # target_ee_quat=(0.8074376258351692, 0.1106042613918073, -0.5450490313370774, 0.19680632913133583),
+            # # If camera is level with the horizon
+            # # target_ee_quat=(0.8282820040827756, 0.02399455087684049, -0.5556401809874196, 0.06809678783251895),
+
+            # Moving goal a bit further from the engine
             # Used to seed IK so demos converge to a shared joint configuration.
-            q_goal_bias=(1.33936567, -1.52838483, 1.92282924, -1.21754169, -0.53407075, -0.73042029),
+            q_goal_bias=(1.223, -1.587, 2.082, -0.925, -0.496, -1.124),
             # target_ee_{pos,quat} were captured from self.get_current_ee_pose() at this q_goal_bias.
-            target_ee_pos=(-0.10123532289544344, 0.5484031509107826, 0.26692192875731213),
+            target_ee_pos=(-0.04133536080021404, 0.48531107901173687, 0.2357459331089757),
             # If camera is tilted 18 degrees down
-            target_ee_quat=(0.8074376258351692, 0.1106042613918073, -0.5450490313370774, 0.19680632913133583),
-            # If camera is level with the horizon
-            # target_ee_quat=(0.8282820040827756, 0.02399455087684049, -0.5556401809874196, 0.06809678783251895),
+            target_ee_quat=(0.7557648104558216, 0.11587548726295122, -0.6202265575111952, 0.175246797648522),
+
 
             pos_tolerance_m=0.03,  # 3 centimeters
             quat_tolerance_deg=10.0,  # 10 degrees
@@ -278,7 +513,20 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
         ],
     )
 
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        in_collision_obstacle_clearance: float = 0.0,
+        in_collision_self_collision_clearance: float = 0.0,
+        **kwargs,
+    ):
+        # Clearances used by check_metrics() when reporting `in_collision`.
+        # Defaults preserve historical behavior (0 m on both = actual contact /
+        # penetration only). When non-zero (typically forwarded from the
+        # caller's `rrt_obstacle_clearance` / `rrt_self_collision_clearance`
+        # so the blend-collision filter matches what RRT planning treats as
+        # a collision), `is_robot_in_collision` reports near-misses too.
+        self._in_collision_obstacle_clearance = float(in_collision_obstacle_clearance)
+        self._in_collision_self_collision_clearance = float(in_collision_self_collision_clearance)
         super().__init__(**kwargs)
         # Set initial camera position on the opposite side of the wall (positive y side)
         # Camera looks at the origin from the positive y side, above the floor
@@ -300,6 +548,12 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
                 list(self.ENV_CONFIG.task.q_goal_bias)
                 if self.ENV_CONFIG.task.q_goal_bias is not None else None
             ),
+            # Read from the env class's single source of truth so changing
+            # `SELF_COLLISION_SKIP_PAIRS` updates the trajectory generator
+            # automatically. Convert tuples → lists for draccus/JSON
+            # round-trip friendliness (TrajectoryGenModeConfig declares
+            # this as List[List[int]]).
+            self_collision_skip_pairs=[list(p) for p in self.SELF_COLLISION_SKIP_PAIRS] or None,
             debug_visualize=False
         )
 

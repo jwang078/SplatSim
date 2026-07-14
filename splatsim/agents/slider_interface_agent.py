@@ -10,7 +10,9 @@ class SliderInterfaceAgent(Agent):
     def __init__(self):
         self.robot = None
         self.joint_signs = [1] * 6
-        self.default_joint = [1.57, -1.57, 1.57, -1.57, -1.57, 0, 1]
+        # Last element is the gripper command: move_gripper((1 - g) * 0.085),
+        # so g=0 -> open, g=1 -> closed. Default open (0).
+        self.default_joint = [1.57, -1.57, 1.57, -1.57, -1.57, 0, 0]
         self.num_joints = len(self.default_joint)
         self.last_action = np.array(self.default_joint)
         self.state = AGENT_STATE.EXECUTING_TRAJ
@@ -22,10 +24,16 @@ class SliderInterfaceAgent(Agent):
         self._init_sliders()
 
     def _init_sliders(self):
-        # Create sliders for each joint
+        # Create sliders for each joint. The last slider is the gripper
+        # (0 = open, 1 = closed), so give it a clean 0..1 range instead of the
+        # arm joints' -3.14..3.14 radian range.
         self.slider_ids = []
+        gripper_idx = len(self.default_joint) - 1
         for i, val in enumerate(self.default_joint):
-            slider_id = p.addUserDebugParameter(f"Joint {i+1}", -3.14, 3.14, val)
+            if i == gripper_idx:
+                slider_id = p.addUserDebugParameter("Gripper (0=open,1=closed)", 0, 1, val)
+            else:
+                slider_id = p.addUserDebugParameter(f"Joint {i+1}", -3.14, 3.14, val)
             self.slider_ids.append(slider_id)
 
         # Create settling button

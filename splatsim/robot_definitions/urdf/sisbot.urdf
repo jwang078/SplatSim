@@ -231,12 +231,24 @@
         <color rgba="0.1 0.1 0.1 1"/>
       </material>
     </visual>
-    <!-- <collision>
+    <!--
+      Was commented out: meant the Robotiq 2F-85 body (~70 mm thick connector
+      between ee_link and the fingers) was INVISIBLE to the physics engine
+      and the RRT planner. Empirically caused the gripper to bump into
+      obstacles during RRT-driven demos because the planner saw empty space
+      where the gripper body actually sits. Uncommented so collisions are
+      now checked. Uses the original .stl from the Robotiq distribution
+      (low-poly enough for physics; matches the arm's .stl collision style).
+      Three new SELF_COLLISION_SKIP_PAIRS were added to handle the now-
+      visible structural pairs between this base and the wrist links:
+      (4, 8), (5, 8), (6, 8) — see sim_robot_pybullet_small_engine.py.
+    -->
+    <collision>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry>
         <mesh filename="collision/robotiq_arg2f_base_link.stl"/>
       </geometry>
-    </collision> -->
+    </collision>
   </link>
   <link name="left_outer_knuckle">
     <inertial>
@@ -622,9 +634,10 @@
     <parent link="robotiq_arg2f_base_link"/>
     <child link="wrist_camera_link"/>
     <!-- the cam is tilted down by about 18 degrees to see the gripper (0.31 rad) -->
-    <!-- <origin xyz="-0.1 0 -0.0" rpy="-0.3141 0 -1.57"/> -->
+    <origin xyz="-0.1 -0.0 -0.035" rpy="-0.3141 0 -1.57"/>
     <!-- Untilted -->
-    <origin xyz="-0.1 0 -0.0" rpy="0 0 -1.57"/>
+    <!-- <origin xyz="-0.1 0 -0.0" rpy="0 0 -1.57"/> -->
+    <!-- idk what this is -->
     <!-- <origin xyz="-0.1 0 -0.05" rpy="-0.3141 0 -1.57"/> -->
   </joint>
 

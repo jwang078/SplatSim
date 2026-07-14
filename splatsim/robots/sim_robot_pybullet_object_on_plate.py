@@ -395,12 +395,15 @@ class ObjectOnPlatePybulletRobotServer(PybulletRobotServerBase):
 
             initial_joint_positions = self.randomize_ee_pose()
 
-            success = self.plan_execute_record_trajectory(
-                initial_joint_positions,
-                self.splatsim_robot.articulation_config.joint_signs
-            )
-            if success:
-                self.trajectory_count += 1
+            # randomize_ee_pose returns None when no collision-free pose was
+            # found; skip this cycle and retry rather than planning from None.
+            if initial_joint_positions is not None:
+                success = self.plan_execute_record_trajectory(
+                    initial_joint_positions,
+                    self.splatsim_robot.articulation_config.joint_signs
+                )
+                if success:
+                    self.trajectory_count += 1
 
             if self.trajectory_count > self.MAX_TRAJECTORY_COUNT:
                 print(

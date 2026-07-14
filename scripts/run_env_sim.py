@@ -319,7 +319,6 @@ def main(args):
     # going to start position
     print("Going to start position")
     obs = env.get_obs()
-    flag = False
     if obs is not None:
         if query_new_joints_per_startup_step:
             start_pos = agent.act(obs)
@@ -373,12 +372,13 @@ def main(args):
             if not isinstance(current_joints, np.ndarray):
                 current_joints = np.array(current_joints)
             
-            if command_joints.shape[0] == 7 and current_joints.shape[0] == 6:
+            # obs joint_positions is truncated to num_dofs (6) in
+            # _raw_obs_to_gym_obs, but the agent outputs num_dofs + 1 (with the
+            # gripper). Pad current_joints with the agent's gripper value so the
+            # delta subtraction and the resulting action are (num_dofs + 1)-dim.
+            if command_joints.shape[0] == current_joints.shape[0] + 1:
                 current_joints = np.append(current_joints, command_joints[-1])
-                flag = True
-            else:
-                flag = False
-            
+
             delta = command_joints - current_joints
             max_joint_delta = np.abs(delta).max()
             if max_joint_delta > max_delta:
@@ -389,9 +389,10 @@ def main(args):
             print("")
             
                 
-            if flag:
-                delta = delta[:-1]
-                current_joints = current_joints[:-1]
+            # env.step expects the full action (num_dofs arm joints + 1 gripper);
+            # do NOT strip the gripper element. current_joints was padded to
+            # match command_joints above, so current_joints + delta is already
+            # the correct (num_dofs + 1)-dim action.
             env.step(current_joints + delta) # ------------------------------
 
 
@@ -503,8 +504,12 @@ def main(args):
                 # with the lerobot eval loop's image renders on the sim server.
                 obs = env.get_obs(render_images=False)
             else:
-                if flag:
-                    action = action[:-1]
+                # env.step expects the full (num_dofs + 1)-dim action including
+                # the gripper at index num_dofs. Previously this stripped the
+                # last element when `flag` was set (agent=7 vs obs=6), which
+                # silently dropped the gripper command after num_dofs changed
+                # 7 -> 6 (obs joint_positions is truncated to num_dofs in
+                # _raw_obs_to_gym_obs). Send the action unmodified.
                 obs = env.step(action)
                 # Save frame after step: state = post-physics obs (matches traj-gen convention)
                 if getattr(agent, 'state', AGENT_STATE.UNKNOWN) == AGENT_STATE.EXECUTING_TRAJ and lerobot_saver is not None and action is not None:

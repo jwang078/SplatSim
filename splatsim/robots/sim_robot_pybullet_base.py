@@ -1,7 +1,7 @@
 import pickle
 import threading
 import time
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, ClassVar, Dict, Optional, List, Tuple
 import gymnasium
 from gymnasium import spaces
 import enum
@@ -264,7 +264,7 @@ class SplatSimCamera:
     camera: Optional[Camera]
     pipeline: Optional[PipelineParams]
     background: Optional[torch.tensor]
-    tracked_link_index: Optional[str] = None
+    tracked_link_index: Optional[int] = None
     # Fisheye rendering via gsplat
     camera_model: str = "pinhole"  # "pinhole" or "fisheye"
     intrinsic_matrix: Optional[torch.Tensor] = None  # [3,3] fisheye K on CUDA
@@ -292,6 +292,71 @@ WRIST_CAM_FISHEYE_CALIBRATIONS: Dict[int, Dict[str, Any]] = {
 
 class PybulletRobotServerBase:
     MAX_TRAJECTORY_COUNT = 500
+    # ── URDF-specific self-collision skip pairs ──────────────────────────────
+    # Non-adjacent link pairs to EXCLUDE from self-collision checks. Use for
+    # URDF link pairs that are structurally close at every reachable joint
+    # config — without skipping them, any non-zero self_collision_clearance
+    # would flag every valid pose. Tied to the URDF, not the scenario, so a
+    # CLASS attribute is the natural home: subclass envs override it once;
+    # every consumer (env-side `is_robot_in_collision`, the trajectory
+    # generator, the LeRobot SA wrapper via the dispatched oracle env
+    # config) reads from this single source of truth.
+    #
+    # Default: no skips (suitable for URDFs without geometrically-close
+    # non-adjacent link pairs). Override at class scope in subclass envs
+    # — see `SmallEnginePybulletRobotServer` for the UR robot's
+    # `[(0, 2)]` (base_link vs upper_arm_link, ~4 mm apart due to the
+    # shoulder bracket).
+    #
+    # Authoring rule: pair tuples should be `(int, int)` and order doesn't
+    # matter ((a,b) is treated identically to (b,a) downstream).
+    SELF_COLLISION_SKIP_PAIRS: ClassVar[list[tuple[int, int]]] = []
+
+    # Robot splat / URDF name used to look up gaussians + collision assets
+    # from `configs/object_configs/objects.yaml`. Read by:
+    #   * `launch_nodes.py` as the default when `--robot_name` isn't passed
+    #   * (indirectly) LeRobot's `SplatSimEnv.robot_name` and
+    #     `SharedAutonomyConfig.robot_name` defaults — kept in sync manually,
+    #     no cross-repo import path from Python config → LeRobot
+    #
+    # Subclass override lives at class scope so every consumer sees the SAME
+    # canonical value without needing to pass it through every constructor.
+    # Change here and nowhere else — bash scripts pass no `--robot_name` by
+    # default, LeRobot side has its own matching default (or query via
+    # `get_env_config()` at env-init).
+    DEFAULT_ROBOT_NAME: ClassVar[str] = "robot_iphone"
+
+    # ADDITIONAL pairs skipped ONLY by the env-side eval-terminate check
+    # `is_robot_in_collision` (via `--env.terminate_on_collision=true` /
+    # `check_metrics`) — NOT by the RRT planner, trajectory generator, or
+    # controller-side collision predicates.
+    #
+    # Populate this with pairs the audit flags as CRITICAL_MUST_UNSKIP
+    # (they kinematically penetrate at some workload configs) but that
+    # PyBullet's constraint solver KICKS on when RRT paths go through
+    # them — leaving them in the strict `SELF_COLLISION_SKIP_PAIRS`
+    # produces recorded joint spikes. The wider `_eval_terminate_skip_pairs()`
+    # helper below unions this list with `SELF_COLLISION_SKIP_PAIRS`; the
+    # env's `check_metrics` passes the union to `is_robot_in_collision`
+    # so eval-terminate silently accepts those URDF-mesh-overlap configs
+    # while the planner keeps rejecting them.
+    #
+    # Empty base default → subclasses opt in per-URDF (see
+    # `SmallEnginePybulletRobotServer` for the wrist-camera-mesh entries).
+    SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA: ClassVar[list[tuple[int, int]]] = []
+
+    def _eval_terminate_skip_pairs(self) -> list[tuple[int, int]] | None:
+        """Union of the strict skip list + the eval-terminate-only extras.
+        Consumers: `check_metrics`'s `is_robot_in_collision(...)` call.
+        Kept as a method (not a class attr) so both class attributes can be
+        overridden freely in subclasses without needing to keep a derived
+        third attribute in sync. Returns None (not []) when the union is
+        empty so `check_links_in_collision`'s skip-set builder path
+        collapses cleanly."""
+        combined = list(self.SELF_COLLISION_SKIP_PAIRS) + list(
+            self.SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA
+        )
+        return combined or None
 
     @property
     def TABLE_LIMITS(self):
@@ -319,6 +384,9 @@ class PybulletRobotServerBase:
 
     # This is the default splat name. Overwrite it in a child class of PybulletRobotServerBase
     background_splat_name = None
+
+    # This sets up the camera. None if it is the same as background_splat_name
+    base_camera_splat_name = None
 
     # COLMAP PINHOLE (undistorted sparse), camera_id=3 — intrinsics only; no wrist splat folder needed.
     wrist_colmap_camera_id = 3
@@ -378,7 +446,7 @@ class PybulletRobotServerBase:
         eval_benchmark_repo_id: Optional[str] = None,
         eval_benchmark_subset: Optional[List[int]] = None,
         use_gsplat: bool = True,
-        wrist_cam_ver: int = 1,
+        wrist_cam_ver: int = 2,
         headless: bool = False,
     ):
         self._splatsim_gui = None
@@ -410,6 +478,17 @@ class PybulletRobotServerBase:
                 f"{sorted(WRIST_CAM_FISHEYE_CALIBRATIONS.keys())} (fisheye)."
             )
         self.wrist_cam_ver = wrist_cam_ver
+        # When the wrist camera is aligned to the real camera's mounting pose,
+        # its optical center sits inside the gaussians of the physical camera
+        # body that were captured in the robot splat — so the wrist view just
+        # renders the black interior of that blob. When True, the gaussians
+        # belonging to the wrist_camera_link segment are made transparent for
+        # the wrist render only (the base/third-person view still shows the
+        # camera). Set False to render the wrist camera body as-is.
+        self.mask_wrist_camera_body = True
+        # Cached robot-relative gaussian indices of the wrist camera body,
+        # computed lazily from the KNN segmentation. None until first use.
+        self._wrist_cam_occluder_rel_idx = None
         self.splatsim_robot = None
         self.splatsim_background = None
         self.scene_gaussian = None
@@ -490,6 +569,11 @@ class PybulletRobotServerBase:
 
         self.splatsim_objects: List[SplatSimObject] = []
         self._skip_pairs: set = set()
+        # `self.SELF_COLLISION_SKIP_PAIRS` (class attribute, declared at the
+        # top of `PybulletRobotServerBase`) is the single source of truth for
+        # URDF-specific self-collision exclusions. NOT an instance attr — so
+        # subclass overrides are at class scope and propagate without an
+        # __init__ pass.
         self.splatsim_robot: SplatSimObject = self.create_object(
             SplatObjectConfig(
                 name="robot",
@@ -504,6 +588,7 @@ class PybulletRobotServerBase:
         # Initialize trajectory generation config and generator
         self.trajectory_generator = TrajectoryGenerator(
             pybullet_client=self.pybullet_client,
+            pb_client_id=self._pb_client_id,
             robot_id=self.splatsim_robot.sim_id,
             joint_indices=list(range(1, self.num_dofs() + 1)), # excludes gripper
             env_config_name=self.ENV_CONFIG.name,
@@ -552,9 +637,30 @@ class PybulletRobotServerBase:
             self.trajectory_count = 0
 
         # Always set up the base camera because wrist_rgb is initialized from it
+        if self.background_splat_name == self.base_camera_splat_name or self.base_camera_splat_name is None:
+            self.splatsim_base_camera = self.splatsim_background
+        else:
+            self.splatsim_base_camera: SplatSimObject = self.create_object(
+                SplatObjectConfig(
+                    name="base_camera",
+                    splat_name=self.base_camera_splat_name,
+                    keep_within_aabb=False,
+                    load_urdf=False,
+                    is_articulated=False,
+                    randomize_pose=False,
+                    rotation_range_z=(0, 0),
+                    position_range_x=(0, 0),
+                    position_range_y=(0, 0),
+                )
+            )
         self.base_camera = self.setup_camera_from_dataset(
-            self.splatsim_background.config, cam_i=self.cam_i, use_train=True
+            self.splatsim_base_camera.config, cam_i=self.cam_i, use_train=True,
+            override_xyz=(0, 1.20, 0.61),
+            override_rpy=(np.pi/2 - 15*np.pi/180, np.pi, 0),
+            override_dist_inc=0.55   
         )
+        if self.splatsim_base_camera is not self.splatsim_background:
+            self.delete_object(self.splatsim_base_camera.config.name)
 
         if "wrist_rgb" in self.camera_names:
             # Intrinsics from COLMAP cameras.txt (PINHOLE id=3); pose comes from get_wrist_camera().
@@ -751,9 +857,6 @@ class PybulletRobotServerBase:
             splatsim_obj.gaussians._features_dc = cuboid_params["_features_dc"]
             splatsim_obj.gaussians._scaling = cuboid_params["_scaling"]
         else:
-            import pdb
-
-            pdb.set_trace()
             raise ValueError("Could not load gaussian splat")
         
         # Disable gradients on this gaussian splat b/c we're not optimizing
@@ -838,11 +941,29 @@ class PybulletRobotServerBase:
                 articulation_config.initial_joint_positions = articulation_config.initial_joint_positions[:num_joints]
                 articulation_config.joint_signs = articulation_config.joint_signs[:num_joints]
 
-            # Use the config to find these values
+            # Use the config to find these values.
             self.teleport_joint_state(splatsim_obj, splatsim_obj.config.articulation_config.initial_joint_positions)
-            # Let the gripper move (it isn't teleporting rn)
-            for _ in range(100):
-                self.pybullet_client.stepSimulation()
+            # Capture the transform-reference link poses at EXACTLY
+            # initial_joint_positions (resetJointState just set every joint,
+            # including the gripper mimic joints). get_curr_link_states uses
+            # computeForwardKinematics=True, so this is valid without stepping.
+            #
+            # CRITICAL: the robot must stay at this pose until AFTER
+            # load_gaussian_splat runs, and the settle loop must NOT run before
+            # it. Two reasons:
+            #   1. The gripper mimic children are no longer position-held (that
+            #      jammed the mimic — see teleport_joint_state/setup_gripper), so
+            #      stepping now would let move_gripper drive the gripper away
+            #      from initial_joint_positions (toward open).
+            #   2. load_gaussian_splat -> transform_object(inplace=True)
+            #      RE-captures initial_link_poses at the CURRENT joint pose. If
+            #      the gripper has settled open by then, that overwrites this
+            #      reference with the open pose, and since the splat's per-link
+            #      labels were assigned at initial_joint_positions in
+            #      articulated_robot_pipeline, the gripper gaussians end up
+            #      anchored to a mismatched reference and never open in-render.
+            # So: capture here, load the splat at the same pose (re-capture is
+            # then consistent), THEN settle below.
             initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
             articulation_config.initial_link_poses = initial_link_poses
 
@@ -871,6 +992,18 @@ class PybulletRobotServerBase:
                 splatsim_obj=splatsim_obj,
             )
             articulation_config.segmented_list = segmented_list
+            # Segmentation changed → drop the cached wrist-cam occluder indices
+            # so they're recomputed from the new segmented_list on next render.
+            self._wrist_cam_occluder_rel_idx = None
+
+            # Now that the transform reference (initial_link_poses) is captured
+            # and the splat is loaded/segmented — all at initial_joint_positions
+            # — let physics settle for the live starting state. This is where
+            # the gripper actually moves (move_gripper drives it per the gripper
+            # command in initial_joint_positions), rendered relative to the
+            # reference above.
+            for _ in range(100):
+                self.pybullet_client.stepSimulation()
 
         # Set the position of the object
         self.randomize_object_scale(splatsim_obj)
@@ -942,30 +1075,45 @@ class PybulletRobotServerBase:
                 f"Expected at most {num_joints - 1} joint states, got {len(joint_state)}."
             )
 
-        for i in range(0, min(len(joint_state), num_joints)):
-            target_position = (
-                joint_state[i]
-                * splatsim_obj.config.articulation_config.joint_signs[i]
-            )
-            # Teleport joint to target position
+        signs = splatsim_obj.config.articulation_config.joint_signs
+
+        # Snap EVERY provided joint to its target with resetJointState — this
+        # includes the gripper's mimic joints, so the gripper starts in the
+        # correct (e.g. open) pose at init.
+        for i in range(0, min(len(joint_state), num_joints - 1)):
             self.pybullet_client.resetJointState(
                 splatsim_obj.sim_id,
                 i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
-                target_position,
+                joint_state[i] * signs[i],
             )
-            # Set position control to hold the joint at target position
+
+        # Hold ONLY the arm DOFs (joints 1..num_dofs) with POSITION_CONTROL.
+        # The gripper's mimic CHILD joints must stay motor-free (they were put
+        # in VELOCITY_CONTROL force=0 by __parse_joint_info__) so the
+        # JOINT_GEAR mimic + move_gripper can actuate them; holding them here
+        # with force=150 would overpower the gears (force=10) and freeze the
+        # gripper. The gripper is actuated solely via move_gripper.
+        for i in range(0, min(len(joint_state), self.num_dofs())):
             self.pybullet_client.setJointMotorControl2(
                 splatsim_obj.sim_id,
                 i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
                 p.POSITION_CONTROL,
-                targetPosition=target_position,
+                targetPosition=joint_state[i] * signs[i],
                 force=150,
                 maxVelocity=3.14,
             )
         self.command_joint_state(splatsim_obj, np.array(joint_state))
 
     def command_joint_state(self, splatsim_obj: SplatSimObject, joint_state: np.ndarray) -> None:
-        for i in range(0, len(joint_state)):
+        # Only drive the arm DOFs (joints 1..num_dofs). Anything beyond that is
+        # the fixed ee/gripper-mount joints and the gripper's mimic joints.
+        # Driving the gripper's mimic CHILD joints here with independent
+        # POSITION_CONTROL (force=150) overpowers the JOINT_GEAR mimic
+        # constraints (force=10) that move_gripper relies on, freezing the
+        # gripper — so the gripper is actuated ONLY via move_gripper below.
+        # (joint_state may carry 18 entries at init; the extra trailing values
+        # must not be applied as per-joint position targets on gripper links.)
+        for i in range(0, min(len(joint_state), self.num_dofs())):
             self.pybullet_client.setJointMotorControl2(
                 splatsim_obj.sim_id,
                 i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
@@ -1342,6 +1490,47 @@ class PybulletRobotServerBase:
 
         print("PyBullet camera updated!\n")
 
+    def _get_wrist_cam_occluder_abs_indices(self) -> Optional[torch.Tensor]:
+        """Absolute indices into ``scene_gaussian`` of the wrist camera body.
+
+        These are the gaussians the KNN segmentation assigned to
+        ``wrist_camera_link`` — i.e. the physical camera captured in the robot
+        splat, which occludes the wrist view once the virtual camera is aligned
+        to the real mounting pose. Returns None if masking isn't applicable
+        (no tracked link, no segmentation, empty segment, or robot not yet in
+        the scene_gaussian offset map).
+        """
+        if not self.mask_wrist_camera_body:
+            return None
+        if self.wrist_camera is None or self.wrist_camera.tracked_link_index is None:
+            return None
+        robot = self.splatsim_robot
+        if robot is None or robot.config.articulation_config is None:
+            return None
+        segmented_list = robot.config.articulation_config.segmented_list
+        link_idx = int(self.wrist_camera.tracked_link_index)
+        if segmented_list is None or link_idx >= len(segmented_list):
+            return None
+
+        # Robot-relative indices (into the robot's own gaussian array) are stable
+        # across steps, so compute once. The scene_gaussian start offset can
+        # change when objects are added/removed, so add it fresh each call.
+        if self._wrist_cam_occluder_rel_idx is None:
+            rel = segmented_list[link_idx]
+            if rel is None or len(rel) == 0:
+                return None
+            # rel is a CUDA long tensor at runtime (from get_segmented_indices);
+            # as_tensor also handles a plain list without copying a tensor.
+            self._wrist_cam_occluder_rel_idx = torch.as_tensor(
+                rel, device="cuda"
+            ).long()
+
+        offsets = getattr(self, "_scene_gaussian_offsets", None)
+        if not offsets or robot.config.name not in offsets:
+            return None
+        start_idx = offsets[robot.config.name][0]
+        return self._wrist_cam_occluder_rel_idx + start_idx
+
     def render_image(self, camera_name, cached_link_states=None):
         if camera_name == "base_rgb":
             if self.debug_mode != DebugModes.OFF:
@@ -1355,14 +1544,31 @@ class PybulletRobotServerBase:
         else:
             raise ValueError(f"Unknown camera name {camera_name}")
 
-        if camera.camera_model == "fisheye" or self.use_gsplat:
-            rendering = render_gsplat(
-                camera, self.scene_gaussian
-            )["render"].cpu().numpy()
-        else:
-            rendering = render(
-                camera.camera, self.scene_gaussian, camera.pipeline, camera.background
-            )["render"].cpu().numpy()
+        # For the wrist view, temporarily hide the gaussians of the physical
+        # camera body (which the aligned virtual camera sits inside). Save and
+        # restore raw opacity so the base view — rendered from the same
+        # scene_gaussian buffers — is unaffected regardless of render order.
+        occluder_idx = None
+        saved_opacity = None
+        if camera_name == "wrist_rgb":
+            occluder_idx = self._get_wrist_cam_occluder_abs_indices()
+            if occluder_idx is not None:
+                saved_opacity = self.scene_gaussian._opacity[occluder_idx].clone()
+                # Raw opacity → sigmoid; a large negative value renders as ~0 alpha.
+                self.scene_gaussian._opacity[occluder_idx] = -1e4
+
+        try:
+            if camera.camera_model == "fisheye" or self.use_gsplat:
+                rendering = render_gsplat(
+                    camera, self.scene_gaussian
+                )["render"].cpu().numpy()
+            else:
+                rendering = render(
+                    camera.camera, self.scene_gaussian, camera.pipeline, camera.background
+                )["render"].cpu().numpy()
+        finally:
+            if saved_opacity is not None:
+                self.scene_gaussian._opacity[occluder_idx] = saved_opacity
         # If you index "depth" instead of "render", you get the depth image
 
         # Preprocess fisheye renders to an equivalent pinhole view so datasets
@@ -1411,8 +1617,49 @@ class PybulletRobotServerBase:
         return np.transpose(rectified, (2, 0, 1))
 
     def setup_camera_from_dataset(
-        self, splatsim_obj_object_config: SplatObjectConfig, cam_i, use_train=True
+        self,
+        splatsim_obj_object_config: SplatObjectConfig,
+        cam_i,
+        use_train=True,
+        override_xyz: Optional[Tuple[float, float, float]] = None,
+        override_rpy: Optional[Tuple[float, float, float]] = None,
+        override_dist_inc: Optional[float] = None,
     ) -> SplatSimCamera:
+        """Load a camera from a gaussian-splat dataset, optionally overriding
+        its extrinsics with a hand-measured pose.
+
+        Intrinsics (``FoVx``, ``FoVy``, resolution, ``scale``) always come
+        from the dataset. Extrinsics come from the dataset by default but can
+        be overridden per-axis:
+
+          * ``override_xyz`` — camera position in the SIMULATOR world frame
+            (the same frame the robot's base sits in, typically at
+            ~(0, 0, 0)). When provided, replaces the position component of
+            the camera-to-world transform.
+          * ``override_rpy`` — camera orientation as roll/pitch/yaw (radians)
+            using PyBullet's Euler convention (``getQuaternionFromEuler`` —
+            R about X, then P about Y, then Y about Z). When provided,
+            replaces the rotation component.
+          * ``override_dist_inc`` — signed distance along the camera's own
+            view axis (metres). POSITIVE values pull the camera BACKWARD
+            along the direction it's looking — i.e. further from whatever
+            point it's aimed at. NEGATIVE values push it forward (closer).
+            Applied AFTER ``override_xyz`` / ``override_rpy``, so the axis
+            is derived from the (possibly overridden) rotation and the
+            translation shifts along it. Use when the ``override_xyz`` you
+            eyeballed puts the camera at the right ANGLE but too close or
+            too far — bump ``override_dist_inc`` instead of recomputing
+            the xyz coordinates by hand.
+
+        Each override can be provided independently. All ``None`` (default)
+        preserves the historical dataset-only behavior.
+
+        Camera-forward convention: gaussian-splatting cameras look down
+        their own +Z axis (COLMAP style), so the world-space forward
+        direction is the 3rd column of the C2W rotation matrix. The
+        ``override_dist_inc`` math relies on this — if a future refactor
+        changes the camera-forward axis, revisit the sign convention below.
+        """
         ###################################################################
         # Load the gaussian splat dataset to get camera parameters
         ###################################################################
@@ -1527,9 +1774,44 @@ class PybulletRobotServerBase:
         M_CW_new_world_pose[:3, :3] = R_mat
         M_CW_new_world_pose[:3, 3] = t  # Keep original translation
 
+        # ---- Optional extrinsic overrides (simulator-frame position + rpy) ----
+        # Replace the dataset-derived rotation and/or translation with a
+        # hand-specified pose BEFORE recomputing T_wc. Intrinsics are
+        # untouched — only the C2W transform gets edited. Both branches are
+        # independent so a caller can pin position while keeping rotation
+        # (or vice versa). See the docstring for the rpy convention.
+        if override_rpy is not None:
+            override_quat = p.getQuaternionFromEuler(list(override_rpy))
+            R_over_np = np.array(
+                p.getMatrixFromQuaternion(override_quat), dtype=np.float32,
+            ).reshape(3, 3)
+            R_mat = torch.from_numpy(R_over_np).to(device=device, dtype=torch.float32)
+            M_CW_new_world_pose[:3, :3] = R_mat
+        if override_xyz is not None:
+            t_over_np = np.array(override_xyz, dtype=np.float32)
+            t = torch.from_numpy(t_over_np).to(device=device, dtype=torch.float32)
+            M_CW_new_world_pose[:3, 3] = t
+
+        # dist_inc: shift the camera along its OWN view axis. Applied last
+        # so the axis reflects any override_rpy / dataset rotation already
+        # sitting in R_mat. Gaussian-splat cameras look down local +Z, so
+        # the world-space forward is `R_mat[:, 2]`. Positive dist_inc pulls
+        # the camera BACKWARD (opposite the view direction) — further from
+        # whatever the camera is looking at. Negative pushes it forward.
+        if override_dist_inc is not None:
+            forward_world = R_mat[:, 2]
+            t = t - float(override_dist_inc) * forward_world
+            M_CW_new_world_pose[:3, 3] = t
+
         # 5. Calculate T_wc (World-to-Camera Translation)
         V_new_world = torch.linalg.inv(M_CW_new_world_pose)
         T_wc = V_new_world[:3, 3]
+
+        print("cam to world transformation:")
+        print(M_CW_new_world_pose)
+
+        print('world to cam translation:')
+        print(T_wc)
 
         # Convert to numpy for the Camera constructor
         R_cw_np = R_mat.detach().cpu().numpy()
@@ -1692,6 +1974,14 @@ class PybulletRobotServerBase:
             "splatsim_object_configs": splatsim_meta["splatsim_object_configs"],
             "current_ee_pos": current_ee_pos,
             "current_ee_quat": current_ee_quat,
+            # Forward the URDF's self-collision skip pairs into the dispatched
+            # oracle config so the LeRobot SA wrapper's RRT planner can pick
+            # them up automatically (no need for the user to also pass
+            # `--rrt_self_collision_skip_pairs` on the DAgger CLI for the
+            # typical case — the env publishes its own URDF-known exclusions).
+            # An explicit SA-config-level override still wins if the user
+            # wants to add more pairs per-run.
+            "self_collision_skip_pairs": list(self.SELF_COLLISION_SKIP_PAIRS),
         }
 
     def get_observations(self, render_images: bool = True) -> Dict[str, np.ndarray]:
@@ -1920,15 +2210,64 @@ class PybulletRobotServerBase:
         Both use_aabb_collision=True  → fast AABB overlap test (no PyBullet narrowphase).
         Otherwise                     → PyBullet pairwise_collision.
 
-        PyBullet's getAABB returns world-space (aabbMin, aabbMax), so it already
-        accounts for position, orientation, and scale for both cuboids and splats.
+        PyBullet's getAABB returns world-space (aabbMin, aabbMax) for a
+        specific link, accounting for position, orientation, and scale.
+
+        Two-object box URDFs in this project (thinkpad_box, starwars_box, ...)
+        wrap their collision geometry in a `<link name="base_link">` that sits
+        BELOW a `<link name="world"/>` root via a fixed joint at
+        `xyz="0 0 0.15875"`. In PyBullet's numbering that puts the world link
+        at linkIndex=-1 (with NO collision shape → zero-volume AABB at the
+        origin) and the actual box collision at linkIndex=0. The default
+        `getAABB(sim_id)` queries linkIndex=-1 and returns the empty world
+        AABB — so two boxes anywhere in the scene have "AABBs" that are both
+        zero-volume points at (0, 0, 0), and this overlap check always
+        returned False regardless of where the visible boxes actually were.
+        Fix: union the per-link AABBs across every link of each body.
         """
         if obj_i.config.use_aabb_collision and obj_j.config.use_aabb_collision:
-            min_i, max_i = self.pybullet_client.getAABB(obj_i.sim_id)
-            min_j, max_j = self.pybullet_client.getAABB(obj_j.sim_id)
-            # Overlap on all three axes ↔ collision
+            min_i, max_i = self._body_world_aabb(obj_i.sim_id)
+            min_j, max_j = self._body_world_aabb(obj_j.sim_id)
+            # Overlap on all three axes ↔ collision.
             return all(max_i[k] > min_j[k] and max_j[k] > min_i[k] for k in range(3))
         return pairwise_collision(obj_i.sim_id, obj_j.sim_id)
+
+    def _body_world_aabb(self, body_id: int) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """Union of all-link world-space AABBs for a body.
+
+        `getAABB(body_id)` alone queries linkIndex=-1 (the base/root link),
+        which is empty for URDFs that keep their collision block on a child
+        link — e.g. the box URDFs whose root is `<link name="world"/>` and
+        whose collision `<box>` lives on a downstream `base_link`. Iterating
+        `range(-1, getNumJoints(body_id))` covers every link (base + all
+        joint-attached children) and returns the outer bounding box that
+        actually contains the visible geometry.
+        """
+        num_joints = self.pybullet_client.getNumJoints(body_id)
+        mins = [float("inf")] * 3
+        maxs = [float("-inf")] * 3
+        # linkIndex range: -1 (base) through num_joints-1 (each joint's child link).
+        for link_idx in range(-1, num_joints):
+            lo, hi = self.pybullet_client.getAABB(body_id, linkIndex=link_idx)
+            # Empty/absent collision shapes surface as a zero-volume AABB at
+            # the link's origin — they can't shrink the union (they're a
+            # point on the boundary of any real geometry we've already seen)
+            # BUT they'd wrongly EXPAND the union if the link's origin sits
+            # outside the real geometry (e.g. the root world link at (0,0,0)
+            # while the collision box is at z=0.16). Skip zero-volume AABBs
+            # so the union reflects real collision extent only.
+            if lo == hi:
+                continue
+            for k in range(3):
+                if lo[k] < mins[k]:
+                    mins[k] = lo[k]
+                if hi[k] > maxs[k]:
+                    maxs[k] = hi[k]
+        # If every link was zero-volume (no collision anywhere), fall back to
+        # base AABB so downstream code doesn't dereference inf.
+        if any(m == float("inf") for m in mins):
+            return self.pybullet_client.getAABB(body_id)
+        return (tuple(mins), tuple(maxs))
 
     def randomize_objects(self):
         collision = True
@@ -1944,7 +2283,12 @@ class PybulletRobotServerBase:
                 self.randomize_object_pose(splatsim_obj)
 
             # TODO the better solution is to make this randomize all articulated joints of any splatsim object (this just does the robot rn)
-            self.randomize_ee_pose()
+            # Returns None if no collision-free arm pose exists for this object
+            # arrangement (and does NOT teleport in that case). Re-randomize the
+            # whole scene rather than committing to a colliding robot pose.
+            if self.randomize_ee_pose() is None:
+                collision = True  # force another loop iteration
+                continue
 
             # Gather candidate object pairs (unique, skipping table and un-fixable pairs)
             candidates = []
@@ -2061,6 +2405,7 @@ class PybulletRobotServerBase:
     def randomize_ee_pose(self, max_attempts=100) -> Optional[Tuple[float, ...]]:
         # generating random initial joint state using random end effector position and orientation
         initial_joint_positions: Optional[Tuple[float, ...]] = None
+        found_collision_free = False
         for attempt in range(max_attempts):
             random_ee_pos, random_ee_quat = self.get_random_ee_pose()
 
@@ -2091,16 +2436,35 @@ class PybulletRobotServerBase:
             # larger query distance so that more things are counted as collisions
             # this matches rrt
             if not self.is_robot_in_collision():
-                # TODO possibly randomize gripper state here, too
-                # Though that might have to edit initial_joint_positions
-                self.teleport_joint_state(self.splatsim_robot, initial_joint_positions)
-                if self.splatsim_robot.config.articulation_config is not None:
-                    self.splatsim_robot.config.articulation_config.initial_joint_positions = list(initial_joint_positions)
-                return initial_joint_positions
+                found_collision_free = True
+                break
 
-        # If we exhausted all attempts, return the last configuration with a warning
-        print(f"Warning: Could not find collision-free EE pose after {max_attempts} attempts")
-        if initial_joint_positions is not None and self.splatsim_robot.config.articulation_config is not None:
+        if not found_collision_free or initial_joint_positions is None:
+            # No collision-free arm pose for this object arrangement. Return None
+            # (WITHOUT teleporting) so the caller re-randomizes the whole scene
+            # rather than committing the robot to a colliding pose. Teleporting to
+            # a colliding pose here is what caused the post-reset stutter (arm
+            # shoved by contact) and the stale (often closed) gripper — the robot
+            # is only ever teleported on the success path below, which snaps +
+            # holds the arm and opens the gripper.
+            print(f"Warning: Could not find collision-free EE pose after {max_attempts} attempts; "
+                  f"returning None to trigger re-randomization.")
+            return None
+
+        # Collision-free pose found → teleport to it. teleport_joint_state does
+        # resetJointState (snap) + POSITION_CONTROL hold on the arm +
+        # move_gripper, so the robot reaches the pose and stays held.
+        #
+        # calculateInverseKinematics returns values for ALL movable joints (6 arm
+        # + the gripper mimic joints); index num_dofs of that raw output is the
+        # finger joint's *current* IK value, NOT a gripper command. Feeding it
+        # straight to teleport would make command_joint_state -> move_gripper read
+        # a stale finger angle and stick. So build the canonical action instead:
+        # 6 arm joints + an explicit gripper-open command (0 => open).
+        # TODO randomize the gripper state here if desired.
+        initial_joint_positions = tuple(initial_joint_positions[:self.num_dofs()]) + (0.0,)
+        self.teleport_joint_state(self.splatsim_robot, initial_joint_positions)
+        if self.splatsim_robot.config.articulation_config is not None:
             self.splatsim_robot.config.articulation_config.initial_joint_positions = list(initial_joint_positions)
         return initial_joint_positions
 
@@ -2112,15 +2476,72 @@ class PybulletRobotServerBase:
             for link_idx in (obj.config.skip_collision_robot_links or [])
         }
 
-    def is_robot_in_collision(self, obstacle_clearance=_COLLISION_CLEARANCE):
+    def is_robot_in_collision(
+        self,
+        obstacle_clearance=_COLLISION_CLEARANCE,
+        verbose=False,
+        return_kind=False,
+        self_collision_clearance=0.0,
+        self_collision_skip_pairs=None,
+    ):
+        """Check whether the robot is in collision with any obstacle or itself.
+
+        Args:
+            obstacle_clearance: Distance threshold for obstacle checks. 0.0 = actual penetration only.
+            verbose: If True, print the offending pair on hit.
+            return_kind: If False (default), returns bool — keeps backward compat
+                with the existing teleport-loop caller (`if not self.is_robot_in_collision()`).
+                If True, returns `(in_collision: bool, kind: str | None)` where
+                `kind` is "obstacle" / "self" / None. The eval-time `check_metrics`
+                path uses this to surface the cause in per-episode metrics →
+                eval_info.json so post-hoc analysis can break down failures.
+            self_collision_skip_pairs: OVERRIDE the self-collision skip list.
+                ``None`` (default) uses the STRICT list
+                (`self.SELF_COLLISION_SKIP_PAIRS`) — matches the RRT planner's
+                contract, so the reset-time "find collision-free start"
+                loop and the trajectory-gen collision predicates see the
+                same "in collision" outcome as the planner. Eval-terminate
+                (`check_metrics`) passes `self._eval_terminate_skip_pairs()`
+                (union of STRICT + `SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA`)
+                so URDF-mesh-overlap artifacts that produce solver kicks
+                — pairs the planner must reject, but that the ENV shouldn't
+                terminate on — get silently accepted at the terminate check.
+
+        Returns:
+            bool, or (bool, str | None) when return_kind=True.
+        """
         joint_indices = list(range(1, self.num_dofs() + 1))
-        obstacle_ids = [
-            obj.sim_id for obj in self.splatsim_objects
+        obstacles = [
+            obj for obj in self.splatsim_objects
             if obj.sim_id is not None and obj != self.splatsim_robot
         ]
+        obstacle_ids = [obj.sim_id for obj in obstacles]
+        # Pass human-readable names so verbose output says
+        # `Collision: robot wrist_link(7) vs obstacle small_engine_new(id=1)`
+        # rather than `vs obstacle 1`. Skipped when verbose=False.
+        # SplatSimObject stores its display name at `obj.config.name`
+        # (not `obj.name`) — the old `getattr(obj, "name", ...)` always
+        # missed and fell back to the sim_id string.
+        obstacle_names = {
+            obj.sim_id: getattr(getattr(obj, "config", None), "name", None) or str(obj.sim_id)
+            for obj in obstacles
+        }
+        # Resolve skip pairs: caller-provided override wins; else fall back
+        # to the strict list (RRT contract). `or None` keeps
+        # `check_links_in_collision`'s skip-set builder path on the
+        # empty-list case.
+        _skip_pairs_for_check = (
+            self_collision_skip_pairs
+            if self_collision_skip_pairs is not None
+            else (self.SELF_COLLISION_SKIP_PAIRS or None)
+        )
         return rrt_path_utils.check_links_in_collision(
             self.splatsim_robot.sim_id, joint_indices, q=None, obstacle_ids=obstacle_ids, skip_pairs=self._skip_pairs,
             obstacle_clearance=obstacle_clearance,
+            self_collision_clearance=self_collision_clearance,
+            self_collision_skip_pairs=_skip_pairs_for_check,
+            verbose=verbose, obstacle_names=obstacle_names,
+            return_kind=return_kind,
         )
 
     def get_random_ee_pose(self):
@@ -2639,26 +3060,41 @@ class PybulletRobotServerBase:
     def _handle_reset(self, seed=None, options=None):
         """Unified reset entry point for serve() loop and ZMQ server.
 
-        In EVAL_BENCHMARK mode, advances to the next episode instead of calling
-        the subclass reset(), so external policies that call reset() always get
-        the next deterministic scenario without needing to know the serve mode.
+        In EVAL_BENCHMARK mode, advances to the next episode in
+        ``self._eval_benchmark_subset`` instead of calling the subclass
+        reset(), so external policies that call reset() always get the next
+        deterministic scenario without needing to know the serve mode.
 
-        When ``seed`` is provided in EVAL_BENCHMARK mode, it pins the next
-        scenario to ``subset[seed % len(subset)]`` (overriding the default
-        increment-from-where-we-left-off behavior). This lets lerobot-train run
-        a deterministic eval batch every ``eval_freq`` steps: ``eval_policy``
-        starts each batch with seed = cfg.seed + batch_offset, so each eval
-        phase starts at the same scenario index regardless of how many
-        scenarios prior eval phases consumed.
+        Scenario selection vs. policy randomness
+        ----------------------------------------
+        The scenario INDEX is determined ENTIRELY by the subset + the
+        per-reset counter (which wraps at end-of-subset). The ``seed``
+        argument does NOT affect which scenario runs — its only role is
+        seeding the env/policy randomness. This lets callers re-evaluate
+        the same subset with multiple seeds (varying policy stochasticity
+        only) and get identical scenario coverage across runs.
+
+        Caller-side override
+        --------------------
+        Callers that need to force a specific starting scenario (e.g.
+        lerobot-train's per-batch eval wanting determinism when
+        eval_n_episodes < len(subset)) can pass
+        ``options={"benchmark_start_index": N}`` to set the next
+        ``_eval_benchmark_next_episode()`` to land on
+        ``subset[N % len(subset)]``. Without this, the counter just
+        increments from wherever it left off (which wraps to 0 cleanly
+        when eval_n_episodes == len(subset) — the common case).
 
         In all other modes, delegates to the subclass reset().
         """
         if self.serve_mode == self.SERVE_MODES.EVAL_BENCHMARK:
-            if seed is not None and self._eval_benchmark_subset:
-                # Set the index so the next _eval_benchmark_next_episode()
-                # increment lands on subset[seed % len(subset)].
+            if (
+                options is not None
+                and "benchmark_start_index" in options
+                and self._eval_benchmark_subset
+            ):
                 n = len(self._eval_benchmark_subset)
-                self._eval_benchmark_episode_index = (int(seed) % n) - 1
+                self._eval_benchmark_episode_index = (int(options["benchmark_start_index"]) % n) - 1
             return self._eval_benchmark_next_episode()
         else:
             return self.reset(seed=seed, options=options)
@@ -2970,6 +3406,48 @@ class PybulletRobotServerBase:
                 c, gearRatio=-multiplier, maxForce=10, erp=1
             )  # Note: the mysterious `erp` is of EXTREME importance
 
+        # Disable PHYSICS self-collision among the gripper's own links. The
+        # Robotiq 2F-85 is a 4-bar linkage whose inner-finger and inner-knuckle
+        # collision meshes overlap by design; with URDF_USE_SELF_COLLISION on,
+        # those overlaps (e.g. left_inner_finger vs left_inner_knuckle) register
+        # as penetrating contacts that jam the mimic — the gripper gets pinned
+        # in a squeezed mid-range and can neither fully open nor fully close.
+        # Collision with EXTERNAL objects (grasping) is a separate filter and is
+        # unaffected. (SELF_COLLISION_SKIP_PAIRS only feeds the RRT planner's
+        # collision check, not the physics engine, so it doesn't help here.)
+        gripper_joint_names = {
+            "finger_joint", "left_outer_finger_joint", "left_inner_finger_joint",
+            "left_inner_finger_pad_joint", "left_inner_knuckle_joint",
+            "right_outer_knuckle_joint", "right_outer_finger_joint",
+            "right_inner_finger_joint", "right_inner_finger_pad_joint",
+            "right_inner_knuckle_joint",
+        }
+        gripper_link_ids = [j.id for j in self.joints if j.name in gripper_joint_names]
+        for a in range(len(gripper_link_ids)):
+            for b in range(a + 1, len(gripper_link_ids)):
+                self.pybullet_client.setCollisionFilterPair(
+                    self.splatsim_robot.sim_id, self.splatsim_robot.sim_id,
+                    gripper_link_ids[a], gripper_link_ids[b], enableCollision=0,
+                )
+
+        # Unify the PHYSICS-side skip contract with the RRT PLANNER's skip
+        # contract. Every pair in SELF_COLLISION_SKIP_PAIRS is a URDF-artifact
+        # overlap the planner already ignores; if physics still enforces them,
+        # planner-accepted configs get pinned by constraint forces at the mesh
+        # overlap (drift-abort). See analyze_forearm_wrist2_penetration.py:
+        # forearm↔wrist_2 has a ~120° wrist_1 zone where the UR5 stock
+        # collision hulls overlap by design, which was jamming joint 3 during
+        # RRT chunk execution. NOT extended to
+        # SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA — those pairs the
+        # planner still checks, so disabling them at the physics level would
+        # let RRT accept a plan whose execution silently produced mesh
+        # overlap.
+        for link_a, link_b in getattr(self, "SELF_COLLISION_SKIP_PAIRS", ()):
+            self.pybullet_client.setCollisionFilterPair(
+                self.splatsim_robot.sim_id, self.splatsim_robot.sim_id,
+                link_a, link_b, enableCollision=0,
+            )
+
     def get_link_pose(self, body, link):
         result = self.pybullet_client.getLinkState(body, link)
         return result[4], result[5]
@@ -2985,7 +3463,7 @@ class PybulletRobotServerBase:
             1
         ))  # angle calculation
         # Control the mimic gripper joint(s)
-        p.setJointMotorControl2(
+        self.pybullet_client.setJointMotorControl2(
             self.splatsim_robot.sim_id,
             self.mimic_parent_id,
             self.pybullet_client.POSITION_CONTROL,

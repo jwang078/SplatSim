@@ -40,11 +40,14 @@ class BWAPybulletRobotServer(PybulletRobotServerBase):
         elif self.serve_mode == self.SERVE_MODES.GENERATE_DEMOS:
             initial_joint_positions = self.randomize_ee_pose()
 
-            success = self.plan_execute_record_trajectory(
-                initial_joint_positions, self.joint_signs
-            )
-            if success:
-                self.trajectory_count += 1
+            # randomize_ee_pose returns None when no collision-free pose was
+            # found; skip this cycle and retry on the next serve tick.
+            if initial_joint_positions is not None:
+                success = self.plan_execute_record_trajectory(
+                    initial_joint_positions, self.joint_signs
+                )
+                if success:
+                    self.trajectory_count += 1
 
             if self.trajectory_count > self.MAX_TRAJECTORY_COUNT:
                 print(
@@ -79,8 +82,12 @@ class BWAPybulletRobotServer(PybulletRobotServerBase):
         self._episode_started = True
 
         # From GENERATE_DEMOS: randomize_ee_pose()
+        # randomize_ee_pose already teleports the robot on success and returns
+        # None if no collision-free pose was found — guard the redundant explicit
+        # teleport against None so reset doesn't crash on that fallback.
         initial_joints = self.randomize_ee_pose()
-        self.teleport_joint_state(self.splatsim_robot, initial_joints)
+        if initial_joints is not None:
+            self.teleport_joint_state(self.splatsim_robot, initial_joints)
         self.open_gripper()
 
         # Let simulation settle
