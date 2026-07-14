@@ -171,6 +171,42 @@ class SplatSimGymEnv(gym.Env):
                         img = img.cpu().numpy()
                     # Convert from (C, H, W) -> (H, W, C) for rendering
                     img = (np.transpose(img, (1, 2, 0)) * 255).astype(np.uint8)
+                    # DEBUG: per-camera pixel-value stats and one-time PNG
+                    # dump per key. Diagnoses "wrist half of the stacked
+                    # video looks blank / identical to base": if wrist's
+                    # mean is ~0 the view is black (occluder masking hides
+                    # everything); if wrist's mean ≈ base's mean AND the
+                    # dumped PNGs look identical, the wrist camera's pose
+                    # is coinciding with base. Remove once the wrist
+                    # rendering is confirmed working.
+                    import os as _os
+                    _rgb_dbg_dir = _os.environ.get("SPLATSIM_RENDER_DBG_DIR")
+                    if _rgb_dbg_dir:
+                        print(
+                            f"[render debug] key={key} shape={img.shape} "
+                            f"min={img.min()} max={img.max()} mean={img.mean():.1f}"
+                        )
+                        # One-time dump per key so a long eval doesn't spam
+                        # thousands of PNGs. Set SPLATSIM_RENDER_DBG_DIR=/tmp/foo
+                        # to enable; unset to disable printouts too.
+                        _dump_flag_attr = f"_dbg_dumped_{key}"
+                        if not getattr(self, _dump_flag_attr, False):
+                            _os.makedirs(_rgb_dbg_dir, exist_ok=True)
+                            try:
+                                from PIL import Image as _PILImage
+                                _PILImage.fromarray(img).save(
+                                    _os.path.join(_rgb_dbg_dir, f"{key}.png")
+                                )
+                            except ImportError:
+                                import imageio.v2 as _imio
+                                _imio.imwrite(
+                                    _os.path.join(_rgb_dbg_dir, f"{key}.png"), img,
+                                )
+                            setattr(self, _dump_flag_attr, True)
+                            print(
+                                f"[render debug] dumped {key} → "
+                                f"{_os.path.join(_rgb_dbg_dir, f'{key}.png')}"
+                            )
                     rgb_images.append(img)
 
             if rgb_images:
