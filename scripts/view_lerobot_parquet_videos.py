@@ -35,10 +35,25 @@ def load_parquet_dataset(parquet_folder: str, episodes: list[int] | None = None)
 
     filters = [("episode_index", "in", episodes)] if episodes is not None else None
     dfs = []
+    skipped = []
     for f in parquet_files:
-        chunk = pd.read_parquet(f, filters=filters)
+        try:
+            chunk = pd.read_parquet(f, filters=filters)
+        except Exception as e:
+            # A live recording leaves its NEWEST file without a parquet footer
+            # ("magic bytes not found in footer") until the round finalizes — a
+            # truncated/partial write looks identical. Skip it with a warning
+            # instead of crashing, so the finalized files (and the episode you
+            # asked for, if it's in one of them) still load.
+            skipped.append((os.path.basename(f), f"{type(e).__name__}: {e}"))
+            continue
         if not chunk.empty:
             dfs.append(chunk)
+    if skipped:
+        print(f"WARNING: skipped {len(skipped)} unreadable parquet file(s) "
+              f"(likely an in-progress/partial write):")
+        for name, err in skipped:
+            print(f"  {name}: {err}")
     if not dfs:
         raise ValueError(f"No frames found for episodes {episodes}")
     df = pd.concat(dfs, ignore_index=True)
@@ -55,7 +70,13 @@ def load_parquet_episode_index(parquet_folder: str) -> list[int]:
         raise FileNotFoundError(f"No parquet files found in {parquet_folder}")
     episodes: set[int] = set()
     for f in parquet_files:
-        table = pq.read_table(f, columns=["episode_index"])
+        try:
+            table = pq.read_table(f, columns=["episode_index"])
+        except Exception as e:
+            # Same in-progress/partial-write tolerance as load_parquet_dataset.
+            print(f"WARNING: skipping unreadable parquet {os.path.basename(f)}: "
+                  f"{type(e).__name__}: {e}")
+            continue
         episodes.update(table.column("episode_index").to_pylist())
     return sorted(episodes)
 
@@ -186,7 +207,12 @@ def save_video(df: pd.DataFrame, output_path: str, episodes: list[int] | None = 
     print(f"Video saved to {output_path}")
 
 
-def play_video(df: pd.DataFrame, episodes: list[int] | None = None, fps: int = 30):
+def play_video(
+    df: pd.DataFrame,
+    episodes: list[int] | None = None,
+    fps: int = 30,
+    pause_every_episode: bool = False,
+):
     """Play collage of all base_rgb* and wrist_rgb* columns."""
     df = _prepare_df(df, episodes)
 
@@ -200,7 +226,14 @@ def play_video(df: pd.DataFrame, episodes: list[int] | None = None, fps: int = 3
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     print(f"Playing {len(df)} frames at {fps} FPS")
-    print("Press 'space' to start/pause, 'q' to quit, 'n' for next frame when paused")
+    hint = "Press 'space' to start/pause, 'q' to quit, 'n' for next frame when paused, 'b' for previous, 'e' to jump to next episode"
+    if pause_every_episode:
+        hint += (
+            "\n[pause-every-episode] will auto-pause on LAST frame of each "
+            "episode AND FIRST frame of the next (two space-presses per "
+            "boundary; overlay text labels which is which)."
+        )
+    print(hint)
 
     paused = True
     frame_idx = 0
@@ -220,10 +253,94 @@ def play_video(df: pd.DataFrame, episodes: list[int] | None = None, fps: int = 3
     else:
         ep_frame_counts = {0: len(df)}
 
+    # First / last row-of-df indices for each episode. Used by 'e' (jump-to-
+    # next) and by --pause-every-episode (we auto-pause at these specific
+    # frame_idx values to bracket boundaries).
+    ep_start_indices: dict[int, int] = {}
+    ep_end_indices: dict[int, int] = {}
+    if has_episode_col:
+        last_ep = None
+        for i in range(len(df)):
+            ep = int(df.iloc[i]["episode_index"])
+            if ep != last_ep:
+                ep_start_indices[ep] = i
+                if last_ep is not None:
+                    ep_end_indices[last_ep] = i - 1
+                last_ep = ep
+        if last_ep is not None:
+            ep_end_indices[last_ep] = len(df) - 1
+    else:
+        ep_start_indices = {0: 0}
+        ep_end_indices = {0: len(df) - 1}
+
+    # Auto-pause schedule: which frame indices should pause when reached for
+    # the first time, and what overlay label to show. We include every
+    # episode-END and every episode-START EXCEPT the very first start
+    # (frame 0 is already paused by the initial `paused=True` above; an
+    # extra "START OF EPISODE N" overlay there would be redundant).
+    auto_pause_label: dict[int, str] = {}
+    if pause_every_episode and has_episode_col:
+        # End-of-episode pauses (skip the very last episode's end — there's
+        # no "next" to advance to; the playback just terminates naturally).
+        for ep in episode_list[:-1]:
+            auto_pause_label[ep_end_indices[ep]] = "END"
+        # Start-of-episode pauses (skip the very first episode's start as
+        # noted above — frame 0 is already the initial-pause).
+        for ep in episode_list[1:]:
+            auto_pause_label[ep_start_indices[ep]] = "START"
+    already_auto_paused_at: set[int] = set()  # don't re-pause on the same frame after user resumes
+
     ep_pbar = tqdm(episode_list, desc="Episode", position=0, leave=True)
     frame_pbar = tqdm(total=ep_frame_counts[episode_list[0]], desc="Frame  ", position=1, leave=True)
 
     current_ep = None
+
+    def _draw_overlay(img: np.ndarray, label: str, ep_num: int, frame_in_ep: int, total_in_ep: int) -> np.ndarray:
+        """Stamp a big bottom banner on the collage with the auto-pause kind
+        (END / START), the episode number, the frame index within the
+        episode, and a usage hint. Drawn as a semi-transparent black bar
+        with white text so it's readable over any video content. Returns
+        a new image (does not mutate the input).
+        """
+        out = img.copy()
+        h, w = out.shape[:2]
+        # Banner height proportional to image height, with floor so text fits.
+        bar_h = max(80, int(h * 0.12))
+        # Semi-transparent black bar across the bottom.
+        overlay = out.copy()
+        cv2.rectangle(overlay, (0, h - bar_h), (w, h), (0, 0, 0), thickness=-1)
+        cv2.addWeighted(overlay, 0.65, out, 0.35, 0, dst=out)
+        # Two lines of text: big label + smaller hint.
+        if label == "END":
+            big = f"END OF EPISODE {ep_num}  (frame {frame_in_ep + 1}/{total_in_ep})"
+            small = "[space] -> advance to first frame of next episode"
+            big_color = (50, 80, 255)  # red-ish in BGR (terminal feedback for "stop")
+        else:
+            big = f"START OF EPISODE {ep_num}  (frame {frame_in_ep + 1}/{total_in_ep})"
+            small = "[space] -> play this episode"
+            big_color = (80, 255, 80)  # green-ish in BGR
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        # Big label.
+        big_scale = max(0.6, w / 1200.0)
+        big_thick = max(2, int(big_scale * 2))
+        (tw, th), _ = cv2.getTextSize(big, font, big_scale, big_thick)
+        cv2.putText(
+            out, big,
+            org=((w - tw) // 2, h - bar_h + th + 10),
+            fontFace=font, fontScale=big_scale, color=big_color,
+            thickness=big_thick, lineType=cv2.LINE_AA,
+        )
+        # Hint below.
+        small_scale = max(0.4, big_scale * 0.55)
+        small_thick = max(1, int(small_scale * 2))
+        (sw, sh), _ = cv2.getTextSize(small, font, small_scale, small_thick)
+        cv2.putText(
+            out, small,
+            org=((w - sw) // 2, h - 12),
+            fontFace=font, fontScale=small_scale, color=(255, 255, 255),
+            thickness=small_thick, lineType=cv2.LINE_AA,
+        )
+        return out
 
     while frame_idx < len(df):
         row = df.iloc[frame_idx]
@@ -241,6 +358,29 @@ def play_video(df: pd.DataFrame, episodes: list[int] | None = None, fps: int = 3
                     ep_pbar.update(1)
                 current_ep = ep_num
                 frame_pbar.reset(total=ep_frame_counts[ep_num])
+        else:
+            ep_num = 0
+
+        # Auto-pause-at-boundary decision. Fire when we land on a boundary
+        # frame for the first time (so users can space through; subsequent
+        # iterations on the same frame_idx while paused don't re-pause).
+        label_for_overlay: str | None = None
+        if frame_idx in auto_pause_label and frame_idx not in already_auto_paused_at:
+            paused = True
+            already_auto_paused_at.add(frame_idx)
+            label_for_overlay = auto_pause_label[frame_idx]
+        elif paused and frame_idx in auto_pause_label:
+            # Still sitting on the auto-paused frame after we already
+            # consumed the auto-pause (e.g. user pressed b to backstep
+            # then n forward). Keep showing the overlay so they see the
+            # banner state matches the frame they're looking at.
+            label_for_overlay = auto_pause_label[frame_idx]
+
+        if label_for_overlay is not None:
+            # Frame-within-episode position for the overlay text.
+            frame_in_ep = frame_idx - ep_start_indices[ep_num]
+            total_in_ep = ep_frame_counts[ep_num]
+            collage = _draw_overlay(collage, label_for_overlay, ep_num, frame_in_ep, total_in_ep)
 
         cv2.imshow(window_name, collage)
 
@@ -249,6 +389,14 @@ def play_video(df: pd.DataFrame, episodes: list[int] | None = None, fps: int = 3
         if key == ord('q'):
             break
         elif key == ord(' '):
+            if paused and label_for_overlay == "END":
+                # Special transition: at end-of-episode pause, advance one
+                # frame (to next episode's first frame) but stay PAUSED so
+                # the START-of-episode auto-pause can fire immediately.
+                # This bracket-the-boundary behavior is the whole point of
+                # --pause-every-episode.
+                frame_idx += 1
+                continue
             paused = not paused
             print("Paused" if paused else "Resumed")
         elif key == ord('n') and paused:
@@ -260,6 +408,15 @@ def play_video(df: pd.DataFrame, episodes: list[int] | None = None, fps: int = 3
             frame_pbar.n = max(frame_pbar.n - 1, 0)
             frame_pbar.refresh()
             continue
+        elif key == ord('e'):
+            # Jump to the first frame of the NEXT episode (skip current).
+            if has_episode_col:
+                next_ep_starts = [i for i in ep_start_indices.values() if i > frame_idx]
+                if next_ep_starts:
+                    frame_idx = min(next_ep_starts)
+                    continue
+                else:
+                    print("[e] no more episodes — already in the last one")
 
         if not paused:
             frame_idx += 1
@@ -544,6 +701,16 @@ def main():
         action="store_true",
         help="Save video to file instead of displaying interactively",
     )
+    parser.add_argument(
+        "--pause-every-episode",
+        action="store_true",
+        help="When playing back, auto-pause TWICE at each episode boundary: "
+        "once on the LAST frame of episode N (overlay: 'END OF EPISODE N'), "
+        "then again on the FIRST frame of episode N+1 (overlay: 'START OF "
+        "EPISODE N+1'). Space advances through each pause. Lets you "
+        "clearly see how an episode stops and how the next one starts. "
+        "No effect on --save_video.",
+    )
 
     args = parser.parse_args()
 
@@ -567,7 +734,7 @@ def main():
         output_path = generate_output_path(args.parquet_folder, args.episode)
         save_video(df, output_path, episodes, args.fps)
     else:
-        play_video(df, episodes, args.fps)
+        play_video(df, episodes, args.fps, pause_every_episode=args.pause_every_episode)
 
 
 if __name__ == "__main__":

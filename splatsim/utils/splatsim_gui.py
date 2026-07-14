@@ -14,7 +14,7 @@ import dataclasses
 
 import numpy as np
 from PIL import Image, ImageTk
-from splatsim.configs.mode_config import EvalBenchmarkModeConfig, ImageResizeMode, SplatSimModeConfig, TrajectoryGenModeConfig
+from splatsim.configs.mode_config import EvalBenchmarkModeConfig, ImageResizeMode, IkGoalSelectionStrategy, PathSelectionStrategy, SplatSimModeConfig, TrajectoryGenModeConfig
 
 
 # =============================================================================
@@ -709,6 +709,8 @@ class TrajectoryGenModePanel(ModePanel):
             IntParam(f"{NS}.min_obstacles", "Min Obstacles", 0, 5),
             IntParam(f"{NS}.max_obstacles", "Max Obstacles", 1, 10),
             IntParam(f"{NS}.num_path_candidates", "Path Candidates", 1, 20),
+            IntParam(f"{NS}.num_ik_candidates", "IK Candidates", 1, 64),
+            IntParam(f"{NS}.max_path_attempts", "Max Path Attempts", 1, 50),
         ]
         for param in int_params:
             builder.add_int_param(param, getattr(config, param.key.split(".", 1)[1]))
@@ -717,13 +719,53 @@ class TrajectoryGenModePanel(ModePanel):
             FloatParam(f"{NS}.k_exp", "k_exp", 0.1, 20.0),
             FloatParam(f"{NS}.k_sig", "k_sig", 0.1, 30.0),
             FloatParam(f"{NS}.threshold", "threshold", 0.0, 1.0),
+            # RRT-planner clearance margins (meters). Defaults match
+            # `_COLLISION_CLEARANCE` (0.01) and `check_links_in_collision`'s
+            # `self_collision_clearance=0.0`, so leaving them alone keeps
+            # behavior identical to pre-config trajectories.
+            # Cap the slider at 0.1 m (10 cm) — beyond that, RRT routinely
+            # fails to find paths in tight scenes. Users who need more can
+            # edit the config directly.
+            FloatParam(f"{NS}.obstacle_clearance", "Obstacle Clearance (m)", 0.0, 0.1),
+            FloatParam(f"{NS}.self_collision_clearance", "Self Coll Clearance (m)", 0.0, 0.1),
+            FloatParam(f"{NS}.path_perturbation_scale", "Path Perturbation (rad)", 0.0, 0.2),
         ]
         for param in float_params:
             builder.add_float_param(param, getattr(config, param.key.split(".", 1)[1]))
 
+        # Path Selection is the SINGLE knob for "how does the trajectory
+        # generator pick among candidate RRT paths". Replaces the legacy
+        # `disable_camera_scoring_for_rrt` checkbox (which is now
+        # deprecated on the config; ignored by the trajectory generator
+        # unless someone is still flipping it from a script).
+        #   * camera_scoring      — score by camera view-angle against
+        #     the target EE pose (legacy default). Only works if the
+        #     URDF defines a wrist camera link.
+        #   * ee_arc_length       — minimize EE-link cartesian travel.
+        #   * joint_arc_length    — minimize joint-space L2 distance.
+        #   * min_pair_clearance  — MAXIMIZE the path's tightest
+        #     non-adjacent link-pair gap. Targets the pretzeled-pose
+        #     failure mode (paths through configs where normally-distant
+        #     links come close) — particularly useful when the resulting
+        #     trajectory will feed a downstream policy that struggles
+        #     with extreme arm folds.
+        builder.add_enum_param(
+            EnumParam(f"{NS}.path_selection", "Path Selection", PathSelectionStrategy),
+            config.path_selection,
+        )
+        # Which IK goal to commit to before planning (orthogonal to Path
+        # Selection). "joint_distance" = nearest IK solution to the start
+        # (avoids wrist-flip self-collision wedges); "none" = score all IK
+        # candidates via Path Selection.
+        builder.add_enum_param(
+            EnumParam(f"{NS}.ik_goal_selection", "IK Goal Selection", IkGoalSelectionStrategy),
+            config.ik_goal_selection,
+        )
+        # Ruckig segmentation: off (default) = single continuous pass through
+        # sharp corners; on = split at >45° corners with a forced stop each.
         builder.add_bool_param(
-            BoolParam(f"{NS}.disable_camera_scoring_for_rrt", "Disable Cam Score"),
-            config.disable_camera_scoring_for_rrt
+            BoolParam(f"{NS}.segment_at_sharp_corners", "Segment at Sharp Corners"),
+            config.segment_at_sharp_corners,
         )
         builder.add_bool_param(
             BoolParam(f"{NS}.verbose", "Verbose"),
@@ -993,8 +1035,62 @@ class SplatSimGui(ThreadedTkinterGui):
 
     def _build_ui(self):
         """Build the SplatSim UI."""
-        main_frame = ttk.Frame(self._root, padding=self._style.padding)
-        main_frame.grid(row=0, column=0, sticky="nsew")
+        # Scrollable shell: a Canvas + vertical Scrollbar host an inner Frame
+        # that holds ALL the existing widgets (camera area, mode buttons,
+        # debug settings, every mode panel). Wrapping at this top level
+        # means every panel and submenu becomes scrollable in one place —
+        # no need to retrofit individual panels. When the inner Frame
+        # outgrows the viewport (e.g. Trajectory Gen mode's clearance
+        # sliders push the panel past screen height), the scrollbar appears
+        # automatically; when content fits, it stays inactive.
+        #
+        # We keep the local variable name `main_frame` pointing at the
+        # SAME inner Frame the rest of this function expects, so no
+        # downstream layout code needs to change.
+        self._root.grid_rowconfigure(0, weight=1)
+        self._root.grid_columnconfigure(0, weight=1)
+
+        _scroll_shell = ttk.Frame(self._root)
+        _scroll_shell.grid(row=0, column=0, sticky="nsew")
+        _scroll_shell.grid_rowconfigure(0, weight=1)
+        _scroll_shell.grid_columnconfigure(0, weight=1)
+
+        _canvas = tk.Canvas(_scroll_shell, borderwidth=0, highlightthickness=0)
+        _vscroll = ttk.Scrollbar(_scroll_shell, orient="vertical", command=_canvas.yview)
+        _canvas.configure(yscrollcommand=_vscroll.set)
+        _canvas.grid(row=0, column=0, sticky="nsew")
+        _vscroll.grid(row=0, column=1, sticky="ns")
+
+        main_frame = ttk.Frame(_canvas, padding=self._style.padding)
+        _main_window_id = _canvas.create_window((0, 0), window=main_frame, anchor="nw")
+
+        # Keep the canvas's scroll region matched to the inner frame's
+        # current bbox. Fires whenever main_frame grows or shrinks — most
+        # importantly when panels are shown/hidden via grid()/grid_remove()
+        # in `_update_panel_visibility`. Without this, the scrollbar
+        # would stay sized for the panel set that existed at startup.
+        def _on_inner_configure(event):
+            _canvas.configure(scrollregion=_canvas.bbox("all"))
+        main_frame.bind("<Configure>", _on_inner_configure)
+
+        # Stretch the inner frame to the canvas's width so widgets
+        # using sticky="ew" fill horizontally instead of clinging to the
+        # left edge. Vertical scrolling only; horizontal isn't needed.
+        def _on_canvas_configure(event):
+            _canvas.itemconfigure(_main_window_id, width=event.width)
+        _canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mousewheel — Windows/Mac vs X11 use different event types.
+        # bind_all so the wheel scrolls the panel even when the cursor
+        # is hovering a button/slider rather than the empty canvas
+        # background; for a settings panel this matches expectation.
+        def _on_mousewheel(event):
+            # event.delta is +/-120 per notch on Windows/Mac; sign is
+            # opposite of yview_scroll's direction (positive delta = up).
+            _canvas.yview_scroll(int(-event.delta / 120), "units")
+        _canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        _canvas.bind_all("<Button-4>", lambda e: _canvas.yview_scroll(-1, "units"))
+        _canvas.bind_all("<Button-5>", lambda e: _canvas.yview_scroll(1, "units"))
 
         builder = GuiBuilder(main_frame, self, self._style)
 
@@ -1064,6 +1160,35 @@ class SplatSimGui(ThreadedTkinterGui):
 
         # Show/hide panels based on initial mode
         self._update_panel_visibility(self._initial_mode)
+
+        # Clamp the window's initial height to ≤90% of the screen so the
+        # scrollable shell's scrollbar actually engages — without this,
+        # Tk auto-sizes the root to the inner frame's natural requested
+        # height (since we never call geometry()), the window grows past
+        # the screen, and the scrollbar never appears because the canvas
+        # itself is taller than its viewport. Run via after_idle so geometry
+        # numbers are settled after the panels have laid out (Tk computes
+        # winfo_reqheight asynchronously during the first idle pass).
+        def _clamp_height():
+            try:
+                self._root.update_idletasks()
+                req_h = self._root.winfo_reqheight()
+                req_w = self._root.winfo_reqwidth()
+                screen_h = self._root.winfo_screenheight()
+                screen_w = self._root.winfo_screenwidth()
+                # Default-size multipliers chosen so the initial window is
+                # roomy: 2× the natural requested width and 3× the natural
+                # requested height. Both are then capped against the screen
+                # (90% to leave taskbar/menubar room) — the scrollbar
+                # handles the case where the requested height exceeds that
+                # cap. Width has no horizontal scrolling, so we just cap to
+                # the screen as a safety net.
+                use_w = min(int(req_w * 2), screen_w)
+                use_h = min(int(req_h * 3), int(screen_h * 0.90))
+                self._root.geometry(f"{use_w}x{use_h}")
+            except tk.TclError:
+                pass
+        self._root.after_idle(_clamp_height)
 
     # ------------------------------------------------------------------
     # Mode state & transitions
