@@ -19,7 +19,16 @@ class Args:
     hostname: str = "127.0.0.1"
     robot_ip: str = "192.168.1.10"
     gaussian_path : str = "/home/jennyw2/data/output/robot_iphone/point_cloud/iteration_30000/point_cloud.ply"
-    robot_name: str = "robot_iphone"
+    # Robot splat/URDF name to load. When None (default), the server variant
+    # picked by `--robot` provides its own class-level
+    # `DEFAULT_ROBOT_NAME` (see `PybulletRobotServerBase.DEFAULT_ROBOT_NAME`
+    # + subclass overrides). Callers should only pass this when overriding
+    # per-run (e.g. running the small_engine env against a different
+    # splat trained on a modified scene). Bash orchestrator scripts
+    # deliberately omit `--robot_name` so the class default flows through
+    # — matches the LeRobot side's default resolution and eliminates the
+    # need to keep two hardcoded strings in sync across repos.
+    robot_name: Optional[str] = None
 
     # Debug mode for PyBullet visualization
     debug_mode: DebugModes = DebugModes.OFF
@@ -34,9 +43,16 @@ class Args:
     # Wrist camera model version (see WRIST_CAM_FISHEYE_CALIBRATIONS in
     # splatsim/robots/sim_robot_pybullet_base.py):
     #   0 = pinhole using base camera intrinsics (matches pre-fisheye datasets)
-    #   1 = fisheye, original 2704x2028 GoPro calibration (default)
-    #   2 = fisheye, recalibrated 1920x1080 GoPro calibration
-    wrist_cam_ver: int = 1
+    #   1 = fisheye, original 2704x2028 GoPro calibration
+    #   2 = fisheye, recalibrated 1920x1080 GoPro calibration (default)
+    # Matches `PybulletRobotServerBase.__init__`'s Python default (2) and
+    # LeRobot's `SplatSimEnv.wrist_cam_ver` default (2). Keeping this in
+    # lockstep prevents client-server calibration mismatch: the client's
+    # LeRobot config passes wrist_cam_ver=2 to the server over ZMQ for
+    # its ObsResampler, and if the launch script had a different default
+    # the sim server would render with ver=1 intrinsics while lerobot
+    # thought it was ver=2.
+    wrist_cam_ver: int = 2
 
     # When True, connect pybullet in DIRECT (no GUI) mode. Skips OpenGL
     # context creation entirely → no display required, ~3-5x faster for
@@ -45,12 +61,59 @@ class Args:
     # replay + collision-check filtering.
     headless: bool = False
 
+    # Clearances used by the robot server's ``check_metrics()`` when
+    # reporting ``info["in_collision"]``. Defaults preserve historical
+    # behavior (0 m on both = actual contact / penetration only). Set
+    # non-zero (typically matching the DAgger SA wrapper's
+    # ``rrt_obstacle_clearance`` / ``rrt_self_collision_clearance``) so
+    # downstream collision filters / termination triggers consider
+    # near-misses as collisions too. Forwarded to the robot server's
+    # constructor; ignored by robot variants that don't accept the
+    # corresponding kwargs.
+    in_collision_obstacle_clearance: float = 0.0
+    in_collision_self_collision_clearance: float = 0.0
+
+
+def _resolve_default_robot_name(robot_variant: str) -> str:
+    """Map a `--robot` variant to its class-level `DEFAULT_ROBOT_NAME`.
+
+    Lazily imports the specific server subclass so this helper doesn't
+    pull in every variant's deps for a single launch. Falls back to the
+    base class's `DEFAULT_ROBOT_NAME` (historical `"robot_iphone"`) when
+    the variant isn't recognized here — matches how `--robot_name`
+    defaulted before this refactor.
+
+    Add a new branch when you add a new robot variant with an env-
+    specific splat: `elif robot_variant == "sim_ur_pybullet_new_env": ...`
+    """
+    if robot_variant in (
+        "sim_ur_pybullet_small_engine_new_interactive",
+        "sim_ur_pybullet_small_engine_new_interactive_strict",
+    ):
+        from splatsim.robots.sim_robot_pybullet_small_engine import (
+            UprightRobotSmallEngineNewPybulletRobotServer,
+        )
+        return UprightRobotSmallEngineNewPybulletRobotServer.DEFAULT_ROBOT_NAME
+    # Fallback: base class default.
+    from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
+    return PybulletRobotServerBase.DEFAULT_ROBOT_NAME
+
 
 def launch_robot_server(args: Args):
     # Match lerobot's precision settings so dataset collection
     # uses the same tf32 precision as evaluation
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
+
+    # Resolve --robot_name from the robot variant's class default when the
+    # user didn't pass an explicit override. Downstream code paths (YAML
+    # lookup, per-branch `robot_name=args.robot_name` on the server
+    # constructor) all consume the same resolved value, so bash callers
+    # who omit `--robot_name` get the env-specific canonical splat name
+    # (e.g. `robot_iphone_w_engine_curtain` for small_engine) without any
+    # hardcoded string on the launch side.
+    if args.robot_name is None:
+        args.robot_name = _resolve_default_robot_name(args.robot)
 
     with open("configs/object_configs/objects.yaml", "r") as f:
         object_config = yaml.safe_load(f)
@@ -173,6 +236,8 @@ def launch_robot_server(args: Args):
            eval_benchmark_subset=args.eval_benchmark_subset,
            wrist_cam_ver=args.wrist_cam_ver,
            headless=args.headless,
+           in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
+           in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_strict":
@@ -194,6 +259,8 @@ def launch_robot_server(args: Args):
            eval_benchmark_repo_id=args.eval_benchmark_repo_id,
            eval_benchmark_subset=args.eval_benchmark_subset,
            wrist_cam_ver=args.wrist_cam_ver,
+           in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
+           in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_stretchimg":
