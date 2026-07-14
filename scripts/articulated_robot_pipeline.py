@@ -109,14 +109,19 @@ def main(args):
     #get the joint states from args
     joint_states = initial_joint_positions
 
-    #set the joint states
+    # Set the joint states. The yaml convention (matching
+    # sim_robot_pybullet_base.py teleport_joint_state) is that entry i of
+    # initial_joint_positions corresponds to pybullet joint index i+1 —
+    # index 0 is the fixed world_joint (world → base_link) and must be
+    # skipped. Older yaml entries used to pad with a leading 0.0 to work
+    # around this; the current convention is no leading 0.
     num_joints = p.getNumJoints(robot_id)
     for joint_index, joint_state in enumerate(joint_states):
-        if joint_index >= num_joints:
-            print(f"Warning: More joint indexes provided ({joint_index + 1}) than available joints ({num_joints}). Skipping excess joint states.")
+        target_pybullet_index = joint_index + 1
+        if target_pybullet_index >= num_joints:
+            print(f"Warning: More joint indexes provided ({joint_index + 1}) than available joints ({num_joints - 1}, excluding world_joint). Skipping excess joint states.")
             break
-        # Set the joint state for the robot
-        p.resetJointState(robot_id, joint_index, joint_state)
+        p.resetJointState(robot_id, target_pybullet_index, joint_state)
 
     #get number of links in the object
     num_links = p.getNumJoints(robot_id)
@@ -188,7 +193,7 @@ def main(args):
     splat_points = np.asarray(pcd_splat.points)
 
     #transform the points
-    rotation_matrix = transformation_matrix[0:3, 0:3] 
+    rotation_matrix = transformation_matrix[0:3, 0:3]
     translation_matrix = transformation_matrix[0:3, 3]
 
     splat_points = np.dot(rotation_matrix, splat_points.T).T + translation_matrix
@@ -237,6 +242,18 @@ def main(args):
     print('splat points', splat_points.shape)
     splat_points = splat_points.cpu().numpy()
 
+    # Diagnostics: compare the FILTERED, transformed splat against the URDF pcd
+    # (X) in the same world frame. Pre-filter extents are meaningless here
+    # because they include the whole scene (curtain/table/walls). If alignment
+    # is good, these two centroids/extents should closely match. A big centroid
+    # offset or extent mismatch means the retuned transformation.matrix places
+    # the robot in the wrong pose/scale even though a viewer that auto-frames
+    # bounds may make it look "aligned".
+    print(f"  [aligned?] URDF pcd (X)          centroid: ({X.mean(0)[0]:+.4f}, {X.mean(0)[1]:+.4f}, {X.mean(0)[2]:+.4f})  "
+          f"extent: ({(X.max(0)-X.min(0))[0]:.4f}, {(X.max(0)-X.min(0))[1]:.4f}, {(X.max(0)-X.min(0))[2]:.4f})")
+    print(f"  [aligned?] splat (filtered+xform) centroid: ({splat_points.mean(0)[0]:+.4f}, {splat_points.mean(0)[1]:+.4f}, {splat_points.mean(0)[2]:+.4f})  "
+          f"extent: ({(splat_points.max(0)-splat_points.min(0))[0]:.4f}, {(splat_points.max(0)-splat_points.min(0))[1]:.4f}, {(splat_points.max(0)-splat_points.min(0))[2]:.4f})")
+
     #infer the labels
     splat_labels = knn.predict(splat_points)
 
@@ -258,6 +275,13 @@ def main(args):
     # Register windows
     create_window(gui.Application.instance, "Original Point Cloud", pcd_with_frame, 50, 50)
     create_window(gui.Application.instance, "New Point Cloud", new_pcd_with_frame, 900, 50)
+    # Overlay window: both clouds in the same camera frame — the side-by-side
+    # windows above use independent setup_camera calls per window (framing set
+    # from that window's own geometry bounds), which can make aligned clouds
+    # look rotated relative to each other. Use this overlay to check actual
+    # world-frame alignment between the URDF-derived pcd and the transformed splat.
+    create_window(gui.Application.instance, "Overlay (pcd + splat)",
+                  [pcd, new_pcd, coordinate_frame], 50, 700)
     # Run app (blocks until all windows closed)
     gui.Application.instance.run()
 
