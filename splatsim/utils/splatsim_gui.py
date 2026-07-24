@@ -14,7 +14,7 @@ import dataclasses
 
 import numpy as np
 from PIL import Image, ImageTk
-from splatsim.configs.mode_config import EvalBenchmarkModeConfig, ImageResizeMode, IkGoalSelectionStrategy, PathSelectionStrategy, SplatSimModeConfig, TrajectoryGenModeConfig
+from splatsim.configs.mode_config import EvalBenchmarkModeConfig, ImageResizeMode, IkGoalSelectionStrategy, PathSelectionStrategy, RenderMode, SplatSimModeConfig, TrajectoryGenModeConfig
 
 
 # =============================================================================
@@ -364,14 +364,42 @@ class ThreadedTkinterGui(ABC):
         except tk.TclError:
             return None
 
+    def _register_value_var(self, key: str, var: "tk.Variable") -> None:
+        """Add a tk.Variable to self._values under the lock.
+
+        All writes to self._values must go through this helper (or the
+        matching sites in _destroy/_shutdown that already lock). Otherwise
+        a GUI-thread widget-add can race a server-thread `get_values()`
+        iteration and trip `RuntimeError: dictionary changed size during
+        iteration` — the exact crash surfaced in launch_nodes' startup.
+        """
+        with self._lock:
+            self._values[key] = var
+
+    def _register_enum_class(self, key: str, enum_class: type) -> None:
+        """Add an enum-class mapping to self._enum_classes under the lock.
+
+        Mirror of _register_value_var for the enum-dropdown metadata dict —
+        `_destroy_window` clears both dicts inside the lock, so writes need
+        to synchronize too.
+        """
+        with self._lock:
+            self._enum_classes[key] = enum_class
+
     def get_values(self) -> Dict[str, Any]:
         """Get all current values from GUI.
 
         Returns:
             Dictionary of parameter key -> value
         """
+        # Snapshot the dict under the lock so widget-add mutations (all
+        # writers now go through _register_value_var) can't change the dict
+        # size mid-iteration. `var.get()` calls happen OUTSIDE the lock so
+        # a slow Tcl round-trip doesn't block widget construction.
+        with self._lock:
+            items_snapshot = list(self._values.items())
         result = {}
-        for key, var in self._values.items():
+        for key, var in items_snapshot:
             try:
                 result[key] = var.get()
             except tk.TclError:
@@ -475,7 +503,7 @@ class GuiBuilder:
         )
 
         var = tk.IntVar(value=int(value))
-        self._gui._values[param.key] = var
+        self._gui._register_value_var(param.key, var)
 
         font = (self._style.font_family, self._style.font_size)
         entry = ttk.Entry(self._parent, textvariable=var, width=10, font=font)
@@ -501,7 +529,7 @@ class GuiBuilder:
         )
 
         var = tk.DoubleVar(value=float(value))
-        self._gui._values[param.key] = var
+        self._gui._register_value_var(param.key, var)
 
         slider_frame = ttk.Frame(self._parent)
         slider_frame.grid(row=self._row, column=1, sticky="e", pady=3)
@@ -536,7 +564,7 @@ class GuiBuilder:
         )
 
         var = tk.BooleanVar(value=bool(value))
-        self._gui._values[param.key] = var
+        self._gui._register_value_var(param.key, var)
 
         check = ttk.Checkbutton(self._parent, variable=var)
         check.grid(row=self._row, column=1, sticky="e", pady=3)
@@ -561,7 +589,7 @@ class GuiBuilder:
         )
 
         var = tk.StringVar(value=str(value))
-        self._gui._values[param.key] = var
+        self._gui._register_value_var(param.key, var)
 
         font = (self._style.font_family, self._style.font_size)
         entry = ttk.Entry(self._parent, textvariable=var, width=param.width, font=font)
@@ -570,12 +598,16 @@ class GuiBuilder:
         self._row += 1
         return self._row - 1
 
-    def add_enum_param(self, param: 'EnumParam', initial_value: Any = None) -> int:
+    def add_enum_param(self, param: 'EnumParam', initial_value: Any = None,
+                       allowed_values: Optional[List[Any]] = None) -> int:
         """Add an enum dropdown parameter.
 
         Args:
             param: Parameter configuration with enum_class
             initial_value: Initial enum member (overrides param.default)
+            allowed_values: Optional subset of enum members to offer in the
+                dropdown (defaults to every member of the enum class). Lets a
+                caller hide options the current context can't support.
 
         Returns:
             Row index
@@ -599,13 +631,14 @@ class GuiBuilder:
             var = tk.StringVar(value=value)
         else:
             var = tk.StringVar(value=value.value)
-        self._gui._values[param.key] = var
+        self._gui._register_value_var(param.key, var)
 
         # Store enum class for later lookup
-        self._gui._enum_classes[param.key] = param.enum_class
+        self._gui._register_enum_class(param.key, param.enum_class)
 
-        # Create dropdown with enum values
-        values = [member.value for member in param.enum_class]
+        # Create dropdown with enum values (optionally a caller-provided subset)
+        members = allowed_values if allowed_values is not None else list(param.enum_class)
+        values = [(m.value if not isinstance(m, str) else m) for m in members]
         combo = ttk.Combobox(self._parent, textvariable=var, values=values, state="readonly", width=18)
         combo.grid(row=self._row, column=1, sticky="e", pady=3)
 
@@ -695,6 +728,12 @@ class TrajectoryGenModePanel(ModePanel):
 
     BTN_START = "start_traj"
     BTN_STOP = "stop_traj"
+    BTN_EXPORT_CONFIG = "export_traj_config"
+    BTN_IMPORT_CONFIG = "import_traj_config"
+    # Widget key for the export/import path. NOT a config field (leading "_"), so
+    # save_to_config skips it and it never leaks into the exported JSON.
+    CONFIG_PATH_KEY = "traj_gen._config_path"
+    DEFAULT_CONFIG_PATH = "traj_config.json"
 
     def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
               style: GuiStyle, config: SplatSimModeConfig) -> None:
@@ -767,6 +806,12 @@ class TrajectoryGenModePanel(ModePanel):
             BoolParam(f"{NS}.segment_at_sharp_corners", "Segment at Sharp Corners"),
             config.segment_at_sharp_corners,
         )
+        # Hold the last joint config frozen for ~1 s at the end of each generated
+        # trajectory (default off). Off = no dead frames padding episode length.
+        builder.add_bool_param(
+            BoolParam(f"{NS}.pad_stopped_last_frames", "Pad stopped last frames"),
+            config.pad_stopped_last_frames,
+        )
         builder.add_bool_param(
             BoolParam(f"{NS}.verbose", "Verbose"),
             config.verbose
@@ -791,14 +836,61 @@ class TrajectoryGenModePanel(ModePanel):
                 getattr(config, f"render_{mode.value}", True)
             )
 
+        # Export/import the WHOLE traj config to/from a JSON file so you can tune
+        # settings here in the GUI, then re-run generation headless with the same
+        # config (see launch_nodes.py --traj_config_file). The path is a plain
+        # text field (keeps the file op thread-safe — no cross-thread dialog).
+        builder.add_str_param(
+            StrParam(self.CONFIG_PATH_KEY, "Config File (JSON)", self.DEFAULT_CONFIG_PATH, width=25),
+            self.DEFAULT_CONFIG_PATH,
+        )
+        builder.add_button_row([
+            ButtonConfig("Export Config", self.BTN_EXPORT_CONFIG),
+            ButtonConfig("Import Config", self.BTN_IMPORT_CONFIG),
+        ])
+
         builder.add_button_row([
             ButtonConfig("Start Traj Gen", self.BTN_START),
             ButtonConfig("Stop", self.BTN_STOP),
         ])
 
     def process_buttons(self, gui: 'SplatSimGui') -> None:
+        import dataclasses as _dc
+        import enum as _enum
+        from splatsim.utils.config_io import save_dataclass_json, update_dataclass_json
+
         start = gui.check_button(self.BTN_START)
         stop = gui.check_button(self.BTN_STOP)
+
+        if gui.check_button(self.BTN_EXPORT_CONFIG):
+            gui.save_to_config(gui._config, prefix="traj_gen")  # sync widgets -> config
+            path = (gui.get_value(self.CONFIG_PATH_KEY) or self.DEFAULT_CONFIG_PATH).strip()
+            try:
+                skipped = save_dataclass_json(gui._config, path)
+                note = f" (skipped non-serializable: {skipped})" if skipped else ""
+                gui.set_status(f"Exported traj config -> {path}{note}")
+                print(f"[GUI] Exported traj config -> {path}{note}")
+            except Exception as e:
+                gui.set_status(f"Export failed: {e}")
+                print(f"[GUI] Export failed: {e}")
+
+        if gui.check_button(self.BTN_IMPORT_CONFIG):
+            path = (gui.get_value(self.CONFIG_PATH_KEY) or self.DEFAULT_CONFIG_PATH).strip()
+            try:
+                update_dataclass_json(gui._config, path, warn=lambda m: print(f"[GUI] {m}"))
+                # Push the imported values back into the widgets (field-driven, so
+                # no field is named here). Fields without a widget are silently
+                # skipped by set_value; enum values map to their dropdown string.
+                for f in _dc.fields(gui._config):
+                    v = getattr(gui._config, f.name)
+                    if isinstance(v, _enum.Enum):
+                        v = v.value
+                    gui.set_value(f"traj_gen.{f.name}", v)
+                gui.set_status(f"Imported traj config <- {path}")
+                print(f"[GUI] Imported traj config <- {path}: {gui._config}")
+            except Exception as e:
+                gui.set_status(f"Import failed: {e}")
+                print(f"[GUI] Import failed: {e}")
 
         if start and gui.mode == "generate_trajectories_idle":
             gui.save_to_config(gui._config, prefix="traj_gen")
@@ -823,6 +915,7 @@ class EvalBenchmarkModePanel(ModePanel):
     BTN_LOAD = "eval_load_dataset"
     BTN_NEXT = "eval_next_episode"
     BTN_PREV = "eval_prev_episode"
+    BTN_REPLAY = "eval_replay_episode"
     BTN_SAVE_PRESET = "eval_save_preset"
     EPISODE_SELECT_KEY = "eval_episode_select"
     PRESET_SELECT_KEY = "eval_preset_select"
@@ -859,6 +952,11 @@ class EvalBenchmarkModePanel(ModePanel):
             ButtonConfig("Prev Episode", self.BTN_PREV),
             ButtonConfig("Next Episode", self.BTN_NEXT),
         ])
+        # Kinematic playback of the current episode's recorded observation.state
+        # sequence (server-side; blocks the serve loop for the episode length).
+        builder.add_button_row([
+            ButtonConfig("Replay Episode", self.BTN_REPLAY),
+        ])
 
         # Episode combobox — starts empty, repopulated after dataset loads
         row = builder.current_row
@@ -869,7 +967,7 @@ class EvalBenchmarkModePanel(ModePanel):
             parent, textvariable=self._episode_var, values=["—"], state="readonly"
         )
         self._episode_menu.grid(row=row, column=1, sticky="ew", pady=2)
-        gui._values[self.EPISODE_SELECT_KEY] = self._episode_var
+        gui._register_value_var(self.EPISODE_SELECT_KEY, self._episode_var)
         builder._row += 1
 
         # ── Preset section ────────────────────────────────────────────────
@@ -893,7 +991,7 @@ class EvalBenchmarkModePanel(ModePanel):
             parent, textvariable=self._preset_var, values=preset_names, state="readonly", width=23
         )
         self._preset_menu.grid(row=row, column=1, sticky="ew", pady=2)
-        gui._values[self.PRESET_SELECT_KEY] = self._preset_var
+        gui._register_value_var(self.PRESET_SELECT_KEY, self._preset_var)
 
         preset_var = self._preset_var
         def _on_preset_selected(event=None, _var=preset_var):
@@ -918,7 +1016,7 @@ class EvalBenchmarkModePanel(ModePanel):
         ttk.Entry(parent, textvariable=self._preset_name_var, width=25, font=font).grid(
             row=row, column=1, sticky="e", pady=2
         )
-        gui._values[self.PRESET_NAME_KEY] = self._preset_name_var
+        gui._register_value_var(self.PRESET_NAME_KEY, self._preset_name_var)
         builder._row += 1
 
         builder.add_button_row([ButtonConfig("Save Preset", self.BTN_SAVE_PRESET)])
@@ -981,6 +1079,8 @@ class SplatSimGui(ThreadedTkinterGui):
     # Key for debug mode dropdown
     DEBUG_MODE_KEY = "debug_mode"
     BTN_RESET_ENV = "reset_env"
+    # Key for the render-mode dropdown (polled by the server each loop tick)
+    RENDER_MODE_KEY = "render_mode"
 
     def __init__(
         self,
@@ -989,6 +1089,8 @@ class SplatSimGui(ThreadedTkinterGui):
         debug_mode_enum: Optional[type] = None,
         initial_debug_mode: Any = None,
         panels: Optional[List[ModePanel]] = None,
+        initial_render_mode: Any = None,
+        available_render_modes: Optional[List[Any]] = None,
     ):
         """Initialize the GUI.
 
@@ -999,8 +1101,19 @@ class SplatSimGui(ThreadedTkinterGui):
             initial_debug_mode: Initial debug mode enum member (optional)
             panels: List of ModePanel instances. Defaults to
                      [InteractiveModePanel(), TrajectoryGenModePanel()].
+            initial_render_mode: Initial selection of the "Render mode" dropdown
+                (a RenderMode member), mirroring the server's launch --render_mode.
+                The server polls get_render_mode() each loop tick and switches its
+                image-observation source (splat / pybullet camera / none) to match.
+            available_render_modes: Subset of RenderMode members to offer in the
+                dropdown (defaults to all). Lets the server hide options the env
+                can't do — e.g. SPLAT when no splat assets are loaded.
         """
         super().__init__(title="SplatSim Controls")
+        self._initial_render_mode = initial_render_mode if initial_render_mode is not None else RenderMode.NONE
+        self._available_render_modes = (
+            list(available_render_modes) if available_render_modes else list(RenderMode)
+        )
         self._config = config
         self._eval_config = EvalBenchmarkModeConfig()
         self._initial_mode = initial_mode
@@ -1109,14 +1222,14 @@ class SplatSimGui(ThreadedTkinterGui):
 
         # Current mode status display
         self._mode_var = tk.StringVar(value=f"Mode: {self._initial_mode}")
-        self._values["_mode_var"] = self._mode_var
+        self._register_value_var("_mode_var", self._mode_var)
         mode_label = ttk.Label(main_frame, textvariable=self._mode_var, style="Header.TLabel")
         mode_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 2))
         builder._row += 1
 
         # Trajectory progress status line
         self._status_var = tk.StringVar(value="")
-        self._values["_status_var"] = self._status_var
+        self._register_value_var("_status_var", self._status_var)
         status_label = ttk.Label(main_frame, textvariable=self._status_var)
         status_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 8))
         builder._row += 1
@@ -1130,6 +1243,17 @@ class SplatSimGui(ThreadedTkinterGui):
         builder.add_button_row([
             ButtonConfig("Reset Env", self.BTN_RESET_ENV),
         ])
+
+        # Render mode dropdown — always visible regardless of mode. The server
+        # polls get_render_mode() each loop tick and switches its image source
+        # on change: SPLAT (Gaussian-splat), PYBULLET (fast getCameraImage), or
+        # NONE (state-only, fastest). Only the modes the env supports are offered
+        # (available_render_modes).
+        builder.add_enum_param(
+            EnumParam(self.RENDER_MODE_KEY, "Render mode", RenderMode),
+            initial_value=self._initial_render_mode,
+            allowed_values=self._available_render_modes,
+        )
 
         # Debug mode dropdown (if enum provided)
         if self._debug_mode_enum is not None:
@@ -1273,6 +1397,17 @@ class SplatSimGui(ThreadedTkinterGui):
         """
         return self.get_enum_value(self.DEBUG_MODE_KEY)
 
+    def get_render_mode(self) -> Any:
+        """Current "Render mode" dropdown selection (a RenderMode member).
+        Thread-safe. Falls back to the initial value when the GUI isn't
+        built/started (e.g. headless mode), so polling callers see no spurious
+        change.
+        """
+        value = self.get_enum_value(self.RENDER_MODE_KEY)
+        if value is None:
+            return self._initial_render_mode
+        return value
+
     def set_eval_episode_options(self, episodes: List[int]) -> None:
         """Repopulate the eval benchmark episode combobox after a dataset is loaded.
 
@@ -1311,9 +1446,20 @@ class SplatSimGui(ThreadedTkinterGui):
 
         Args:
             frames: Dict mapping camera name to RGB numpy array (H, W, 3), uint8.
+                An EMPTY dict clears the camera display entirely — used when
+                camera rendering is toggled off so stale frames don't linger.
         """
         with self._image_lock:
             self._pending_images = dict(frames)
+
+    def clear_camera_images(self) -> None:
+        """Clear all displayed camera images (thread-safe).
+
+        Convenience wrapper for ``update_camera_images({})`` — used by the
+        server when the "Camera rendering" checkbox is unchecked, so the GUI
+        doesn't keep showing the last rendered (now-stale) frames.
+        """
+        self.update_camera_images({})
 
     def _poll_camera_images(self) -> None:
         """Poll for pending image updates from other threads."""
@@ -1330,15 +1476,18 @@ class SplatSimGui(ThreadedTkinterGui):
         self._root.after(33, self._poll_camera_images)  # ~30 fps
 
     def _render_camera_images(self, frames: Dict[str, np.ndarray]) -> None:
-        """Render camera images into the GUI. Must be called from Tk thread."""
+        """Render camera images into the GUI. Must be called from Tk thread.
+
+        An empty ``frames`` dict clears the display: the stale-label removal
+        below sees every existing camera as stale and destroys its widgets
+        (used when camera rendering is toggled off).
+        """
         if self._camera_frame is None:
             return
 
         # Determine grid layout: arrange in rows of up to 2 columns
         camera_names = sorted(frames.keys())
         num_cameras = len(camera_names)
-        if num_cameras == 0:
-            return
         cols = min(num_cameras, 2)
         max_thumb_width = 224
 
