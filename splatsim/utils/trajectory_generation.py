@@ -92,6 +92,13 @@ class TrajectoryGenerator:
         # constructing this generator, so calling it now would AttributeError.
         self._planner = None
 
+        # Optional pre-validated base trajectory (T, num_dofs), set by the env's
+        # reset via `_check_scenario_solvable` after it already planned a path to
+        # prove the scenario is solvable. `generate_trajectory_batch` consumes it
+        # ONCE instead of re-planning the base path (obstacle variations still
+        # plan fresh). None disables the shortcut.
+        self._cached_base_traj = None
+
         # Static obstacles from environment (walls, table, etc.)
         self.loaded_obstacle_ids = []
 
@@ -245,6 +252,37 @@ class TrajectoryGenerator:
 
         return q_start is not None and len(q_goals) > 0
 
+    def try_plan_to_goal(
+        self,
+        q_start,
+        target_ee_pos,
+        target_ee_quat,
+        q_goal_bias=None,
+    ) -> Optional[np.ndarray]:
+        """Attempt goal-IK + a full RRT path from ``q_start`` to the EE pose.
+
+        Shared 'is this scenario actually solvable — and here's the demo path'
+        primitive used by env resets. STRONGER than ``check_able_to_solve``,
+        which only checks a goal CONFIG exists; this also verifies a
+        collision-free PATH reaches it. Returns the ruckig-smoothed joint path
+        ``(T, num_dofs)`` on success (the chosen goal config is published on
+        ``self._planner._last_chosen_q_goal``), or ``None`` on
+        ``RRTPlanningError``. The robot's joint state is restored by
+        ``planner.plan`` itself, so this is side-effect-free on the pose."""
+        self._ensure_planner()
+        self._sync_planner_obstacles()
+        q_start = np.asarray(q_start, dtype=np.float64).reshape(-1)[: len(self.joint_indices)]
+        try:
+            traj, _ = self._planner.plan(
+                q_start,
+                np.asarray(target_ee_pos, dtype=np.float64),
+                np.asarray(target_ee_quat, dtype=np.float64),
+                q_goal_bias=(None if q_goal_bias is None else np.asarray(q_goal_bias, dtype=np.float64)),
+            )
+            return traj
+        except RRTPlanningError:
+            return None
+
     def _get_start_and_goal_qs(self) -> Tuple[Optional[np.ndarray], List[np.ndarray]]:
         """
         Get collision free start and goal joint configurations, resolving EE pose goals to joint space via IK if needed.
@@ -320,7 +358,9 @@ class TrajectoryGenerator:
                 lower_limits=self.lower_limits,
                 upper_limits=self.upper_limits,
                 num_ik_candidates=self.config.num_ik_candidates,
-                max_joint_vel=0.5, max_joint_acc=1.0, max_joint_jerk=10.0,
+                max_joint_vel=self.config.max_joint_vel,
+                max_joint_acc=self.config.max_joint_acc,
+                max_joint_jerk=self.config.max_joint_jerk,
                 # Ruckig only the FINAL trajectory (cheap linear-densify checks
                 # per candidate) so we don't hit the ruckig cloud API once per
                 # candidate — that overwhelmed it during batch trajectory-gen.
@@ -335,6 +375,13 @@ class TrajectoryGenerator:
                 num_path_candidates_per_ik=self.config.num_path_candidates,
                 max_path_attempts_per_ik=self.config.max_path_attempts,
                 path_perturbation_scale=self.config.path_perturbation_scale,
+                rrt_smooth_iterations=self.config.rrt_smooth_iterations,
+                ruckig_obstacle_clearance_factor=self.config.ruckig_obstacle_clearance_factor,
+                final_approach_dist=self.config.final_approach_dist,
+                final_approach_vel_scale=self.config.final_approach_vel_scale,
+                final_approach_acc_scale=self.config.final_approach_acc_scale,
+                uniform_path_speed=self.config.uniform_path_speed,
+                freeze_visualizer_during_plan=self.config.freeze_visualizer_during_plan,
                 obstacle_clearance=self.config.obstacle_clearance,
                 self_collision_clearance=self.config.self_collision_clearance,
                 self_collision_skip_pairs=self.config.self_collision_skip_pairs,
@@ -412,40 +459,50 @@ class TrajectoryGenerator:
         if self.config.save_zarr:
             self._init_zarr_storage()
 
-        q_start, all_q_goals = self._get_start_and_goal_qs()
-        if q_start is None or len(all_q_goals) == 0:
-            print("[TrajectoryGenerator] Failed to get valid start/goal configurations. Skipping this trajectory.")
-            return None
-
-        # Delegate RRT/IK/path-scoring/ruckig to the shared planner. We keep
-        # `_get_start_and_goal_qs()` for goal RESOLUTION (EE-goal vs direct-q
-        # vs random → joint config), then bridge into the planner's EE-pose
-        # API by FK'ing the chosen joint goal to an EE pose. `q_goal_bias` is
-        # seeded with that joint config so the planner's IK converges back to
-        # the same branch. The returned `base_traj` is ALREADY ruckig-smoothed
-        # (with the same conservative 0.5/1.0/10.0 limits configured on the
-        # planner), so no standalone ruckig pass runs here.
-        self._sync_planner_obstacles()
-        q_goal = all_q_goals[0]
-
-        # Prefer a user-specified EE-pose goal as the target for fidelity;
-        # otherwise FK the resolved joint goal to an EE pose.
-        if self.config.ee_pos_goal is not None and self.config.ee_quat_goal is not None:
-            target_ee_pos = np.asarray(self.config.ee_pos_goal, dtype=np.float64)
-            target_ee_quat = np.asarray(self.config.ee_quat_goal, dtype=np.float64)
+        # Reuse the path already validated during env.reset() if one was cached,
+        # skipping the (expensive) base-path re-plan. Consumed exactly once.
+        cached = self._cached_base_traj
+        self._cached_base_traj = None
+        if cached is not None and len(cached) >= 2:
+            base_traj = np.asarray(cached, dtype=np.float64)
+            q_start = base_traj[0].copy()
+            q_goal = base_traj[-1].copy()
+            self._sync_planner_obstacles()
         else:
-            target_ee_pos, target_ee_quat = self._fk_ee_pose(q_goal)
+            q_start, all_q_goals = self._get_start_and_goal_qs()
+            if q_start is None or len(all_q_goals) == 0:
+                print("[TrajectoryGenerator] Failed to get valid start/goal configurations. Skipping this trajectory.")
+                return None
 
-        try:
-            base_traj, _escape_end_q = self._planner.plan(
-                q_start,
-                target_ee_pos,
-                target_ee_quat,
-                q_goal_bias=q_goal,
-            )
-        except RRTPlanningError as e:
-            print(f"[TrajectoryGenerator] RRT planning failed: {e}. Skipping this trajectory (will retry next iteration).")
-            return None  # Failed, will retry next iteration
+            # Delegate RRT/IK/path-scoring/ruckig to the shared planner. We keep
+            # `_get_start_and_goal_qs()` for goal RESOLUTION (EE-goal vs direct-q
+            # vs random → joint config), then bridge into the planner's EE-pose
+            # API by FK'ing the chosen joint goal to an EE pose. `q_goal_bias` is
+            # seeded with that joint config so the planner's IK converges back to
+            # the same branch. The returned `base_traj` is ALREADY ruckig-smoothed
+            # (with the same conservative 0.5/1.0/10.0 limits configured on the
+            # planner), so no standalone ruckig pass runs here.
+            self._sync_planner_obstacles()
+            q_goal = all_q_goals[0]
+
+            # Prefer a user-specified EE-pose goal as the target for fidelity;
+            # otherwise FK the resolved joint goal to an EE pose.
+            if self.config.ee_pos_goal is not None and self.config.ee_quat_goal is not None:
+                target_ee_pos = np.asarray(self.config.ee_pos_goal, dtype=np.float64)
+                target_ee_quat = np.asarray(self.config.ee_quat_goal, dtype=np.float64)
+            else:
+                target_ee_pos, target_ee_quat = self._fk_ee_pose(q_goal)
+
+            try:
+                base_traj, _escape_end_q = self._planner.plan(
+                    q_start,
+                    target_ee_pos,
+                    target_ee_quat,
+                    q_goal_bias=q_goal,
+                )
+            except RRTPlanningError as e:
+                print(f"[TrajectoryGenerator] RRT planning failed: {e}. Skipping this trajectory (will retry next iteration).")
+                return None  # Failed, will retry next iteration
 
         # Debug visualization: show the chosen start/goal then play back the trajectory
         if self.config.debug_visualize:
@@ -462,11 +519,14 @@ class TrajectoryGenerator:
         # Append gripper state (hardcoded 0 = open) as the last column of each q.
         base_traj = np.hstack([base_traj, np.zeros((base_traj.shape[0], 1), dtype=base_traj.dtype)])
 
-        # 2b. Extend the path so that it stays at the last position for a second
-        num_extra_steps = int(1 * self.config.robot_update_rate)
-        last_q = base_traj[-1]
-        extra_steps = np.tile(last_q, (num_extra_steps, 1))
-        base_traj = np.vstack((base_traj, extra_steps))
+        # 2b. Optionally extend the path so it holds the last position for a
+        # second (opt-in via pad_stopped_last_frames; default off — the frozen
+        # tail is otherwise dead frames that inflate episode length).
+        if self.config.pad_stopped_last_frames:
+            num_extra_steps = int(1 * self.config.robot_update_rate)
+            last_q = base_traj[-1]
+            extra_steps = np.tile(last_q, (num_extra_steps, 1))
+            base_traj = np.vstack((base_traj, extra_steps))
 
         # 3. Get EE trajectory for obstacle placement
         base_ee_traj = self._get_ee_trajectory(base_traj)
@@ -521,11 +581,13 @@ class TrajectoryGenerator:
                         modified_traj = None
 
                     if modified_traj is not None:
-                        # Extend the path so that it stays at the last position for a second
-                        num_extra_steps = int(1 * self.config.robot_update_rate)
-                        last_q = modified_traj[-1]
-                        extra_steps = np.tile(last_q, (num_extra_steps, 1))
-                        modified_traj = np.vstack((modified_traj, extra_steps))
+                        # Optionally hold the last position for a second (opt-in;
+                        # see the base_traj site above).
+                        if self.config.pad_stopped_last_frames:
+                            num_extra_steps = int(1 * self.config.robot_update_rate)
+                            last_q = modified_traj[-1]
+                            extra_steps = np.tile(last_q, (num_extra_steps, 1))
+                            modified_traj = np.vstack((modified_traj, extra_steps))
 
                         zarr_group = self._save_trajectory_zarr(
                             modified_traj,
@@ -684,12 +746,20 @@ class TrajectoryGenerator:
         # jointRanges, restPoses is silently ignored and only the joint-state
         # seed weakly influences the converged branch.
         joint_ranges = (self.upper_limits - self.lower_limits).tolist()
+        # maxNumIterations=512 (was 100000): DLS converges or plateaus well
+        # under 200 iterations — profiled identical FK error at 200 vs 100k,
+        # but 100k costs ~14-380 ms/call (residualThreshold=1e-10 never
+        # early-exits). This runs num_ik_candidates (32) times per goal
+        # resolution — including check_able_to_solve inside the env-reset
+        # randomize_objects loop — so the cap turns a multi-second reset
+        # stall into ~60 ms. Bad/inaccurate solutions are still rejected by
+        # the bias-drift check and collision filter below.
         q_solution = self.pb.calculateInverseKinematics(
             self.robot_id,
             ee_link_index,
             ee_pos,
             ee_quat,
-            maxNumIterations=100000,
+            maxNumIterations=512,
             residualThreshold=1e-10,
             lowerLimits=self.lower_limits.tolist(),
             upperLimits=self.upper_limits.tolist(),

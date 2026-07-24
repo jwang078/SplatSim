@@ -165,6 +165,35 @@ def crop_splat(splatsim_obj: SplatSimObject, keep_within_aabb=True):
         splatsim_obj.gaussians._features_dc = pc._features_dc[segmented_indices]
         splatsim_obj.gaussians._scaling = pc._scaling[segmented_indices]
 
+def _flat_link_index(splatsim_obj, segmented_list, num_joints):
+    """Per-gaussian link map: (flat_idx, flat_link).
+
+    `flat_idx` concatenates every link's gaussian indices; `flat_link[i]` is the
+    link that owns `flat_idx[i]`. Together they let one fancy-index gather +
+    scatter replace a per-link loop.
+
+    Valid because the segmentation is a DISJOINT partition — segmented_list[j] is
+    `condition[labels == j]`, and each gaussian carries exactly one label — so
+    "read every link's gaussians, transform, write back" is equivalent whether
+    done link-by-link or all at once. Gaussians with no link (outside the AABB)
+    appear in no segment and are left untouched, exactly as before.
+
+    Cached on the object: the segmentation is static config, so this is built once.
+    """
+    cache = splatsim_obj._cache
+    if cache.get("flat_link_num_joints") != num_joints or "flat_idx" not in cache:
+        segs = [segmented_list[j] for j in range(num_joints)]
+        flat_idx = torch.cat(segs)
+        flat_link = torch.cat([
+            torch.full((s.numel(),), j, dtype=torch.long, device=flat_idx.device)
+            for j, s in enumerate(segs)
+        ])
+        cache["flat_idx"] = flat_idx
+        cache["flat_link"] = flat_link
+        cache["flat_link_num_joints"] = num_joints
+    return cache["flat_idx"], cache["flat_link"]
+
+
 @high_precision_mode
 def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base_position=True, inplace=False, output_slices=None):
     """Transform articulated object gaussians (e.g., robot with multiple joints).
@@ -221,24 +250,55 @@ def transform_means(splatsim_obj: SplatSimObject, transformations_list, use_base
             ).float()
         base_position = splatsim_obj._cache['base_position']
 
-    for joint_index in range(p.getNumJoints(robot_uid)):
-        r_rel, t = transformations_list[joint_index] # T between initial link and current link
+    num_joints = p.getNumJoints(robot_uid)
+
+    # Every link's relative rotation / translation, stacked once and shared by
+    # the xyz, covariance-rotation and SH paths below.
+    R_all = torch.stack([transformations_list[j][0] for j in range(num_joints)])  # (K,3,3)
+    T_all = torch.stack([transformations_list[j][1] for j in range(num_joints)])  # (K,3)
+
+    # Precompute the SH rotation for EVERY link in ONE batched call. Computing
+    # the Wigner-D matrices means a GPU->CPU sync (e3nn runs on CPU) plus an
+    # upload, so doing it per link inside the loop cost ~3 syncs x num_joints
+    # (~69/frame on the UR5+gripper) and was 72% of this function's runtime.
+    # Batched, it's a single sync; the per-link work left in the loop is then
+    # pure GPU math. Output is unchanged — same D, just computed together.
+    shs_D_all = compute_shs_wigner_d(
+        R_all, out_device=shs_featrest.device, out_dtype=shs_featrest.dtype,
+    )
+
+    # Per-gaussian link map, so the position + covariance updates become ONE
+    # gather / transform / scatter instead of one per link (23 pairs of tiny
+    # kernels on the UR5+gripper). Segments are disjoint, so this is equivalent.
+    flat_idx, flat_link = _flat_link_index(splatsim_obj, segmented_list, num_joints)
+    R_sel = R_all[flat_link]  # (M,3,3) each gaussian's link rotation
+    T_sel = T_all[flat_link]  # (M,3)
+
+    # --- means: batched equivalent of
+    #     (x + base) @ r_rel.T - base @ r_rel.T + t     (per link, as before)
+    x = xyz[flat_idx]
+    if use_base_position:
+        x = (
+            torch.einsum('mij,mj->mi', R_sel, x + base_position)
+            - torch.einsum('mij,j->mi', R_sel, base_position)
+            + T_sel
+        )
+    else:
+        x = torch.einsum('mij,mj->mi', R_sel, x) + T_sel
+    xyz[flat_idx] = x
+
+    # --- covariance rotation: r_rel @ R(quat), batched over every gaussian.
+    # o3.quaternion_to_matrix takes (w,x,y,z) format for quaternions
+    rot[flat_idx] = o3.matrix_to_quaternion(
+        torch.bmm(R_sel, o3.quaternion_to_matrix(rot[flat_idx]))
+    )
+
+    # --- SH features stay per link: the apply is already cheap (~1.6 ms total),
+    # and batching it would need a materialised (M,15,15) gather (~110 MB/frame).
+    for joint_index in range(num_joints):
         segment = segmented_list[joint_index]
-
-        if use_base_position:
-            rotated_base_position = base_position @ r_rel.T
-            xyz[segment] = torch.matmul(r_rel, xyz[segment].T + base_position[:, None]).T - rotated_base_position + t
-        else:
-            xyz[segment] = torch.matmul(r_rel, xyz[segment].T).T + t
-        
-        # Defining rotation matrix for the covariance
-        rot_rotation_matrix = r_rel # (inv_rotation_matrix*scale_robot) @ r_rel @ rotation_matrix
-        # o3.quaternion to matrix takes in (w,x,y,z) format for quaternions
-        rot[segment] = o3.matrix_to_quaternion(rot_rotation_matrix @ o3.quaternion_to_matrix(rot[segment]))
-
-        #transform the shs features
         shs_feat = shs_featrest[segment]
-        shs_feat = transform_shs(shs_feat, rot_rotation_matrix)
+        shs_feat = apply_shs_rotation(shs_feat, shs_D_all[joint_index])
         with torch.no_grad():
             shs_featrest[segment] = shs_feat
 
@@ -469,47 +529,74 @@ def transform_object(splatsim_obj: SplatSimObject, pos=None, quat=None, transfor
 
     return xyz_obj, rot_obj, opacity_obj, scales_obj, features_dc_obj, features_rest_obj
 
-# Cached permutation matrix for transform_shs (created once, reused)
+# Cached permutation matrix (and its inverse) for transform_shs. P is a constant
+# permutation, so inverting it on every call was pure waste.
 _P_MATRIX_CACHE = {}
+_P_INV_CACHE = {}
+
 
 @high_precision_mode
-def transform_shs(shs_feat, rotation_matrix):
-    ## rotate shs
+def compute_shs_wigner_d(rotation_matrix, out_device=None, out_dtype=None):
+    """Block-diagonal Wigner-D matrices rotating SH bands l=1..3.
+
+    Args:
+        rotation_matrix: (3, 3) for a single rotation, or (K, 3, 3) for K of them.
+        out_device/out_dtype: where to return D (defaults to the input's).
+
+    Returns:
+        (15, 15) or (K, 15, 15).
+
+    BATCH THIS. e3nn's wigner_D runs on CPU, so every call costs a GPU->CPU sync
+    for the angles plus an upload of the result. transform_means used to call it
+    once per robot link (23x/frame => ~69 syncs/frame, 72% of its runtime);
+    passing all K link rotations in ONE call collapses that to a single sync.
+    """
     device = rotation_matrix.device
     if device not in _P_MATRIX_CACHE:
-        _P_MATRIX_CACHE[device] = torch.tensor([[0, 0, 1], [1, 0, 0], [0, 1, 0]], device=device).float()
-    P = _P_MATRIX_CACHE[device]
-    permuted_rotation_matrix = torch.linalg.inv(P) @ rotation_matrix @ P
+        P = torch.tensor([[0, 0, 1], [1, 0, 0], [0, 1, 0]], device=device).float()
+        _P_MATRIX_CACHE[device] = P
+        # P is a fixed permutation — its inverse is constant, so cache it instead
+        # of running torch.linalg.inv on every call.
+        _P_INV_CACHE[device] = torch.linalg.inv(P)
+    P, P_inv = _P_MATRIX_CACHE[device], _P_INV_CACHE[device]
+
+    # Broadcasts over a leading batch dim when rotation_matrix is (K, 3, 3).
+    permuted_rotation_matrix = P_inv @ rotation_matrix @ P
     rot_angles = o3._rotation.matrix_to_angles(permuted_rotation_matrix)
-    rot_angles = (rot_angles[0].cpu(), rot_angles[1].cpu(), rot_angles[2].cpu())
-    
+    # ONE sync for the whole batch (this is the expensive bit).
+    a, b, c = rot_angles[0].cpu(), rot_angles[1].cpu(), rot_angles[2].cpu()
+
     # Construction coefficient
-    D_1 = o3.wigner_D(1, rot_angles[0], - rot_angles[1], rot_angles[2]).to(device=shs_feat.device)
-    D_2 = o3.wigner_D(2, rot_angles[0], - rot_angles[1], rot_angles[2]).to(device=shs_feat.device)
-    D_3 = o3.wigner_D(3, rot_angles[0], - rot_angles[1], rot_angles[2]).to(device=shs_feat.device)
+    D_1 = o3.wigner_D(1, a, -b, c)
+    D_2 = o3.wigner_D(2, a, -b, c)
+    D_3 = o3.wigner_D(3, a, -b, c)
 
-    # shs_feat: (..., 15, 3)   # [SH-index, RGB]
-    # D_1: (..., 3, 3) or (3,3)
-    # D_2: (..., 5, 5) or (5,5)
-    # D_3: (..., 7, 7) or (7,7)
-
-    device = shs_feat.device
-    dtype  = shs_feat.dtype
+    device = out_device if out_device is not None else device
+    dtype = out_dtype if out_dtype is not None else rotation_matrix.dtype
 
     # Build block-diagonal Wigner-D. If D_1/2/3 are batched (have leading ...),
     # make a batched block-diagonal; otherwise a single 15x15 is fine.
-
     if D_1.dim() == 2:  # unbatched (3,3),(5,5),(7,7)
-        D = torch.block_diag(D_1.to(device=device, dtype=dtype),
-                            D_2.to(device=device, dtype=dtype),
-                            D_3.to(device=device, dtype=dtype))                    # (15,15)
-    else:
-        # batched: D_1: (...,3,3), etc. Build (...,15,15)
-        *batch, _, _ = D_1.shape
-        D = torch.zeros(*batch, 15, 15, device=device, dtype=dtype)
-        D[...,  0: 3,  0: 3] = D_1
-        D[...,  3: 8,  3: 8] = D_2
-        D[...,  8:15,  8:15] = D_3
+        return torch.block_diag(D_1.to(device=device, dtype=dtype),
+                                D_2.to(device=device, dtype=dtype),
+                                D_3.to(device=device, dtype=dtype))     # (15,15)
+    # batched: D_1: (...,3,3), etc. Build (...,15,15)
+    *batch, _, _ = D_1.shape
+    D = torch.zeros(*batch, 15, 15, device=device, dtype=dtype)
+    D[...,  0: 3,  0: 3] = D_1.to(device=device, dtype=dtype)
+    D[...,  3: 8,  3: 8] = D_2.to(device=device, dtype=dtype)
+    D[...,  8:15,  8:15] = D_3.to(device=device, dtype=dtype)
+    return D
+
+
+@high_precision_mode
+def apply_shs_rotation(shs_feat, D):
+    """Apply a precomputed block-diagonal Wigner-D to SH features, in place.
+
+    shs_feat: (..., 15, 3)  [SH-index, RGB];  D: (15, 15) or broadcastable.
+    Pure GPU work with no host sync — cheap, unlike computing D.
+    """
+    D = D.to(device=shs_feat.device, dtype=shs_feat.dtype)
 
     # take l=1..3 bands and move RGB before SH for a single einsum
     sh = einops.rearrange(shs_feat[..., :15, :], '... s r -> ... r s')  # (..., 3, 15)
@@ -521,6 +608,20 @@ def transform_shs(shs_feat, rotation_matrix):
     shs_feat[..., :15, :] = einops.rearrange(sh_rot, '... r i -> ... i r')  # (..., 15, 3)
 
     return shs_feat
+
+
+def transform_shs(shs_feat, rotation_matrix):
+    """Rotate SH features by a single rotation matrix (compute D, then apply).
+
+    Convenience wrapper preserving the original API. When rotating MANY sets by
+    MANY rotations (e.g. once per robot link), don't call this in a loop — call
+    compute_shs_wigner_d() ONCE with all the rotations stacked, then
+    apply_shs_rotation() per set. That turns N host syncs into one.
+    """
+    return apply_shs_rotation(
+        shs_feat,
+        compute_shs_wigner_d(rotation_matrix, out_device=shs_feat.device, out_dtype=shs_feat.dtype),
+    )
 
 
 def get_segmented_indices(splatsim_obj: SplatSimObject):

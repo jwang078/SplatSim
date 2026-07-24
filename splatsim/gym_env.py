@@ -23,6 +23,7 @@ def _raw_obs_to_gym_obs(raw_obs: Dict[str, Any], num_dofs: int, camera_names: li
     if isinstance(gripper, (list, np.ndarray)):
         gripper = float(gripper[0]) if len(gripper) > 0 else 0.0
 
+    # observation.state (agent_pos) is proprioception ONLY: [joints, gripper].
     agent_pos = np.concatenate([joint_positions, [gripper]]).astype(np.float32)
 
     pixels = {}
@@ -42,6 +43,13 @@ def _raw_obs_to_gym_obs(raw_obs: Dict[str, Any], num_dofs: int, camera_names: li
                 pixels[key] = np.zeros((224, 224, 3), dtype=np.uint8)
 
     gym_obs = {"agent_pos": agent_pos, "pixels": pixels}
+
+    # Privileged world state (object coords, ...) for oracle/state-only policies,
+    # exposed as a SEPARATE key mapped to observation.environment_state. Omitted
+    # when empty (normal envs). Must match build_lerobot_frame's recording layout.
+    env_state = np.asarray(raw_obs.get("environment_state", []), dtype=np.float32).reshape(-1)
+    if len(env_state):
+        gym_obs["environment_state"] = env_state
 
     if "policy_guidance_chunk" in raw_obs:
         gym_obs["policy_guidance_chunk"] = np.array(raw_obs["policy_guidance_chunk"], dtype=np.float32)
@@ -106,6 +114,12 @@ class SplatSimGymEnv(gym.Env):
                             remap[dk] = v
                             break
             gym_obs["pixels"] = remap
+        # The SplatSim server ALWAYS emits environment_state (oracle info) so
+        # recordings are dual-purpose (image + oracle). But an image-only eval env
+        # (env_state_dim=0 → observation_space omits it) must not leak an
+        # undeclared key into the vectorized rollout — drop it unless declared.
+        if "environment_state" in gym_obs and "environment_state" not in self.observation_space.spaces:
+            gym_obs.pop("environment_state")
         return gym_obs
 
     def step(self, action: np.ndarray):
@@ -221,6 +235,22 @@ class SplatSimGymEnv(gym.Env):
                     padded_images.append(img)
                 # Stack all RGB images horizontally
                 return np.concatenate(padded_images, axis=1)
+
+            # No policy camera images (e.g. a state-only oracle eval, camera_names
+            # = []). Fall back to a fixed third-person debug view so eval videos
+            # still work — you can watch the arm even though the policy consumes no
+            # pixels. lerobot only renders the handful of episodes it actually
+            # saves (first-N + failures) for an image-free policy, so this overhead
+            # is bounded. Only the in-process server has the pybullet renderer; a
+            # remote ZMQ backend has no local pybullet and returns None here.
+            render_cam = getattr(self.robot_server, "_render_pybullet_camera", None)
+            if render_cam is not None:
+                try:
+                    chw = render_cam("base_rgb")  # falls back to fixed PYBULLET_CAMERA_* pose
+                except Exception:
+                    chw = None
+                if chw is not None:
+                    return (np.transpose(np.asarray(chw), (1, 2, 0)) * 255.0).clip(0, 255).astype(np.uint8)
         return None
 
     def close(self):
@@ -297,8 +327,16 @@ def _populate_registry():
         BWAPybulletRobotServer,
         OpenSpaceBWAPybulletRobotServer,
     )
+    from splatsim.robots.sim_robot_pybullet_planar import (
+        Planar3JointPybulletRobotServer,
+        Planar3JointOraclePybulletRobotServer,
+        Planar3JointOracleSimplePybulletRobotServer,
+    )
 
     register_env("small_engine", SmallEnginePybulletRobotServer)
+    register_env("planar_3joint", Planar3JointPybulletRobotServer)
+    register_env("planar_3joint_oracle", Planar3JointOraclePybulletRobotServer)
+    register_env("planar_3joint_oracle_simple", Planar3JointOracleSimplePybulletRobotServer)
     register_env("upright_small_engine_new", UprightRobotSmallEngineNewPybulletRobotServer)
     register_env("upright_small_engine_new_strict", UprightRobotSmallEngineNewStrictPybulletRobotServer)
     register_env("object_on_plate", ObjectOnPlatePybulletRobotServer)
@@ -460,10 +498,11 @@ class _ZMQBackend:
     PLACEHOLDER_TIME_DIM = 1
 
     def __init__(self, client, camera_names, image_resize_modes, num_dofs, image_height, image_width,
-                 max_episode_steps=400):
+                 max_episode_steps=400, env_state_dim=0):
         self._client = client
         self._max_episode_steps = max_episode_steps
         self._num_dofs = num_dofs
+        self._env_state_dim = env_state_dim
         self.camera_names = camera_names
         self.image_resize_modes = image_resize_modes
         self.action_space = spaces.Box(
@@ -472,7 +511,7 @@ class _ZMQBackend:
         )
         # observation_space uses bare camera names (no mode suffix) to match lerobot's features_map.
         # policy_guidance_chunk is always declared; NaN when no guidance process is active.
-        self.observation_space = spaces.Dict({
+        obs_space = {
             "agent_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(num_dofs + 1,), dtype=np.float32),
             "pixels": spaces.Dict({
                 cam: spaces.Box(low=0, high=255, shape=(image_height, image_width, 3), dtype=np.uint8)
@@ -480,7 +519,13 @@ class _ZMQBackend:
             }),
             # TODO what if the policy_guidance_chunk has a variable time dimension (e.g. N, 7)? We could declare it as shape=(None, num_dofs + 1) but Gym doesn't support None dimensions.
             "policy_guidance_chunk": spaces.Box(low=-np.inf, high=np.inf, shape=(self.PLACEHOLDER_TIME_DIM, num_dofs + 1), dtype=np.float32),
-        })
+        }
+        # Oracle/state-only envs expose privileged world state as a separate
+        # observation.environment_state feature (FeatureType.ENV downstream).
+        if env_state_dim > 0:
+            obs_space["environment_state"] = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(env_state_dim,), dtype=np.float32)
+        self.observation_space = spaces.Dict(obs_space)
 
     def _get_policy_guidance(self, raw_obs):
         pga = raw_obs.get("policy_guidance_chunk")
@@ -538,13 +583,14 @@ class ZMQSplatSimGymEnv(SplatSimGymEnv):
 
     def __init__(self, host, port, camera_names, image_resize_modes,
                  num_dofs=6, image_height=224, image_width=224, render_mode=None,
-                 include_oracle_info: bool = False, **kwargs):
+                 include_oracle_info: bool = False, env_state_dim: int = 0, **kwargs):
         from gello.zmq_core.robot_node import ZMQClientRobot
 
         client = ZMQClientRobot(port=port, host=host)
         backend = _ZMQBackend(
             client,
             camera_names, image_resize_modes, num_dofs, image_height, image_width,
+            env_state_dim=env_state_dim,
             **kwargs,
         )
         super().__init__(robot_server=backend, render_mode=render_mode)  # type: ignore[arg-type]

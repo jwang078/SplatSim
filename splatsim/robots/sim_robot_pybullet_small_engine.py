@@ -24,6 +24,14 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     # To fill in with subclasses
     ENV_CONFIG: EnvConfig
 
+    # Mild per-joint viscous damping for the UR5 arm (URDF declares none). Real
+    # servo-controlled joints have friction; the heavy UR5 is already near
+    # critically damped, so a small value suffices (vs. the light planar arm's
+    # 2.0). Applied by the base's `_apply_joint_damping()`. Calibrate to the
+    # real UR5's settling response; note nonzero damping changes recorded
+    # dynamics vs. datasets captured at damping=0.
+    JOINT_DAMPING = 0.5
+
     # UR URDF: base_link(0) and upper_arm_link(2) are non-adjacent (separated
     # by shoulder_link(1)) but the shoulder bracket places upper_arm_link's
     # lower face ~4 mm above base_link's top face. Any self_collision_clearance
@@ -136,16 +144,14 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         (6, 14),  # wrist_3 vs right_outer_knuckle
         (6, 18),  # wrist_3 vs right_inner_knuckle
         # ---- Gripper-internal URDF mesh overlaps (Robotiq 2F-85 design) ----
-        # The parallel-jaw mimic mechanism has visual meshes that
-        # geometrically overlap at the pivot — URDF artifacts, not real
-        # collisions. Audit confirms constant penetration at −13.51 mm
-        # for finger↔knuckle and small oscillation around 0 mm for
-        # finger_pad↔knuckle across every sampled config. Kept so the
-        # planner doesn't reject every gripper-present pose.
-        (11, 13),  # left_inner_finger      ↔ left_inner_knuckle
-        (12, 13),  # left_inner_finger_pad  ↔ left_inner_knuckle
-        (16, 18),  # right_inner_finger     ↔ right_inner_knuckle
-        (17, 18),  # right_inner_finger_pad ↔ right_inner_knuckle
+        # No longer listed here by index. The Robotiq gripper is shared across
+        # robots, so its skip pairs live in the base class's
+        # GRIPPER_SELF_COLLISION_SKIP_PAIR_NAMES (by link name) and are resolved
+        # + merged into SELF_COLLISION_SKIP_PAIRS at construction. For this UR5
+        # they resolve to exactly the old hardcoded indices —
+        # (11,13),(12,13),(16,18),(17,18) — so this env's skippable set is
+        # UNCHANGED, but the planar debug env now shares the identical
+        # definition. See _init_self_collision_skip_pairs.
     ]
 
     # Additional pairs skipped ONLY by the env-side eval-terminate check
@@ -172,12 +178,53 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
         (4, 19),  # wrist_1 ↔ wrist_camera_link — same wrist-cam mesh class
     ]
 
+    def __init__(
+        self,
+        in_collision_obstacle_clearance: float = 0.005,
+        in_collision_self_collision_clearance: float = 0.005,
+        **kwargs,
+    ):
+        # Near-miss clearances used by check_metrics()'s is_robot_in_collision()
+        # when reporting `in_collision`. Default 5 mm (bumped from historical
+        # 0.0 = penetration-only) because PyBullet's constraint solver holds
+        # rigid bodies at ~0 mm gap under contact force — a link PRESSED against
+        # an obstacle stays a rounding hair above zero penetration, so the old
+        # penetration-only check silently missed "arm slid into obstacle" and
+        # "arm folded onto own body" cases. 5 mm matches the SA wrapper's
+        # `rrt_self_collision_clearance=0.005` default so env-terminate agrees
+        # with what the planner treats as a collision. Lives on THIS shared base
+        # so every SmallEngine-derived env — the UR5 concrete classes AND the
+        # planar debug arm — accepts --in_collision_*_clearance identically
+        # (check_metrics here already reads these attributes). Callers who
+        # NEED penetration-only semantics (legacy scripts, unit tests) can
+        # still pass `--in_collision_obstacle_clearance=0` to restore.
+        self._in_collision_obstacle_clearance = float(in_collision_obstacle_clearance)
+        self._in_collision_self_collision_clearance = float(in_collision_self_collision_clearance)
+        super().__init__(**kwargs)
+
     def plan_given_this_state(self, initial_joint_positions):
         all_paths = []
         return all_paths
 
     def serve_loop(self) -> None:
         pass
+
+    def _resolve_goal_ee_target(self):
+        """Goal for the reset-time reachability check: the fixed task EE pose.
+
+        Upgrades this env's reset from 'a goal CONFIG exists' to 'a full RRT
+        PATH from the random start reaches the goal' (see base
+        `_check_scenario_solvable`). Returns None if no task pose is configured,
+        which falls back to the legacy `check_able_to_solve`."""
+        task = self.ENV_CONFIG.task
+        if task is None or task.target_ee_pos is None or task.target_ee_quat is None:
+            return None
+        bias = list(task.q_goal_bias) if task.q_goal_bias is not None else None
+        return (
+            np.asarray(task.target_ee_pos, dtype=np.float64),
+            np.asarray(task.target_ee_quat, dtype=np.float64),
+            bias,
+        )
 
     # =========================================================================
     # Gym Environment Interface
@@ -396,6 +443,18 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
     background_splat_name = DEFAULT_ROBOT_NAME
     # base_camera_splat_name = "robot_iphone_w_engine_new"
 
+    # PyBullet-camera pose for the "pybullet" render mode (dropdown). The base
+    # default frames the PLANAR env from the -Y side, which for THIS scene sits
+    # behind the wall (y=-0.225) and renders only the wall. Reuse this env's
+    # tuned debug-camera framing (orbit form) so the third-person view actually
+    # shows the robot + engine + table. NOTE: this camera pose lives on the
+    # concrete class (not the shared SmallEngine base) so it doesn't override
+    # the planar env's own eye/target pose.
+    PYBULLET_CAMERA_TARGET = (0.0, 0.0, 0.3)
+    PYBULLET_CAMERA_DISTANCE = 2.0
+    PYBULLET_CAMERA_YAW = 180.0
+    PYBULLET_CAMERA_PITCH = -30.0
+
     ENV_CONFIG = EnvConfig(
         # name="upright_robot_small_engine_new",
         name="upright_robot_small_engine_curtain",
@@ -513,20 +572,9 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
         ],
     )
 
-    def __init__(
-        self,
-        in_collision_obstacle_clearance: float = 0.0,
-        in_collision_self_collision_clearance: float = 0.0,
-        **kwargs,
-    ):
-        # Clearances used by check_metrics() when reporting `in_collision`.
-        # Defaults preserve historical behavior (0 m on both = actual contact /
-        # penetration only). When non-zero (typically forwarded from the
-        # caller's `rrt_obstacle_clearance` / `rrt_self_collision_clearance`
-        # so the blend-collision filter matches what RRT planning treats as
-        # a collision), `is_robot_in_collision` reports near-misses too.
-        self._in_collision_obstacle_clearance = float(in_collision_obstacle_clearance)
-        self._in_collision_self_collision_clearance = float(in_collision_self_collision_clearance)
+    def __init__(self, **kwargs):
+        # in_collision_*_clearance is handled by SmallEnginePybulletRobotServer
+        # (shared with the planar env); it flows through **kwargs to super().
         super().__init__(**kwargs)
         # Set initial camera position on the opposite side of the wall (positive y side)
         # Camera looks at the origin from the positive y side, above the floor

@@ -61,17 +61,67 @@ class Args:
     # replay + collision-check filtering.
     headless: bool = False
 
+    # Keep the Tkinter "SplatSim Controls" panel even when --headless. pybullet
+    # still connects DIRECT (no 3D OpenGL window, EGL GPU rendering, no ~30 Hz
+    # render-loop throttle), but the control panel launches so you can pick modes,
+    # tune the trajectory config, and press Start interactively — with fast
+    # headless rendering. Needs a display for Tkinter (use on a workstation, not a
+    # display-less node). No effect without --headless (a GUI run already shows
+    # the panel). Only wired for the pybullet sim envs.
+    control_gui: bool = False
+
+    # Path to a trajectory-generator config JSON exported from the SplatSim GUI
+    # ("Export Config" in the Traj Gen panel). When set, its values are applied
+    # to the server's trajectory generator at startup — so you can tune settings
+    # interactively in the GUI, export, then re-run generation elsewhere (e.g.
+    # headless) with the exact same config. Loaded field-by-field and tolerant of
+    # schema drift (see splatsim/utils/config_io.py); only affects envs that have
+    # a trajectory generator.
+    traj_config_file: Optional[str] = None
+
+    # When True, skip the per-step gsplat camera render: get_observations
+    # returns None for every image key but still runs physics, joint/EE
+    # state, metrics, and RRT. Much faster when you don't need images (e.g.
+    # scripted/collision-only runs). Unlike --headless this keeps the GUI
+    # and the base camera loaded, so you can flip rendering back on at
+    # runtime via the server's enable_rendering().
+    no_camera_rendering: bool = False
+
+    # Client-driven physics: when True, physics only steps in response to a
+    # client `command_joint_state` call — the main serve loop's autonomous
+    # 240 Hz step is disabled. Eliminates the "sim races ahead while the
+    # policy is thinking" pathology visible with slow policies (e.g. a
+    # diffusion U-Net taking 200-500 ms per chunk-boundary inference; the
+    # sim was previously advancing physics under the last commanded target
+    # during that entire window, so the robot visibly jumped forward when
+    # the client resumed and could catch up). Each command runs
+    # `physics_substeps_per_command` (default 8) `stepSimulation` calls,
+    # matching the async default rate of 240 Hz when the client is running
+    # at 30 Hz. Only affects INTERACTIVE / EVAL_BENCHMARK* modes.
+    sync_physics_to_client: bool = False
+    physics_substeps_per_command: int = 8
+
+    # Image-observation source: "splat" (Gaussian-splat render), "pybullet"
+    # (fast PyBullet getCameraImage — works without splat assets), or "none"
+    # (state/action-only, fastest). Overrides --no_camera_rendering when set.
+    # If unset, the env's own default is used (splat envs -> splat; the planar
+    # env -> pybullet). Also switchable at runtime via the GUI "Render mode"
+    # dropdown.
+    render_mode: Optional[str] = None
+
     # Clearances used by the robot server's ``check_metrics()`` when
-    # reporting ``info["in_collision"]``. Defaults preserve historical
-    # behavior (0 m on both = actual contact / penetration only). Set
-    # non-zero (typically matching the DAgger SA wrapper's
-    # ``rrt_obstacle_clearance`` / ``rrt_self_collision_clearance``) so
-    # downstream collision filters / termination triggers consider
-    # near-misses as collisions too. Forwarded to the robot server's
-    # constructor; ignored by robot variants that don't accept the
-    # corresponding kwargs.
-    in_collision_obstacle_clearance: float = 0.0
-    in_collision_self_collision_clearance: float = 0.0
+    # reporting ``info["in_collision"]``. Default 5 mm (bumped from historical
+    # 0.0 = penetration-only) because PyBullet's constraint solver holds rigid
+    # bodies at ~0 mm gap under contact force — a link pressed against an
+    # obstacle stays a rounding hair above zero penetration, so the old
+    # penetration-only default silently missed "arm slid into obstacle" and
+    # "arm folded onto own body" cases. 5 mm matches the SA wrapper's
+    # ``rrt_self_collision_clearance=0.005`` default so env-terminate agrees
+    # with what the planner treats as a collision. Forwarded to the robot
+    # server's constructor; ignored by robot variants that don't accept the
+    # corresponding kwargs. Pass ``0`` explicitly to restore penetration-only.
+    in_collision_obstacle_clearance: float = 0.005
+    in_collision_self_collision_clearance: float = 0.005
 
 
 def _resolve_default_robot_name(robot_variant: str) -> str:
@@ -94,6 +144,13 @@ def _resolve_default_robot_name(robot_variant: str) -> str:
             UprightRobotSmallEngineNewPybulletRobotServer,
         )
         return UprightRobotSmallEngineNewPybulletRobotServer.DEFAULT_ROBOT_NAME
+    if robot_variant in ("sim_pybullet_planar_interactive",
+                         "sim_pybullet_planar_oracle_interactive",
+                         "sim_pybullet_planar_oracle_simple_interactive"):
+        from splatsim.robots.sim_robot_pybullet_planar import (
+            Planar3JointPybulletRobotServer,
+        )
+        return Planar3JointPybulletRobotServer.DEFAULT_ROBOT_NAME  # all share robot_name=planar_3joint
     # Fallback: base class default.
     from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
     return PybulletRobotServerBase.DEFAULT_ROBOT_NAME
@@ -114,6 +171,17 @@ def launch_robot_server(args: Args):
     # hardcoded string on the launch side.
     if args.robot_name is None:
         args.robot_name = _resolve_default_robot_name(args.robot)
+
+    # Resolve the image-observation source. --render_mode wins; else the legacy
+    # --no_camera_rendering maps to NONE; else None = let the env pick its
+    # default (splat envs -> splat; planar -> pybullet via RENDER_PYBULLET_CAMERA).
+    from splatsim.configs.mode_config import RenderMode
+    if args.render_mode is not None:
+        resolved_render_mode = RenderMode(args.render_mode)
+    elif args.no_camera_rendering:
+        resolved_render_mode = RenderMode.NONE
+    else:
+        resolved_render_mode = None
 
     with open("configs/object_configs/objects.yaml", "r") as f:
         object_config = yaml.safe_load(f)
@@ -236,8 +304,12 @@ def launch_robot_server(args: Args):
            eval_benchmark_subset=args.eval_benchmark_subset,
            wrist_cam_ver=args.wrist_cam_ver,
            headless=args.headless,
+           show_control_gui=args.control_gui,
+           render_mode=resolved_render_mode,
            in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
            in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
+           sync_physics_to_client=args.sync_physics_to_client,
+           physics_substeps_per_command=args.physics_substeps_per_command,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_strict":
@@ -259,8 +331,80 @@ def launch_robot_server(args: Args):
            eval_benchmark_repo_id=args.eval_benchmark_repo_id,
            eval_benchmark_subset=args.eval_benchmark_subset,
            wrist_cam_ver=args.wrist_cam_ver,
+           render_mode=resolved_render_mode,
            in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
            in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
+        )
+
+    elif args.robot == "sim_pybullet_planar_interactive":
+        # Fast planar 3-joint arm. RENDER_SPLATS=False -> no splat assets/base
+        # camera, so SPLAT is unavailable; it defaults to the PyBullet camera
+        # (RENDER_PYBULLET_CAMERA=True). Pass --render_mode {pybullet,none} to
+        # pick, or the GUI "Render mode" dropdown at runtime.
+        from splatsim.robots.sim_robot_pybullet_planar import Planar3JointPybulletRobotServer
+
+        # Auto-switch to EVAL_BENCHMARK when an eval-benchmark dataset is given so
+        # the server cycles through its recorded scenarios (via the reset's
+        # benchmark_start_index) instead of doing a RANDOM reset — and so the GUI
+        # opens on the Eval Benchmark tab. Mirrors the small_engine branch.
+        serve_mode = (
+            Planar3JointPybulletRobotServer.SERVE_MODES.EVAL_BENCHMARK
+            if args.eval_benchmark_repo_id is not None
+            else Planar3JointPybulletRobotServer.SERVE_MODES.INTERACTIVE
+        )
+        server = Planar3JointPybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=serve_mode,
+           camera_names=["base_rgb"], robot_name=args.robot_name, use_gripper=use_gripper,
+           render_mode=resolved_render_mode,
+           debug_mode=args.debug_mode,
+           eval_benchmark_repo_id=args.eval_benchmark_repo_id,
+           eval_benchmark_subset=args.eval_benchmark_subset,
+           headless=args.headless,
+           show_control_gui=args.control_gui,
+           in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
+           in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
+           sync_physics_to_client=args.sync_physics_to_client,
+           physics_substeps_per_command=args.physics_substeps_per_command,
+        )
+
+    elif args.robot in ("sim_pybullet_planar_oracle_interactive",
+                        "sim_pybullet_planar_oracle_simple_interactive"):
+        # Oracle-state planar env: observation.state carries exact object coords
+        # (goal + obstacles) for a STATE-ONLY policy. `_simple_` = 0 obstacles.
+        # We KEEP the base_rgb camera so the SplatSim GUI's pybullet render panel
+        # works (blank with camera_names=[]) and you get a free vision dataset;
+        # the policy stays image-free because training uses --cameras=state
+        # (input_features = observation.state only).
+        from splatsim.robots.sim_robot_pybullet_planar import (
+            Planar3JointOraclePybulletRobotServer,
+            Planar3JointOracleSimplePybulletRobotServer,
+        )
+        _oracle_cls = (
+            Planar3JointOracleSimplePybulletRobotServer
+            if args.robot == "sim_pybullet_planar_oracle_simple_interactive"
+            else Planar3JointOraclePybulletRobotServer
+        )
+        # See the sim_pybullet_planar_interactive branch: EVAL_BENCHMARK when a
+        # benchmark dataset is given (cycles recorded scenarios + opens the Eval
+        # Benchmark tab), else INTERACTIVE.
+        serve_mode = (
+            _oracle_cls.SERVE_MODES.EVAL_BENCHMARK
+            if args.eval_benchmark_repo_id is not None
+            else _oracle_cls.SERVE_MODES.INTERACTIVE
+        )
+        server = _oracle_cls(
+           port=port, host=args.hostname, serve_mode=serve_mode,
+           camera_names=["base_rgb"], robot_name=args.robot_name, use_gripper=use_gripper,
+           render_mode=resolved_render_mode,
+           debug_mode=args.debug_mode,
+           eval_benchmark_repo_id=args.eval_benchmark_repo_id,
+           eval_benchmark_subset=args.eval_benchmark_subset,
+           headless=args.headless,
+           show_control_gui=args.control_gui,
+           in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
+           in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
+           sync_physics_to_client=args.sync_physics_to_client,
+           physics_substeps_per_command=args.physics_substeps_per_command,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_stretchimg":
@@ -394,8 +538,20 @@ def launch_robot_server(args: Args):
             )
         server = ZMQServerRobot(robot, port=port, host=args.hostname)
         print(f"Starting robot server on port {port}")
-    
-    
+
+    # Apply a GUI-exported trajectory-generator config, if given. Field-driven +
+    # schema-drift tolerant (config_io), and updates the config IN PLACE so the
+    # generator and GUI keep the same object.
+    if getattr(args, "traj_config_file", None):
+        gen = getattr(server, "trajectory_generator", None)
+        if gen is not None and getattr(gen, "config", None) is not None:
+            from splatsim.utils.config_io import update_dataclass_json
+            update_dataclass_json(gen.config, args.traj_config_file, warn=print)
+            print(f"[launch] Applied traj config from {args.traj_config_file}")
+        else:
+            print(f"[launch] --traj_config_file set but '{args.robot}' has no trajectory "
+                  f"generator; ignoring.")
+
     try:
         server.serve()
     except KeyboardInterrupt:

@@ -151,15 +151,15 @@ def make_collage(row: pd.Series, base_cols: list[str], wrist_cols: list[str]) ->
     return np.concatenate([base_row, wrist_row], axis=0)
 
 
-def generate_output_path(parquet_folder: str, episode_str: str | None) -> str:
-    """Generate output video path based on parquet folder and episode."""
+def generate_output_path(parquet_folder: str, episode_str: str | None, fmt: str = "mp4") -> str:
+    """Generate output video path based on parquet folder, episode, and format."""
     parts = parquet_folder.rstrip("/").split("/")
     chunk_name = parts[-1]
     dataset_name = parts[-3]
 
     output_dir = "outputs/view_lerobot_parquet_video"
     ep_str = f"episode_{episode_str}" if episode_str is not None else "all_episodes"
-    output_filename = f"{dataset_name}_{chunk_name}_{ep_str}.mp4"
+    output_filename = f"{dataset_name}_{chunk_name}_{ep_str}.{fmt}"
     return os.path.join(output_dir, output_filename)
 
 
@@ -181,8 +181,18 @@ def _prepare_df(df: pd.DataFrame, episodes: list[int] | None = None) -> pd.DataF
     return df
 
 
-def save_video(df: pd.DataFrame, output_path: str, episodes: list[int] | None = None, fps: int = 30):
-    """Save collage video of all base_rgb* and wrist_rgb* columns to a file."""
+def save_video(
+    df: pd.DataFrame,
+    output_path: str,
+    episodes: list[int] | None = None,
+    fps: int = 30,
+    gif_fps: int = 10,
+):
+    """Save collage video of all base_rgb* and wrist_rgb* columns to a file.
+
+    GIFs are subsampled to ~gif_fps (keeping every Nth frame) so playback stays
+    real-time while the file shrinks proportionally.
+    """
     df = _prepare_df(df, episodes)
 
     base_cols, wrist_cols = find_image_columns(df)
@@ -190,9 +200,18 @@ def save_video(df: pd.DataFrame, output_path: str, episodes: list[int] | None = 
     print(f"Wrist columns: {wrist_cols}")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    print(f"Saving {len(df)} frames at {fps} FPS to {output_path}")
 
-    writer = imageio.get_writer(output_path, fps=fps, codec='libx264', pixelformat='yuv420p')
+    if output_path.lower().endswith(".gif"):
+        stride = max(1, round(fps / gif_fps))
+        if stride > 1:
+            df = df.iloc[::stride]
+            fps = fps / stride
+            print(f"GIF: keeping every {stride}th frame ({len(df)} frames at {fps:g} FPS)")
+        print(f"Saving {len(df)} frames at {fps:g} FPS to {output_path}")
+        writer = imageio.get_writer(output_path, fps=fps, loop=0)
+    else:
+        print(f"Saving {len(df)} frames at {fps} FPS to {output_path}")
+        writer = imageio.get_writer(output_path, fps=fps, codec='libx264', pixelformat='yuv420p')
 
     for frame_idx in range(len(df)):
         row = df.iloc[frame_idx]
@@ -702,6 +721,21 @@ def main():
         help="Save video to file instead of displaying interactively",
     )
     parser.add_argument(
+        "-f",
+        "--format",
+        type=str,
+        choices=["mp4", "gif"],
+        default="mp4",
+        help="Output format for --save_video (default: mp4)",
+    )
+    parser.add_argument(
+        "--gif_fps",
+        type=int,
+        default=10,
+        help="Target FPS for GIF output; frames are subsampled from --fps to keep "
+        "real-time playback speed (default: 10)",
+    )
+    parser.add_argument(
         "--pause-every-episode",
         action="store_true",
         help="When playing back, auto-pause TWICE at each episode boundary: "
@@ -731,8 +765,8 @@ def main():
     df = load_parquet_dataset(args.parquet_folder, episodes)
 
     if args.save_video:
-        output_path = generate_output_path(args.parquet_folder, args.episode)
-        save_video(df, output_path, episodes, args.fps)
+        output_path = generate_output_path(args.parquet_folder, args.episode, args.format)
+        save_video(df, output_path, episodes, args.fps, gif_fps=args.gif_fps)
     else:
         play_video(df, episodes, args.fps, pause_every_episode=args.pause_every_episode)
 

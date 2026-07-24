@@ -235,6 +235,35 @@ robot_iphone_w_engine_curtain:
   is_articulated: true
   use_fixed_base: true
   wrist_camera_link_name: wrist_camera_link
+# Simple planar 3-joint (RRR) arm — physics-only, no Gaussian splat. Used by
+# the fast, non-rendered oracle-info env (PlanarPybulletRobotServer, which sets
+# RENDER_SPLATS=False). No `transformation` / `model_path` / labels.npy needed
+# because nothing is ever rendered from a splat. The Robotiq 2F-85 gripper and
+# wrist_camera_link (EE reference) come from planar_3joint.urdf.
+planar_3joint:
+  urdf_path: ./splatsim/robot_definitions/urdf/planar_3joint.urdf
+  base_position:
+  - 0.0
+  - 0.0
+  - 0.0
+  use_gripper: true
+  is_articulated: true
+  use_fixed_base: true
+  wrist_camera_link_name: wrist_camera_link
+  articulation_config:
+    # [joint_1, joint_2, joint_3, gripper]. Index num_dofs(=3) is the gripper
+    # command (0 = open). The three arm joints start bent so the gripper faces
+    # down toward the table.
+    initial_joint_positions:
+    - 0.5
+    - -0.9
+    - -0.8
+    - 0.0
+    joint_signs:
+    - 1
+    - 1
+    - 1
+    - 1
 bwa_open_space:
   transformation:
     matrix:

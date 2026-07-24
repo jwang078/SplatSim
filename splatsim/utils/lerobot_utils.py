@@ -12,18 +12,38 @@ from typing import List, Optional
 import numpy as np
 
 
-def build_lerobot_features(image_keys: List[str], num_dofs: int = 6) -> dict:
+def build_lerobot_features(
+    image_keys: List[str],
+    num_dofs: int = 6,
+    state_dim: Optional[int] = None,
+    env_state_dim: int = 0,
+) -> dict:
     """Build the standard LeRobotDataset feature spec for SplatSim recordings.
 
     Args:
         image_keys: obs dict keys to use as images
                     (e.g. ["base_rgb_letterbox"] from the sim,
                      or ["base_rgb"] from a real-robot wrapper)
-        num_dofs: number of arm joints (gripper adds 1 more, so state/action
-                  shape will be num_dofs + 1)
+        num_dofs: number of arm joints (gripper adds 1 more, so ACTION shape is
+                  num_dofs + 1)
+        state_dim: observation.state width. Defaults to num_dofs + 1 (joints +
+                   gripper). observation.state is proprioception ONLY.
+        env_state_dim: width of observation.environment_state, a SEPARATE
+                   FeatureType.ENV feature holding privileged world state (object
+                   coords etc.) for oracle/state-only policies. 0 → the feature
+                   is omitted. Kept out of observation.state because policies
+                   like the diffusion policy treat environment_state as a
+                   distinct conditioning input (see build_lerobot_frame's
+                   "environment_state"). The ACTION stays num_dofs + 1.
     """
+    action_dim = num_dofs + 1
+    if state_dim is None:
+        state_dim = action_dim
     dof_names = [f"joint_{i+1}" for i in range(num_dofs)] + ["gripper"]
-    return {
+    # observation.state is proprioception only (joints + gripper). Any width
+    # beyond that (legacy datasets) is named generically.
+    state_names = dof_names + [f"state_extra_{i}" for i in range(state_dim - action_dim)]
+    features = {
         **{
             f"observation.images.{key}": {
                 "dtype": "image",
@@ -34,15 +54,22 @@ def build_lerobot_features(image_keys: List[str], num_dofs: int = 6) -> dict:
         },
         "observation.state": {
             "dtype": "float32",
-            "shape": (num_dofs + 1,),
-            "names": dof_names,
+            "shape": (state_dim,),
+            "names": state_names,
         },
         "action": {
             "dtype": "float32",
-            "shape": (num_dofs + 1,),
+            "shape": (action_dim,),
             "names": dof_names,
         },
     }
+    if env_state_dim > 0:
+        features["observation.environment_state"] = {
+            "dtype": "float32",
+            "shape": (env_state_dim,),
+            "names": [f"env_{i}" for i in range(env_state_dim)],
+        }
+    return features
 
 
 def load_lerobot_dataset(repo_id: str) -> Optional["LeRobotDataset"]:
@@ -100,8 +127,14 @@ def create_lerobot_dataset(
     image_keys: List[str],
     num_dofs: int = 6,
     robot_type: str = "lerobot_splatsim",
+    state_dim: Optional[int] = None,
+    env_state_dim: int = 0,
 ) -> "LeRobotDataset":
-    """Create a fresh LeRobot dataset with standard SplatSim settings."""
+    """Create a fresh LeRobot dataset with standard SplatSim settings.
+
+    `state_dim` defaults to num_dofs + 1 (proprioception). Oracle-info envs pass
+    `env_state_dim` > 0 to add a separate observation.environment_state feature
+    holding object coords."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     return LeRobotDataset.create(
@@ -109,7 +142,9 @@ def create_lerobot_dataset(
         fps=fps,
         robot_type=robot_type,
         use_videos=True,
-        features=build_lerobot_features(image_keys, num_dofs),
+        features=build_lerobot_features(
+            image_keys, num_dofs, state_dim=state_dim, env_state_dim=env_state_dim,
+        ),
     )
 
 
@@ -150,34 +185,56 @@ def push_lerobot_to_hub(dataset: "LeRobotDataset") -> None:
 
 
 def build_lerobot_frame(
-    action_7: np.ndarray,
+    action: np.ndarray,
     obs: dict,
     image_keys: List[str],
     task: str = "",
+    num_dofs: Optional[int] = None,
 ) -> dict:
     """Build a frame dict suitable for LeRobotDataset.add_frame().
 
     Convention: ``obs`` should be the *post-step* observation — the robot state
-    after the physics step that followed ``action_7``.  Both
+    after the physics step that followed ``action``.  Both
     ``_render_and_save_episode`` (traj-gen) and ``run_env_sim.py`` (interactive)
     follow this convention so that saved datasets are directly comparable.
 
+    The state is ``[arm joints (num_dofs), gripper]`` — shape ``num_dofs + 1`` —
+    matching ``build_lerobot_features``. This adapts to the arm's DOF count (6
+    for the UR5, 3 for the planar arm), so it must NOT be hardcoded.
+
     Args:
-        action_7: 7-DOF commanded joint state [j0..j5, gripper]
+        action: commanded joint state ``[j0..j{num_dofs-1}, gripper]`` (shape
+                ``num_dofs + 1``)
         obs: observation dict from get_observations()
         image_keys: obs dict keys to include as images (values must be
                     (C, H, W) float32 arrays in [0, 1])
         task: task description string (from get_task_description() or "")
+        num_dofs: arm joint count. If None, inferred from the observation —
+                  ``obs["joint_positions"]`` is sliced to ``num_dofs + 1`` in
+                  get_observations, so the count is ``len - 1``.
     """
-    state_7 = np.zeros(7, dtype=np.float32)
-    state_7[:6] = np.asarray(obs["joint_positions"])[:6]
-    state_7[6] = np.asarray(obs.get("gripper_position", [0.0]))[0]
+    joints = np.asarray(obs["joint_positions"], dtype=np.float32)
+    if num_dofs is None:
+        num_dofs = len(joints) - 1
+
+    # observation.state is proprioception ONLY: [joints, gripper].
+    state = np.zeros(num_dofs + 1, dtype=np.float32)
+    state[:num_dofs] = joints[:num_dofs]
+    state[num_dofs] = np.asarray(obs.get("gripper_position", [0.0]))[0]
 
     frame: dict = {
-        "observation.state": state_7,
-        "action": np.asarray(action_7, dtype=np.float32),
+        "observation.state": state,
+        "action": np.asarray(action, dtype=np.float32),
         "task": task,
     }
+
+    # Privileged world state (object coords, ...) goes in a SEPARATE
+    # observation.environment_state feature — empty for normal envs. Must match
+    # _raw_obs_to_gym_obs's eval-side layout so record == eval.
+    env_state = np.asarray(obs.get("environment_state", []), dtype=np.float32).reshape(-1)
+    if len(env_state):
+        frame["observation.environment_state"] = env_state
+
     for key in image_keys:
         if obs.get(key) is not None:
             frame[f"observation.images.{key}"] = obs[key]

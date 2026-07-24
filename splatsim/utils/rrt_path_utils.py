@@ -108,7 +108,7 @@ def set_default_client_id(client_id: int) -> None:
 def _resolve_client_id(physics_client_id):
     return _DEFAULT_CLIENT_ID if physics_client_id is None else int(physics_client_id)
 
-def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, verbose=False, obstacle_names=None, self_collision_clearance=0.0, skip_pairs=None, obstacle_clearance=None, physics_client_id=None, return_kind=False, self_collision_skip_pairs=None):
+def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indices_to_check=None, verbose=False, obstacle_names=None, self_collision_clearance=0.0, skip_pairs=None, obstacle_clearance=None, physics_client_id=None, return_kind=False, self_collision_skip_pairs=None, self_collision_check_adjacent_pairs=None):
     """
     Single source-of-truth collision checker.
 
@@ -219,16 +219,33 @@ def check_links_in_collision(robot_id, joint_indices, q, obstacle_ids, link_indi
         _self_skip = None
         if self_collision_skip_pairs:
             _self_skip = {frozenset((int(a), int(b))) for a, b in self_collision_skip_pairs}
+        # `self_collision_check_adjacent_pairs`: force-INCLUDE these adjacent
+        # (parent-child) pairs in the self-collision check. Default: skip all
+        # adjacent pairs (correct when parent-child geometry legitimately touches
+        # at the joint pivot — e.g., small_engine's UR5+Robotiq URDF). Robots
+        # whose extreme joint angles can fold a child link's BODY onto its
+        # parent's (e.g., the planar 3-DOF arm at |joint_2| ≈ π) list those
+        # pairs here so the check catches the fold-over case.
+        _check_adjacent = None
+        if self_collision_check_adjacent_pairs:
+            _check_adjacent = {
+                frozenset((int(a), int(b))) for a, b in self_collision_check_adjacent_pairs
+            }
 
-        # Check self-collisions between non-adjacent link pairs
+        # Check self-collisions between non-adjacent link pairs (plus the
+        # whitelisted-adjacent pairs from `_check_adjacent`).
         for a, b in itertools.combinations(link_indices_to_check, 2):
             if _self_skip is not None and frozenset((a, b)) in _self_skip:
                 continue
-            if not are_adjacent_links(robot_id, a, b, physics_client_id=cid):
-                if len(p.getClosestPoints(robot_id, robot_id, self_collision_clearance, linkIndexA=a, linkIndexB=b, physicsClientId=cid)) > 0:
-                    if verbose:
-                        print(f"Self-collision: robot {_robot_link_name(a)} vs {_robot_link_name(b)}")
-                    return (True, "self") if return_kind else True
+            if are_adjacent_links(robot_id, a, b, physics_client_id=cid):
+                # Adjacent by URDF topology. Default: skip (natural joint-pivot
+                # overlap). Override: caller explicitly listed this pair.
+                if _check_adjacent is None or frozenset((a, b)) not in _check_adjacent:
+                    continue
+            if len(p.getClosestPoints(robot_id, robot_id, self_collision_clearance, linkIndexA=a, linkIndexB=b, physicsClientId=cid)) > 0:
+                if verbose:
+                    print(f"Self-collision: robot {_robot_link_name(a)} vs {_robot_link_name(b)}")
+                return (True, "self") if return_kind else True
 
         return (False, None) if return_kind else False
     finally:
@@ -549,7 +566,8 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal,
                  verbose=True, obstacle_names=None, skip_pairs=None,
                  physics_client_id=None,
                  obstacle_clearance=None, self_collision_clearance=None,
-                 self_collision_skip_pairs=None):
+                 self_collision_skip_pairs=None,
+                 actual_gripper_q=None):
     """Plan a joint-space path from q_start to q_goal with bidirectional RRT.
 
     `physics_client_id` controls which PyBullet server every call goes to,
@@ -566,6 +584,21 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal,
     if verbose:
         print("Planning with pybullet planning...")
     set_robot_joint_positions(robot_id, joint_indices, q_start, physics_client_id=cid)
+    # `set_robot_joint_positions` internally calls `open_gripper()` — resets
+    # every gripper joint to 0.0. Re-snap them to the env's actual gripper
+    # config so BiRRT's per-sample `collision_fn` (which uses bare
+    # resetJointState on arm joints only) evaluates against the SAME finger
+    # geometry the caller's outer collision predicates expect. Without this,
+    # BiRRT samples paths against wide-open finger geometry while ruckig-
+    # smoothed / dense-checked paths use actual (typically closed) fingers,
+    # producing "escape says safe / RRT says colliding" cascade failures on
+    # grasp tasks.
+    if actual_gripper_q is not None:
+        _n_pb_joints = p.getNumJoints(robot_id, physicsClientId=cid)
+        _dof = len(joint_indices)
+        _gv = float(actual_gripper_q)
+        for _idx in range(_dof + 1, _n_pb_joints):
+            p.resetJointState(robot_id, _idx, _gv, physicsClientId=cid)
 
     if lower_limits is not None and upper_limits is not None:
         sample_fn = _make_uniform_sample_fn(lower_limits, upper_limits)
@@ -590,15 +623,30 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal,
     if self_collision_skip_pairs:
         _ccheck_kwargs["self_collision_skip_pairs"] = self_collision_skip_pairs
 
+    # Link scope for every collision check in this BiRRT invocation.
+    # MUST match the RRTToGoalPlanner's `_current_pose_in_planner_collision`
+    # scope (which excludes ONLY the world frame -1 — base_link 0 IS
+    # included so gripper-into-own-mount self-collisions are caught) so the
+    # escape chain's "safe" verdict agrees with the BiRRT collision_fn's
+    # verdict. Prior mismatches caused escape to find a config that RRT's
+    # `collision_fn` immediately declared in-collision (or vice versa)
+    # → cascade of 5-retry backoffs. Any obstacle false-fires against
+    # base_link should be silenced per-env via `skip_pairs` (the obstacle-
+    # side skip mechanism is separate from self_collision_skip_pairs, so
+    # silencing an obstacle pair doesn't disable the self-check).
+    _n_pb_joints = p.getNumJoints(robot_id, physicsClientId=cid)
+    _link_indices_to_check = list(range(0, _n_pb_joints))
+
     def collision_fn(q):
         return check_links_in_collision(robot_id, joint_indices, q, obstacle_ids,
                                          skip_pairs=skip_pairs, physics_client_id=cid,
+                                         link_indices_to_check=_link_indices_to_check,
                                          **_ccheck_kwargs)
 
     path = birrt(q_start, q_goal, distance_fn, sample_fn, extend_fn, collision_fn)
     if path is None:
-        start_in_col = check_links_in_collision(robot_id, joint_indices, q_start, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid, **_ccheck_kwargs)
-        goal_in_col = check_links_in_collision(robot_id, joint_indices, q_goal, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid, **_ccheck_kwargs)
+        start_in_col = check_links_in_collision(robot_id, joint_indices, q_start, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid, link_indices_to_check=_link_indices_to_check, **_ccheck_kwargs)
+        goal_in_col = check_links_in_collision(robot_id, joint_indices, q_goal, obstacle_ids, verbose=True, obstacle_names=obstacle_names, skip_pairs=skip_pairs, physics_client_id=cid, link_indices_to_check=_link_indices_to_check, **_ccheck_kwargs)
         if start_in_col and goal_in_col:
             print("PyBullet planning failed: both q_start and q_goal are in collision.")
         elif start_in_col:
@@ -683,8 +731,18 @@ def _ruckig_run_segment(
     max_joint_acc: np.ndarray,
     max_joint_jerk: np.ndarray,
     control_hz: float,
+    per_section_max_velocity: list | None = None,
+    per_section_max_acceleration: list | None = None,
 ) -> tuple:
-    """Run ruckig on a single segment. Returns (samples, final_vel, final_acc)."""
+    """Run ruckig on a single segment. Returns (samples, final_vel, final_acc).
+
+    per_section_max_velocity / per_section_max_acceleration: optional
+    per-section limit lists (length = number of waypoint gaps =
+    len(waypoints) - 1, each entry a DOF-length list). Used by the
+    final-approach taper to slow only the sections near the goal while
+    ruckig plans ONE trajectory through them (it picks the section-boundary
+    velocities itself). None = uniform limits (historical behavior).
+    """
     from ruckig import InputParameter, Ruckig, Trajectory, Synchronization, ControlInterface  # type: ignore
 
     dof = waypoints.shape[1]
@@ -706,6 +764,10 @@ def _ruckig_run_segment(
     inp.max_velocity = max_joint_vel.tolist()
     inp.max_acceleration = max_joint_acc.tolist()
     inp.max_jerk = max_joint_jerk.tolist()
+    if per_section_max_velocity is not None:
+        inp.per_section_max_velocity = list(per_section_max_velocity)
+    if per_section_max_acceleration is not None:
+        inp.per_section_max_acceleration = list(per_section_max_acceleration)
 
     traj = Trajectory(dof)
     result = otg.calculate(inp, traj)
@@ -749,6 +811,11 @@ def ruckig_parametrize_path(
     segment_at_sharp_corners: bool = True,
     start_vel: np.ndarray | None = None,
     start_acc: np.ndarray | None = None,
+    final_approach_dist: float = 0.0,
+    final_approach_vel_scale: float = 0.3,
+    final_approach_acc_scale: float = 0.25,
+    end_vel: np.ndarray | None = None,
+    uniform_path_speed: bool = False,
 ) -> np.ndarray:
     """
     Time-optimal path parametrization using Ruckig.
@@ -789,6 +856,28 @@ def ruckig_parametrize_path(
             policy's last commanded velocity for a smooth handoff at
             intervention trigger time. Default None = zeros (cold start).
         start_acc: (DOF,) initial joint acceleration. Default None = zeros.
+        final_approach_dist: Joint-space L2 distance (rad) before the FINAL
+            waypoint at which the "final approach" begins: a split waypoint is
+            inserted there and every section from it to the goal gets the
+            scaled-down vel/acc limits below, via ruckig PER-SECTION limits in
+            a single trajectory problem. Ruckig chooses the split-boundary
+            velocity itself (time-optimal and feasible), so the profile
+            neither stops short of the goal nor enters the approach too fast
+            to brake (both failure modes of hand-picking a handoff state).
+            Motivation: a uniform-limit time-optimal profile brakes at max
+            deceleration right up to the last sample; the PD-tracked physical
+            robot carries momentum PAST the goal and gets dragged back by the
+            hold — demonstrations then teach the policy to overshoot. A
+            low-acceleration final approach is trivial to track, while
+            intermediate motion keeps the full limits.
+            0.0 (default) disables — identical to historical behavior.
+        final_approach_vel_scale: Velocity limit scale for sections inside the
+            final approach (only used when final_approach_dist > 0).
+        final_approach_acc_scale: Acceleration limit scale for sections inside
+            the final approach (only used when final_approach_dist > 0). Jerk
+            is not scaled — it only shapes the (now small) accel ramps.
+        end_vel: (DOF,) target joint velocity at the FINAL waypoint. Default
+            None = zeros (come to rest at the goal — historical behavior).
 
     Returns:
         (M, DOF) trajectory sampled at control_hz.
@@ -798,6 +887,94 @@ def ruckig_parametrize_path(
     zeros = np.zeros(dof)
     start_vel = zeros if start_vel is None else np.asarray(start_vel, dtype=np.float64)
     start_acc = zeros if start_acc is None else np.asarray(start_acc, dtype=np.float64)
+    end_vel = zeros if end_vel is None else np.asarray(end_vel, dtype=np.float64)
+
+    # Final-approach taper via ruckig PER-SECTION limits: insert a split
+    # waypoint `final_approach_dist` of joint-space arc length before the
+    # goal and give every section from the split onward the scaled-down
+    # vel/acc limits. ONE ruckig problem plans through it, so ruckig itself
+    # chooses the section-boundary velocity (time-optimal AND feasible).
+    # This replaces an earlier two-call design that hand-computed a handoff
+    # velocity at the split — that was fragile: too fast an entry forced a
+    # command overshoot-and-reverse at the goal, too slow (or a zero
+    # handoff) taught the policy to stop short of the goal. With
+    # per-section limits neither failure mode is possible: the scales are
+    # preferences, not correctness-critical.
+    per_section_vel: list | None = None
+    per_section_acc: list | None = None
+    if final_approach_dist and final_approach_dist > 0 and waypoints.shape[0] >= 2:
+        scaled_vel = np.asarray(max_joint_vel, dtype=np.float64) * float(final_approach_vel_scale)
+        scaled_acc = np.asarray(max_joint_acc, dtype=np.float64) * float(final_approach_acc_scale)
+        seg_vecs = np.diff(waypoints, axis=0)
+        seg_lens = np.linalg.norm(seg_vecs, axis=1)
+        total_len = float(seg_lens.sum())
+        if total_len <= final_approach_dist:
+            # Whole path is inside the approach zone — cap the global limits.
+            max_joint_vel = scaled_vel
+            max_joint_acc = scaled_acc
+        else:
+            # Walk backward from the goal to find the split point at
+            # final_approach_dist of joint-space arc length.
+            remaining = float(final_approach_dist)
+            i = len(seg_lens) - 1
+            while i > 0 and remaining > seg_lens[i]:
+                remaining -= seg_lens[i]
+                i -= 1
+            seg_len = float(seg_lens[i])
+            t = (seg_len - remaining) / seg_len if seg_len > 1e-12 else 0.0
+            t = min(max(t, 0.0), 1.0)
+            split_pt = waypoints[i] + t * seg_vecs[i]
+            # Insert the split as a real waypoint unless it coincides with an
+            # existing one; sections at/after it get the scaled limits.
+            if (
+                np.linalg.norm(split_pt - waypoints[i]) > 1e-9
+                and np.linalg.norm(split_pt - waypoints[i + 1]) > 1e-9
+            ):
+                waypoints = np.vstack([waypoints[: i + 1], split_pt, waypoints[i + 1 :]])
+                first_scaled_section = i + 1
+            elif np.linalg.norm(split_pt - waypoints[i]) <= 1e-9:
+                first_scaled_section = i  # split == waypoint i
+            else:
+                first_scaled_section = i + 1  # split == waypoint i+1
+            base_vel = np.asarray(max_joint_vel, dtype=np.float64)
+            base_acc = np.asarray(max_joint_acc, dtype=np.float64)
+            n_sections = waypoints.shape[0] - 1
+            per_section_vel = [
+                (scaled_vel if s >= first_scaled_section else base_vel).tolist()
+                for s in range(n_sections)
+            ]
+            per_section_acc = [
+                (scaled_acc if s >= first_scaled_section else base_acc).tolist()
+                for s in range(n_sections)
+            ]
+
+    if uniform_path_speed and waypoints.shape[0] >= 2:
+        # Equalize JOINT-SPACE PATH SPEED across sections. Per-joint box
+        # velocity limits are direction-anisotropic: a section moving one
+        # joint tops out at max_vel, while a section spread across all N
+        # joints legally reaches max_vel*sqrt(N) of L2 path speed — the
+        # time-optimal profile sprints there, then brakes for the next
+        # section, which reads as surging/jerky execution. Capping each
+        # section's per-joint velocity at v_path * |unit_dir_j| bounds every
+        # section's L2 path speed to the same v_path (the section's smallest
+        # existing per-joint cap, so final-approach scaling composes). The
+        # 0.1 floor keeps near-stationary joints controllable through
+        # waypoint transitions. Acceleration limits are left as-is.
+        n_sections = waypoints.shape[0] - 1
+        base_vel = np.asarray(max_joint_vel, dtype=np.float64)
+        if per_section_vel is None:
+            per_section_vel = [base_vel.tolist() for _ in range(n_sections)]
+        uniformed = []
+        for s in range(n_sections):
+            sec_cap = np.asarray(per_section_vel[s], dtype=np.float64)
+            d = waypoints[s + 1] - waypoints[s]
+            seg_norm = float(np.linalg.norm(d))
+            if seg_norm > 1e-12:
+                dir_abs = np.abs(d) / seg_norm
+                v_path = float(np.min(sec_cap))
+                sec_cap = np.minimum(sec_cap, v_path * np.maximum(dir_abs, 0.1))
+            uniformed.append(sec_cap.tolist())
+        per_section_vel = uniformed
 
     if not segment_at_sharp_corners:
         # Fast path: single ruckig call. `_ruckig_run_segment` already passes
@@ -807,12 +984,14 @@ def ruckig_parametrize_path(
             waypoints,
             start_vel=start_vel,
             start_acc=start_acc,
-            end_vel=zeros,
+            end_vel=end_vel,
             end_acc=zeros,
             max_joint_vel=max_joint_vel,
             max_joint_acc=max_joint_acc,
             max_joint_jerk=max_joint_jerk,
             control_hz=control_hz,
+            per_section_max_velocity=per_section_vel,
+            per_section_max_acceleration=per_section_acc,
         )
         return samples
 
@@ -828,13 +1007,25 @@ def ruckig_parametrize_path(
     prev_end_acc = start_acc
     for seg_idx, seg in enumerate(segments):
         is_last = seg_idx == len(segments) - 1
-        # End at zero only when the next boundary is genuinely sharp or it's
-        # the trajectory's final point. At other boundaries, pass through.
-        is_next_sharp = (
-            not is_last and split_points[seg_idx + 1] in sharp_indices
-        )
-        seg_end_vel = zeros if (is_last or is_next_sharp) else zeros
+        # Sharp internal boundaries stop at zero velocity (segments are split
+        # exactly at sharp corners); the FINAL point targets the caller's
+        # end_vel (zeros by default — come to rest; the final-approach split
+        # passes a creep-speed handoff velocity here).
+        seg_end_vel = end_vel if is_last else zeros
         seg_end_acc = zeros
+        # Slice the global per-section limit arrays (built by the
+        # final-approach taper; None when disabled) to this segment's span:
+        # global section s covers waypoints[s] -> waypoints[s+1], so segment k
+        # (waypoints split_points[k]..split_points[k+1]) owns sections
+        # split_points[k]..split_points[k+1]-1.
+        _seg_psv = (
+            per_section_vel[split_points[seg_idx]: split_points[seg_idx + 1]]
+            if per_section_vel is not None else None
+        )
+        _seg_psa = (
+            per_section_acc[split_points[seg_idx]: split_points[seg_idx + 1]]
+            if per_section_acc is not None else None
+        )
         samples, end_v, end_a = _ruckig_run_segment(
             seg,
             start_vel=prev_end_vel,
@@ -845,6 +1036,8 @@ def ruckig_parametrize_path(
             max_joint_acc=max_joint_acc,
             max_joint_jerk=max_joint_jerk,
             control_hz=control_hz,
+            per_section_max_velocity=_seg_psv,
+            per_section_max_acceleration=_seg_psa,
         )
         if not is_last:
             samples = samples[:-1]
@@ -897,7 +1090,7 @@ def open_gripper(robot_id, physics_client_id=None):
 
 
 
-def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, robot_update_rate, use_gui=False, verbose=True, max_joint_vel=None, max_joint_acc=None, max_joint_jerk=None, obstacle_names=None, skip_pairs=None, physics_client_id=None, obstacle_clearance=None, self_collision_clearance=None, self_collision_skip_pairs=None):
+def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, robot_update_rate, use_gui=False, verbose=True, max_joint_vel=None, max_joint_acc=None, max_joint_jerk=None, obstacle_names=None, skip_pairs=None, physics_client_id=None, obstacle_clearance=None, self_collision_clearance=None, self_collision_skip_pairs=None, max_smooth_iterations=50, actual_gripper_q=None):
     cid = _resolve_client_id(physics_client_id)
     dof = len(joint_indices)
     if max_joint_vel is None:
@@ -906,8 +1099,21 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, rob
         max_joint_acc = np.full(dof, 1.0)   # rad/s^2
     if max_joint_jerk is None:
         max_joint_jerk = np.full(dof, 10.0)  # rad/s^3, ~10x max_acc
-    # Set joints to q_start
+    # Set joints to q_start (this ALSO forces open_gripper via
+    # set_robot_joint_positions — wipes the caller's actual-gripper snap).
     set_robot_joint_positions(robot_id, joint_indices, q_start, physics_client_id=cid)
+    # Re-snap the gripper joints (URDF indices dof+1..num_pb_joints) to the
+    # actual env gripper if the caller told us the value. Without this every
+    # BiRRT sample/extend collision check runs on wide-open finger geometry
+    # while the real robot's fingers are typically closing around an object;
+    # RRT then falsely reports q_start/q_goal in collision and the intervention
+    # cascades to 5-retry backoff. Matches the fix in `RRTToGoalPlanner.plan`
+    # and mirrors what `check_chunk_collision` does at line ~3341.
+    if actual_gripper_q is not None:
+        _n_pb_joints = p.getNumJoints(robot_id, physicsClientId=cid)
+        _gv = float(actual_gripper_q)
+        for _idx in range(dof + 1, _n_pb_joints):
+            p.resetJointState(robot_id, _idx, _gv, physicsClientId=cid)
 
     # movable_joints = get_movable_joints(robot_id)
 
@@ -936,6 +1142,7 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, rob
         obstacle_clearance=obstacle_clearance,
         self_collision_clearance=self_collision_clearance,
         self_collision_skip_pairs=self_collision_skip_pairs,
+        actual_gripper_q=actual_gripper_q,
     )
     if rrt_path is None:
         return None
@@ -948,11 +1155,19 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, rob
 
     extend_fn = _make_linear_extend_fn(resolutions)
 
+    # Random-shortcut smoothing (pybullet_planning): repeatedly pick two random
+    # points on the path and replace the intermediate segment with a straight
+    # joint-space connection when it is collision-free and shorter. This is
+    # what removes RRT's characteristic detours/zigzags — ruckig downstream
+    # only smooths the TIME parametrization (vel/acc/jerk), it does not
+    # straighten the geometric path, so erratic-looking waypoints must be
+    # fixed here. Iterations beyond convergence are cheap (a candidate is
+    # collision-checked only when it would shorten the path).
     smoothed_path = smooth_path(
         rrt_path.tolist(),
         extend_fn,
         collision_fn,
-        max_smooth_iterations=50,
+        max_smooth_iterations=max_smooth_iterations,
     )
 
     # Visualize in GUI if requested

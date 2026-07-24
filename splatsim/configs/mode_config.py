@@ -9,6 +9,24 @@ class ImageResizeMode(enum.Enum):
     STRETCH = "stretch"
 
 
+class RenderMode(enum.Enum):
+    """Source for image observations, selectable at launch (--render_mode) and
+    at runtime via the SplatSim GUI dropdown.
+
+    NONE     - no image rendering (state/action-only, fastest).
+    SPLAT    - Gaussian-splat rendering (photorealistic; needs splat assets).
+    PYBULLET - PyBullet getCameraImage (fast, no assets; works for any env).
+
+    Plain (non-str-mixed) Enum on purpose: the GUI's add_enum_param stores a
+    str-subclass member as its repr rather than its .value, which would break
+    the dropdown's initial selection. Construct from the CLI string via
+    RenderMode(arg) (value lookup works for a plain Enum).
+    """
+    NONE = "none"
+    SPLAT = "splat"
+    PYBULLET = "pybullet"
+
+
 # `PathSelectionStrategy` is owned by the shared planner
 # (`splatsim.utils.rrt_to_goal`, the canonical RRTToGoalPlanner used by BOTH
 # SplatSim trajectory-gen and the LeRobot DAgger/SA intervention side) and
@@ -51,6 +69,16 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     time_per_traj: float = 6.0
     robot_update_rate: int = 30
     rrt_vis_fps: int = 10
+    # Ruckig kinematic limits for the planned/smoothed trajectory (per joint).
+    # Previously hardcoded in TrajectoryGenerator._ensure_planner; exposed here
+    # so envs can tune the PLANNED motion, and so the robot server can tie its
+    # execution-time CONTROL_MAX_VELOCITY to max_joint_vel (a servo that tracks
+    # a T-Hz reference must be allowed to move at ~the planned velocity — see
+    # PybulletRobotServerBase.CONTROL_MAX_VELOCITY). Defaults match the old
+    # hardcoded 0.5 / 1.0 / 10.0, so behavior is unchanged unless overridden.
+    max_joint_vel: float = 0.5
+    max_joint_acc: float = 1.0
+    max_joint_jerk: float = 10.0
     use_obstacles: bool = True
     q_start: Optional[List[float] | np.ndarray] = None
     q_goal: Optional[List[float] | np.ndarray] = None # ex: 7-dof-joint robot configuration goal
@@ -75,6 +103,59 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # them). Larger = more diverse candidates. Forwarded to
     # RRTToGoalPlanner(path_perturbation_scale=).
     path_perturbation_scale: float = 0.05
+    # Random-shortcut smoothing iterations applied to each raw BiRRT path
+    # (pybullet_planning smooth_path inside rrt_path_utils.get_path). This is
+    # the pass that straightens RRT's characteristic detours/zigzags — ruckig
+    # downstream only smooths the TIME parametrization (vel/acc/jerk), never
+    # the geometric path, so erratic-looking trajectories are fixed here.
+    # Iterations past convergence are cheap (candidate segments are
+    # collision-checked only when they would shorten the path). 200 (vs the
+    # planner's legacy 50) noticeably straightens paths at modest planning
+    # cost; raise further if trajectories still look wandery.
+    rrt_smooth_iterations: int = 200
+    # Scale applied to `obstacle_clearance` for the RUCKIG-SMOOTHED trajectory
+    # collision check (raw RRT/densify checks always use the full clearance).
+    # The planner's own default is 0.5 ("RRT-clean at 2 cm, ruckig-clean at
+    # 1 cm") to tolerate ruckig's cornering bulge past the linear chord — but
+    # that let the wrist camera pass visibly close to obstacles in generated
+    # demos. 0.9 keeps the smoothed check nearly as strict as planning
+    # (0.02 → 1.8 cm) at the cost of more rejects at sharp corners.
+    ruckig_obstacle_clearance_factor: float = 0.9
+    # Final-approach taper (see ruckig_parametrize_path): the trajectory
+    # brakes to a stop this many rad (joint-space L2) before the goal, then
+    # creeps the remainder at final_approach_{vel,acc}_scale × the normal
+    # limits. Rationale: the time-optimal profile brakes at max deceleration
+    # into the very last sample, so the PD-tracked robot carries momentum
+    # PAST the goal and the 1 s hold drags it back — recorded demos then
+    # teach the policy to overshoot the goal. Braking from creep speed
+    # tracks cleanly (no overshoot); intermediate waypoints keep full
+    # limits. 0.0 disables.
+    final_approach_dist: float = 0.15
+    final_approach_vel_scale: float = 0.5
+    final_approach_acc_scale: float = 0.25
+    # When True, equalize joint-space PATH SPEED across trajectory sections (see
+    # ruckig_parametrize_path / rrt_path_utils). Per-joint box velocity limits
+    # are direction-anisotropic, so the time-optimal profile SPRINTS through
+    # multi-joint sections and BRAKES for single-joint ones — surging the PD
+    # controller tracks as overshoot / ringing. Capping each section's L2 path
+    # speed to a uniform value removes that surge. Complements final_approach_*
+    # (which only tapers the very last leg). False = time-optimal (historical).
+    uniform_path_speed: bool = False
+    # Pad the END of each generated trajectory by holding the last joint config
+    # frozen for ~1 second (robot_update_rate frames). Historically always on;
+    # now default OFF. Useful when a downstream consumer expects the arm to
+    # visibly settle at the goal, but for most datasets the frozen tail is dead
+    # frames that just inflate episode length. Toggle in the SplatSim GUI's
+    # Traj Gen panel ("Pad stopped last frames").
+    pad_stopped_last_frames: bool = False
+    # Freeze the pybullet visualizer's world redraw while the RRT planner is
+    # running (IK sampling + collision checks issue thousands of
+    # resetJointState/stepSimulation calls that each sync with the GUI
+    # redraw). Same optimization as the episode-render freeze in
+    # _generate_and_render_one_episode, applied to the PLANNING phase. The
+    # 3D view appears frozen during each plan; SplatSim GUI thumbnails and
+    # planning progress prints are unaffected.
+    freeze_visualizer_during_plan: bool = True
     # RRT planner-time collision clearances, in meters. Reject any path bringing
     # the robot within this margin of an obstacle / of itself — gives execution
     # drift margin so a planning-time near-miss doesn't become a real collision
@@ -84,7 +165,7 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # NOTE: self_collision_clearance relies on `self_collision_skip_pairs` to
     # exclude structurally-close URDF pairs, else every pose reads as colliding.
     obstacle_clearance: float = 0.02
-    self_collision_clearance: float = 0.005
+    self_collision_clearance: float = 0.01
     # Which scoring strategy picks the winning path among the RRT candidates
     # generated per IK goal. Default `MIN_PAIR_CLEARANCE` — picks the path whose
     # tightest non-adjacent link-pair gap is LARGEST, avoiding pretzeled / near-

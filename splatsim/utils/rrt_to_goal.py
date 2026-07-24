@@ -260,6 +260,12 @@ class RRTToGoalPlanner:
         num_path_candidates_per_ik: int = 1,
         max_path_attempts_per_ik: int = 5,
         path_perturbation_scale: float = 0.001,
+        rrt_smooth_iterations: int = 50,
+        final_approach_dist: float = 0.0,
+        final_approach_vel_scale: float = 0.3,
+        final_approach_acc_scale: float = 0.25,
+        uniform_path_speed: bool = False,
+        freeze_visualizer_during_plan: bool = False,
         obstacle_clearance: float | None = None,
         self_collision_clearance: float | None = None,
         self_collision_skip_pairs: list[tuple[int, int]] | None = None,
@@ -275,6 +281,45 @@ class RRTToGoalPlanner:
     ) -> None:
         self._pb_client = pb_client
         self._robot_id = robot_id
+        # Canonical link scope for EVERY planner-owned collision check —
+        # excludes ONLY the world frame (-1). The static base_link (0) IS
+        # included so gripper/arm swinging back into the robot's own mount
+        # is caught by the self-collision check.
+        #
+        # PRIOR VERSION excluded base_link too, on the theory that its AABB
+        # sits ~7 mm above the table top and would false-fire obstacle_collision.
+        # In practice (a) the planar env has no table body loaded, (b) the
+        # small-engine/UR5 setups place base_link ≥ 100 mm above any obstacle,
+        # and (c) the failure mode the exclusion caused (gripper→own-base
+        # collision silently ignored) is worse than the false-fire it
+        # prevented. If any future env truly has base_link overlapping an
+        # obstacle AABB, add (0, obstacle_body_id) to that env's
+        # skip_collision_robot_links — the obstacle-side skip mechanism is
+        # already separate from self_collision_skip_pairs, so silencing the
+        # obstacle false-fire won't disable the self-check.
+        #
+        # The shared helper `_current_pose_in_planner_collision` uses this
+        # scope; the ruckig-smoothed / linear-densified / raw-path /
+        # start-in-collision / `check_chunk_collision` checks MUST use the
+        # same one or escape's "safe" verdict disagrees with RRT's per-
+        # waypoint verdict and the planner cascades into 5-retry backoff at
+        # every intervention. See `_current_pose_in_planner_collision`'s
+        # docstring for the mismatch-cascade background.
+        _n_pb_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
+        self._planner_link_indices_to_check: list[int] = list(range(0, _n_pb_joints))
+        self._planner_num_pb_joints: int = _n_pb_joints
+        # Actual gripper config for this plan() call, snapped onto the
+        # planner's pybullet client so every downstream collision check
+        # (BiRRT collision_fn, IK candidate check, ruckig-smoothed check,
+        # linear-densified check) uses the SAME gripper geometry the escape
+        # rewind check used. Without this, birrt_path's `set_robot_joint_positions`
+        # call forces `open_gripper()` — collision checks then run on OPEN
+        # (wide-finger) geometry while escape's check ran on CLOSED (actual)
+        # geometry, so escape says "safe" and RRT immediately says "colliding
+        # at waypoint 0" for grasp tasks where the env's gripper is closing.
+        # Set per plan() invocation; refreshed via `_snap_gripper_to_actual`
+        # after every get_path/birrt_path call (which resets it to open).
+        self._current_actual_gripper_q: float | None = None
         self._joint_indices = list(joint_indices)
         self._ee_link_index = ee_link_index
         self._num_dofs = num_dofs
@@ -368,6 +413,34 @@ class RRTToGoalPlanner:
         self._num_path_candidates_per_ik = int(num_path_candidates_per_ik)
         self._max_path_attempts_per_ik = int(max_path_attempts_per_ik)
         self._path_perturbation_scale = float(path_perturbation_scale)
+        # Random-shortcut smoothing iterations forwarded to get_path /
+        # pybullet_planning smooth_path. Shortcutting is what straightens
+        # RRT's detours — ruckig only smooths the time parametrization, not
+        # the geometric path. Iterations past convergence are cheap (a
+        # candidate segment is collision-checked only when it would shorten
+        # the path), so higher values mainly trade a little planning time
+        # for visibly less erratic paths.
+        self._rrt_smooth_iterations = int(rrt_smooth_iterations)
+        # Final-approach taper forwarded to ruckig_parametrize_path: brake to
+        # a stop `final_approach_dist` rad (joint-space L2) before the goal,
+        # then creep the last stretch at scaled-down vel/acc so the PD-tracked
+        # robot doesn't carry momentum past the final waypoint. 0.0 = off
+        # (historical behavior — DAgger runtime keeps this off by default).
+        self._final_approach_dist = float(final_approach_dist)
+        self._final_approach_vel_scale = float(final_approach_vel_scale)
+        self._final_approach_acc_scale = float(final_approach_acc_scale)
+        # Equalize joint-space path speed across sections (per-section velocity
+        # caps proportional to section direction). Removes the direction-
+        # anisotropy surging of box limits — see ruckig_parametrize_path.
+        self._uniform_path_speed = bool(uniform_path_speed)
+        # Freeze the pybullet visualizer's world redraw for the duration of
+        # plan(). Planning issues thousands of resetJointState +
+        # per-collision-check stepSimulation calls; under a GUI connection
+        # each syncs with the redraw, dominating planning wall-time. Off by
+        # default (DAgger side likes watching the planner explore); SplatSim
+        # trajectory-gen enables it for batch throughput. No-op on DIRECT
+        # clients.
+        self._freeze_visualizer_during_plan = bool(freeze_visualizer_during_plan)
         # Collision clearances threaded into every check_links_in_collision
         # + get_path call so RRT plans paths with the configured margin.
         # None = use SplatSim's defaults (_COLLISION_CLEARANCE = 0.01 m
@@ -569,11 +642,14 @@ class RRTToGoalPlanner:
         the escape methods' iteration loop). Uses the exact same
         parameters + link-scope as `is_q_in_collision`:
 
-          * `link_indices_to_check = range(1, n_joints)` — excludes world
-            (-1) and static base_link (0). base_link's AABB is
-            structurally close to the table top (~7 mm gap), so including
-            it would false-fire obstacle_collision at any clearance > 7 mm,
-            and (0, X) self-pairs would false-fire at every arm config.
+          * `link_indices_to_check = range(0, n_joints)` — excludes ONLY
+            the world frame (-1). base_link (0) IS included so the
+            gripper/arm swinging back into the robot's own mount is caught
+            by the self-collision check. (The prior "range(1, n_joints)"
+            scope silently ignored those gripper→base collisions.) If a
+            specific env has base_link geometrically overlapping an
+            obstacle AABB, silence it via env-config `skip_pairs` —
+            obstacle-side skips leave the (0, X) self-check live.
           * `skip_pairs = self._skip_pairs` — env-config per-obstacle skips.
           * `**self._collision_kwargs` — same obstacle/self_collision
             clearances and skip_pairs the BiRRT collision_fn uses.
@@ -595,14 +671,13 @@ class RRTToGoalPlanner:
             kwargs["obstacle_clearance"] = float(obstacle_clearance)
         if self_collision_clearance is not None:
             kwargs["self_collision_clearance"] = float(self_collision_clearance)
-        n_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
         result = check_links_in_collision(
             self._robot_id,
             self._joint_indices,
             None,
             self._loaded_obstacle_ids,
             obstacle_names=self._obstacle_names,
-            link_indices_to_check=list(range(1, n_joints)),
+            link_indices_to_check=self._planner_link_indices_to_check,
             skip_pairs=self._skip_pairs,
             verbose=False,
             physics_client_id=self._pb_client,
@@ -613,6 +688,32 @@ class RRTToGoalPlanner:
             colliding, kind = result
             return bool(colliding), kind
         return bool(result)
+
+    def _snap_gripper_to_actual(self) -> None:
+        """Snap the planner's pybullet gripper joints (URDF indices
+        n_dof+1..num_pb_joints) to ``self._current_actual_gripper_q``.
+        No-op when actual_gripper_q was not passed to `plan()` (legacy
+        callers, or the wrapper's obs.state excludes the gripper dim).
+
+        MUST be called (a) at the top of `plan()` after storing
+        `_current_actual_gripper_q`, and (b) after every `get_path` /
+        `birrt_path` call — those go through `set_robot_joint_positions`
+        which forces `open_gripper()` (resets all gripper joints to 0.0
+        = wide-open geometry). Without the re-snap, every downstream
+        `check_links_in_collision(q=arm_only)` runs with wide-open fingers
+        while the real env robot's fingers are typically closing around
+        an object; the geometric mismatch is exactly the "escape says
+        safe / ruckig says collides at waypoint 0" cascade.
+        """
+        if self._current_actual_gripper_q is None:
+            return
+        gripper_val = float(self._current_actual_gripper_q)
+        # Joint 0 isn't in `_joint_indices` (fixed base attach), arm
+        # joints occupy [1, n_dof]; gripper joints start at n_dof+1.
+        # Same convention as `is_q_in_collision` at line ~718 and
+        # `check_chunk_collision` at line ~3341.
+        for idx in range(self._num_dofs + 1, self._planner_num_pb_joints):
+            p.resetJointState(self._robot_id, idx, gripper_val, physicsClientId=self._pb_client)
 
     def is_q_in_collision(
         self,
@@ -681,15 +782,26 @@ class RRTToGoalPlanner:
         # returns True — firing a spurious retry every tick even though
         # the env's actually-closed gripper would have plenty of clearance.
         # Per-callsite manual reset + q=None below avoids this entirely.
+        num_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
+        # Joint 0 isn't in `_joint_indices` (likely a fixed attach), so arm joints
+        # occupy [1, n_dof]; gripper joints start at n_dof+1. Matches
+        # `open_gripper`'s `range(7, num_joints)` convention when n_dof=6.
         if q_arr.size > n_dof:
+            # q carries the gripper (the [joints, gripper] state layout).
             gripper_val = float(q_arr[n_dof])
-            num_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
-            # Joint 0 isn't in `_joint_indices` (likely a fixed attach), so
-            # arm joints occupy [1, n_dof]; gripper joints start at
-            # n_dof+1. Matches `open_gripper`'s `range(7, num_joints)`
-            # convention when n_dof=6.
             for idx in range(n_dof + 1, num_joints):
                 p.resetJointState(self._robot_id, idx, gripper_val, physicsClientId=self._pb_client)
+        else:
+            # q has NO gripper dim (e.g. --exclude_gripper_from_state sliced it out
+            # of observation.state). DON'T leave the gripper at whatever stale
+            # value the planner robot last held — a garbage / mimic-inconsistent
+            # gripper self-collides at nearly every arm pose, which makes the
+            # escape→RRT recovery fail at waypoint 0 every time. Force the OPEN
+            # pose (all gripper joints 0.0). Excluding the gripper from state
+            # implies it's constant/irrelevant to the task (a non-grasp reach), so
+            # open is the correct, always-valid assumption.
+            for idx in range(n_dof + 1, num_joints):
+                p.resetJointState(self._robot_id, idx, 0.0, physicsClientId=self._pb_client)
         # Delegate the actual check to `_current_pose_in_planner_collision`
         # — the canonical "planner-contract" check every callsite (this
         # method, all `_escape_*` methods) shares. See that helper's
@@ -757,12 +869,11 @@ class RRTToGoalPlanner:
         self_skip: set[frozenset[int]] = {frozenset((int(a), int(b))) for a, b in _self_skip_raw}
 
         n_links = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
-        # Iterate links 1..n_links-1 — same exclusion as is_q_in_collision /
-        # check_chunk_collision so the absolute-closest pair reported here
-        # is comparable with what the planner's collision checks see. The
-        # world frame (-1) and the static base_link (0) never move, so
-        # they're irrelevant for joint-driven motion checks.
-        link_indices = list(range(1, n_links))
+        # Iterate links 0..n_links-1 — same scope as is_q_in_collision /
+        # check_chunk_collision (which now include base_link so gripper-
+        # into-mount self-collisions are caught). The world frame (-1) is
+        # still skipped because it doesn't move and isn't a robot link.
+        link_indices = list(range(0, n_links))
 
         def _link_name(idx: int) -> str:
             if idx == -1:
@@ -971,9 +1082,29 @@ class RRTToGoalPlanner:
             size = obj.get("size") or (1.0, 1.0, 1.0)
             half = [s / 2.0 for s in size]
             shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=half, physicsClientId=self._pb_client)
+            # Visual shape with the color the sim uses. Same source of truth
+            # (CuboidObjectConfig.color_rgb, published in the oracle env
+            # config as `color_rgb` — three ints in 0-255). Without a
+            # visual shape pybullet renders the collision shape in a default
+            # gray, making planner-side pybullet-GUI diagnostics ambiguous
+            # (obstacle_1 vs obstacle_2 vs block indistinguishable). Alpha
+            # fixed at 1.0 — the oracle config carries no transparency.
+            _rgb = obj.get("color_rgb")
+            _visual_kwargs = {}
+            if _rgb is not None and len(_rgb) >= 3:
+                _visual_kwargs["rgbaColor"] = [
+                    float(_rgb[0]) / 255.0,
+                    float(_rgb[1]) / 255.0,
+                    float(_rgb[2]) / 255.0,
+                    1.0,
+                ]
+            visual_shape = p.createVisualShape(
+                p.GEOM_BOX, halfExtents=half, physicsClientId=self._pb_client, **_visual_kwargs
+            )
             return p.createMultiBody(
                 baseMass=0,
                 baseCollisionShapeIndex=shape,
+                baseVisualShapeIndex=visual_shape,
                 basePosition=list(position),
                 baseOrientation=list(quat),
                 physicsClientId=self._pb_client,
@@ -1095,6 +1226,7 @@ class RRTToGoalPlanner:
         recent_joint_velocity: np.ndarray | None = None,
         exclude_q_goals: list[np.ndarray] | None = None,
         ruckig_start_vel: np.ndarray | None = None,
+        actual_gripper_q: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray | None]:
         """Plan a joint-space trajectory to an end-effector pose.
 
@@ -1155,6 +1287,23 @@ class RRTToGoalPlanner:
         q_start = np.asarray(q_start, dtype=np.float64).reshape(-1)[: self._num_dofs]
         target_ee_pos = np.asarray(target_ee_pos, dtype=np.float64).reshape(-1)[:3]
         target_ee_quat = np.asarray(target_ee_quat, dtype=np.float64).reshape(-1)[:4]
+        # Snap the planner's gripper joints to the env's ACTUAL gripper
+        # config BEFORE any collision check runs. Every downstream check
+        # (start-in-collision precheck, escape rewind, IK candidate filter,
+        # BiRRT sample/extend, ruckig-smoothed dense check) then evaluates
+        # against a gripper geometry that matches the real robot's fingers.
+        # Without this, birrt_path's `set_robot_joint_positions` forces
+        # `open_gripper()` and every check downstream runs on wide-open
+        # fingers while the real robot's fingers are closing around an
+        # object — the exact cause of the "escape rewound to safe frame,
+        # ruckig-smoothed path collides at waypoint 0" cascade. Re-snapped
+        # after every get_path call inside `_generate_paths_for_ik` (which
+        # goes through set_robot_joint_positions again). None from the
+        # caller = leave gripper untouched (legacy behavior).
+        self._current_actual_gripper_q = (
+            float(actual_gripper_q) if actual_gripper_q is not None else None
+        )
+        self._snap_gripper_to_actual()
         if q_goal_bias is not None:
             q_goal_bias = np.asarray(q_goal_bias, dtype=np.float64).reshape(-1)[: self._num_dofs]
 
@@ -1168,12 +1317,20 @@ class RRTToGoalPlanner:
             s = p.getJointState(self._robot_id, i, physicsClientId=self._pb_client)
             saved_joint_states.append((i, float(s[0]), float(s[1])))
 
-        # Viewport rendering was previously disabled here for planning speed
-        # (IK candidate sampler + RRT call resetJointState many times; each
-        # triggers a GUI redraw). Re-enabled per user request so the robot is
-        # visible mid-plan — slower and jumpier to watch, but useful for
-        # debugging what the planner is actually exploring. If planning speed
-        # becomes a bottleneck again, wrap this block in a config flag.
+        # Freeze the visualizer's world redraw while planning when configured
+        # (freeze_visualizer_during_plan). Historically always-disabled for
+        # speed, then re-enabled per user request for debugging visibility —
+        # now a per-consumer choice: traj-gen batches freeze it (planning is
+        # GUI-redraw-bound otherwise), the DAgger side keeps it visible.
+        _froze_viz = False
+        if self._freeze_visualizer_during_plan:
+            try:
+                p.configureDebugVisualizer(
+                    p.COV_ENABLE_RENDERING, 0, physicsClientId=self._pb_client
+                )
+                _froze_viz = True
+            except Exception:
+                pass
 
         try:
             # If the start config is in collision (the policy got stuck), try to
@@ -1190,6 +1347,7 @@ class RRTToGoalPlanner:
                 skip_pairs=self._skip_pairs,
                 verbose=True,
                 physics_client_id=self._pb_client,
+                link_indices_to_check=self._planner_link_indices_to_check,
                 **self._collision_kwargs,
             ):
                 logger.info(
@@ -1586,8 +1744,41 @@ class RRTToGoalPlanner:
 
             return traj, escape_end_q
         finally:
+            if _froze_viz:
+                try:
+                    p.configureDebugVisualizer(
+                        p.COV_ENABLE_RENDERING, 1, physicsClientId=self._pb_client
+                    )
+                except Exception:
+                    pass
             for i, pos, vel in saved_joint_states:
                 p.resetJointState(self._robot_id, i, pos, vel, physicsClientId=self._pb_client)
+            # Re-assert POSITION_CONTROL holds on the ARM joints at the
+            # restored positions. Planning internals (IK candidate sampling,
+            # set_robot_joint_positions(hold=True) in collision checks) issue
+            # setJointMotorControl2 with their own targets; resetJointState
+            # alone leaves those STALE motor targets active, so on a shared
+            # live sim client the PD motors drag the robot away from the
+            # restored pose toward the last sampled config as soon as physics
+            # steps again (e.g. env reset's settle loop right after the
+            # reset-time plan-feasibility check) — observed as "robot doesn't
+            # return to the start configuration after the RRT check".
+            # Arm joints only: position-holding the gripper mimic children
+            # would overpower the JOINT_GEAR mimic and freeze the gripper
+            # (see setup_gripper). Harmless on the DAgger side, where the
+            # planning client is separate from the live env.
+            _restored_pos = {i: pos for i, pos, _vel in saved_joint_states}
+            for j_idx in self._joint_indices:
+                if j_idx in _restored_pos:
+                    p.setJointMotorControl2(
+                        self._robot_id,
+                        j_idx,
+                        p.POSITION_CONTROL,
+                        targetPosition=_restored_pos[j_idx],
+                        force=150,
+                        maxVelocity=3.14,
+                        physicsClientId=self._pb_client,
+                    )
             # (No render re-enable here: the pre-plan disable above was removed
             # per user request. Left as a marker so it's obvious this was
             # deliberate, not forgotten.)
@@ -1641,6 +1832,7 @@ class RRTToGoalPlanner:
                 skip_pairs=self._skip_pairs,
                 verbose=False,
                 physics_client_id=self._pb_client,
+                link_indices_to_check=self._planner_link_indices_to_check,
                 **self._collision_kwargs,
             ):
                 return ("sparse RRT waypoints", k)
@@ -1662,6 +1854,7 @@ class RRTToGoalPlanner:
                     skip_pairs=self._skip_pairs,
                     verbose=False,
                     physics_client_id=self._pb_client,
+                    link_indices_to_check=self._planner_link_indices_to_check,
                     **self._collision_kwargs,
                 ):
                     return ("linear-densified path", k)
@@ -1680,6 +1873,7 @@ class RRTToGoalPlanner:
                 skip_pairs=self._skip_pairs,
                 verbose=False,
                 physics_client_id=self._pb_client,
+                link_indices_to_check=self._planner_link_indices_to_check,
                 **_ruckig_kwargs,
             ):
                 return ("ruckig-smoothed trajectory", k)
@@ -1725,6 +1919,7 @@ class RRTToGoalPlanner:
                 skip_pairs=self._skip_pairs,
                 verbose=False,
                 physics_client_id=self._pb_client,
+                link_indices_to_check=self._planner_link_indices_to_check,
                 **self._collision_kwargs,
             ):
                 return rrt_waypoints, k
@@ -1777,6 +1972,10 @@ class RRTToGoalPlanner:
                 max_jerk,
                 control_hz=self._fps,
                 segment_at_sharp_corners=self._segment_at_sharp_corners,
+                final_approach_dist=self._final_approach_dist,
+                final_approach_vel_scale=self._final_approach_vel_scale,
+                final_approach_acc_scale=self._final_approach_acc_scale,
+                uniform_path_speed=self._uniform_path_speed,
                 **_ruckig_kwargs,
             ),
             dtype=np.float64,
@@ -1787,6 +1986,8 @@ class RRTToGoalPlanner:
         # factor 0.5 (RRT ≥2 cm ⇒ ruckig ≥1 cm) — still catches real
         # penetration.
         _kwargs = self._ruckig_collision_kwargs()
+        import os as _os
+        _dbg_wp0 = _os.environ.get("SPLATSIM_RRT_DEBUG_WP0")
         for k in range(traj.shape[0]):
             if check_links_in_collision(
                 self._robot_id,
@@ -1797,10 +1998,71 @@ class RRTToGoalPlanner:
                 skip_pairs=self._skip_pairs,
                 verbose=False,
                 physics_client_id=self._pb_client,
+                link_indices_to_check=self._planner_link_indices_to_check,
                 **_kwargs,
             ):
+                # Waypoint 0 == q_start (the just-escaped, supposedly-safe frame).
+                # Its collision here contradicts the escape's own safety check, so
+                # dump WHY (kind, links, gripper-state sensitivity, whether
+                # is_q_in_collision agrees) to localize the escape↔ruckig
+                # inconsistency. Gated on SPLATSIM_RRT_DEBUG_WP0.
+                if _dbg_wp0 and k == 0:
+                    self._debug_waypoint0_collision(traj[0], _kwargs)
                 return traj, k
         return traj, None
+
+    def _debug_waypoint0_collision(self, q_arm: np.ndarray, ruckig_kwargs: dict) -> None:
+        """Diagnose why the just-escaped q_start (== waypoint 0) collides in the
+        ruckig check when the escape's own `is_q_in_collision` cleared it.
+
+        Prints, for this exact arm config:
+          1. the ruckig check's kind + colliding link pair (verbose re-check),
+          2. the gripper joint value the ruckig check actually used,
+          3. gripper SENSITIVITY — does the collision persist with the gripper
+             forced open vs closed? (if it toggles, gripper state is the culprit),
+          4. whether `is_q_in_collision` (the escape's checker) AGREES.
+        Enabled by SPLATSIM_RRT_DEBUG_WP0; best-effort, never raises.
+        """
+        from splatsim.utils.rrt_path_utils import check_links_in_collision
+
+        try:
+            rid, cid = self._robot_id, self._pb_client
+            n = self._num_dofs
+            njoints = p.getNumJoints(rid, physicsClientId=cid)
+            grip_idx = list(range(n + 1, njoints))  # gripper joints (arm = [1..n])
+
+            def _recheck(verbose=False):
+                _, kind = check_links_in_collision(
+                    rid, self._joint_indices, q_arm, self._loaded_obstacle_ids,
+                    obstacle_names=self._obstacle_names, skip_pairs=self._skip_pairs,
+                    verbose=verbose, physics_client_id=cid,
+                    link_indices_to_check=self._planner_link_indices_to_check,
+                    return_kind=True, **ruckig_kwargs,
+                )
+                return kind
+
+            cur_grip = [round(float(p.getJointState(rid, gi, physicsClientId=cid)[0]), 3) for gi in grip_idx]
+            logger.warning("[wp0-debug] waypoint-0 collides. ruckig used gripper joints=%s", cur_grip)
+            logger.warning("[wp0-debug]   colliding pair (verbose): kind=%s", _recheck(verbose=True))
+
+            # Gripper sensitivity: force open (0.0) vs closed (0.8), re-check.
+            for label, gval in (("open(0.0)", 0.0), ("closed(0.8)", 0.8)):
+                for gi in grip_idx:
+                    p.resetJointState(rid, gi, gval, physicsClientId=cid)
+                logger.warning("[wp0-debug]   gripper=%s -> collision kind=%s", label, _recheck())
+            # Restore the gripper the ruckig check had left.
+            for gi, gv in zip(grip_idx, cur_grip):
+                p.resetJointState(rid, gi, float(gv), physicsClientId=cid)
+
+            # Does the escape's own checker agree on this exact config?
+            iqc = self.is_q_in_collision(np.asarray(q_arm, dtype=np.float64), return_kind=True)
+            logger.warning(
+                "[wp0-debug]   is_q_in_collision (escape's checker) says: %s   "
+                "(ruckig obstacle_clr=%.4f)",
+                iqc, ruckig_kwargs.get("obstacle_clearance", -1),
+            )
+        except Exception as e:  # never let debug break planning
+            logger.warning("[wp0-debug] diagnostic failed: %s", e)
 
     def _score_candidate(
         self,
@@ -1940,8 +2202,14 @@ class RRTToGoalPlanner:
                 skip_pairs=self._skip_pairs,
                 verbose=True,
                 physics_client_id=self._pb_client,
+                max_smooth_iterations=self._rrt_smooth_iterations,
+                actual_gripper_q=self._current_actual_gripper_q,
                 **self._collision_kwargs,
             )
+            # get_path → set_robot_joint_positions → open_gripper resets the
+            # gripper to 0.0. Re-snap so downstream ruckig-smoothed / dense
+            # collision checks see the actual gripper geometry.
+            self._snap_gripper_to_actual()
             return [np.asarray(attempt, dtype=np.float64)] if attempt is not None else []
 
         paths: list[np.ndarray] = []
@@ -1977,8 +2245,13 @@ class RRTToGoalPlanner:
                 skip_pairs=self._skip_pairs,
                 verbose=True,
                 physics_client_id=self._pb_client,
+                max_smooth_iterations=self._rrt_smooth_iterations,
+                actual_gripper_q=self._current_actual_gripper_q,
                 **self._collision_kwargs,
             )
+            # get_path resets the gripper open — re-snap for the next
+            # iteration's checks and for the caller's ruckig/dense check.
+            self._snap_gripper_to_actual()
             if attempt is None:
                 continue
             arr = np.asarray(attempt, dtype=np.float64)
@@ -3004,13 +3277,19 @@ class RRTToGoalPlanner:
         # Pass null-space arrays sized to the URDF's full movable-joint count
         # so PyBullet actually engages null-space IK (it silently disables it
         # when the array sizes don't match), giving us bias toward seed_q.
+        # maxNumIterations=512 (was 100000): DLS converges or plateaus well
+        # under 200 iterations — profiled identical FK error at 200 vs 100k,
+        # but 100k costs ~14-380 ms/call since residualThreshold=1e-10 never
+        # early-exits. This runs num_ik_candidates times per plan; the FK
+        # accuracy verification below rejects any insufficiently-converged
+        # solution, so the cap trades no correctness.
         q_solution = p.calculateInverseKinematics(
             self._robot_id,
             self._ee_link_index,
             list(ee_pos),
             list(ee_quat),
             **self._ik_null_space_kwargs(np.asarray(seed_q, dtype=np.float64)),
-            maxNumIterations=100000,
+            maxNumIterations=512,
             residualThreshold=1e-10,
             physicsClientId=self._pb_client,
         )
@@ -3043,6 +3322,7 @@ class RRTToGoalPlanner:
             skip_pairs=self._ik_skip_pairs(),
             verbose=False,
             physics_client_id=self._pb_client,
+            link_indices_to_check=self._planner_link_indices_to_check,
             **self._collision_kwargs,
         ):
             return None
@@ -3202,15 +3482,17 @@ def check_chunk_collision(
     if obstacle_names is not None:
         collide_kwargs["obstacle_names"] = obstacle_names
     # When the caller doesn't scope the link set, default to everything
-    # downstream of (and including) the first DOF — i.e., skip the static
-    # base_link (0) and world frame (-1) which never move and are always
-    # close to the table top, causing spurious obstacle-clearance hits.
-    # The RRT planner does this scoping for its own collision checks; the
-    # shield must do the same or every shielded chunk gets flagged as
-    # "base_link vs table" no matter what the policy actually predicts.
+    # downstream of (and including) the STATIC base_link — i.e., skip only
+    # the world frame (-1). base_link (0) IS included so the shield catches
+    # gripper/arm swinging back into the robot's own mount, matching the
+    # planner's `_planner_link_indices_to_check` scope. If a specific env
+    # has base_link geometrically overlapping an obstacle AABB (e.g., an
+    # older UR5+table setup where the mount is very close to the table
+    # top), silence it per-env via `skip_pairs`, which is obstacle-side
+    # only — the base_link↔gripper self-check stays live.
     if link_indices_to_check is None:
         n_joints = p.getNumJoints(robot_id, physicsClientId=pb_client)
-        link_indices_to_check = list(range(1, n_joints))
+        link_indices_to_check = list(range(0, n_joints))
     collide_kwargs["link_indices_to_check"] = link_indices_to_check
 
     # Pre-snap the gripper joints (URDF indices ≥ n_dof+1) ONCE to the
