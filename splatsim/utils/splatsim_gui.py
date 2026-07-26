@@ -768,6 +768,15 @@ class TrajectoryGenModePanel(ModePanel):
             FloatParam(f"{NS}.obstacle_clearance", "Obstacle Clearance (m)", 0.0, 0.1),
             FloatParam(f"{NS}.self_collision_clearance", "Self Coll Clearance (m)", 0.0, 0.1),
             FloatParam(f"{NS}.path_perturbation_scale", "Path Perturbation (rad)", 0.0, 0.2),
+            # Final-approach taper. `final_approach_dist=0` disables (Ruckig
+            # runs at full limits right up to the goal; PD may overshoot 1-2
+            # frames but no slow tail teaches "freeze near goal" into the
+            # policy). Default 0.15 rad brakes to `vel_scale × max_joint_vel`
+            # over the last 0.15 rad of joint-L2 to the goal — see
+            # TrajectoryGenModeConfig.final_approach_* docstring.
+            FloatParam(f"{NS}.final_approach_dist", "Final Approach Dist (rad)", 0.0, 0.5),
+            FloatParam(f"{NS}.final_approach_vel_scale", "Final Approach Vel Scale", 0.0, 1.0),
+            FloatParam(f"{NS}.final_approach_acc_scale", "Final Approach Acc Scale", 0.0, 1.0),
         ]
         for param in float_params:
             builder.add_float_param(param, getattr(config, param.key.split(".", 1)[1]))

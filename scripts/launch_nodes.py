@@ -331,9 +331,13 @@ def launch_robot_server(args: Args):
            eval_benchmark_repo_id=args.eval_benchmark_repo_id,
            eval_benchmark_subset=args.eval_benchmark_subset,
            wrist_cam_ver=args.wrist_cam_ver,
+           headless=args.headless,
+           show_control_gui=args.control_gui,
            render_mode=resolved_render_mode,
            in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
            in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
+           sync_physics_to_client=args.sync_physics_to_client,
+           physics_substeps_per_command=args.physics_substeps_per_command,
         )
 
     elif args.robot == "sim_pybullet_planar_interactive":

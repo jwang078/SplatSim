@@ -1,0 +1,89 @@
+{
+  "cuboids_fn": null,
+  "debug_visualize": false,
+  "disable_camera_scoring_for_rrt": false,
+  "ee_pos_goal": null,
+  "ee_pos_start": null,
+  "ee_quat_goal": null,
+  "ee_quat_start": null,
+  "final_approach_acc_scale": 0.25,
+  "final_approach_dist": 0.15,
+  "final_approach_vel_scale": 0.5,
+  "freeze_visualizer_during_plan": true,
+  "ik_goal_selection": "joint_distance",
+  "ik_skip_gripper_obstacle_pairs": true,
+  "k_exp": 5.0,
+  "k_sig": 15.0,
+  "lerobot_repo_id": "JennyWWW/eval_planar_3joint_benchmark",
+  "max_fails": 2,
+  "max_joint_acc": 1.0,
+  "max_joint_jerk": 10.0,
+  "max_joint_vel": 0.5,
+  "max_obstacle_fails_per_base_traj": 20,
+  "max_obstacles": 3,
+  "max_path_attempts": 15,
+  "min_obstacles": 1,
+  "num_base_trajectories": 100,
+  "num_ik_candidates": 32,
+  "num_path_candidates": 5,
+  "obstacle_clearance": 0.02,
+  "obstacles_per_base_trajectory": 0,
+  "pad_stopped_last_frames": false,
+  "path_perturbation_scale": 0.05,
+  "path_selection": "min_pair_clearance",
+  "paths_per_obstacle": 0,
+  "push_to_hub": true,
+  "q_goal": null,
+  "q_goal_bias": null,
+  "q_start": null,
+  "render_images": false,
+  "render_letterbox": true,
+  "render_stretch": true,
+  "robot_update_rate": 30,
+  "rrt_smooth_iterations": 200,
+  "rrt_vis_fps": 10,
+  "ruckig_obstacle_clearance_factor": 0.9,
+  "save_base_trajectory": true,
+  "save_zarr": false,
+  "segment_at_sharp_corners": false,
+  "self_collision_clearance": 0.01,
+  "self_collision_skip_pairs": [
+    [
+      7,
+      9
+    ],
+    [
+      8,
+      9
+    ],
+    [
+      12,
+      14
+    ],
+    [
+      13,
+      14
+    ],
+    [
+      5,
+      9
+    ],
+    [
+      10,
+      14
+    ],
+    [
+      6,
+      9
+    ],
+    [
+      11,
+      14
+    ]
+  ],
+  "threshold": 0.4,
+  "time_per_traj": 6.0,
+  "uniform_path_speed": true,
+  "use_obstacles": true,
+  "verbose": true
+}

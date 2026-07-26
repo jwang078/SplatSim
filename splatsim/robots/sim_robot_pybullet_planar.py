@@ -61,17 +61,15 @@ class PlanarPybulletRobotServer(SmallEnginePybulletRobotServer):
     # resolved + merged in at construction, identically for both robots.
     SELF_COLLISION_SKIP_PAIRS = []
     SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA = []
-    # The planar arm's URDF has slim, non-overlapping link geometry — nothing
-    # touches at rest — so parent-child link pairs are ACTUAL fold-over hazards
-    # when a revolute joint drives its child link back onto the parent's body
-    # (|joint_i| ≈ π). Force-check these pairs in the self-collision loop so
-    # env-terminate + planner both catch the fold-over. Empty on other robots
-    # (UR5+Robotiq at small_engine has natural joint-pivot overlap by URDF
-    # design — checking would false-fire at every arm config).
-    CHECK_ADJACENT_LINK_PAIRS_NAMES = [
-        ("link_1", "link_2"),
-        ("link_2", "link_3"),
-    ]
+    # Empty. Turns out the planar arm's URDF ISN'T slim enough to avoid the
+    # natural pivot overlap either — pybullet's getClosestPoints between
+    # adjacent parent-child links returns near-zero at every reachable joint
+    # config, not just at fold-over angles. Whitelisting these pairs made
+    # `is_robot_in_collision` reject every randomized start pose in the
+    # scene-solvability check → randomize_objects gave up on 100/100 attempts.
+    # Non-adjacent pairs (link_1 ↔ link_3) still get checked normally and
+    # catch the important fold-over case (elbow folded back over shoulder).
+    CHECK_ADJACENT_LINK_PAIRS_NAMES = []
 
     # Reach-task parameters (override per concrete env if desired). Success
     # tolerance (6 cm) exceeds the block's half-diagonal (~4.3 cm for a 5 cm

@@ -33,3 +33,4 @@ MUJOCO_LOG.TXT
 **/build/*
 data/datasets/*
 output/*
+scripts/recordings/
