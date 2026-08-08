@@ -1,0 +1,23 @@
+# Conda layer ONLY — the non-pip dependencies that pyproject.toml cannot express.
+#
+#   conda env create -f environment.yml
+#   conda activate splatsim
+#   ./install.sh          # torch + pip deps + submodule builds, in order
+#
+# Why these belong here and not in pyproject.toml:
+#   * ffmpeg      — native libs; pyav and LeRobot's torchcodec link against it.
+#                   This env runs 8.0.1. torchcodec ships per-FFmpeg-major cores
+#                   (4-8) and picks the matching one at import.
+#   * cuda-nvcc   — needed to COMPILE diff-gaussian-rasterization and simple-knn.
+#     + cudart      Their nvcc major must match the torch CUDA build (12.8) or
+#                   the extensions build but fail to load.
+name: splatsim
+channels:
+  - nvidia/label/cuda-12.8.0
+  - conda-forge
+dependencies:
+  - python=3.12
+  - ffmpeg=8.0.1
+  - cuda-nvcc=12.8.61
+  - cuda-cudart-dev=12.8.57
+  - pip

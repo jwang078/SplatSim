@@ -9,80 +9,51 @@ This repository contains the code for the paper "SplatSim".
 
 ## Installation
 
-### Clone this repository
-```bash
-cd ~/code
-git clone --recursive https://github.com/qureshinomaan/SplatSim.git
-```
-
-If you accidentally forgot the `--recursive`, run this command to download the files for the `submodules` folder: `git submodule update --init --recursive`
-
-### Create conda env
+Requires conda and an NVIDIA GPU. Tested on Python 3.12 / CUDA 12.8.
 
 ```bash
-conda create -n splatsim python=3.12
+git clone --recursive git@github.com:jwang078/SplatSim.git ~/code/SplatSim
+cd ~/code/SplatSim
+conda env create -f environment.yml
 conda activate splatsim
+./install.sh
 ```
 
-### Install pytorch
+`install.sh` installs everything (including compiling the CUDA extensions, which
+takes a few minutes) and import-checks the result when it finishes.
 
+To drive a physical xArm, add the hardware extras afterwards:
+`pip install -e '.[hardware]'`
 
-Go to https://pytorch.org/get-started/locally/ to find the right commands for your system. For example, this repo worked with this configuration:
-  - torch==2.7.1
-  - torchaudio=2.7.1+cu126
-  - torchvision=0.22.1+cu126
+### LeRobot
+
+Training and dataset tooling live in a companion repo, cloned next to this one:
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+git clone git@github.com:jwang078/lerobot.git ~/code/lerobot
+pip install -e ~/code/lerobot
 ```
 
-### Install submodules
+`install.sh` does this for you if it finds `../lerobot`. Use
+`LEROBOT_DIR=/path/to/lerobot ./install.sh` for a different location, or
+`SKIP_LEROBOT=true ./install.sh` to skip it.
 
-Note: If nothing is inside the `submodules/` folder, run `git submodule update --init --recursive`
+### Troubleshooting
 
-```bash
-pip install submodules/gaussian-splatting-wrapper/gaussian_splatting/submodules/diff-gaussian-rasterization submodules/pybullet-URDF-models submodules/pybullet-playground-wrapper/ submodules/ghalton
-
-# This needs editable mode for some reason
-pip install -e submodules/gaussian-splatting-wrapper
-
-# Seems like -e pip installs must be installed separately
-pip install -e submodules/gello_software
-
-# Install dependencies from gello_software
-pip install -r submodules/gello_software/requirements.txt
-pip install -e submodules/gello_software/third_party/DynamixelSDK/python
-
-# Allow the install to use your version of pytorch; this takes a few mins for some reason
-pip install submodules/simple-knn/ --no-build-isolation
-```
-
-QOL to clean up git status
-```bash
-echo '*.egg-info' >> .git/modules/submodules/ghalton/info/exclude
-echo '*.egg-info' >> .git/modules/submodules/pybullet-URDF-models/info/exclude
-echo 'build/*' >> .git/modules/submodules/pybullet-URDF-models/info/exclude
-echo '*.egg-info' >> .git/modules/submodules/gello_software/modules/third_party/DynamixelSDK/info/exclude
-```
-
-### Install other dependencies
-
-Install requirements:
-```bash
-cd ~/code/SplatSim
-pip install -r requirements.txt
-```
-
-Note: It's important to pip install the `ghalton` submodule in the previous step before installing requirements.txt because for some reason ghalton must be installed from source
-
-### Install this repo as a package
-
-Install in editable mode:
-
-```bash
-cd ~/code/SplatSim
-pip install -e .
-```
+- **`ModuleNotFoundError: simple_knn`** (or an empty `submodules/` folder) — the
+  clone missed its submodules. Run `git submodule update --init --recursive`,
+  then `./install.sh` again.
+- **Don't upgrade torch.** The version is pinned to 2.11.0+cu128 on purpose:
+  the CUDA extensions are compiled against it, and video dataloading gets
+  several times slower on other builds. Same for the CUDA 12.8 toolchain.
+- **`nvcc: command not found`** — the conda env isn't active
+  (`conda activate splatsim`).
+- **Noisy `git status` after installing** — the submodule builds leave
+  artifacts behind:
+  ```bash
+  echo '*.egg-info' >> .git/modules/submodules/ghalton/info/exclude
+  echo '*.egg-info' >> .git/modules/submodules/gello_software/modules/third_party/DynamixelSDK/info/exclude
+  ```
 
 ## Running the rendering code 
 ### 1. Download the colmap and gaussian-splatting models from the below links:

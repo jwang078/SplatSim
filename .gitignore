@@ -34,3 +34,8 @@ MUJOCO_LOG.TXT
 data/datasets/*
 output/*
 scripts/recordings/
+
+# generated at runtime / by helper scripts
+data/scenarios/
+data/vine_seg/
+scripts/outputs/

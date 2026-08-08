@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "SplatSim"
+version = "0.1.0"
+description = "Gaussian-splat photorealistic simulation for robot manipulation policy training"
+requires-python = ">=3.12,<3.13"
+readme = "README.md"
+
+# Pinned to a known-good environment (Python 3.12.12, CUDA 12.8, RTX 50-series).
+#
+# torch/torchvision are declared as RANGES, not the exact `+cu128` local
+# versions, because those builds do not exist on PyPI — `pip install .` would
+# silently pull a CPU wheel. install.sh installs them from the CUDA 12.8 index
+# FIRST, so by the time this metadata is resolved pip already sees them
+# satisfied. Keep the 2.11.x floor: it is the first release carrying torch's
+# stable C ABI, which torchcodec (LeRobot's fast video decoder) links against.
+# A 2.11 *nightly* predates that shim and cannot load torchcodec.
+dependencies = [
+    "torch>=2.11,<2.12",
+    "torchvision>=0.26,<0.27",
+
+    # Gaussian splatting / rendering
+    "gsplat==1.5.3",
+    "open3d==0.19.0",
+    "plyfile==1.1.2",
+    "e3nn==0.5.6",
+    "einops==0.8.1",
+
+    # Simulation, kinematics & motion planning
+    "pybullet==3.2.7",
+    "pybullet-planning==0.6.0",
+    "toppra==0.6.3",
+    # NOTE: community ruckig delegates INTERMEDIATE-waypoint trajectories to a
+    # rate-limited cloud API and fails closed when unreachable; only
+    # target-state trajectories solve locally.
+    "ruckig==0.15.3",
+    "numpy-quaternion==2024.0.13",
+    "pyquaternion==0.9.9",
+    "ghalton==0.6.2",
+    "mujoco==3.3.7",
+    "dm_control==1.0.34",
+    "gymnasium==1.3.0",
+
+    # Data / IO. zarr is held on the 2.x line — the code uses the v2 API.
+    "zarr==2.18.7",
+    "numcodecs==0.15.1",
+    "pyarrow==22.0.0",
+    "pandas==2.3.3",
+    "huggingface_hub==1.21.0",
+    "av==15.1.0",
+    "imageio==2.37.2",
+    "opencv-python==4.12.0.88",
+    "pillow==12.0.0",
+    "PyYAML==6.0.3",
+    "dill==0.4.0",
+
+    # Networking / CLI / misc
+    "pyzmq==27.1.0",
+    "tyro==0.9.35",
+    "tqdm==4.67.1",
+    "termcolor==3.2.0",
+    "typing_extensions==4.15.0",
+    "transformers==5.3.0",
+
+    # Scientific
+    "numpy==2.2.6",
+    "scipy==1.16.3",
+    "scikit-learn==1.8.0",
+    "matplotlib==3.10.8",
+
+    # Teleop input (keyboard/gamepad recording is part of the sim workflow)
+    "pygame==2.6.1",
+    "pynput==1.8.1",
+    "pyspacemouse==1.1.5",
+]
+
+[project.optional-dependencies]
+# Only needed to drive a PHYSICAL xArm. Skip for sim-only use.
+# NOTE: an unrelated `xarm==0.0.4` on PyPI shadows the same `xarm` import
+# name — install only one.
+hardware = ["xarm-python-sdk==1.17.3"]
+
+[tool.setuptools.packages.find]
+include = ["splatsim*"]
