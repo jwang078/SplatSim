@@ -226,6 +226,14 @@ class EnvConfig:
     task_description: str = ""
     task: Optional[TaskConfig] = None
     terminate_on_collision: bool = False
+    # Optional soft-cost payload for cost-aware RRT (pushable vegetation
+    # etc.). Published verbatim as the oracle env config's "soft_cost" key
+    # and consumed by RRTToGoalPlanner.load_obstacles ->
+    # SoftCostField.from_config. Shape:
+    #   {"npz_path": <str>, ["transform": 4x4], ["grid_resolution": m],
+    #    ["influence_radius": m], ["normalize": bool]}
+    # None (default) = binary-obstacle env, planner behavior unchanged.
+    soft_cost: Optional[dict] = None
 
 @dataclass
 class SplatSimObject:

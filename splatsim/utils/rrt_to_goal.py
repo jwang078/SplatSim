@@ -1,6 +1,6 @@
 """RRT-to-goal planner for the shared autonomy wrapper.
 
-Wraps SplatSim's RRT (`splatsim.utils.rrt_path_utils.get_path`) and ruckig time
+Wraps SplatSim's RRT (`splatsim.utils.rrt_path_utils.get_path`) and TOPP-RA time
 parametrization with a small interface tailored to the wrapper's needs:
 
   * Loads obstacle bodies from a serialized env config (sent over ZMQ from the
@@ -125,6 +125,30 @@ class IkGoalSelectionStrategy(Enum):
     NONE = "none"
 
 
+class SoftCostMode(Enum):
+    """How a loaded soft-cost field (pushable vegetation) is used by
+    `RRTToGoalPlanner`. Enum mirror of the planner's string
+    ``soft_cost_mode`` kwarg so config dropdowns (SplatSim GUI) can offer
+    the options; the planner itself accepts plain strings.
+
+    * ``OFF`` — ignore the field entirely (binary planning only).
+    * ``SCORE`` — candidates are generated cost-blind; ``weight *
+      path-integral(cost)`` is added to the path-selection score, so the
+      least-exposed of the generated candidates wins. Cheap, but shortcut
+      smoothing tends to collapse all candidates onto the same straight
+      (often high-cost) route, so the effect is limited in practice.
+    * ``GUIDED`` — SCORE plus cost-aware GENERATION: T-RRT transition test
+      on every tree-extension step and cost-gated shortcut / elastic /
+      trajopt smoothing (see ``rrt_path_utils.cost_aware_birrt``). Paths
+      actively route around the field. Costs more planning time (one field
+      lookup per extension step); no effect when no field is loaded.
+    """
+
+    OFF = "off"
+    SCORE = "score"
+    GUIDED = "guided"
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -170,7 +194,7 @@ class RRTRuntimeState:
     excluded_q_goals: list[np.ndarray] = field(default_factory=list)
     # When True for the next _do_plan invocation: skip the pre-jump
     # lookback sampling AND the teleport-to-q_start entirely. q_start is
-    # read from the wrapper's CURRENT joint state (no rewind), and ruckig
+    # read from the wrapper's CURRENT joint state (no rewind), and the parametrizer
     # is invoked with `start_vel = recent_joint_velocity` so the
     # parametrized trajectory begins at velocity-continuous matching the
     # robot's actual motion. Set per-trigger by RRTGuidanceSource.trigger();
@@ -230,6 +254,7 @@ def _hash_config(cfg: dict) -> str:
     return hashlib.sha1(_canonical_for_hash(objs).encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
+
 class RRTToGoalPlanner:
     """Plans a joint-space trajectory to a fixed goal using SplatSim's RRT.
 
@@ -252,7 +277,7 @@ class RRTToGoalPlanner:
         max_joint_vel: float = 0.5,
         max_joint_acc: float = 1.0,
         max_joint_jerk: float = 10.0,
-        ruckig_per_candidate: bool = True,
+        parametrize_per_candidate: bool = True,
         path_selection: PathSelectionStrategy = PathSelectionStrategy.EE_ARC_LENGTH,
         velocity_match_window: int = 3,
         segment_at_sharp_corners: bool = True,
@@ -261,6 +286,21 @@ class RRTToGoalPlanner:
         max_path_attempts_per_ik: int = 5,
         path_perturbation_scale: float = 0.001,
         rrt_smooth_iterations: int = 50,
+        elastic_smooth_passes: int = 0,
+        # CHOMP-lite trajopt smoothing (soft collision + smoothness). 0 = off.
+        # See trajopt_smooth_path in rrt_path_utils.py for cost formulation.
+        # Default 15 matches both SharedAutonomyConfig and
+        # TrajectoryGenModeConfig (which passes it through explicitly).
+        trajopt_passes: int = 15,
+        trajopt_lr: float = 0.02,
+        trajopt_smoothness_weight: float = 1.0,
+        trajopt_collision_weight: float = 5.0,
+        trajopt_collision_threshold: float = 0.10,
+        trajopt_fd_step: float = 0.01,
+        # Run trajopt + elastic smoothing on the SELECTED candidate only,
+        # instead of on every candidate before ranking. See
+        # `_postprocess_path` for the cost/fidelity trade-off.
+        postprocess_after_ranking: bool = True,
         final_approach_dist: float = 0.0,
         final_approach_vel_scale: float = 0.3,
         final_approach_acc_scale: float = 0.25,
@@ -272,12 +312,19 @@ class RRTToGoalPlanner:
         diagnostic_log_pairs: str = "off",
         escape_clearance_factor: float = 1.5,
         rewind_clearance_factor: float | None = None,
-        ruckig_obstacle_clearance_factor: float = 0.5,
+        obstacle_clearance_factor: float = 0.5,
         ik_skip_gripper_obstacle_pairs: bool = False,
         wrist_camera_link_index: int | None = None,
         camera_k_exp: float = 5.0,
         camera_k_sig: float = 15.0,
         camera_threshold: float = 0.4,
+        soft_cost_mode: str = "score",
+        soft_cost_weight: float = 1.0,
+        soft_cost_sample_spacing: float = 0.05,
+        soft_cost_surface_samples: int = 6,
+        soft_cost_aggregation: str = "max",
+        soft_cost_debug_draw: bool = False,
+        soft_cost_guided_params: dict | None = None,
     ) -> None:
         self._pb_client = pb_client
         self._robot_id = robot_id
@@ -299,7 +346,7 @@ class RRTToGoalPlanner:
         # obstacle false-fire won't disable the self-check.
         #
         # The shared helper `_current_pose_in_planner_collision` uses this
-        # scope; the ruckig-smoothed / linear-densified / raw-path /
+        # scope; the time-parametrized / linear-densified / raw-path /
         # start-in-collision / `check_chunk_collision` checks MUST use the
         # same one or escape's "safe" verdict disagrees with RRT's per-
         # waypoint verdict and the planner cascades into 5-retry backoff at
@@ -310,7 +357,7 @@ class RRTToGoalPlanner:
         self._planner_num_pb_joints: int = _n_pb_joints
         # Actual gripper config for this plan() call, snapped onto the
         # planner's pybullet client so every downstream collision check
-        # (BiRRT collision_fn, IK candidate check, ruckig-smoothed check,
+        # (BiRRT collision_fn, IK candidate check, time-parametrized check,
         # linear-densified check) uses the SAME gripper geometry the escape
         # rewind check used. Without this, birrt_path's `set_robot_joint_positions`
         # call forces `open_gripper()` — collision checks then run on OPEN
@@ -334,6 +381,63 @@ class RRTToGoalPlanner:
         # Set per-candidate inside the planning loop so `_path_camera_score`
         # can FK the goal EE position as the camera's aim target.
         self._score_goal_q: np.ndarray | None = None
+        # Soft-cost (pushable vegetation) scoring. The field itself arrives
+        # via env_config["soft_cost"] in load_obstacles; these knobs only
+        # control how it is used. With no field loaded (every binary-obstacle
+        # env: small_engine, planar_3joint, ...) all of this is a None-check
+        # — behavior and cost are identical to the pre-soft-cost planner.
+        #   soft_cost_mode: "score" adds weight * path-integral(cost) to the
+        #     path-selection score (hard collision checks are untouched);
+        #     "guided" does everything "score" does AND makes path GENERATION
+        #     cost-aware — T-RRT transition test on tree growth, cost-gated
+        #     shortcut/elastic/trajopt smoothing (see rrt_path_utils
+        #     cost_aware_birrt). Use "guided" when candidates must actively
+        #     route around the field, not just be ranked by it: with "score"
+        #     alone every candidate is generated cost-blind and shortcut
+        #     smoothing collapses them onto the same (often high-cost)
+        #     straight route, leaving the scorer nothing to choose between.
+        #     "off" ignores a loaded field entirely.
+        #   soft_cost_weight: scale of the soft term relative to the base
+        #     score. Fields are normalized to max=1 at build, so the term is
+        #     commensurate with EE/joint arc length (both ~"meters").
+        #   soft_cost_sample_spacing: spacing (m) of extra samples between
+        #     link origins when evaluating the field along the arm.
+        #   soft_cost_debug_draw: draw the winning trajectory's EE trace in
+        #     the GUI colored by local soft cost (green=free .. red=dense).
+        #   soft_cost_guided_params: optional dict of T-RRT overrides
+        #     forwarded to get_path(trrt_params=...) in guided mode
+        #     (max_iterations, max_time, t_init, t_min, alpha, nfail_max,
+        #     restarts, direct_cost_threshold, fallback_to_binary).
+        #     None = rrt_path_utils._TRRT_DEFAULTS (10 s/attempt, 1 restart,
+        #     then fall back to plain binary birrt so a hard scene degrades
+        #     to score-mode quality instead of stalling).
+        if isinstance(soft_cost_mode, SoftCostMode):
+            soft_cost_mode = soft_cost_mode.value
+        if soft_cost_mode not in ("off", "score", "guided"):
+            raise ValueError(
+                "soft_cost_mode must be 'off', 'score' or 'guided', "
+                f"got {soft_cost_mode!r}"
+            )
+        self._soft_cost_mode = soft_cost_mode
+        self._soft_cost_weight = float(soft_cost_weight)
+        self._soft_cost_sample_spacing = float(soft_cost_sample_spacing)
+        # Surface-ring sampling + reduction: see `_config_soft_cost_points`
+        # and `_aggregate_soft_cost` for why the defaults are 6 rings and
+        # "max" rather than centerline-only + "mean". Set surface_samples=0
+        # and aggregation="mean" to restore the pre-2026-08-01 behavior.
+        self._soft_cost_surface_samples = int(soft_cost_surface_samples)
+        if soft_cost_aggregation not in ("max", "mean"):
+            raise ValueError(
+                "soft_cost_aggregation must be 'max' or 'mean', "
+                f"got {soft_cost_aggregation!r}"
+            )
+        self._soft_cost_aggregation = soft_cost_aggregation
+        self._link_radii_cache: np.ndarray | None = None
+        self._soft_cost_debug_draw = bool(soft_cost_debug_draw)
+        self._soft_cost_guided_params = (
+            dict(soft_cost_guided_params) if soft_cost_guided_params else None
+        )
+        self._soft_cost_field = None  # SoftCostField | None; set by load_obstacles
         self._fps = fps
         self._lower_limits = (
             np.asarray(lower_limits, dtype=np.float64)
@@ -349,15 +453,15 @@ class RRTToGoalPlanner:
         self._max_joint_vel = max_joint_vel
         self._max_joint_acc = max_joint_acc
         self._max_joint_jerk = max_joint_jerk
-        # Ruckig call frequency inside plan(). True (default): ruckig-smooth +
+        # Parametrization frequency inside plan(). True (default): parametrize +
         # dense-check EACH candidate path so a candidate whose smoothed spline
         # curves into an obstacle is rejected and the next tried (max robustness;
         # the DAgger/SA intervention side wants this). False: per-candidate checks
-        # use a cheap LINEAR-DENSIFY collision check (no ruckig) and ruckig runs
+        # use a cheap LINEAR-DENSIFY collision check (no parametrization) and it runs
         # EXACTLY ONCE on the winning path. SplatSim trajectory-gen sets False so
-        # it doesn't hit the ruckig cloud API once per candidate — which
-        # overwhelms it ("[ruckig] could not reach cloud API server").
-        self._ruckig_per_candidate = bool(ruckig_per_candidate)
+        # it doesn't re-parametrize once per candidate (and, on the
+        # ruckig fallback backend, doesn't hit its cloud API that often).
+        self._parametrize_per_candidate = bool(parametrize_per_candidate)
         self._path_selection = path_selection
         # MIN_PAIR_CLEARANCE diagnostic toggle (validated upstream by the
         # SA config's __post_init__). Controls the structural-offender
@@ -368,9 +472,9 @@ class RRTToGoalPlanner:
                 f"diagnostic_log_pairs must be one of 'off'/'first'/'always', got {diagnostic_log_pairs!r}"
             )
         self._diagnostic_log_pairs = diagnostic_log_pairs
-        # Forwarded to ruckig_parametrize_path. True (default) = historical
+        # Forwarded to parametrize_path. True (default) = historical
         # per-segment mode with zero velocity at each sharp corner. False =
-        # single-call ruckig with intermediate_positions (no forced internal
+        # a single continuous parametrization pass (no forced internal
         # stops). Empirically indistinguishable on typical manipulation
         # RRT plans; True is the safer default.
         self._segment_at_sharp_corners = bool(segment_at_sharp_corners)
@@ -415,13 +519,33 @@ class RRTToGoalPlanner:
         self._path_perturbation_scale = float(path_perturbation_scale)
         # Random-shortcut smoothing iterations forwarded to get_path /
         # pybullet_planning smooth_path. Shortcutting is what straightens
-        # RRT's detours — ruckig only smooths the time parametrization, not
+        # RRT's detours — the parametrizer only shapes timing, not
         # the geometric path. Iterations past convergence are cheap (a
         # candidate segment is collision-checked only when it would shorten
         # the path), so higher values mainly trade a little planning time
         # for visibly less erratic paths.
         self._rrt_smooth_iterations = int(rrt_smooth_iterations)
-        # Final-approach taper forwarded to ruckig_parametrize_path: brake to
+        # Corner-rounding relaxation after shortcut smoothing (see
+        # rrt_path_utils.elastic_smooth_path). 0 = off (historical behavior).
+        # Enable for cluttered scenes (vine canopy) where shortcuts collide
+        # and jagged joint-space corners survive into the trajectory as wobble.
+        self._elastic_smooth_passes = int(elastic_smooth_passes)
+        # CHOMP-lite trajopt smoothing after (or in place of) elastic. Explicit
+        # repulsive collision cost pushes waypoints away from obstacles rather
+        # than just refusing entry into collision. Combined with the Laplacian
+        # smoothness term this gives paths with genuinely wider clearance,
+        # reducing the sensitivity of downstream imitation policies to small
+        # obstacle-position changes (fewer boundary flip-flops between
+        # nearly-identical scenarios). Off by default; see the trajopt_*
+        # forwarding into get_path() below for how the args flow through.
+        self._trajopt_passes = int(trajopt_passes)
+        self._trajopt_lr = float(trajopt_lr)
+        self._trajopt_smoothness_weight = float(trajopt_smoothness_weight)
+        self._trajopt_collision_weight = float(trajopt_collision_weight)
+        self._trajopt_collision_threshold = float(trajopt_collision_threshold)
+        self._trajopt_fd_step = float(trajopt_fd_step)
+        self._postprocess_after_ranking = bool(postprocess_after_ranking)
+        # Final-approach taper forwarded to parametrize_path: brake to
         # a stop `final_approach_dist` rad (joint-space L2) before the goal,
         # then creep the last stretch at scaled-down vel/acc so the PD-tracked
         # robot doesn't carry momentum past the final waypoint. 0.0 = off
@@ -431,7 +555,7 @@ class RRTToGoalPlanner:
         self._final_approach_acc_scale = float(final_approach_acc_scale)
         # Equalize joint-space path speed across sections (per-section velocity
         # caps proportional to section direction). Removes the direction-
-        # anisotropy surging of box limits — see ruckig_parametrize_path.
+        # anisotropy surging of box limits — see parametrize_path.
         self._uniform_path_speed = bool(uniform_path_speed)
         # Freeze the pybullet visualizer's world redraw for the duration of
         # plan(). Planning issues thousands of resetJointState +
@@ -464,18 +588,18 @@ class RRTToGoalPlanner:
             self._collision_kwargs["obstacle_clearance"] = self._obstacle_clearance_override
         if self._self_collision_clearance_override is not None:
             self._collision_kwargs["self_collision_clearance"] = self._self_collision_clearance_override
-        # Ruckig-smoothed checks use a LOOSER obstacle clearance than the
-        # sparse/dense RRT checks. Motivation: ruckig's C² spline naturally
+        # Time-parametrized checks use a LOOSER obstacle clearance than the
+        # sparse/dense RRT checks. Motivation: the parametrizer's C² spline naturally
         # bulges outside the linear chord at sharp corners; if it had to
         # satisfy the same clearance as the raw path, the reject rate would
         # go through the roof even for paths whose smoothed form only grazes
         # the buffer (say, 1.5 cm on a 2 cm requirement). Halving (default
-        # 0.5) says: RRT-clean at 2 cm, ruckig-clean at 1 cm — still catches
+        # 0.5) says: RRT-clean at 2 cm, parametrizer-clean at 1 cm — still catches
         # actual penetration, doesn't reject cornering bulges. Applies to
         # obstacle clearance only; self-collision clearance stays symmetric.
         # Only the `_smooth_and_check_collision` callsites and stage 3 of
-        # `_validate_final_trajectory` use these ruckig-scaled kwargs.
-        self._ruckig_obstacle_clearance_factor = float(ruckig_obstacle_clearance_factor)
+        # `_validate_final_trajectory` use these parametrizer-scaled kwargs.
+        self._smoothed_obstacle_clearance_factor = float(obstacle_clearance_factor)
         # Skip-pair list goes into the same kwargs dict so every
         # `check_links_in_collision(**self._collision_kwargs)` / `get_path(...)`
         # callsite picks it up automatically — same pattern as the clearance
@@ -488,9 +612,9 @@ class RRTToGoalPlanner:
         # Multiplier on `_effective_obstacle_clearance()` used by
         # `_escape_collision` to set how far past the BiRRT collision
         # threshold the escape pushes before declaring "clear". Provides
-        # a buffer so subsequent ruckig motion doesn't immediately dip
+        # a buffer so subsequent motion doesn't immediately dip
         # back into the threshold (cascade-retry the user observed:
-        # escape stops at exactly the planner clearance → ruckig moves
+        # escape stops at exactly the planner clearance → the trajectory moves
         # 1 step toward goal → controller's per-tick check fires → retry
         # → escape re-runs to the same barely-safe config → repeat).
         # Default 1.5× gives ~50% margin (e.g., 3cm escape for a 2cm
@@ -523,7 +647,7 @@ class RRTToGoalPlanner:
         # contact-normal / self-collision-gradient escapes.
         self._policy_history_ref: object | None = None
         self._policy_history_max_lookback: int = 0
-        # Published by plan() before ruckig — last successful IK goal as
+        # Published by plan() before parametrization — last successful IK goal as
         # joint config. Consumed by RRTGuidanceSource's retry-on-collision
         # to track which IK branch to exclude when re-planning.
         self._last_chosen_q_goal: np.ndarray | None = None
@@ -615,19 +739,19 @@ class RRTToGoalPlanner:
 
         return _COLLISION_CLEARANCE
 
-    def _ruckig_collision_kwargs(self) -> dict:
-        """Kwargs dict for ruckig-smoothed collision checks. Same as
+    def _smoothed_collision_kwargs(self) -> dict:
+        """Kwargs dict for time-parametrized collision checks. Same as
         `self._collision_kwargs` but with `obstacle_clearance` scaled by
-        `_ruckig_obstacle_clearance_factor` (default 0.5). Sparse/dense RRT
+        `_smoothed_obstacle_clearance_factor` (default 0.5). Sparse/dense RRT
         checks keep the full clearance; only the smoothed-spline check uses
-        this looser bound so ruckig's natural cornering bulge past the linear
+        this looser bound so the parametrizer's natural cornering bulge past the linear
         chord doesn't cause spurious rejects. Self-collision clearance and
         skip-pairs are preserved as-is (the bulge argument doesn't apply to
         self-collision — those pairs are geometric constants of the URDF).
         """
         kwargs = dict(self._collision_kwargs)
         base_obs = self._effective_obstacle_clearance()
-        kwargs["obstacle_clearance"] = base_obs * self._ruckig_obstacle_clearance_factor
+        kwargs["obstacle_clearance"] = base_obs * self._smoothed_obstacle_clearance_factor
         return kwargs
 
     def _current_pose_in_planner_collision(
@@ -703,7 +827,7 @@ class RRTToGoalPlanner:
         `check_links_in_collision(q=arm_only)` runs with wide-open fingers
         while the real env robot's fingers are typically closing around
         an object; the geometric mismatch is exactly the "escape says
-        safe / ruckig says collides at waypoint 0" cascade.
+        safe / parametrized path collides at waypoint 0" cascade.
         """
         if self._current_actual_gripper_q is None:
             return
@@ -1043,6 +1167,32 @@ class RRTToGoalPlanner:
             except p.error as e:
                 logger.warning("getAABB failed for %s (body_id=%d): %s", name, body_id, e)
 
+        # Optional soft-cost payload (pushable vegetation). Travels in the
+        # same env-config dict as `objects`; absent for binary-obstacle envs,
+        # in which case the field stays None and scoring is unchanged.
+        self._soft_cost_field = None
+        soft_payload = env_config.get("soft_cost")
+        if soft_payload:
+            try:
+                from splatsim.utils.soft_cost_field import SoftCostField
+
+                self._soft_cost_field = SoftCostField.from_config(soft_payload)
+                logger.info(
+                    "load_obstacles: soft-cost field loaded from %s "
+                    "(%d pts, grid %s, mode=%s, weight=%.3f)",
+                    soft_payload.get("npz_path"),
+                    len(self._soft_cost_field.points),
+                    tuple(self._soft_cost_field.grid.shape),
+                    self._soft_cost_mode,
+                    self._soft_cost_weight,
+                )
+            except Exception:
+                logger.exception(
+                    "load_obstacles: failed to load soft_cost payload %s — "
+                    "continuing WITHOUT soft-cost scoring",
+                    soft_payload,
+                )
+
         self._loaded_config_hash = cfg_hash
         logger.info(
             "RRTToGoalPlanner.load_obstacles: %d obstacle(s) loaded (%s)",
@@ -1225,7 +1375,7 @@ class RRTToGoalPlanner:
         q_goal_bias: np.ndarray | None = None,
         recent_joint_velocity: np.ndarray | None = None,
         exclude_q_goals: list[np.ndarray] | None = None,
-        ruckig_start_vel: np.ndarray | None = None,
+        start_vel: np.ndarray | None = None,
         actual_gripper_q: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray | None]:
         """Plan a joint-space trajectory to an end-effector pose.
@@ -1240,7 +1390,7 @@ class RRTToGoalPlanner:
 
         `exclude_q_goals`: optional list of joint configurations to FILTER OUT
         of the IK candidate set before planning. Used by the retry-on-collision
-        path: when a path executed in sim collides (typically because ruckig
+        path: when a path executed in sim collides (typically because the parametrizer
         smoothing curved through an obstacle the RRT-raw path didn't), the
         source adds that path's q_goal to this list and re-calls plan() — the
         filter discards any candidate within ~0.05 rad (per-joint L2) of an
@@ -1252,7 +1402,7 @@ class RRTToGoalPlanner:
         scraping the trajectory's terminal pose.
 
         Returns ``(traj, escape_end_q)`` where:
-          * ``traj`` is the ruckig-smoothed RRT chunk of shape (T, num_dofs)
+          * ``traj`` is the time-parametrized RRT chunk of shape (T, num_dofs)
             sampled at ``self._fps``. **NEW (formerly traj contained
             prepended escape waypoints):** the escape segment is no longer
             included in ``traj``. Callers that have access to the env must
@@ -1280,7 +1430,7 @@ class RRTToGoalPlanner:
         Raises ``RRTPlanningError`` if no IK candidate can be reached.
         """
         from splatsim.utils.rrt_path_utils import check_links_in_collision
-        # ruckig_parametrize_path is no longer used inline here — the per-IK
+        # parametrize_path is no longer used inline here — the per-IK
         # loop now calls self._smooth_and_check_collision which owns both
         # the parametrize and the dense collision check.
 
@@ -1290,13 +1440,13 @@ class RRTToGoalPlanner:
         # Snap the planner's gripper joints to the env's ACTUAL gripper
         # config BEFORE any collision check runs. Every downstream check
         # (start-in-collision precheck, escape rewind, IK candidate filter,
-        # BiRRT sample/extend, ruckig-smoothed dense check) then evaluates
+        # BiRRT sample/extend, time-parametrized dense check) then evaluates
         # against a gripper geometry that matches the real robot's fingers.
         # Without this, birrt_path's `set_robot_joint_positions` forces
         # `open_gripper()` and every check downstream runs on wide-open
         # fingers while the real robot's fingers are closing around an
         # object — the exact cause of the "escape rewound to safe frame,
-        # ruckig-smoothed path collides at waypoint 0" cascade. Re-snapped
+        # time-parametrized path collides at waypoint 0" cascade. Re-snapped
         # after every get_path call inside `_generate_paths_for_ik` (which
         # goes through set_robot_joint_positions again). None from the
         # caller = leave gripper untouched (legacy behavior).
@@ -1497,14 +1647,14 @@ class RRTToGoalPlanner:
                 if not candidate_paths:
                     continue
                 # Among this IK's path candidates, pick the best-scored one
-                # whose RUCKIG-SMOOTHED form is collision-free. Score all
-                # candidates, sort best-first, then ruckig + dense-check
+                # whose PARAMETRIZED form is collision-free. Score all
+                # candidates, sort best-first, then parametrize + dense-check
                 # each in score order — take the first that passes. Falling
                 # back to a lower-scored path WITHIN the same IK goal is
                 # almost always preferable to giving up on the IK goal and
                 # trying the next IK (which may itself fail the same way).
                 # When num_path_candidates_per_ik=1, this collapses to "try
-                # the single path; if its ruckig collides, treat this IK
+                # the single path; if its parametrized form collides, treat this IK
                 # as failed".
                 # CAMERA_SCORING aims the wrist camera at this goal's EE
                 # position — stash the goal so `_path_camera_score` can FK it.
@@ -1524,17 +1674,32 @@ class RRTToGoalPlanner:
                     _cp_snapped[0] = q_start
                     _cp_snapped[-1] = q_goal
                     _cp_arr = np.asarray(_cp_snapped, dtype=np.float64)
-                    if self._ruckig_per_candidate:
+                    # NOTE: trajopt + elastic do NOT run here. They are applied
+                    # exactly once, to the GLOBAL winner, after both loops (see
+                    # the `_postprocess_path` block below `_last_chosen_q_goal`).
+                    # Running them per candidate — even lazily, in score order —
+                    # meant every gate rejection paid a full trajopt: a scene
+                    # where all 5 candidates fail cost 5 runs per IK goal and
+                    # produced nothing. Gate first, optimize the survivor.
+                    # BOTH modes: cheap linear-densified check of the RAW path
+                    # first, at the planner's FULL collision contract. This is
+                    # exactly what `_validate_final_trajectory` stage 2 asserts
+                    # on the winner — parametrize_per_candidate=True mode (see that kwarg)
+                    # historically skipped it and validated candidates only on
+                    # their time-parametrized form at the PARAMETRIZER-SCALED (looser)
+                    # clearance, so a raw path inside the full clearance band
+                    # sailed through the loop and then died at the final gate
+                    # as a hard RRTPlanningError instead of a recoverable
+                    # "try the next candidate" (vine bench: finger pad at
+                    # 12.9 mm passed the 1 cm parametrizer-scaled check, failed the
+                    # 2 cm gate).
+                    _cp_checked, _coll_idx = self._densify_and_check_collision(_cp_arr)
+                    _coll_kind = "linear-densified"
+                    if _coll_idx is None and self._parametrize_per_candidate:
                         _cp_checked, _coll_idx = self._smooth_and_check_collision(
-                            _cp_arr, ruckig_start_vel,
+                            _cp_arr, start_vel,
                         )
-                        _coll_kind = "ruckig-smoothed"
-                    else:
-                        # Cheap validation: linear-densify the RAW path + collision
-                        # check (NO ruckig cloud call). The winner is ruckig'd
-                        # exactly once after the loop.
-                        _cp_checked, _coll_idx = self._densify_and_check_collision(_cp_arr)
-                        _coll_kind = "linear-densified"
+                        _coll_kind = "time-parametrized"
                     if _coll_idx is not None:
                         logger.info(
                             "  path %d/%d (score=%.4f): %s path collides "
@@ -1546,24 +1711,24 @@ class RRTToGoalPlanner:
                             _coll_idx,
                         )
                         continue
-                    # Densify mode: linear-densify passed, but ruckig's C² spline
+                    # Densify mode: linear-densify passed, but the parametrizer's C² spline
                     # can curve wider than the linear chord near sharp corners
                     # and collide with an obstacle the chord clears. Do the
-                    # ruckig check NOW (one cloud-API call per surviving
+                    # parametrization check NOW (one parametrize call per surviving
                     # candidate); if it fails, try the next-best candidate.
                     # Historically we warned + executed the colliding trajectory
                     # anyway — that's how the gripper/wrist ended up bumping
                     # box obstacles at corners. Bounded cost: at most
-                    # len(_scored_cps) ruckig calls per IK in the worst case,
+                    # len(_scored_cps) parametrize calls per IK in the worst case,
                     # ~1-2 in practice.
-                    if not self._ruckig_per_candidate:
+                    if not self._parametrize_per_candidate:
                         _smoothed_traj, _smoothed_coll = self._smooth_and_check_collision(
-                            _cp_checked, ruckig_start_vel,
+                            _cp_checked, start_vel,
                         )
                         if _smoothed_coll is not None:
                             logger.info(
                                 "  path %d/%d (score=%.4f): linear-densify clean "
-                                "but ruckig-smoothed collides at waypoint %d/%d "
+                                "but time-parametrized collides at waypoint %d/%d "
                                 "— trying next path candidate.",
                                 _rank,
                                 len(_scored_cps),
@@ -1572,19 +1737,22 @@ class RRTToGoalPlanner:
                                 _smoothed_traj.shape[0],
                             )
                             continue
-                        # Ruckig-smoothed is also clean. Cache the smoothed
+                        # Time-parametrized is also clean. Cache the smoothed
                         # trajectory so the post-outer-loop block doesn't
-                        # need to re-ruckig it.
+                        # need to re-parametrize it.
                         _cp_checked = _smoothed_traj
                     # Found one whose checked form is collision-free.
                     local_best_score = _s
-                    local_best_path = _cp
-                    # Both branches now store the ruckig-smoothed trajectory.
+                    # The POST-PROCESSED, endpoint-snapped path — this is what
+                    # produced `local_best_traj`, so it is what the final
+                    # gate's sparse-waypoint stage must validate.
+                    local_best_path = _cp_arr
+                    # Both branches now store the time-parametrized trajectory.
                     local_best_traj = _cp_checked
                     break
                 if local_best_path is None:
                     logger.warning(
-                        "IK candidate %d/%d: all %d path(s) had ruckig-smoothed "
+                        "IK candidate %d/%d: all %d path(s) had time-parametrized "
                         "collisions — moving to next IK candidate.",
                         tried,
                         len(_loop_ordered),
@@ -1618,7 +1786,7 @@ class RRTToGoalPlanner:
                 if local_best_score < best_path_score:
                     best_path_score = local_best_score
                     path = local_best_path
-                    traj = local_best_traj  # cache the smoothed path so we don't re-ruckig below
+                    traj = local_best_traj  # cache the smoothed path so we don't re-parametrize below
                     chosen_q_goal = q_goal
                     chosen_ik_score = ik_score
                     if early_exit_on_first_ik:
@@ -1671,17 +1839,46 @@ class RRTToGoalPlanner:
 
             # Publish the chosen IK goal so callers (RRTGuidanceSource) can
             # track it across plan() calls without having to scrape the
-            # trajectory's terminal pose. Set BEFORE ruckig so the value
-            # reflects the actual IK solution, not the post-ruckig endpoint
+            # trajectory's terminal pose. Set BEFORE parametrization so the value
+            # reflects the actual IK solution, not the post-parametrization endpoint
             # (which might drift by tiny amounts from boundary effects).
             self._last_chosen_q_goal = np.asarray(chosen_q_goal, dtype=np.float64).copy()
+
+            # Trajopt + elastic, ONCE, on the global winner. Everything above
+            # ranked and gated the shortcut-smoothed geometry, so exactly one
+            # path per plan() reaches these passes — the expensive ones (a
+            # trajopt pass is 2*DOF min-distance queries per waypoint, ~10 ms
+            # each on a concave mesh).
+            #
+            # The winner is already gate-clean, and both passes are internally
+            # hard-collision-gated, so this can only refine it. Re-gate anyway
+            # (the optimized geometry is what gets executed) and fall back to
+            # the pre-optimization pair on failure — never worse than not
+            # having run them, and never a wasted rejection.
+            if self._postprocess_after_ranking:
+                _opt_path = self._postprocess_path(path)
+                if _opt_path is not path:
+                    _opt_traj = None
+                    _, _opt_coll = self._densify_and_check_collision(_opt_path)
+                    if _opt_coll is None:
+                        _opt_traj, _opt_coll = self._smooth_and_check_collision(
+                            _opt_path, start_vel,
+                        )
+                    if _opt_coll is None and _opt_traj is not None:
+                        path, traj = _opt_path, _opt_traj
+                    else:
+                        logger.info(
+                            "trajopt/elastic output collides at waypoint %d — "
+                            "keeping the pre-optimization path.",
+                            _opt_coll,
+                        )
 
             # `traj` is already populated from the per-IK loop above
             # (_smooth_and_check_collision was called there per path
             # candidate; the winning path's smoothed form was cached).
-            # Historically, ruckig smoothing happened here as a single
+            # Historically, time parametrization happened here as a single
             # post-loop step on the global winner, and the smoothed path
-            # was never collision-checked — so a ruckig spline that curved
+            # was never collision-checked — so a spline that curved
             # through obstacles would silently reach the env. Per-IK
             # smoothing+checking moved that logic up, so we just use the
             # cached `traj` here.
@@ -1689,7 +1886,7 @@ class RRTToGoalPlanner:
             # Why escape isn't prepended: the escape segment was historically
             # PREPENDED raw (un-smoothed) so each escape waypoint became one
             # env-step command — needed because the simulator's PD controller
-            # wouldn't overcome contact forces with smooth ruckig sub-samples.
+            # wouldn't overcome contact forces with smooth sub-samples.
             # That left 10×-mean-delta outlier frames in the recorded dataset
             # that corrupted the diffusion policy's score field. Now: escape
             # segment is NOT included in `traj` — `escape_end_q` is returned
@@ -1698,18 +1895,18 @@ class RRTToGoalPlanner:
             # without recording the artifact.
             assert traj is not None  # guaranteed when path/chosen_q_goal are set
 
-            # Densify mode (ruckig_per_candidate=False) USED TO ruckig-smooth
+            # Densify mode (parametrize_per_candidate=False) USED TO parametrize
             # the winner here (one cloud-API call per plan) and then log a
             # WARNING if the smoothed path collided but execute it anyway —
             # which is how gripper/wrist tips ended up bumping obstacles at
-            # corners where ruckig's spline curved outside the linear chord.
-            # The per-candidate loop above now does the ruckig check inline
+            # corners where the parametrizer's spline curved outside the linear chord.
+            # The per-candidate loop above now does the parametrization check inline
             # and caches the smoothed trajectory in `local_best_traj` when it
-            # passes, so `traj` is already ruckig-smoothed and clean here in
-            # both modes — no additional ruckig call needed.
+            # passes, so `traj` is already time-parametrized and clean here in
+            # both modes — no additional parametrize call needed.
 
             # Final three-stage collision gate on the trajectory we're about
-            # to hand back. Stage 3 (ruckig-smoothed) is what the per-IK loop
+            # to hand back. Stage 3 (time-parametrized) is what the per-IK loop
             # already checks — running it here catches drift between check and
             # return. Stages 1 (sparse RRT) and 2 (linear-densified) are
             # diagnostic breadcrumbs: if we ever see collisions in the
@@ -1722,7 +1919,7 @@ class RRTToGoalPlanner:
                 _stage, _idx = _final_gate
                 _n_wp = (
                     path.shape[0] if _stage == "sparse RRT waypoints"
-                    else traj.shape[0] if _stage == "ruckig-smoothed trajectory"
+                    else traj.shape[0] if _stage == "time-parametrized trajectory"
                     else -1
                 )
                 raise RRTPlanningError(
@@ -1737,11 +1934,12 @@ class RRTToGoalPlanner:
             # config so the caller can teleport the env's robot directly to
             # `traj[0]`. ``escape_path[-1]`` equals ``traj[0]`` by construction
             # (the planner ran from `q_start = escape_path[-1].copy()`), so the
-            # teleport puts the robot exactly where the ruckig chunk begins.
+            # teleport puts the robot exactly where the chunk begins.
             escape_end_q: np.ndarray | None = None
             if escape_path is not None and len(escape_path) >= 1:
                 escape_end_q = np.asarray(escape_path[-1], dtype=np.float64)
 
+            self._debug_draw_soft_cost_path(traj)
             return traj, escape_end_q
         finally:
             if _froze_viz:
@@ -1805,9 +2003,9 @@ class RRTToGoalPlanner:
           2. Linear-densified `path` (0.02 rad) — catches obstacles between
                                                   sparse waypoints that the
                                                   chord skips over.
-          3. Ruckig-smoothed `traj`             — the actually-executed path;
+          3. Time-parametrized `traj`             — the actually-executed path;
                                                   catches obstacles that
-                                                  ruckig's spline curves into
+                                                  the parametrizer's spline curves into
                                                   at sharp corners the linear
                                                   chord clears.
 
@@ -1858,11 +2056,11 @@ class RRTToGoalPlanner:
                     **self._collision_kwargs,
                 ):
                     return ("linear-densified path", k)
-        # Stage 3: ruckig-smoothed trajectory (the one actually replayed).
-        # Uses the RUCKIG-scaled obstacle clearance (default 0.5×) — a bulge
+        # Stage 3: time-parametrized trajectory (the one actually replayed).
+        # Uses the parametrizer-scaled obstacle clearance (default 0.5×) — a bulge
         # that stays within the halved bound but outside the raw path's
         # bound is still safe to execute, no reason to reject.
-        _ruckig_kwargs = self._ruckig_collision_kwargs()
+        _smoothed_kwargs = self._smoothed_collision_kwargs()
         for k in range(traj.shape[0]):
             if check_links_in_collision(
                 self._robot_id,
@@ -1874,25 +2072,25 @@ class RRTToGoalPlanner:
                 verbose=False,
                 physics_client_id=self._pb_client,
                 link_indices_to_check=self._planner_link_indices_to_check,
-                **_ruckig_kwargs,
+                **_smoothed_kwargs,
             ):
-                return ("ruckig-smoothed trajectory", k)
+                return ("time-parametrized trajectory", k)
         return None
 
     def _densify_and_check_collision(
         self,
         rrt_waypoints: np.ndarray,
     ) -> tuple[np.ndarray, int | None]:
-        """Cheap per-candidate collision validation WITHOUT ruckig. Linearly
+        """Cheap per-candidate collision validation WITHOUT time parametrization. Linearly
         densifies the raw BiRRT path (so collision checks don't tunnel between
         sparse waypoints) and dense-checks each interpolated config under the
         planner's collision contract. Returns ``(rrt_waypoints, first_coll_idx)``
-        — the RAW path is returned UNCHANGED (the caller ruckig-smooths the
+        — the RAW path is returned UNCHANGED (the caller parametrizes the
         winner exactly once after the candidate loop); ``first_coll_idx is None``
         means collision-free.
 
-        Used when ``ruckig_per_candidate=False`` (SplatSim trajectory-gen) so
-        plan() hits the ruckig cloud API only once per call instead of once per
+        Used when ``parametrize_per_candidate=False`` (SplatSim trajectory-gen) so
+        plan() parametrizes only once per call instead of once per
         candidate. Caller restores joint state (plan()'s finally block).
         """
         from splatsim.utils.rrt_path_utils import (
@@ -1925,19 +2123,137 @@ class RRTToGoalPlanner:
                 return rrt_waypoints, k
         return rrt_waypoints, None
 
+    def _postprocess_path(self, path: np.ndarray) -> np.ndarray:
+        """Run trajopt + elastic smoothing on ONE path, outside `get_path`.
+
+        These two passes used to run inside `get_path`, i.e. on EVERY path
+        candidate, before `plan()` had scored any of them — so a 5-candidate
+        IK paid 5x their cost and threw 4 of the results away. `plan()`
+        already sorts candidates by score and tries them one at a time, so
+        the cheapest correct place for them is right before the collision
+        gate of the candidate actually being considered: normally one run per
+        plan, and at most one per candidate the gate rejects.
+
+        Trade-off: ranking now scores the SHORTCUT-SMOOTHED path rather than
+        the fully post-processed one. Trajopt's repulsion term only fires
+        within `trajopt_collision_threshold` of an obstacle, so candidates
+        that hug obstacles grow while free-space candidates only shrink —
+        enough asymmetry to flip near-ties in arc-length-style metrics.
+        `MIN_PAIR_CLEARANCE` is the strategy most exposed to this, since
+        raising clearance is precisely what trajopt does; set
+        `postprocess_after_ranking=False` to restore rank-after-postprocess
+        if that matters more than the planning time.
+
+        Pass ORDER is preserved from `get_path`: trajopt first, then elastic.
+        Elastic runs second on purpose — trajopt's outward push can create
+        sharp corners at the bow apex that the parametrizer renders as hard
+        decelerations, and the Laplacian pass rounds them off (see the
+        ordering comment in `rrt_path_utils.get_path`).
+
+        Both passes are internally hard-collision-gated and revert any sweep
+        that would break the path, so this cannot turn a clean candidate into
+        a colliding one; the caller still gates the result, which keeps the
+        contract identical to the old in-`get_path` placement.
+
+        Returns the path unchanged when neither pass is enabled, when the
+        path is too short to optimize (< 3 waypoints — no interior points),
+        or when `postprocess_after_ranking` is off (in which case `get_path`
+        already did the work).
+        """
+        from splatsim.utils.rrt_path_utils import (
+            elastic_smooth_path,
+            min_distance_to_obstacles,
+            trajopt_smooth_path,
+        )
+        from splatsim.utils.rrt_path_utils import check_links_in_collision
+
+        if not self._postprocess_after_ranking:
+            return path
+        if path.shape[0] < 3:
+            return path
+        if not self._trajopt_passes and not self._elastic_smooth_passes:
+            return path
+
+        def _collision_fn(q):
+            return check_links_in_collision(
+                self._robot_id,
+                self._joint_indices,
+                q,
+                self._loaded_obstacle_ids,
+                obstacle_names=self._obstacle_names,
+                skip_pairs=self._skip_pairs,
+                verbose=False,
+                physics_client_id=self._pb_client,
+                link_indices_to_check=self._planner_link_indices_to_check,
+                **self._collision_kwargs,
+            )
+
+        # "guided" soft-cost mode: same q -> cost lookup get_path would have
+        # handed these passes, so the cost-gating behaves identically.
+        _cost_fn = self._rrt_config_cost_fn()
+        out = np.asarray(path, dtype=np.float64)
+
+        if self._trajopt_passes:
+            def _distance_fn(q):
+                return min_distance_to_obstacles(
+                    self._robot_id,
+                    self._joint_indices,
+                    q,
+                    self._loaded_obstacle_ids,
+                    # Matches get_path: the hinge cost is zero past the
+                    # threshold, and getClosestPoints cost explodes with the
+                    # query margin on large concave meshes.
+                    max_dist=max(float(self._trajopt_collision_threshold) * 2.0, 0.2),
+                )
+
+            out = np.asarray(
+                trajopt_smooth_path(
+                    out,
+                    collision_fn=_collision_fn,
+                    distance_fn=_distance_fn,
+                    passes=int(self._trajopt_passes),
+                    lr=float(self._trajopt_lr),
+                    smoothness_weight=float(self._trajopt_smoothness_weight),
+                    collision_weight=float(self._trajopt_collision_weight),
+                    collision_threshold=float(self._trajopt_collision_threshold),
+                    fd_step=float(self._trajopt_fd_step),
+                    config_cost_fn=_cost_fn,
+                ),
+                dtype=np.float64,
+            )
+
+        if self._elastic_smooth_passes and out.shape[0] >= 3:
+            out = np.asarray(
+                elastic_smooth_path(
+                    out,
+                    _collision_fn,
+                    passes=int(self._elastic_smooth_passes),
+                    config_cost_fn=_cost_fn,
+                ),
+                dtype=np.float64,
+            )
+
+        # `min_distance_to_obstacles` goes through `set_robot_joint_positions`,
+        # which forces the gripper OPEN and steps physics. Re-snap so the
+        # collision gate below sees the env's actual gripper geometry — the
+        # same restore `_generate_paths_for_ik` does after every get_path.
+        self._snap_gripper_to_actual()
+        return out
+
     def _smooth_and_check_collision(
         self,
         rrt_waypoints: np.ndarray,
-        ruckig_start_vel: np.ndarray | None,
+        start_vel: np.ndarray | None,
     ) -> tuple[np.ndarray, int | None]:
-        """Ruckig-parametrize a raw RRT path and dense-check the smoothed
+        """Time-parametrize a raw RRT path (TOPP-RA by default; see
+        rrt_path_utils.parametrize_path) and dense-check the smoothed
         result for collisions. Returns ``(smoothed_traj, first_colliding_idx)``;
         ``first_colliding_idx is None`` means the smoothed path is
         collision-free.
 
         Used inside ``plan()``'s per-IK loop to try each candidate path's
         smoothed form BEFORE settling on one. Without this, the BiRRT raw
-        check (which only validates discrete waypoints) lets ruckig's
+        check (which only validates discrete waypoints) lets the parametrizer's
         continuous spline curve through obstacles at sharp corners; the
         bad chunk then reaches the env, robot collides, and the controller
         has to retry from inside an already-contaminated teleop buffer.
@@ -1948,24 +2264,24 @@ class RRTToGoalPlanner:
         """
         from splatsim.utils.rrt_path_utils import (
             check_links_in_collision,
-            ruckig_parametrize_path,
+            parametrize_path,
         )
 
         if rrt_waypoints.shape[0] < 2:
-            # Single-waypoint path — nothing to ruckig and nothing the
+            # Single-waypoint path — nothing to parametrize and nothing the
             # raw collision check would have missed.
             return rrt_waypoints, None
 
         max_vel = np.full(self._num_dofs, self._max_joint_vel)
         max_acc = np.full(self._num_dofs, self._max_joint_acc)
         max_jerk = np.full(self._num_dofs, self._max_joint_jerk)
-        _ruckig_kwargs: dict = {}
-        if ruckig_start_vel is not None:
-            _ruckig_kwargs["start_vel"] = np.asarray(ruckig_start_vel, dtype=np.float64).reshape(-1)[
+        _parametrize_kwargs: dict = {}
+        if start_vel is not None:
+            _parametrize_kwargs["start_vel"] = np.asarray(start_vel, dtype=np.float64).reshape(-1)[
                 : self._num_dofs
             ]
         traj = np.asarray(
-            ruckig_parametrize_path(
+            parametrize_path(
                 rrt_waypoints,
                 max_vel,
                 max_acc,
@@ -1976,16 +2292,16 @@ class RRTToGoalPlanner:
                 final_approach_vel_scale=self._final_approach_vel_scale,
                 final_approach_acc_scale=self._final_approach_acc_scale,
                 uniform_path_speed=self._uniform_path_speed,
-                **_ruckig_kwargs,
+                **_parametrize_kwargs,
             ),
             dtype=np.float64,
         )
-        # Ruckig-scaled clearance: the smoothed C² spline naturally curves
+        # Parametrizer-scaled clearance: the smoothed C² spline naturally curves
         # outside the linear chord at sharp corners, so a stricter-than-raw
         # obstacle_clearance would reject too many good candidates. Default
-        # factor 0.5 (RRT ≥2 cm ⇒ ruckig ≥1 cm) — still catches real
+        # factor 0.5 (RRT ≥2 cm ⇒ parametrized ≥1 cm) — still catches real
         # penetration.
-        _kwargs = self._ruckig_collision_kwargs()
+        _kwargs = self._smoothed_collision_kwargs()
         import os as _os
         _dbg_wp0 = _os.environ.get("SPLATSIM_RRT_DEBUG_WP0")
         for k in range(traj.shape[0]):
@@ -2004,20 +2320,20 @@ class RRTToGoalPlanner:
                 # Waypoint 0 == q_start (the just-escaped, supposedly-safe frame).
                 # Its collision here contradicts the escape's own safety check, so
                 # dump WHY (kind, links, gripper-state sensitivity, whether
-                # is_q_in_collision agrees) to localize the escape↔ruckig
+                # is_q_in_collision agrees) to localize the escape↔parametrization
                 # inconsistency. Gated on SPLATSIM_RRT_DEBUG_WP0.
                 if _dbg_wp0 and k == 0:
                     self._debug_waypoint0_collision(traj[0], _kwargs)
                 return traj, k
         return traj, None
 
-    def _debug_waypoint0_collision(self, q_arm: np.ndarray, ruckig_kwargs: dict) -> None:
+    def _debug_waypoint0_collision(self, q_arm: np.ndarray, collision_kwargs: dict) -> None:
         """Diagnose why the just-escaped q_start (== waypoint 0) collides in the
-        ruckig check when the escape's own `is_q_in_collision` cleared it.
+        parametrization check when the escape's own `is_q_in_collision` cleared it.
 
         Prints, for this exact arm config:
-          1. the ruckig check's kind + colliding link pair (verbose re-check),
-          2. the gripper joint value the ruckig check actually used,
+          1. the parametrization check's kind + colliding link pair (verbose re-check),
+          2. the gripper joint value the parametrization check actually used,
           3. gripper SENSITIVITY — does the collision persist with the gripper
              forced open vs closed? (if it toggles, gripper state is the culprit),
           4. whether `is_q_in_collision` (the escape's checker) AGREES.
@@ -2037,12 +2353,12 @@ class RRTToGoalPlanner:
                     obstacle_names=self._obstacle_names, skip_pairs=self._skip_pairs,
                     verbose=verbose, physics_client_id=cid,
                     link_indices_to_check=self._planner_link_indices_to_check,
-                    return_kind=True, **ruckig_kwargs,
+                    return_kind=True, **collision_kwargs,
                 )
                 return kind
 
             cur_grip = [round(float(p.getJointState(rid, gi, physicsClientId=cid)[0]), 3) for gi in grip_idx]
-            logger.warning("[wp0-debug] waypoint-0 collides. ruckig used gripper joints=%s", cur_grip)
+            logger.warning("[wp0-debug] waypoint-0 collides. check used gripper joints=%s", cur_grip)
             logger.warning("[wp0-debug]   colliding pair (verbose): kind=%s", _recheck(verbose=True))
 
             # Gripper sensitivity: force open (0.0) vs closed (0.8), re-check.
@@ -2050,7 +2366,7 @@ class RRTToGoalPlanner:
                 for gi in grip_idx:
                     p.resetJointState(rid, gi, gval, physicsClientId=cid)
                 logger.warning("[wp0-debug]   gripper=%s -> collision kind=%s", label, _recheck())
-            # Restore the gripper the ruckig check had left.
+            # Restore the gripper the parametrization check had left.
             for gi, gv in zip(grip_idx, cur_grip):
                 p.resetJointState(rid, gi, float(gv), physicsClientId=cid)
 
@@ -2058,8 +2374,8 @@ class RRTToGoalPlanner:
             iqc = self.is_q_in_collision(np.asarray(q_arm, dtype=np.float64), return_kind=True)
             logger.warning(
                 "[wp0-debug]   is_q_in_collision (escape's checker) says: %s   "
-                "(ruckig obstacle_clr=%.4f)",
-                iqc, ruckig_kwargs.get("obstacle_clearance", -1),
+                "(parametrized obstacle_clr=%.4f)",
+                iqc, collision_kwargs.get("obstacle_clearance", -1),
             )
         except Exception as e:  # never let debug break planning
             logger.warning("[wp0-debug] diagnostic failed: %s", e)
@@ -2073,20 +2389,173 @@ class RRTToGoalPlanner:
 
         `recent_joint_velocity` is consulted only when the strategy is
         JOINT_VELOCITY_MATCH; for other strategies it is ignored.
+
+        When a soft-cost field is loaded (vegetation scenes) and
+        soft_cost_mode == "score", ``weight * path-integral(cost)`` is ADDED
+        to whichever base strategy is active, so among hard-feasible
+        candidates the one brushing the least foliage wins. With no field
+        loaded this is a None-check — identical to the historical scorer.
         """
         strategy = self._path_selection
         if strategy == PathSelectionStrategy.EE_ARC_LENGTH:
-            return self._path_ee_arc_length(path)
-        if strategy == PathSelectionStrategy.JOINT_ARC_LENGTH:
-            return self._path_joint_arc_length(path)
-        if strategy == PathSelectionStrategy.JOINT_VELOCITY_MATCH:
+            base = self._path_ee_arc_length(path)
+        elif strategy == PathSelectionStrategy.JOINT_ARC_LENGTH:
+            base = self._path_joint_arc_length(path)
+        elif strategy == PathSelectionStrategy.JOINT_VELOCITY_MATCH:
             assert recent_joint_velocity is not None  # caller guarantees, see plan()
-            return self._path_velocity_deviation(path, recent_joint_velocity)
-        if strategy == PathSelectionStrategy.MIN_PAIR_CLEARANCE:
-            return self._path_min_pair_clearance(path)
-        if strategy == PathSelectionStrategy.CAMERA_SCORING:
-            return self._path_camera_score(path)
-        raise ValueError(f"Unknown PathSelectionStrategy: {strategy!r}")
+            base = self._path_velocity_deviation(path, recent_joint_velocity)
+        elif strategy == PathSelectionStrategy.MIN_PAIR_CLEARANCE:
+            base = self._path_min_pair_clearance(path)
+        elif strategy == PathSelectionStrategy.CAMERA_SCORING:
+            base = self._path_camera_score(path)
+        else:
+            raise ValueError(f"Unknown PathSelectionStrategy: {strategy!r}")
+        if not self._soft_cost_active():
+            return base
+        soft = self._path_soft_cost(path)
+        logger.debug(
+            "_score_candidate: base(%s)=%.4f + soft_cost=%.4f (weight=%.3f)",
+            strategy, base, self._soft_cost_weight * soft, self._soft_cost_weight,
+        )
+        return base + self._soft_cost_weight * soft
+
+    def set_soft_cost_field(self, field_or_payload) -> None:
+        """Attach a SoftCostField (or an env-config-style payload dict)
+        directly. For callers that never go through ``load_obstacles`` —
+        e.g. the in-env TrajectoryGenerator, which plans against the env's
+        live pybullet world where obstacles already exist as bodies."""
+        if field_or_payload is None or hasattr(field_or_payload, "cost_at"):
+            self._soft_cost_field = field_or_payload
+            return
+        from splatsim.utils.soft_cost_field import SoftCostField
+
+        self._soft_cost_field = SoftCostField.from_config(field_or_payload)
+
+    def _soft_cost_active(self) -> bool:
+        """Whether the soft-cost term participates in candidate SCORING.
+        True for both "score" and "guided" (guided is score + cost-aware
+        generation)."""
+        return (
+            self._soft_cost_field is not None
+            and self._soft_cost_mode in ("score", "guided")
+            and self._soft_cost_weight > 0.0
+        )
+
+    def _config_soft_cost(self, q: np.ndarray) -> float:
+        """Scalar soft cost of a single configuration: aggregated field cost
+        over the arm surface sample points (same sampling and reduction as
+        `_path_soft_cost`, one config). Mutates the planning client's joint
+        state — same contract as `_config_soft_cost_points`."""
+        pts = self._config_soft_cost_points(q)
+        return self._aggregate_soft_cost(self._soft_cost_field.cost_at(pts))
+
+    def _rrt_config_cost_fn(self):
+        """The `config_cost_fn` handed to rrt_path_utils.get_path: a
+        q -> float soft-cost lookup in "guided" mode, None otherwise (which
+        makes get_path run the exact historical binary pipeline)."""
+        if self._soft_cost_field is None or self._soft_cost_mode != "guided":
+            return None
+        return self._config_soft_cost
+
+    def _link_radii(self) -> np.ndarray:
+        """Per-link cross-sectional radii, cached. Delegates to
+        soft_cost_field.link_radii so the planner and any other soft-cost
+        consumer measure the arm the same way."""
+        if getattr(self, "_link_radii_cache", None) is None:
+            from splatsim.utils.pybullet_client import BulletClientShim
+            from splatsim.utils.soft_cost_field import link_radii
+            self._link_radii_cache = link_radii(
+                BulletClientShim(self._pb_client), self._robot_id,
+                self._planner_link_indices_to_check,
+                joint_indices=self._joint_indices,
+            )
+        return self._link_radii_cache
+
+    def _config_soft_cost_points(self, q: np.ndarray) -> np.ndarray:
+        """World-space sample points on the arm's SURFACE at joint config
+        ``q``. Sampling lives in soft_cost_field.link_surface_points so the
+        planner, goal-pose ranking and any diagnostic all measure the same
+        geometry; see that function for why surfaces beat the centreline.
+        Mutates the planning client's joint state; caller relies on plan()'s
+        finally block to restore it."""
+        from splatsim.utils.soft_cost_field import link_surface_points
+
+        for idx, qi in zip(self._joint_indices,
+                           np.asarray(q, dtype=np.float64).reshape(-1)):
+            p.resetJointState(self._robot_id, idx, float(qi),
+                              physicsClientId=self._pb_client)
+        origins = [
+            p.getLinkState(self._robot_id, link_i, computeForwardKinematics=True,
+                           physicsClientId=self._pb_client)[4]
+            for link_i in self._planner_link_indices_to_check
+        ]
+        return link_surface_points(
+            origins, self._link_radii(),
+            spacing=self._soft_cost_sample_spacing,
+            n_ring=int(self._soft_cost_surface_samples),
+        )
+
+    def _aggregate_soft_cost(self, costs: np.ndarray) -> float:
+        """Reduce per-sample costs to one scalar. Delegates to
+        soft_cost_field.aggregate_soft_cost (see it for why "max")."""
+        from splatsim.utils.soft_cost_field import aggregate_soft_cost
+
+        return aggregate_soft_cost(costs, self._soft_cost_aggregation)
+
+    def _path_soft_cost(self, path: np.ndarray) -> float:
+        """Path integral of the soft-cost field along the arm's sweep.
+
+        Densifies the sparse RRT path (same helper the MIN_PAIR_CLEARANCE
+        scorer uses), evaluates the field at arm sample points per dense
+        waypoint, and integrates mean cost against joint-space arc length so
+        the result is invariant to densification resolution. Field grids are
+        normalized to max=1, so the value is roughly "radians traveled
+        weighted by foliage density" — commensurate with arc-length scores.
+        """
+        assert self._soft_cost_field is not None
+        dense = self._densify_path_for_scoring(np.asarray(path, dtype=np.float64))
+        costs = np.empty(dense.shape[0])
+        for k in range(dense.shape[0]):
+            pts = self._config_soft_cost_points(dense[k])
+            costs[k] = self._aggregate_soft_cost(
+                self._soft_cost_field.cost_at(pts))
+        if dense.shape[0] < 2:
+            return float(costs[0])
+        seg_len = np.linalg.norm(np.diff(dense, axis=0), axis=1)
+        seg_cost = 0.5 * (costs[:-1] + costs[1:])
+        return float(np.sum(seg_len * seg_cost))
+
+    def _debug_draw_soft_cost_path(self, traj: np.ndarray) -> None:
+        """GUI-only: draw the winning trajectory's EE trace colored by local
+        soft cost (green=free, red=max). Gated by soft_cost_debug_draw."""
+        if not (self._soft_cost_debug_draw and self._soft_cost_field is not None):
+            return
+        try:
+            idxs = np.linspace(0, traj.shape[0] - 1,
+                               min(traj.shape[0], 120), dtype=int)
+            ee = []
+            for k in idxs:
+                for idx, qi in zip(self._joint_indices, traj[k]):
+                    p.resetJointState(self._robot_id, idx, float(qi),
+                                      physicsClientId=self._pb_client)
+                ee.append(p.getLinkState(
+                    self._robot_id, self._ee_link_index,
+                    computeForwardKinematics=True,
+                    physicsClientId=self._pb_client,
+                )[0])
+            ee_arr = np.asarray(ee)
+            c = self._soft_cost_field.cost_at(ee_arr)
+            cmax = max(float(c.max()), 1e-9)
+            for a, b, ca in zip(ee_arr[:-1], ee_arr[1:], c[:-1]):
+                frac = float(ca) / cmax
+                p.addUserDebugLine(
+                    a.tolist(), b.tolist(),
+                    lineColorRGB=[frac, 1.0 - frac, 0.0],
+                    lineWidth=3, lifeTime=30,
+                    physicsClientId=self._pb_client,
+                )
+        except Exception:
+            logger.exception("soft-cost debug draw failed (non-fatal)")
 
     def _get_camera_link_pose(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """FK the wrist-camera link at joint config ``q``. Returns
@@ -2187,7 +2656,21 @@ class RRTToGoalPlanner:
         # plan(). Resolves to the same `get_path` used there.
         from splatsim.utils.rrt_path_utils import get_path
 
+        # With `postprocess_after_ranking` on (the default), trajopt and
+        # elastic are NOT run per candidate here — `plan()` applies them via
+        # `_postprocess_path` to the candidate it actually selects. Zeroing
+        # them means get_path stops after RRT + shortcut smoothing, which is
+        # what the scorer then ranks.
+        _gp_trajopt = 0 if self._postprocess_after_ranking else self._trajopt_passes
+        _gp_elastic = (
+            0 if self._postprocess_after_ranking else self._elastic_smooth_passes
+        )
+
         num_target = self._num_path_candidates_per_ik
+        # "guided" soft-cost mode: hand get_path a q -> cost lookup so RRT
+        # growth + smoothing avoid the field, not just the final scorer.
+        # None in every other mode / with no field — historical pipeline.
+        _cost_fn = self._rrt_config_cost_fn()
         if num_target <= 1:
             attempt = get_path(
                 q_start,
@@ -2203,11 +2686,20 @@ class RRTToGoalPlanner:
                 verbose=True,
                 physics_client_id=self._pb_client,
                 max_smooth_iterations=self._rrt_smooth_iterations,
+                elastic_smooth_passes=_gp_elastic,
+                trajopt_passes=_gp_trajopt,
+                trajopt_lr=self._trajopt_lr,
+                trajopt_smoothness_weight=self._trajopt_smoothness_weight,
+                trajopt_collision_weight=self._trajopt_collision_weight,
+                trajopt_collision_threshold=self._trajopt_collision_threshold,
+                trajopt_fd_step=self._trajopt_fd_step,
                 actual_gripper_q=self._current_actual_gripper_q,
+                config_cost_fn=_cost_fn,
+                trrt_params=self._soft_cost_guided_params,
                 **self._collision_kwargs,
             )
             # get_path → set_robot_joint_positions → open_gripper resets the
-            # gripper to 0.0. Re-snap so downstream ruckig-smoothed / dense
+            # gripper to 0.0. Re-snap so downstream time-parametrized / dense
             # collision checks see the actual gripper geometry.
             self._snap_gripper_to_actual()
             return [np.asarray(attempt, dtype=np.float64)] if attempt is not None else []
@@ -2216,7 +2708,22 @@ class RRTToGoalPlanner:
         attempts = 0
         max_attempts = self._max_path_attempts_per_ik
         scale = self._path_perturbation_scale
+        # Early abort on a dead IK goal: attempts against one q_goal differ
+        # only by +-scale endpoint perturbation, so RRT failures are near-
+        # perfectly correlated — an IK branch whose approach corridor is
+        # sealed at the configured clearance fails ALL max_attempts (vine
+        # bench: 15 consecutive ~2s failures before plan() moved to the next
+        # IK candidate). If the first few attempts produce zero paths, give
+        # up on this goal and let the caller try the next IK candidate.
+        early_abort_after = 10**6
         while len(paths) < num_target and attempts < max_attempts:
+            if not paths and attempts >= early_abort_after:
+                logger.info(
+                    "IK goal looks unplannable (%d/%d attempts, 0 paths) — "
+                    "skipping to the next IK candidate.",
+                    attempts, max_attempts,
+                )
+                break
             attempts += 1
             if len(paths) == 0:
                 plan_start = q_start
@@ -2246,24 +2753,33 @@ class RRTToGoalPlanner:
                 verbose=True,
                 physics_client_id=self._pb_client,
                 max_smooth_iterations=self._rrt_smooth_iterations,
+                elastic_smooth_passes=_gp_elastic,
+                trajopt_passes=_gp_trajopt,
+                trajopt_lr=self._trajopt_lr,
+                trajopt_smoothness_weight=self._trajopt_smoothness_weight,
+                trajopt_collision_weight=self._trajopt_collision_weight,
+                trajopt_collision_threshold=self._trajopt_collision_threshold,
+                trajopt_fd_step=self._trajopt_fd_step,
                 actual_gripper_q=self._current_actual_gripper_q,
+                config_cost_fn=_cost_fn,
+                trrt_params=self._soft_cost_guided_params,
                 **self._collision_kwargs,
             )
             # get_path resets the gripper open — re-snap for the next
-            # iteration's checks and for the caller's ruckig/dense check.
+            # iteration's checks and for the caller's parametrize/dense check.
             self._snap_gripper_to_actual()
             if attempt is None:
                 continue
             arr = np.asarray(attempt, dtype=np.float64)
             # Snap initial pose back to the exact q_start. The perturbed
             # plan_start exists ONLY to diversify RRT's exploration; it must
-            # not leak into the executed trajectory. arr[0] is what ruckig
+            # not leak into the executed trajectory. arr[0] is what the parametrizer
             # parametrizes from and what the robot is commanded to on the
             # first frame, but the robot is physically at the true q_start.
             # A perturbed arr[0] (up to ±path_perturbation_scale per joint)
             # teleports the command on frame 1 → a single-frame joint spike
             # at the RRT onset (and at every mid-trajectory replan), worst on
-            # otherwise-static wrist joints. Prepend the true q_start so ruckig
+            # otherwise-static wrist joints. Prepend the true q_start so the parametrizer
             # accelerates from the robot's actual config over several frames
             # instead of jumping. Mirrors the terminal q_goal snap below; the
             # added lead-in segment is still dense-collision-checked in
@@ -2305,7 +2821,7 @@ class RRTToGoalPlanner:
         ``leading_deltas`` are spatial deltas between raw RRT waypoints
         (which aren't uniformly time-spaced), while ``recent_joint_velocity``
         is a real per-step velocity (rad / control-tick). Comparing their
-        magnitudes ranked paths in a way that didn't survive Ruckig's
+        magnitudes ranked paths in a way that didn't survive the parametrizer's
         time-parametrization, producing sustained high-velocity stretches
         in some recorded trajectories (e.g. one joint at 5 rad/s for many
         consecutive frames). Direction-only comparison sidesteps the
@@ -2382,7 +2898,7 @@ class RRTToGoalPlanner:
         Densification is PURELY a scoring-side concern: callers of
         ``_path_min_pair_clearance`` pass the sparse RRT path, this helper
         densifies internally, the SAME sparse path is what gets returned
-        from ``plan()`` and handed to ruckig. So the actual execution
+        from ``plan()`` and handed to the parametrizer. So the actual execution
         trajectory is unchanged; only the score reflects the dense view.
 
         Args:
@@ -2434,7 +2950,7 @@ class RRTToGoalPlanner:
         but scoring is done on a DENSIFIED copy (linear interpolation,
         per-joint L-infinity step ≤ 0.05 rad) so configurations between
         the sparse waypoints aren't missed. The sparse path is what
-        ruckig sees — densification is internal to scoring only. See
+        the parametrizer sees — densification is internal to scoring only. See
         ``_densify_path_for_scoring`` for the rationale.
 
         Query distance cap is set to ``_PAIR_CLEARANCE_QUERY_CAP`` (10 cm
@@ -2677,8 +3193,8 @@ class RRTToGoalPlanner:
         #
         #   Without the inflation, escape stops at exactly the BiRRT
         #   collision threshold (e.g., 0.02 m). The planner then starts
-        #   RRT from this barely-safe config and ruckig begins executing
-        #   the resulting trajectory. The very first ruckig waypoint
+        #   RRT from this barely-safe config and the robot begins executing
+        #   the resulting trajectory. The very first trajectory waypoint
         #   moves slightly toward the goal — which for approach/grasp
         #   tasks is itself near the obstacle — and the robot dips
         #   BELOW the threshold within 1-2 chunk steps. The controller's
@@ -2689,7 +3205,7 @@ class RRTToGoalPlanner:
         #
         #   With the inflation, escape pushes the robot to ≥1.5× the
         #   threshold (e.g., 0.03 m for a 0.02 m planner clearance). The
-        #   1cm buffer gives ruckig room to move toward the goal for a
+        #   1cm buffer gives the trajectory room to move toward the goal for a
         #   handful of ticks before tripping the controller's check.
         #
         # Weight formula at line ~1781 keeps the original `_eff_clearance`
@@ -3101,7 +3617,7 @@ class RRTToGoalPlanner:
             (obs, RRT-action) recordings start on-manifold.
           - q_start has the same clearance margin as the contact-normal
             escape would target (both use `escape_clearance_factor`), so
-            ruckig has the same headroom for the first chunk steps.
+            the trajectory has the same headroom for the first chunk steps.
 
         Returns None (so the chain falls through to the contact-normal
         and self-collision-gradient methods) when:
@@ -3327,7 +3843,12 @@ class RRTToGoalPlanner:
         ):
             return None
 
-        # Verify IK accuracy via FK
+        # Verify IK accuracy via FK. Compare the URDF LINK FRAME pose
+        # (indices 4/5), not the link COM (0/1): calculateInverseKinematics
+        # solves for the link frame, so a robot whose EE link has a COM
+        # offset (e.g. KUKA iiwa flange, ~20 mm) would otherwise fail this
+        # gate for EVERY solution. Identical for links with COM == frame
+        # (all current SplatSim robots' wrist_camera_link).
         for idx, qi in zip(self._joint_indices, q_solution, strict=False):
             p.resetJointState(self._robot_id, idx, float(qi), physicsClientId=self._pb_client)
         link_state = p.getLinkState(
@@ -3336,10 +3857,10 @@ class RRTToGoalPlanner:
             computeForwardKinematics=True,
             physicsClientId=self._pb_client,
         )
-        actual_pos = np.array(link_state[0])
+        actual_pos = np.array(link_state[4])
         if np.linalg.norm(actual_pos - ee_pos) > 0.005:  # 5 mm tolerance
             return None
-        actual_quat = np.array(link_state[1])
+        actual_quat = np.array(link_state[5])
         dot = float(np.clip(abs(np.dot(actual_quat, ee_quat)), -1.0, 1.0))
         if np.degrees(2 * np.arccos(dot)) > 5.0:  # 5° tolerance
             return None

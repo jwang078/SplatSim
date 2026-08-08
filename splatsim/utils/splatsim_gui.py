@@ -14,7 +14,7 @@ import dataclasses
 
 import numpy as np
 from PIL import Image, ImageTk
-from splatsim.configs.mode_config import EvalBenchmarkModeConfig, ImageResizeMode, IkGoalSelectionStrategy, PathSelectionStrategy, RenderMode, SplatSimModeConfig, TrajectoryGenModeConfig
+from splatsim.configs.mode_config import EvalBenchmarkModeConfig, ImageResizeMode, IkGoalSelectionStrategy, PathSelectionStrategy, RenderMode, SoftCostMode, SplatSimModeConfig, TrajectoryGenModeConfig
 
 
 # =============================================================================
@@ -406,6 +406,28 @@ class ThreadedTkinterGui(ABC):
                 pass
         return result
 
+    def _commit_pending_entries(self) -> None:
+        """Force any focused ttk.Entry to commit its typed text to its bound
+        Variable BEFORE we call get_values(). Fixes a Tk gotcha: text typed
+        into an Entry sits in the widget's display buffer and is not written
+        to the `textvariable` until focus leaves the widget — so a user who
+        types "5" into an int Entry then clicks a Button without clicking
+        outside first has the old IntVar value read here.
+
+        Root window's `focus_set()` takes focus away from any child widget,
+        which fires ttk.Entry's internal <FocusOut> handler that syncs the
+        display buffer into the textvariable. Runs on the Tk thread — the
+        caller (a button-handler in the periodic tick loop) is already
+        marshaling via _run_on_tk / mainloop.
+        """
+        if self._root is None:
+            return
+        try:
+            self._root.focus_set()
+            self._root.update_idletasks()
+        except Exception:
+            pass
+
     def save_to_config(self, config: SplatSimModeConfig, prefix: str = "") -> None:
         """Save current GUI values to a SplatSimModeConfig dataclass.
 
@@ -733,7 +755,7 @@ class TrajectoryGenModePanel(ModePanel):
     # Widget key for the export/import path. NOT a config field (leading "_"), so
     # save_to_config skips it and it never leaks into the exported JSON.
     CONFIG_PATH_KEY = "traj_gen._config_path"
-    DEFAULT_CONFIG_PATH = "traj_config.json"
+    DEFAULT_CONFIG_PATH = "configs/traj_config.json"
 
     def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
               style: GuiStyle, config: SplatSimModeConfig) -> None:
@@ -750,6 +772,21 @@ class TrajectoryGenModePanel(ModePanel):
             IntParam(f"{NS}.num_path_candidates", "Path Candidates", 1, 20),
             IntParam(f"{NS}.num_ik_candidates", "IK Candidates", 1, 64),
             IntParam(f"{NS}.max_path_attempts", "Max Path Attempts", 1, 50),
+            # Corner-rounding relaxation after shortcut smoothing — bends the
+            # jagged joint-space corners that survive in cluttered scenes
+            # (straight shortcuts collide) into gentle arcs; the time
+            # parametrizer otherwise renders each corner as visible wobble.
+            # 0 = off (historical).
+            IntParam(f"{NS}.elastic_smooth_passes", "Elastic Smooth Passes", 0, 100),
+            # CHOMP-lite trajopt smoothing (soft collision cost + smoothness).
+            # Runs AFTER elastic (opt-in, both can be on). Pushes waypoints
+            # AWAY from obstacles rather than just refusing entry into
+            # collision — makes paths more consistent across small obstacle-
+            # position variations (fewer homotopy-class flip-flops in demo
+            # data). ~3-5s per trajectory at 30 passes (default is now 15).
+            # Dominates planning time on scenes with large concave collision
+            # meshes — see TrajectoryGenModeConfig.trajopt_passes. 0 = off.
+            IntParam(f"{NS}.trajopt_passes", "Trajopt Passes", 0, 100),
         ]
         for param in int_params:
             builder.add_int_param(param, getattr(config, param.key.split(".", 1)[1]))
@@ -768,7 +805,7 @@ class TrajectoryGenModePanel(ModePanel):
             FloatParam(f"{NS}.obstacle_clearance", "Obstacle Clearance (m)", 0.0, 0.1),
             FloatParam(f"{NS}.self_collision_clearance", "Self Coll Clearance (m)", 0.0, 0.1),
             FloatParam(f"{NS}.path_perturbation_scale", "Path Perturbation (rad)", 0.0, 0.2),
-            # Final-approach taper. `final_approach_dist=0` disables (Ruckig
+            # Final-approach taper. `final_approach_dist=0` disables (the parametrizer
             # runs at full limits right up to the goal; PD may overshoot 1-2
             # frames but no slow tail teaches "freeze near goal" into the
             # policy). Default 0.15 rad brakes to `vel_scale × max_joint_vel`
@@ -777,6 +814,22 @@ class TrajectoryGenModePanel(ModePanel):
             FloatParam(f"{NS}.final_approach_dist", "Final Approach Dist (rad)", 0.0, 0.5),
             FloatParam(f"{NS}.final_approach_vel_scale", "Final Approach Vel Scale", 0.0, 1.0),
             FloatParam(f"{NS}.final_approach_acc_scale", "Final Approach Acc Scale", 0.0, 1.0),
+            # CHOMP-lite trajopt smoothing tunables. Only used when
+            # trajopt_passes > 0 (Int slider above).
+            #   - collision_threshold: distance (m) below which the
+            #     soft-repulsion cost activates. Larger = paths take
+            #     wider berth around obstacles.
+            #   - collision_weight: strength of the repulsion. Larger =
+            #     stronger push away from obstacles, at the cost of path
+            #     length / smoothness. Range 0-20 covers gentle to
+            #     aggressive.
+            #   - smoothness_weight: Laplacian pull toward neighbor-midpoint.
+            #     Range 0-5 typical.
+            #   - lr: gradient descent step size. Rarely needs tuning.
+            FloatParam(f"{NS}.trajopt_collision_threshold", "Trajopt Coll Threshold (m)", 0.0, 0.5),
+            FloatParam(f"{NS}.trajopt_collision_weight", "Trajopt Coll Weight", 0.0, 20.0),
+            FloatParam(f"{NS}.trajopt_smoothness_weight", "Trajopt Smooth Weight", 0.0, 5.0),
+            FloatParam(f"{NS}.trajopt_lr", "Trajopt LR", 0.001, 0.1),
         ]
         for param in float_params:
             builder.add_float_param(param, getattr(config, param.key.split(".", 1)[1]))
@@ -809,11 +862,32 @@ class TrajectoryGenModePanel(ModePanel):
             EnumParam(f"{NS}.ik_goal_selection", "IK Goal Selection", IkGoalSelectionStrategy),
             config.ik_goal_selection,
         )
-        # Ruckig segmentation: off (default) = single continuous pass through
+        # Soft-cost usage (vine-style envs publishing EnvConfig.soft_cost;
+        # inert elsewhere). off = ignore field; score = rank cost-blind
+        # candidates by exposure (historical); guided = cost-aware
+        # GENERATION (T-RRT transition test + cost-gated smoothing) so paths
+        # actively route around the vegetation. Weight scales the scoring
+        # term in score/guided.
+        builder.add_enum_param(
+            EnumParam(f"{NS}.soft_cost_mode", "Soft Cost Mode", SoftCostMode),
+            config.soft_cost_mode,
+        )
+        builder.add_float_param(
+            FloatParam(f"{NS}.soft_cost_weight", "Soft Cost Weight", 0.0, 20.0),
+            config.soft_cost_weight,
+        )
+        # Corner segmentation: off (default) = single continuous pass through
         # sharp corners; on = split at >45° corners with a forced stop each.
         builder.add_bool_param(
             BoolParam(f"{NS}.segment_at_sharp_corners", "Segment at Sharp Corners"),
             config.segment_at_sharp_corners,
+        )
+        # Equalize joint-space path speed across sections (anti-surge). Off =
+        # time-optimal per-joint box limits: multi-joint sections sprint, then
+        # brake — reads as wobble/ringing in recorded demos.
+        builder.add_bool_param(
+            BoolParam(f"{NS}.uniform_path_speed", "Uniform Path Speed"),
+            config.uniform_path_speed,
         )
         # Hold the last joint config frozen for ~1 s at the end of each generated
         # trajectory (default off). Off = no dead frames padding episode length.
@@ -887,6 +961,14 @@ class TrajectoryGenModePanel(ModePanel):
             path = (gui.get_value(self.CONFIG_PATH_KEY) or self.DEFAULT_CONFIG_PATH).strip()
             try:
                 update_dataclass_json(gui._config, path, warn=lambda m: print(f"[GUI] {m}"))
+                # Env-owned fields (task goal pose, q_goal_bias, skip pairs,
+                # DOF-mismatched q_*) always win over the file: a config
+                # exported from a DIFFERENT env otherwise silently wipes them
+                # (a planar export once nulled the small-engine lever goal and
+                # generation produced random-goal episodes).
+                reasserted = []
+                if gui._traj_env_reassert_fn is not None:
+                    reasserted = gui._traj_env_reassert_fn(gui._config)
                 # Push the imported values back into the widgets (field-driven, so
                 # no field is named here). Fields without a widget are silently
                 # skipped by set_value; enum values map to their dropdown string.
@@ -895,13 +977,29 @@ class TrajectoryGenModePanel(ModePanel):
                     if isinstance(v, _enum.Enum):
                         v = v.value
                     gui.set_value(f"traj_gen.{f.name}", v)
-                gui.set_status(f"Imported traj config <- {path}")
-                print(f"[GUI] Imported traj config <- {path}: {gui._config}")
+                note = (
+                    f" (env-owned fields re-asserted over the file: {sorted(reasserted)})"
+                    if reasserted else ""
+                )
+                gui.set_status(f"Imported traj config <- {path}{note}")
+                print(f"[GUI] Imported traj config <- {path}{note}: {gui._config}")
             except Exception as e:
                 gui.set_status(f"Import failed: {e}")
                 print(f"[GUI] Import failed: {e}")
 
         if start and gui.mode == "generate_trajectories_idle":
+            # ttk.Entry bound to an IntVar/DoubleVar/StringVar only commits
+            # the currently-typed text into the variable when the widget
+            # LOSES focus. If the user typed a new value and clicked Start
+            # WITHOUT clicking outside the entry first, the variable is
+            # still holding the pre-edit value → save_to_config below copies
+            # that stale value into the config → trajgen runs with the old
+            # setting. Force focus off any entry by focusing the parent
+            # frame BEFORE save_to_config so pending text is committed.
+            try:
+                gui._commit_pending_entries()
+            except AttributeError:
+                pass  # older GUI without the helper — skip; the docstring workaround is "click outside the entry before Start"
             gui.save_to_config(gui._config, prefix="traj_gen")
             gui.set_mode("generate_trajectories")
             print(f"[GUI] Started trajectory generation with config: {gui._config}")
@@ -1090,6 +1188,7 @@ class SplatSimGui(ThreadedTkinterGui):
     BTN_RESET_ENV = "reset_env"
     # Key for the render-mode dropdown (polled by the server each loop tick)
     RENDER_MODE_KEY = "render_mode"
+    SPLAT_SHADOWS_KEY = "splat_shadows"
 
     def __init__(
         self,
@@ -1100,6 +1199,8 @@ class SplatSimGui(ThreadedTkinterGui):
         panels: Optional[List[ModePanel]] = None,
         initial_render_mode: Any = None,
         available_render_modes: Optional[List[Any]] = None,
+        initial_splat_shadows: bool = False,
+        traj_env_reassert_fn=None,
     ):
         """Initialize the GUI.
 
@@ -1117,9 +1218,18 @@ class SplatSimGui(ThreadedTkinterGui):
             available_render_modes: Subset of RenderMode members to offer in the
                 dropdown (defaults to all). Lets the server hide options the env
                 can't do — e.g. SPLAT when no splat assets are loaded.
+            initial_splat_shadows: Initial state of the "Splat shadows" checkbox
+                (mirrors the server's launch --splat_shadows). The server polls
+                get_splat_shadows() each loop tick; when on, SPLAT-mode renders
+                get PyBullet-computed shadows composited in as a depth cue.
         """
         super().__init__(title="SplatSim Controls")
         self._initial_render_mode = initial_render_mode if initial_render_mode is not None else RenderMode.NONE
+        self._initial_splat_shadows = bool(initial_splat_shadows)
+        # Server callback: re-assert env-owned trajectory-config fields after
+        # an Import (see PybulletRobotServerBase.reassert_env_traj_config_fields).
+        # None => imports apply verbatim (historical behavior).
+        self._traj_env_reassert_fn = traj_env_reassert_fn
         self._available_render_modes = (
             list(available_render_modes) if available_render_modes else list(RenderMode)
         )
@@ -1262,6 +1372,15 @@ class SplatSimGui(ThreadedTkinterGui):
             EnumParam(self.RENDER_MODE_KEY, "Render mode", RenderMode),
             initial_value=self._initial_render_mode,
             allowed_values=self._available_render_modes,
+        )
+
+        # Splat shadows checkbox — composite PyBullet shadow-mapped shadows
+        # onto the SPLAT render as a depth cue (helps judge robot-obstacle
+        # proximity). Only affects Render mode = splat; polled by the server
+        # via get_splat_shadows(). Leave OFF when recording datasets.
+        builder.add_bool_param(
+            BoolParam(self.SPLAT_SHADOWS_KEY, "Splat shadows (pybullet)"),
+            initial_value=self._initial_splat_shadows,
         )
 
         # Debug mode dropdown (if enum provided)
@@ -1416,6 +1535,15 @@ class SplatSimGui(ThreadedTkinterGui):
         if value is None:
             return self._initial_render_mode
         return value
+
+    def get_splat_shadows(self) -> Optional[bool]:
+        """Current "Splat shadows" checkbox state. Thread-safe. Falls back to
+        the initial value when the GUI isn't built/started (e.g. headless), so
+        polling callers see no spurious change."""
+        value = self.get_value(self.SPLAT_SHADOWS_KEY)
+        if value is None:
+            return self._initial_splat_shadows
+        return bool(value)
 
     def set_eval_episode_options(self, episodes: List[int]) -> None:
         """Repopulate the eval benchmark episode combobox after a dataset is loaded.

@@ -572,3 +572,65 @@ T_object:
     - [0.10481339830160141, 0.029833329349756244, 0.04666666078567505]
   ply_path: /home/jennyw2/data/output/T_object/point_cloud/iteration_7000/point_cloud.ply
   use_fixed_base: false
+# (The former `vine` entry — vegetation-only vine_only.ply — was removed when
+# its data/vine_seg/vine_only assets were deleted; use vine_and_trellis.)
+# Same vine, but the hand-segmented splat ALSO includes the trellis/frame —
+# trellis gaussians are forced into the hard collision mesh via
+# `segment_vine_splat.py --force-hard-diff vine_only.ply` (xyz diff vs the
+# vegetation-only subset; same scan, same splat->sim transform as `vine`).
+vine_and_trellis:
+  transformation:
+    matrix:
+    - [0.249156, 0.007369, -0.019156, -0.640470]
+    - [0.020509, -0.080399, 0.235829, -0.260051]
+    - [0.000791, -0.236605, -0.080732, 0.774136]
+    - [0, 0, 0, 1]
+  aabb:
+    bounding_box:
+    - [-1.488, 0.150, -0.536]
+    - [0.770, 1.055, 1.620]
+    urdf_bbox_adjustment:
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+  ply_path: /home/jennyw2/code/gaussian-splatting/output/grape_prop_in_highbay2_images_500_500match_800height_SIMPLE_RADIALcam/point_cloud/iteration_30000/vine_and_trellis.ply
+  urdf_path: ./data/vine_seg/vine_and_trellis/vine_and_trellis.urdf
+  base_position:
+  - 0.0
+  - 0.0
+  - 0.0
+  use_fixed_base: true
+  note: collision OBJ is pre-baked in SIM frame (splat->sim matrix already applied),
+    so the URDF loads at the origin with identity orientation. RRT soft-cost payload
+    (trellis excluded from soft cost, it is hard) -> ./data/vine_seg/vine_and_trellis/vine_softcost_payload.json
+# Full grape-vine highbay scan — used as the RENDERING BACKGROUND of the vine
+# env (the whole scene: vine, trellis, room). Same splat->sim transform as the
+# `vine` entry (vine_only.ply is a subset of this scan, same frame). The scan
+# contains no robot, so no robot crop-out labels are needed.
+vine_scene:
+  transformation:
+    matrix:
+    - [0.249156, 0.007369, -0.019156, -0.640470]
+    - [0.020509, -0.080399, 0.235829, -0.260051]
+    - [0.000791, -0.236605, -0.080732, 0.774136]
+    - [0, 0, 0, 1]
+  # NOTE: for a BACKGROUND entry the aabb is the region crop_splat REMOVES
+  # from the scene (keep_within_aabb=False) so the articulated robot splat
+  # can composite there without z-fighting. NOT the object's bounds! The
+  # vine scan has no robot (~500 solid gaussians in this box), so this crop
+  # is nearly a no-op — but never widen it into the vine (x<-0.25).
+  aabb:
+    bounding_box:
+    - [-0.25, -0.35, -0.1]
+    - [0.25, 0.30, 0.8]
+    urdf_bbox_adjustment:
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+    - [0.0, 0.0]
+  model_path: /home/jennyw2/code/gaussian-splatting/output/grape_prop_in_highbay2_images_500_500match_800height_SIMPLE_RADIALcam
+  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/grape_prop_in_highbay2_images_500_500match_800height_SIMPLE_RADIALcam/sfm_disk_disk+lightglue/undistorted
+  base_position:
+  - 0.0
+  - 0.0
+  - 0.0
+  use_fixed_base: true

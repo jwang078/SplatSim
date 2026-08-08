@@ -32,6 +32,13 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     # dynamics vs. datasets captured at damping=0.
     JOINT_DAMPING = 0.5
 
+    # Rigid gripper mimic (see the base attr): the small-engine tasks are
+    # approach/touch tasks — the gripper never closes on an object, so
+    # capping finger crush force is irrelevant here, while the historical
+    # gear-only coupling let obstacle contact visibly bend a single finger
+    # 50+ deg (the real 2F-85 is structurally rigid and never does this).
+    GRIPPER_MIMIC_HOLD_FORCE = 500.0
+
     # UR URDF: base_link(0) and upper_arm_link(2) are non-adjacent (separated
     # by shoulder_link(1)) but the shoulder bracket places upper_arm_link's
     # lower face ~4 mm above base_link's top face. Any self_collision_clearance
@@ -233,6 +240,9 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
     def _reset_episode_state(self):
         self._step_count = 0
         self._episode_started = True
+        # Per-episode shadow-strength jitter (base class; no-op visual change
+        # unless splat_shadows is on). Runs after reset() seeds np.random.
+        self._resample_splat_shadow_strength()
         self._prev_action = None
         self._action_delta = 0.0
         self._prev_action_delta = 0.0
@@ -257,8 +267,36 @@ class SmallEnginePybulletRobotServer(PybulletRobotServerBase):
 
         self._reset_episode_state()
 
-        # This now also randomizes the robot's joints
-        self.randomize_objects()
+        # A pinned scenario (launch_nodes --scenario_file) replaces the
+        # randomize/solvability search: that search can burn 100 attempts,
+        # each running goal IK, which is minutes on a scene where the goal is
+        # hard to solve. Reusing a known-good arrangement makes launch and
+        # interactive/eval resets deterministic and fast.
+        #
+        # NOT during trajectory GENERATION though: randomize_objects() is
+        # what varies the box arrangement AND the robot's start joints per
+        # episode — honoring the pin there froze every recorded episode to
+        # one identical scene + start pose (zero dataset diversity; observed
+        # as "reset never randomizes anything"). Generation-mode resets
+        # therefore always randomize; the pin keeps serving the launch-time
+        # setup and non-generation resets. An explicit
+        # options={"force_randomize": True} bypasses the pin from ANY mode —
+        # the GUI "Reset Env" button sends it, since a user pressing Reset
+        # is asking for a fresh scene, not a replay of the pinned one.
+        generating = self.serve_mode in (
+            self.SERVE_MODES.GENERATE_TRAJECTORIES,
+            self.SERVE_MODES.GENERATE_DEMOS,
+        )
+        force_randomize = bool(options.get("force_randomize")) if options else False
+        if (
+            getattr(self, "_pinned_scenario", None) is not None
+            and not generating
+            and not force_randomize
+        ):
+            self.apply_scenario(self._pinned_scenario)
+        else:
+            # This now also randomizes the robot's joints
+            self.randomize_objects()
 
         # From GENERATE_DEMOS: randomize_ee_pose()
         # initial_joints = self.randomize_ee_pose()
@@ -454,6 +492,24 @@ class UprightRobotSmallEngineNewPybulletRobotServer(SmallEnginePybulletRobotServ
     PYBULLET_CAMERA_DISTANCE = 2.0
     PYBULLET_CAMERA_YAW = 180.0
     PYBULLET_CAMERA_PITCH = -30.0
+
+    # ── observation.environment_state layout: 7-wide ─────────────────────────
+    #   [box1(x,y), box2(x,y), ee(x,y,z)]
+    # Only the RANDOMIZED objects are recorded — engine/table/wall are pinned
+    # (randomize_pose=False, fixed ranges), so their coords were 9 constant
+    # dims of the historical 15-wide layout carrying zero information (and
+    # degenerate min==max normalization stats). The boxes sit ON the table so
+    # their z is constant → (x,y) only; the EE moves in full 3D → (x,y,z) via
+    # ORACLE_STATE_EE_COORD_INDICES. Mirrors the planar recipe (EE appended
+    # after objects; see planar's 8-wide [block,obs1,obs2,ee](x,z)).
+    # HISTORY: pre-2026-08-04 recordings (e.g. approach_lever_13_smooth) are
+    # 15-wide [engine,table,wall,box1,box2](x,y,z) with NO EE — checkpoints
+    # and datasets are NOT width-compatible across this change; re-record or
+    # migrate (slice box coords + FK-append EE).
+    ORACLE_OBJECT_NAMES = ["box1", "box2"]
+    ORACLE_STATE_COORD_INDICES = (0, 1)      # boxes: world x, y (z = table height)
+    ORACLE_STATE_INCLUDE_EE_POS = True
+    ORACLE_STATE_EE_COORD_INDICES = (0, 1, 2)  # EE: full 3D
 
     ENV_CONFIG = EnvConfig(
         # name="upright_robot_small_engine_new",

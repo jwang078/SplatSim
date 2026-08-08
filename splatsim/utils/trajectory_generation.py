@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import zarr
 import os
@@ -11,6 +12,9 @@ from splatsim.configs.mode_config import PathSelectionStrategy
 from splatsim.utils import rrt_path_utils
 from splatsim.utils.rrt_to_goal import RRTToGoalPlanner, RRTPlanningError
 from splatsim.configs.env_config import SplatSimObject
+
+logger = logging.getLogger(__name__)
+
 
 class TrajectoryGenerator:
     """Helper class for RRT-based trajectory generation."""
@@ -28,6 +32,7 @@ class TrajectoryGenerator:
         wrist_camera_link_name: Optional[str] = None,
         trajectory_gen_config: Optional[TrajectoryGenModeConfig] = None,
         pb_client_id: int = 0,
+        soft_cost_payload: Optional[dict] = None,
     ):
         """
         Initialize trajectory generator.
@@ -44,6 +49,11 @@ class TrajectoryGenerator:
             splatsim_objects: List of SplatSimObject instances
             wrist_camera_link_name: Name of wrist camera link for camera-aware scoring
             trajectory_gen_config: Trajectory generation configuration (uses defaults if None)
+            soft_cost_payload: Optional env_config-style soft-cost dict
+                (EnvConfig.soft_cost). The generator's planner never calls
+                load_obstacles (it plans against the env's live world), so
+                the field must be attached explicitly or cost-aware scoring
+                silently stays off for in-env trajectory generation.
         """
         self.pb = pybullet_client
         self._pb_client_id = pb_client_id
@@ -56,6 +66,7 @@ class TrajectoryGenerator:
         self.env_config_name = env_config_name
         self.get_ee_link_fn = get_ee_link_fn
         self.splatsim_objects = splatsim_objects
+        self.soft_cost_payload = soft_cost_payload
 
         # Store and resolve camera link for scoring
         self.wrist_camera_link_name = wrist_camera_link_name
@@ -79,7 +90,7 @@ class TrajectoryGenerator:
         )
 
         # Canonical shared planner. TrajectoryGenerator now DELEGATES all
-        # RRT/IK/path-scoring/ruckig work to RRTToGoalPlanner (the same planner
+        # RRT/IK/path-scoring/parametrization work to RRTToGoalPlanner (the same planner
         # the LeRobot DAgger/SA intervention side uses), so SplatSim
         # trajectory-gen and intervention share ONE implementation. Obstacles
         # are pushed into the planner via `_sync_planner_obstacles()` before
@@ -264,7 +275,7 @@ class TrajectoryGenerator:
         Shared 'is this scenario actually solvable — and here's the demo path'
         primitive used by env resets. STRONGER than ``check_able_to_solve``,
         which only checks a goal CONFIG exists; this also verifies a
-        collision-free PATH reaches it. Returns the ruckig-smoothed joint path
+        collision-free PATH reaches it. Returns the time-parametrized joint path
         ``(T, num_dofs)`` on success (the chosen goal config is published on
         ``self._planner._last_chosen_q_goal``), or ``None`` on
         ``RRTPlanningError``. The robot's joint state is restored by
@@ -344,7 +355,7 @@ class TrajectoryGenerator:
         """Build the shared RRTToGoalPlanner on first use (see the deferral
         note in __init__ — `get_ee_link_fn()` isn't safe to call until the
         parent robot server has finished setting up `self.wrist_camera`).
-        Cached after the first call. Ruckig limits are hardcoded 0.5/1.0/10.0
+        Cached after the first call. Kinematic limits are hardcoded 0.5/1.0/10.0
         to match the conservative smoothing `generate_trajectory_batch`
         historically applied."""
         if self._planner is None:
@@ -361,10 +372,10 @@ class TrajectoryGenerator:
                 max_joint_vel=self.config.max_joint_vel,
                 max_joint_acc=self.config.max_joint_acc,
                 max_joint_jerk=self.config.max_joint_jerk,
-                # Ruckig only the FINAL trajectory (cheap linear-densify checks
-                # per candidate) so we don't hit the ruckig cloud API once per
+                # Parametrize only the FINAL trajectory (cheap linear-densify checks
+                # per candidate) so we parametrize once per plan, not once per
                 # candidate — that overwhelmed it during batch trajectory-gen.
-                ruckig_per_candidate=False,
+                parametrize_per_candidate=False,
                 segment_at_sharp_corners=self.config.segment_at_sharp_corners,
                 path_selection=PathSelectionStrategy(self.config.path_selection),
                 # Config-driven (default "joint_distance"): pick the IK goal
@@ -376,7 +387,14 @@ class TrajectoryGenerator:
                 max_path_attempts_per_ik=self.config.max_path_attempts,
                 path_perturbation_scale=self.config.path_perturbation_scale,
                 rrt_smooth_iterations=self.config.rrt_smooth_iterations,
-                ruckig_obstacle_clearance_factor=self.config.ruckig_obstacle_clearance_factor,
+                elastic_smooth_passes=self.config.elastic_smooth_passes,
+                trajopt_passes=self.config.trajopt_passes,
+                trajopt_lr=self.config.trajopt_lr,
+                trajopt_smoothness_weight=self.config.trajopt_smoothness_weight,
+                trajopt_collision_weight=self.config.trajopt_collision_weight,
+                trajopt_collision_threshold=self.config.trajopt_collision_threshold,
+                trajopt_fd_step=self.config.trajopt_fd_step,
+                obstacle_clearance_factor=self.config.obstacle_clearance_factor,
                 final_approach_dist=self.config.final_approach_dist,
                 final_approach_vel_scale=self.config.final_approach_vel_scale,
                 final_approach_acc_scale=self.config.final_approach_acc_scale,
@@ -396,7 +414,34 @@ class TrajectoryGenerator:
                 camera_k_exp=self.config.k_exp,
                 camera_k_sig=self.config.k_sig,
                 camera_threshold=self.config.threshold,
+                # Soft-cost usage ("off"/"score"/"guided") + scoring weight.
+                # Config default is "off" (small_engine/planar have no field
+                # and stay cost-blind by construction); envs with a field
+                # opt in via their traj-gen config (vine -> "guided").
+                soft_cost_mode=getattr(self.config, "soft_cost_mode", "off"),
+                soft_cost_weight=getattr(self.config, "soft_cost_weight", 1.0),
+                # Surface-ring sampling + max reduction (see
+                # RRTToGoalPlanner._config_soft_cost_points). getattr-guarded
+                # like the two above so an older config JSON without these
+                # fields still loads.
+                soft_cost_surface_samples=getattr(
+                    self.config, "soft_cost_surface_samples", 6),
+                soft_cost_aggregation=getattr(
+                    self.config, "soft_cost_aggregation", "max"),
             )
+            # This planner never sees load_obstacles (it plans against the
+            # env's live world), so the soft-cost field must be attached
+            # explicitly — otherwise cost-aware scoring silently stays off
+            # for in-env trajectory generation.
+            if self.soft_cost_payload:
+                try:
+                    self._planner.set_soft_cost_field(self.soft_cost_payload)
+                except Exception:
+                    logger.exception(
+                        "TrajectoryGenerator: failed to attach soft-cost "
+                        "field %s — continuing cost-blind",
+                        self.soft_cost_payload,
+                    )
         return self._planner
 
     def _sync_planner_obstacles(self, additional_obstacles=None):
@@ -416,7 +461,7 @@ class TrajectoryGenerator:
         self._planner._obstacle_names = self.get_obstacle_names()
         # Use BASE skip pairs (per-obstacle skip_collision_robot_links from the
         # env config) for the planner's global collision check. Path checks —
-        # RRT tree, linear densify, ruckig-smoothed, final gate — see the
+        # RRT tree, linear densify, time-parametrized, final gate — see the
         # gripper's real collision mesh here so mid-trajectory gripper⟷obstacle
         # contact is detected and rejected. Previously this line pushed
         # `_ik_augmented_skip_pairs()` here, which added (finger, obstacle) for
@@ -444,7 +489,10 @@ class TrajectoryGenerator:
         link_state = self.pb.getLinkState(
             self.robot_id, ee_link_index, computeForwardKinematics=True
         )
-        return np.asarray(link_state[0]), np.asarray(link_state[1])
+        # URDF link frame (4/5), not COM (0/1) — must match what pybullet IK
+        # solves for and what the planner's FK-accuracy gate compares
+        # (identical for links whose COM sits at the frame origin).
+        return np.asarray(link_state[4]), np.asarray(link_state[5])
 
     def generate_trajectory_batch(self):
         """Generate one base trajectory with multiple obstacle configurations.
@@ -474,14 +522,14 @@ class TrajectoryGenerator:
                 print("[TrajectoryGenerator] Failed to get valid start/goal configurations. Skipping this trajectory.")
                 return None
 
-            # Delegate RRT/IK/path-scoring/ruckig to the shared planner. We keep
+            # Delegate RRT/IK/path-scoring/parametrization to the shared planner. We keep
             # `_get_start_and_goal_qs()` for goal RESOLUTION (EE-goal vs direct-q
             # vs random → joint config), then bridge into the planner's EE-pose
             # API by FK'ing the chosen joint goal to an EE pose. `q_goal_bias` is
             # seeded with that joint config so the planner's IK converges back to
-            # the same branch. The returned `base_traj` is ALREADY ruckig-smoothed
+            # the same branch. The returned `base_traj` is ALREADY time-parametrized
             # (with the same conservative 0.5/1.0/10.0 limits configured on the
-            # planner), so no standalone ruckig pass runs here.
+            # planner), so no standalone parametrization pass runs here.
             self._sync_planner_obstacles()
             q_goal = all_q_goals[0]
 

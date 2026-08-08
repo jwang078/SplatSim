@@ -78,6 +78,16 @@ class PlanarPybulletRobotServer(SmallEnginePybulletRobotServer):
     TARGET_OBJECT_NAME = "block"
     OBSTACLE_OBJECT_NAMES = ("obstacle_1", "obstacle_2")
     pos_tolerance_m = 0.06
+    # Strict-tolerance override: reacher task, not precision manipulation, so
+    # 5 mm (default in the base class) is unreachably tight — the arm would
+    # oscillate around the goal without converging. 1 cm is achievable by
+    # RRT and still ~6x tighter than the eval-time 6 cm threshold, giving
+    # RRT enough runway to converge to the goal cleanly during intervention
+    # recording without overshooting into "done" before the intervention
+    # completes.
+    STRICT_POS_TOLERANCE_M = 0.01
+    # planar success check ignores orientation (pure reacher) so the quat
+    # tolerance is a no-op here; leaving the base default for consistency.
 
     # ── Object placement: annulus around the base pivot (all 4 quadrants) ─────
     # Randomizable objects are placed on an annulus around the arm's base pivot
@@ -141,6 +151,8 @@ class PlanarPybulletRobotServer(SmallEnginePybulletRobotServer):
         # its skip_collision_robot_links (see ENV_CONFIG). Done once here — the
         # block isn't rescaled, so its body id is stable.
         self._disable_target_physics_collision()
+        # Debug pass-through mode (see base ctor kwarg phantom_obstacles).
+        self._apply_phantom_obstacles()
         # NOTE: joint damping is applied by the base via JOINT_DAMPING (set
         # below) — no longer done inline here.
 
@@ -298,7 +310,12 @@ class PlanarPybulletRobotServer(SmallEnginePybulletRobotServer):
         _CK_CODE = {None: 0, "obstacle": 1, "self": 2}
         return {
             "is_success": success,
-            "distance_to_target_m": pos_diff,
+            # Same semantics as small_engine's position_error_m (EE-to-target
+            # distance norm) — shares its name so downstream eval consumers
+            # (dagger_progress.sh, dagger_plot.py, eval_info.json readers)
+            # see one consistent key across envs. Was `distance_to_target_m`
+            # until 2026-07-30; pre-rename eval artifacts keep the old key.
+            "position_error_m": pos_diff,
             "in_collision": in_collision,
             "collision_kind": collision_kind,
             "collision_kind_code": _CK_CODE[collision_kind],
@@ -335,16 +352,33 @@ class PlanarPybulletRobotServer(SmallEnginePybulletRobotServer):
     # ── Oracle state (privileged) ─────────────────────────────────────────────
     # Every planar recording carries a SEPARATE observation.environment_state
     # feature (FeatureType.ENV):
-    #   [<block x,z>, <obstacle_i x,z>...]
+    #   [<block x,z>, <obstacle_i x,z>..., <ee x,z>]
     # i.e. exact object coords (goal = the block) for EVERY scene object in
-    # ENV_CONFIG order, so an oracle policy sees the goal AND what to avoid.
+    # ENV_CONFIG order, so an oracle policy sees the goal AND what to avoid,
+    # plus the gripper (EE) position appended LAST — redundant with FK of
+    # observation.state's joints, but explicit EE coords make goal-reaching a
+    # direct env_state comparison instead of a learned kinematics problem.
     # observation.state stays pure proprioception [joint_1, joint_2, joint_3,
     # gripper]. This lets one dataset train both an image policy (ignores
     # environment_state) and a state-only policy (consumes it — a pure control
     # problem, no perception, so it trains fast). Only the X-Z axes are recorded
     # (planar plane; Y is a constant 0). The generic recording logic lives in the
     # base (oracle_environment_state / env_state_dim); this only picks the axes.
+    # NOTE: datasets recorded before EE-pos inclusion are 2 dims narrower — the
+    # object coords are a stable prefix, so retrofit them with
+    # lerobot/my_scripts/append_ee_to_env_state.py (FK from recorded joints)
+    # rather than re-recording.
     ORACLE_STATE_COORD_INDICES = (0, 2)  # world x, z
+    ORACLE_STATE_INCLUDE_EE_POS = True   # append gripper (x,z) after objects
+    # Per-link min-obstacle distances are NO LONGER part of env_state (was
+    # briefly True → 11-wide layout [<objects>, <ee_xz>, <link_i_min_d>×3]).
+    # Retired 2026-07-30: the planar env_state is back to the 8-wide
+    # [<objects>, <ee_xz>] layout. Datasets recorded during the 11-wide window
+    # were migrated back with
+    # lerobot/my_scripts/strip_link_obstacle_dists_from_env_state.py; the
+    # forward retrofit (append_link_obstacle_dists_to_env_state.py) remains
+    # available should the feature come back.
+    ORACLE_STATE_INCLUDE_LINK_OBSTACLE_DIST = False
 
 
 def _planar_env_config(name: str, obstacle_count: int) -> EnvConfig:
@@ -398,9 +432,10 @@ class Planar3JointPybulletRobotServer(PlanarPybulletRobotServer):
 class Planar3JointOraclePybulletRobotServer(Planar3JointPybulletRobotServer):
     """Oracle-state variant: same 2-obstacle reach scene, but a separate
     observation.environment_state carries [block(x,z), obstacle_1(x,z),
-    obstacle_2(x,z)] — exact coords, no perception — alongside proprioceptive
-    observation.state [joints, gripper]. For a state-only diffusion policy (no
-    image) that trains fast; use it to isolate control from vision."""
+    obstacle_2(x,z), ee(x,z)] — exact coords, no perception — alongside
+    proprioceptive observation.state [joints, gripper]. For a state-only
+    diffusion policy (no image) that trains fast; use it to isolate control
+    from vision."""
 
     DEFAULT_ROBOT_NAME = "planar_3joint"  # same URDF/objects.yaml entry
     ENV_CONFIG = _planar_env_config("planar_3joint_oracle", obstacle_count=2)
@@ -409,7 +444,11 @@ class Planar3JointOraclePybulletRobotServer(Planar3JointPybulletRobotServer):
 class Planar3JointOracleSimplePybulletRobotServer(Planar3JointOraclePybulletRobotServer):
     """Simplest debug scene: oracle state, ZERO obstacles (pure reach).
     observation.state = [joints, gripper]; observation.environment_state =
-    [block(x,z)]. Should train to ~100% in a few thousand steps — the green
-    baseline that confirms the pipeline/action space are correct."""
+    [block(x,z), ee(x,z)]. Should train to ~100% in a few thousand steps — the
+    green baseline that confirms the pipeline/action space are correct."""
 
     ENV_CONFIG = _planar_env_config("planar_3joint_oracle_simple", obstacle_count=0)
+    # Redundant with the parent (the feature is now off for ALL planar
+    # variants) but kept explicit so this simple/debug variant stays at the
+    # 4-wide [block(x,z), ee(x,z)] layout even if the parent flag flips again.
+    ORACLE_STATE_INCLUDE_LINK_OBSTACLE_DIST = False
