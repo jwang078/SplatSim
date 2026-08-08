@@ -17,6 +17,7 @@ def build_lerobot_features(
     num_dofs: int = 6,
     state_dim: Optional[int] = None,
     env_state_dim: int = 0,
+    image_dtype: str = "video",
 ) -> dict:
     """Build the standard LeRobotDataset feature spec for SplatSim recordings.
 
@@ -35,6 +36,16 @@ def build_lerobot_features(
                    like the diffusion policy treat environment_state as a
                    distinct conditioning input (see build_lerobot_frame's
                    "environment_state"). The ACTION stays num_dofs + 1.
+        image_dtype: storage mode for camera features. "video" (default since
+                   2026-08-04) encodes each episode's frames into per-episode
+                   MP4s (AV1) under videos/ — ~20x smaller than the historical
+                   "image" mode, which embedded one PNG per frame INSIDE the
+                   parquet rows (a 29 GB data/ dir on approach_lever_13_smooth,
+                   and every dataloader row access paid full PNG
+                   materialization even for state-only policies). Pass
+                   "image" to restore the legacy behavior. Resuming an
+                   EXISTING dataset keeps its recorded schema either way
+                   (create() only fires for new datasets).
     """
     action_dim = num_dofs + 1
     if state_dim is None:
@@ -46,7 +57,7 @@ def build_lerobot_features(
     features = {
         **{
             f"observation.images.{key}": {
-                "dtype": "image",
+                "dtype": image_dtype,
                 "shape": (3, 224, 224),
                 "names": ["channels", "height", "width"],
             }
@@ -129,6 +140,7 @@ def create_lerobot_dataset(
     robot_type: str = "lerobot_splatsim",
     state_dim: Optional[int] = None,
     env_state_dim: int = 0,
+    image_dtype: str = "video",
 ) -> "LeRobotDataset":
     """Create a fresh LeRobot dataset with standard SplatSim settings.
 
@@ -144,6 +156,7 @@ def create_lerobot_dataset(
         use_videos=True,
         features=build_lerobot_features(
             image_keys, num_dofs, state_dim=state_dim, env_state_dim=env_state_dim,
+            image_dtype=image_dtype,
         ),
     )
 

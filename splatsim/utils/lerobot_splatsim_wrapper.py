@@ -175,7 +175,7 @@ class ZMQSimRobot(Robot):
         """Define observation space"""
         features = {
             "images.base_rgb": {
-                "dtype": "image",
+                "dtype": "video",
                 "shape": (3, 224, 224),
                 "names": ["channels", "height", "width"]
             },
@@ -196,7 +196,7 @@ class ZMQSimRobot(Robot):
         
         # Add wrist camera if you have it
         # features["images.wrist_rgb"] = {
-        #     "dtype": "image",
+        #     "dtype": "video",
         #     "shape": (3, 224, 224),
         #     "names": ["channels", "height", "width"]
         # }

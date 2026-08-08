@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-Script to view videos (sequences of images) from a parquet dataset.
-Finds all base_rgb* and wrist_rgb* columns and displays them as a collage.
+Script to view videos (sequences of images) from a LeRobot dataset.
+
+Supports both storage layouts:
+  * image-in-parquet: base_rgb*/wrist_rgb* columns hold encoded PNG/JPEG bytes.
+  * video-backed (LeRobot v2.x/v3.0): the parquet holds only state/action, and
+    frames live in mp4 files under <root>/videos/. The mp4s are located via
+    meta/info.json + meta/episodes/*.parquet and decoded on demand.
 """
 
 import argparse
 import glob
 import io
+import json
 import os
+from collections import OrderedDict
 
 import cv2
 import imageio
@@ -88,10 +95,141 @@ def decode_image(image_data: dict) -> np.ndarray:
     return np.array(img)
 
 
-def find_image_columns(df: pd.DataFrame) -> tuple[list[str], list[str]]:
-    """Return (base_cols, wrist_cols) — all columns matching base_rgb* and wrist_rgb*, sorted."""
-    base_cols = sorted(c for c in df.columns if "base_rgb" in c.lower())
-    wrist_cols = sorted(c for c in df.columns if "wrist_rgb" in c.lower())
+def find_dataset_root(parquet_folder: str) -> str | None:
+    """Walk up from a data/chunk-XXX folder to the dataset root (the dir with meta/info.json)."""
+    path = os.path.abspath(parquet_folder)
+    for _ in range(4):
+        path = os.path.dirname(path)
+        if os.path.isfile(os.path.join(path, "meta", "info.json")):
+            return path
+    return None
+
+
+class VideoFrameSource:
+    """Decodes frames of video-backed LeRobot datasets (dtype == "video" features).
+
+    v3.0 packs many episodes into one mp4 per camera; meta/episodes/*.parquet says
+    which file an episode lives in and at what timestamp it starts. v2.x writes one
+    mp4 per (camera, episode), which we detect from the {episode_index} placeholder
+    in info.json's video_path template.
+
+    Frames are decoded a whole episode at a time (sequential decode is ~1000x faster
+    than seeking per frame) and the last few episodes are kept in an LRU cache so
+    stepping backwards / replaying doesn't re-decode.
+    """
+
+    def __init__(self, dataset_root: str, max_cached_episodes: int = 8):
+        self.root = dataset_root
+        with open(os.path.join(dataset_root, "meta", "info.json")) as f:
+            info = json.load(f)
+        self.info = info
+        self.video_path_tmpl = info.get(
+            "video_path", "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+        )
+        self.keys = sorted(k for k, v in info.get("features", {}).items() if v.get("dtype") == "video")
+        self.per_episode_files = "{episode_index" in self.video_path_tmpl
+        self._ep_meta = None if self.per_episode_files else self._load_episode_meta()
+        self._cache: OrderedDict[tuple[str, int], list[np.ndarray]] = OrderedDict()
+        self._max_cached = max_cached_episodes
+        self._containers: dict[str, object] = {}
+
+    def _load_episode_meta(self) -> pd.DataFrame:
+        files = sorted(glob.glob(os.path.join(self.root, "meta", "episodes", "**", "*.parquet"), recursive=True))
+        if not files:
+            raise FileNotFoundError(
+                f"Video-backed dataset at {self.root} has no meta/episodes/*.parquet — "
+                "cannot locate episode segments inside the mp4 files."
+            )
+        cols_needed = ["episode_index", "length"] + [
+            f"videos/{k}/{sfx}" for k in self.keys for sfx in ("chunk_index", "file_index", "from_timestamp", "to_timestamp")
+        ]
+        dfs = []
+        for f in files:
+            df = pd.read_parquet(f, columns=None)
+            dfs.append(df[[c for c in cols_needed if c in df.columns]])
+        meta = pd.concat(dfs, ignore_index=True).set_index("episode_index")
+        return meta
+
+    def _locate(self, key: str, ep: int) -> tuple[str, float, int | None]:
+        """Return (mp4 path, start timestamp in that file, expected frame count)."""
+        if self.per_episode_files:
+            chunk = ep // int(self.info.get("chunks_size", 1000))
+            rel = self.video_path_tmpl.format(
+                video_key=key, episode_chunk=chunk, episode_index=ep, chunk_index=chunk, file_index=ep
+            )
+            return os.path.join(self.root, rel), 0.0, None
+
+        if ep not in self._ep_meta.index:
+            raise KeyError(f"Episode {ep} not present in meta/episodes")
+        row = self._ep_meta.loc[ep]
+        rel = self.video_path_tmpl.format(
+            video_key=key,
+            chunk_index=int(row[f"videos/{key}/chunk_index"]),
+            file_index=int(row[f"videos/{key}/file_index"]),
+        )
+        length = int(row["length"]) if "length" in row.index else None
+        return os.path.join(self.root, rel), float(row[f"videos/{key}/from_timestamp"]), length
+
+    def _container(self, path: str):
+        import av
+
+        if path not in self._containers:
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"Video file not found: {path}")
+            container = av.open(path)
+            # Must be set before the codec opens (i.e. before the first decode).
+            container.streams.video[0].thread_type = "AUTO"
+            self._containers[path] = container
+        return self._containers[path]
+
+    def _decode_episode(self, key: str, ep: int) -> list[np.ndarray]:
+        path, from_ts, length = self._locate(key, ep)
+        container = self._container(path)
+        stream = container.streams.video[0]
+        # Seek to the keyframe at/just before the episode start, then drop the
+        # pre-roll frames by timestamp.
+        container.seek(int(from_ts / stream.time_base), stream=stream, backward=True)
+        eps = 1e-4
+        frames: list[np.ndarray] = []
+        for frame in container.decode(video=0):
+            if frame.pts is None:
+                continue
+            if float(frame.pts * stream.time_base) < from_ts - eps:
+                continue
+            frames.append(frame.to_ndarray(format="rgb24"))
+            if length is not None and len(frames) >= length:
+                break
+        if not frames:
+            raise RuntimeError(f"Decoded 0 frames for {key} episode {ep} from {path}")
+        return frames
+
+    def get_frame(self, key: str, ep: int, frame_in_ep: int) -> np.ndarray:
+        cache_key = (key, ep)
+        frames = self._cache.get(cache_key)
+        if frames is None:
+            frames = self._decode_episode(key, ep)
+            self._cache[cache_key] = frames
+            while len(self._cache) > self._max_cached:
+                self._cache.popitem(last=False)
+        else:
+            self._cache.move_to_end(cache_key)
+        # Clamp: an episode's last frame can be missing if the mp4 was truncated.
+        return frames[min(frame_in_ep, len(frames) - 1)]
+
+
+def find_image_columns(
+    df: pd.DataFrame, video_source: VideoFrameSource | None = None, key_filter: list[str] | None = None
+) -> tuple[list[str], list[str]]:
+    """Return (base_cols, wrist_cols) — all image keys matching base_rgb* and wrist_rgb*, sorted.
+
+    Keys come from parquet columns holding encoded images, plus (for video-backed
+    datasets) the video feature keys of `video_source`.
+    """
+    names = list(df.columns) + (list(video_source.keys) if video_source is not None else [])
+    if key_filter:
+        names = [n for n in names if any(f.lower() in n.lower() for f in key_filter)]
+    base_cols = sorted(set(c for c in names if "base_rgb" in c.lower()))
+    wrist_cols = sorted(set(c for c in names if "wrist_rgb" in c.lower()))
     return base_cols, wrist_cols
 
 
@@ -106,15 +244,25 @@ def _labeled_tile(img_rgb: np.ndarray, label: str) -> np.ndarray:
     return np.concatenate([bar, img_bgr], axis=0)
 
 
-def make_collage(row: pd.Series, base_cols: list[str], wrist_cols: list[str]) -> np.ndarray:
+def make_collage(
+    row: pd.Series,
+    base_cols: list[str],
+    wrist_cols: list[str],
+    video_source: VideoFrameSource | None = None,
+) -> np.ndarray:
     """
     Build a collage with base_rgb* on the top row and wrist_rgb* on the bottom row.
     Each tile has a label bar. Tiles/rows are padded with black if sizes differ.
     """
+    def get_image(col: str) -> np.ndarray:
+        if video_source is not None and col in video_source.keys:
+            return video_source.get_frame(col, int(row["episode_index"]), int(row["frame_index"]))
+        return decode_image(row[col])
+
     def build_row(cols: list[str]) -> np.ndarray | None:
         tiles = []
         for col in cols:
-            img = decode_image(row[col])
+            img = get_image(col)
             label = col.removeprefix("observation.images.")
             tiles.append(_labeled_tile(img, label))
         if not tiles:
@@ -164,6 +312,22 @@ def generate_output_path(parquet_folder: str, episode_str: str | None, fmt: str 
 
 
 
+def _check_image_keys(base_cols, wrist_cols, video_source: VideoFrameSource | None) -> None:
+    """Fail early (with an actionable message) instead of on the first frame."""
+    if base_cols or wrist_cols:
+        return
+    if video_source is not None:
+        raise ValueError(
+            "No base_rgb*/wrist_rgb* image keys found. Video features in this dataset: "
+            f"{video_source.keys} (check --keys filter)"
+        )
+    raise ValueError(
+        "No image columns in the parquet and no video-backed dataset root found. "
+        "Point --parquet_folder at <dataset_root>/data/chunk-XXX so meta/info.json "
+        "and videos/ can be located."
+    )
+
+
 def _prepare_df(df: pd.DataFrame, episodes: list[int] | None = None) -> pd.DataFrame:
     """Filter by episodes and sort by (episode_index, frame_index)."""
     if episodes is not None:
@@ -187,6 +351,8 @@ def save_video(
     episodes: list[int] | None = None,
     fps: int = 30,
     gif_fps: int = 10,
+    video_source: VideoFrameSource | None = None,
+    key_filter: list[str] | None = None,
 ):
     """Save collage video of all base_rgb* and wrist_rgb* columns to a file.
 
@@ -195,9 +361,10 @@ def save_video(
     """
     df = _prepare_df(df, episodes)
 
-    base_cols, wrist_cols = find_image_columns(df)
+    base_cols, wrist_cols = find_image_columns(df, video_source, key_filter)
     print(f"Base columns: {base_cols}")
     print(f"Wrist columns: {wrist_cols}")
+    _check_image_keys(base_cols, wrist_cols, video_source)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -215,7 +382,7 @@ def save_video(
 
     for frame_idx in range(len(df)):
         row = df.iloc[frame_idx]
-        collage_bgr = make_collage(row, base_cols, wrist_cols)
+        collage_bgr = make_collage(row, base_cols, wrist_cols, video_source)
         collage_rgb = cv2.cvtColor(collage_bgr, cv2.COLOR_BGR2RGB)
         writer.append_data(collage_rgb)
 
@@ -231,13 +398,16 @@ def play_video(
     episodes: list[int] | None = None,
     fps: int = 30,
     pause_every_episode: bool = False,
+    video_source: VideoFrameSource | None = None,
+    key_filter: list[str] | None = None,
 ):
     """Play collage of all base_rgb* and wrist_rgb* columns."""
     df = _prepare_df(df, episodes)
 
-    base_cols, wrist_cols = find_image_columns(df)
+    base_cols, wrist_cols = find_image_columns(df, video_source, key_filter)
     print(f"Base columns: {base_cols}")
     print(f"Wrist columns: {wrist_cols}")
+    _check_image_keys(base_cols, wrist_cols, video_source)
 
     delay_ms = int(1000 / fps)
     ep_label = str(episodes) if episodes is not None else "all"
@@ -245,7 +415,11 @@ def play_video(
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     print(f"Playing {len(df)} frames at {fps} FPS")
-    hint = "Press 'space' to start/pause, 'q' to quit, 'n' for next frame when paused, 'b' for previous, 'e' to jump to next episode"
+    hint = (
+        "Press 'space' to start/pause, 'q' to quit, 'n' for next frame when paused, "
+        "'b' for previous, 'e' to jump to next episode, 'r' (or Backspace) when "
+        "paused to replay the episode from its start"
+    )
     if pause_every_episode:
         hint += (
             "\n[pause-every-episode] will auto-pause on LAST frame of each "
@@ -332,11 +506,11 @@ def play_video(
         # Two lines of text: big label + smaller hint.
         if label == "END":
             big = f"END OF EPISODE {ep_num}  (frame {frame_in_ep + 1}/{total_in_ep})"
-            small = "[space] -> advance to first frame of next episode"
+            small = "[space] -> next episode    [r]/[backspace] -> replay this episode"
             big_color = (50, 80, 255)  # red-ish in BGR (terminal feedback for "stop")
         else:
             big = f"START OF EPISODE {ep_num}  (frame {frame_in_ep + 1}/{total_in_ep})"
-            small = "[space] -> play this episode"
+            small = "[space] -> play this episode    [r]/[backspace] -> replay previous episode"
             big_color = (80, 255, 80)  # green-ish in BGR
         font = cv2.FONT_HERSHEY_SIMPLEX
         # Big label.
@@ -363,7 +537,7 @@ def play_video(
 
     while frame_idx < len(df):
         row = df.iloc[frame_idx]
-        collage = make_collage(row, base_cols, wrist_cols)
+        collage = make_collage(row, base_cols, wrist_cols, video_source)
 
         if not window_sized:
             cv2.resizeWindow(window_name, collage.shape[1], collage.shape[0])
@@ -426,6 +600,30 @@ def play_video(
             frame_idx -= 1
             frame_pbar.n = max(frame_pbar.n - 1, 0)
             frame_pbar.refresh()
+            continue
+        elif key in (ord('r'), 8) and paused:  # 8 = Backspace
+            # Replay an episode from its first frame and auto-play. Which
+            # episode: at a START-of-episode pause screen, "the episode that
+            # just finished" is the PREVIOUS one (the current frame is
+            # already the next episode's first frame); everywhere else
+            # (END screen, or manually paused mid-episode) it's the current
+            # episode.
+            target_ep = ep_num
+            if label_for_overlay == "START" and has_episode_col:
+                prev_eps = [e for e in episode_list if e < ep_num]
+                if prev_eps:
+                    target_ep = prev_eps[-1]
+            # Re-arm the target's END auto-pause so the replay pauses there
+            # again. Its START pause stays consumed — we're playing straight
+            # through from the first frame, a start-banner would be noise.
+            already_auto_paused_at.discard(ep_end_indices.get(target_ep, -1))
+            frame_idx = ep_start_indices.get(target_ep, 0)
+            paused = False
+            # None forces the episode-change block above to reset the frame
+            # progress bar WITHOUT bumping ep_pbar (that guard checks
+            # `current_ep is not None`), so replays don't inflate the count.
+            current_ep = None
+            print(f"[r] replaying episode {target_ep}")
             continue
         elif key == ord('e'):
             # Jump to the first frame of the NEXT episode (skip current).
@@ -701,6 +899,13 @@ def main():
     )
 
     parser.add_argument(
+        "--keys",
+        type=str,
+        default=None,
+        help="Comma-separated substrings to filter which image/video keys are shown, "
+        "e.g. --keys stretch (default: all base_rgb*/wrist_rgb* keys)",
+    )
+    parser.add_argument(
         "--list-episodes",
         action="store_true",
         help="List available episodes and exit",
@@ -764,11 +969,29 @@ def main():
 
     df = load_parquet_dataset(args.parquet_folder, episodes)
 
+    # Video-backed datasets keep no images in the parquet; look for the dataset
+    # root so frames can be decoded from <root>/videos/*.mp4 instead.
+    video_source = None
+    base_cols, wrist_cols = find_image_columns(df)
+    if not base_cols and not wrist_cols:
+        root = find_dataset_root(args.parquet_folder)
+        if root is not None:
+            video_source = VideoFrameSource(root)
+            print(f"No image columns in parquet — decoding video features from {root}/videos")
+
+    key_filter = [k.strip() for k in args.keys.split(",")] if args.keys else None
+
     if args.save_video:
         output_path = generate_output_path(args.parquet_folder, args.episode, args.format)
-        save_video(df, output_path, episodes, args.fps, gif_fps=args.gif_fps)
+        save_video(
+            df, output_path, episodes, args.fps, gif_fps=args.gif_fps,
+            video_source=video_source, key_filter=key_filter,
+        )
     else:
-        play_video(df, episodes, args.fps, pause_every_episode=args.pause_every_episode)
+        play_video(
+            df, episodes, args.fps, pause_every_episode=args.pause_every_episode,
+            video_source=video_source, key_filter=key_filter,
+        )
 
 
 if __name__ == "__main__":

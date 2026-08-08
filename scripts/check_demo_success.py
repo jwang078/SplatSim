@@ -55,7 +55,7 @@ def main():
         m = srv.check_metrics()
         n_success += bool(m["is_success"])
         n_collision += bool(m["in_collision"])
-        dists.append(m["distance_to_target_m"])
+        dists.append(m["position_error_m"])
 
     dists = np.array(dists)
     print("=" * 56)

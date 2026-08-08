@@ -38,7 +38,7 @@ def create_dataset(repo_id: str, fps: int) -> LeRobotDataset:
     features = {
         **{
             f"observation.images.{cam}": {
-                "dtype": "image",
+                "dtype": "video",
                 "shape": (3, 224, 224),
                 "names": ["channels", "height", "width"],
             }
