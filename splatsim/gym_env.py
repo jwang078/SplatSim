@@ -12,6 +12,22 @@ import torch
 from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
 
 
+def _stamp_state_version(info: Dict[str, Any], raw_obs: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy the server's env-mutation clock from the raw obs into info.
+
+    The stamp rides in `info` (freeform) rather than the gym observation
+    because the observation space is a fixed spaces.Dict — an undeclared key
+    would break vector-env stacking. Consumers (e.g. lerobot_eval's rollout)
+    forward it to the policy so staleness can be detected against the version
+    a mutating RPC (teleport) returned. No-op when the server predates the
+    state_version stamp (missing key → info untouched).
+    """
+    ver = raw_obs.get("state_version")
+    if ver is not None:
+        info["state_version"] = int(ver)
+    return info
+
+
 def _raw_obs_to_gym_obs(raw_obs: Dict[str, Any], num_dofs: int, camera_names: list, image_resize_modes: list) -> Dict[str, Any]:
     """Convert raw robot observations to gym format (agent_pos + pixels dict).
 
@@ -133,6 +149,7 @@ class SplatSimGymEnv(gym.Env):
         """
         assert self.robot_server is not None, "step() called after close()"
         raw_obs, reward, terminated, truncated, info = self.robot_server.step(action)
+        _stamp_state_version(info, raw_obs)
         return self._to_gym_obs(raw_obs), reward, terminated, truncated, info
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
@@ -145,6 +162,7 @@ class SplatSimGymEnv(gym.Env):
         """
         super().reset(seed=seed)
         raw_obs, info = self.robot_server._handle_reset(seed=seed, options=options)
+        _stamp_state_version(info, raw_obs)
         return self._to_gym_obs(raw_obs), info
 
     def render(self) -> Optional[np.ndarray]:
@@ -237,16 +255,19 @@ class SplatSimGymEnv(gym.Env):
                 return np.concatenate(padded_images, axis=1)
 
             # No policy camera images (e.g. a state-only oracle eval, camera_names
-            # = []). Fall back to a fixed third-person debug view so eval videos
-            # still work — you can watch the arm even though the policy consumes no
-            # pixels. lerobot only renders the handful of episodes it actually
-            # saves (first-N + failures) for an image-free policy, so this overhead
-            # is bounded. Only the in-process server has the pybullet renderer; a
-            # remote ZMQ backend has no local pybullet and returns None here.
-            render_cam = getattr(self.robot_server, "_render_pybullet_camera", None)
-            if render_cam is not None:
+            # = []). Fall back to a base-camera view so eval videos still work —
+            # you can watch the arm even though the policy consumes no pixels.
+            # render_video_fallback_frame honors the server's render mode: splat
+            # render in SPLAT mode (same imagery an image policy would see),
+            # fixed pybullet debug camera in PYBULLET mode or when splat assets
+            # aren't loaded. lerobot only renders the handful of episodes it
+            # actually saves (first-N + failures) for an image-free policy, so
+            # this overhead is bounded. Only the in-process server has these
+            # renderers; a remote ZMQ backend has neither and returns None here.
+            render_fallback = getattr(self.robot_server, "render_video_fallback_frame", None)
+            if render_fallback is not None:
                 try:
-                    chw = render_cam("base_rgb")  # falls back to fixed PYBULLET_CAMERA_* pose
+                    chw = render_fallback(obs=obs)
                 except Exception:
                     chw = None
                 if chw is not None:
@@ -295,10 +316,13 @@ class SplatSimGymEnv(gym.Env):
         result: Optional[Dict[str, Any]] = fn()
         return result
 
-    @property
-    def unwrapped(self) -> PybulletRobotServerBase:
-        """Return the underlying robot server."""
-        return self.robot_server
+    # NOTE: no `unwrapped` override. gym.Env.unwrapped's contract is to return
+    # the base *env* (self), and callers rely on that — e.g. lerobot's
+    # seed_splatsim_env_to_state probes `env.unwrapped._to_gym_obs` to convert
+    # the post-teleport obs; an old override here returned the robot SERVER
+    # instead, which silently skipped that refresh and left the policy's first
+    # chunk conditioned on the pre-teleport home pose. Use the public
+    # `robot_server` attribute to reach the server.
 
 
 # Registry of available environments
@@ -564,14 +588,20 @@ class _ZMQBackend:
     # the simulator subprocess.
     splatsim_robot = object()
 
-    def teleport_joint_state(self, splatsim_robot, joint_state) -> None:
+    def teleport_joint_state(self, splatsim_robot, joint_state):
         """Forward a teleport request over ZMQ. Mirrors the local
         ``PybulletRobotServerBase.teleport_joint_state`` signature so the
         seeding helper can call either backend the same way; the
         ``splatsim_robot`` arg is ignored (the simulator owns its own).
         """
         del splatsim_robot  # unused — server side picks self._robot.splatsim_robot
-        self._client.teleport_joint_state(joint_state)
+        return self._client.teleport_joint_state(joint_state)
+
+    def set_eval_benchmark_indices(self, indices):
+        """Forward playlist update to the remote server. See the client-side
+        docstring for semantics (order + duplicates preserved).
+        """
+        return self._client.set_eval_benchmark_indices(indices)
 
 
 class ZMQSplatSimGymEnv(SplatSimGymEnv):
@@ -616,11 +646,13 @@ class ZMQSplatSimGymEnv(SplatSimGymEnv):
     def step(self, action: np.ndarray):
         """Send joint command and read back observations asynchronously."""
         raw_obs, reward, terminated, truncated, info = self.robot_server.step(action)  # type: ignore[union-attr]
+        _stamp_state_version(info, raw_obs)
         return self._to_gym_obs(raw_obs), reward, terminated, truncated, info
 
     def reset(self, *, seed=None, options=None):
         super(SplatSimGymEnv, self).reset(seed=seed)
         raw_obs, info = self.robot_server.reset(seed=seed, options=options)  # type: ignore[union-attr]
+        _stamp_state_version(info, raw_obs)
         # Re-fetch oracle config on reset in case the server's task changed
         # (e.g. eval_benchmark mode cycles through different scenarios).
         self._oracle_env_config = None

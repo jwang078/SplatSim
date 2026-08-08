@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
+
+from splatsim.utils.paths import SPLATSIM_ROOT
 from typing import Optional, List
 
 import torch
@@ -29,6 +31,17 @@ class Args:
     # — matches the LeRobot side's default resolution and eliminates the
     # need to keep two hardcoded strings in sync across repos.
     robot_name: Optional[str] = None
+    # Cached oracle scenario. Left None it is INFERRED from --robot as
+    # data/scenarios/<robot>[__<robot_name>].json — on by default, because the
+    # randomize/solvability search costs 1-2 minutes per launch on these
+    # scenes and interactive work relaunches constantly. If the file exists it
+    # is loaded and PINNED; if not, the scene is randomized ONCE, validated,
+    # and written there for next time.
+    scenario_file: Optional[str] = None
+    # Opt out of the cache entirely (always randomize afresh).
+    no_scenario_cache: bool = False
+    # Write the current scene to this path at launch and continue.
+    save_scenario: Optional[str] = None
 
     # Debug mode for PyBullet visualization
     debug_mode: DebugModes = DebugModes.OFF
@@ -56,9 +69,15 @@ class Args:
 
     # When True, connect pybullet in DIRECT (no GUI) mode. Skips OpenGL
     # context creation entirely → no display required, ~3-5x faster for
-    # physics-only workloads. Gaussian splat rendering is unavailable in
-    # this mode. Intended for fast batch operations like trajectory
-    # replay + collision-check filtering.
+    # physics-only workloads. Affects the PYBULLET-camera render path
+    # (getCameraImage uses the EGL plugin, falling back to the CPU TINY
+    # renderer — a different look from the GUI's hardware GL; see the
+    # RENDER-MISMATCH note in sim_robot_pybullet_base) and suppresses the
+    # 3D window. Gaussian-SPLAT rendering is CUDA-side (gsplat) and does
+    # not use the pybullet GL context, so --render_mode splat still
+    # renders in headless mode. (An older version of this comment claimed
+    # splat was unavailable headless — that was a conservative assumption
+    # from the physics-only-batch use case, never enforced in code.)
     headless: bool = False
 
     # Keep the Tkinter "SplatSim Controls" panel even when --headless. pybullet
@@ -101,6 +120,25 @@ class Args:
     sync_physics_to_client: bool = False
     physics_substeps_per_command: int = 8
 
+    # Tighten the per-env is_success tolerances (STRICT_POS_TOLERANCE_M /
+    # STRICT_QUAT_TOLERANCE_DEG on the server class) at __init__ time. Set
+    # this for INTERVENTION-RECORDING sim launches so RRT-style corrections
+    # run to full convergence instead of terminating early under the loose
+    # eval-time thresholds (small_engine: 30 mm→5 mm, planar: 60 mm→10 mm,
+    # vine: 30 mm→5 mm). Leave False for eval/freerun where the loose
+    # thresholds are the intended success semantics. dagger_orchestrate.sh
+    # sets this unconditionally when starting the sim for interventions.
+    strict_goal_tolerances: bool = False
+
+    # DEBUG: robot passes THROUGH all objects physically (collision filter
+    # pairs disabled robot<->object) while everything else stays intact —
+    # rendering, oracle env_state (policy still sees obstacles), and the
+    # distance-based in_collision metrics (getClosestPoints ignores collision
+    # filters, so would-be collisions still get reported). Use to debug
+    # closed-loop behavior (e.g. blend-ratio comparisons) without contact
+    # dynamics confounding trajectories. Never use for data you train on.
+    phantom_obstacles: bool = False
+
     # Image-observation source: "splat" (Gaussian-splat render), "pybullet"
     # (fast PyBullet getCameraImage — works without splat assets), or "none"
     # (state/action-only, fastest). Overrides --no_camera_rendering when set.
@@ -108,6 +146,22 @@ class Args:
     # env -> pybullet). Also switchable at runtime via the GUI "Render mode"
     # dropdown.
     render_mode: Optional[str] = None
+
+    # Composite PyBullet shadow-mapped shadows onto SPLAT-mode renders as a
+    # depth cue (helps judge robot-obstacle proximity in the splat view).
+    # Costs two extra getCameraImage calls per camera per rendered frame.
+    # Default OFF: it alters the images policies see, so leave off for
+    # dataset recording/eval. Also toggleable at runtime via the GUI
+    # "Splat shadows" checkbox.
+    splat_shadows: bool = False
+
+    # DEBUG: near-unlimited servo force + maxVelocity so the arm snaps to each
+    # commanded target within a physics tick or two. Use to expose latency
+    # artifacts (shadow-vs-splat lag, wrist-camera pose staleness, obs-vs-state
+    # skew): at debug speed a one-tick lag shows as a large pose error instead
+    # of sub-millimeter. Dynamics are completely unrealistic — NEVER use for
+    # data collection or eval.
+    debug_fast_control: bool = False
 
     # Clearances used by the robot server's ``check_metrics()`` when
     # reporting ``info["in_collision"]``. Default 5 mm (bumped from historical
@@ -151,6 +205,11 @@ def _resolve_default_robot_name(robot_variant: str) -> str:
             Planar3JointPybulletRobotServer,
         )
         return Planar3JointPybulletRobotServer.DEFAULT_ROBOT_NAME  # all share robot_name=planar_3joint
+    if robot_variant == "sim_pybullet_vine_interactive":
+        from splatsim.robots.sim_robot_pybullet_vine import (
+            VineGrapeReachPybulletRobotServer,
+        )
+        return VineGrapeReachPybulletRobotServer.DEFAULT_ROBOT_NAME
     # Fallback: base class default.
     from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
     return PybulletRobotServerBase.DEFAULT_ROBOT_NAME
@@ -182,6 +241,24 @@ def launch_robot_server(args: Args):
         resolved_render_mode = RenderMode.NONE
     else:
         resolved_render_mode = None
+
+    # Loud physics-stepping-mode banner: this single knob decides whether a
+    # slow client (diffusion inference at chunk boundaries) sees a sim that
+    # waited for it or one that raced ahead in wallclock time.
+    if args.sync_physics_to_client:
+        print(
+            "[sync_physics] ON — physics steps ONLY on client commands. "
+            "Sim time is gated on the connected client; slow policies never "
+            "see the sim race ahead."
+        )
+    else:
+        print(
+            "[sync_physics] OFF — physics integrates in WALLCLOCK time. "
+            "A slow policy (e.g. diffusion at chunk boundaries) will see the "
+            "sim race ahead between commands (jumpy videos, off-distribution "
+            "observations). Pass --sync_physics_to_client to gate stepping "
+            "on client commands."
+        )
 
     with open("configs/object_configs/objects.yaml", "r") as f:
         object_config = yaml.safe_load(f)
@@ -306,10 +383,14 @@ def launch_robot_server(args: Args):
            headless=args.headless,
            show_control_gui=args.control_gui,
            render_mode=resolved_render_mode,
+           splat_shadows=args.splat_shadows,
+           debug_fast_control=args.debug_fast_control,
            in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
            in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
            sync_physics_to_client=args.sync_physics_to_client,
            physics_substeps_per_command=args.physics_substeps_per_command,
+           strict_goal_tolerances=args.strict_goal_tolerances,
+           phantom_obstacles=args.phantom_obstacles,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_strict":
@@ -334,10 +415,14 @@ def launch_robot_server(args: Args):
            headless=args.headless,
            show_control_gui=args.control_gui,
            render_mode=resolved_render_mode,
+           splat_shadows=args.splat_shadows,
+           debug_fast_control=args.debug_fast_control,
            in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
            in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
            sync_physics_to_client=args.sync_physics_to_client,
            physics_substeps_per_command=args.physics_substeps_per_command,
+           strict_goal_tolerances=args.strict_goal_tolerances,
+           phantom_obstacles=args.phantom_obstacles,
         )
 
     elif args.robot == "sim_pybullet_planar_interactive":
@@ -360,6 +445,8 @@ def launch_robot_server(args: Args):
            port=port, host=args.hostname, serve_mode=serve_mode,
            camera_names=["base_rgb"], robot_name=args.robot_name, use_gripper=use_gripper,
            render_mode=resolved_render_mode,
+           splat_shadows=args.splat_shadows,
+           debug_fast_control=args.debug_fast_control,
            debug_mode=args.debug_mode,
            eval_benchmark_repo_id=args.eval_benchmark_repo_id,
            eval_benchmark_subset=args.eval_benchmark_subset,
@@ -369,6 +456,43 @@ def launch_robot_server(args: Args):
            in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
            sync_physics_to_client=args.sync_physics_to_client,
            physics_substeps_per_command=args.physics_substeps_per_command,
+           strict_goal_tolerances=args.strict_goal_tolerances,
+           phantom_obstacles=args.phantom_obstacles,
+        )
+
+    elif args.robot == "sim_pybullet_vine_interactive":
+        # UR5 (small-engine mount) + scanned grape vine at the origin.
+        # Publishes a soft_cost payload in the oracle env config so the
+        # RRT planner runs cost-aware over foliage/grapes (trunk = hard).
+        from splatsim.robots.sim_robot_pybullet_vine import (
+            VineGrapeReachPybulletRobotServer,
+        )
+
+        serve_mode = (
+            VineGrapeReachPybulletRobotServer.SERVE_MODES.EVAL_BENCHMARK
+            if args.eval_benchmark_repo_id is not None
+            else VineGrapeReachPybulletRobotServer.SERVE_MODES.INTERACTIVE
+        )
+        server = VineGrapeReachPybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=serve_mode,
+           # base_rgb + wrist_rgb (robot_iphone_w_engine_curtain has a wrist
+           # camera; `camera_names` is computed above from objects.yaml)
+           camera_names=camera_names, robot_name=args.robot_name, use_gripper=use_gripper,
+           wrist_cam_ver=args.wrist_cam_ver,
+           render_mode=resolved_render_mode,
+           splat_shadows=args.splat_shadows,
+           debug_fast_control=args.debug_fast_control,
+           debug_mode=args.debug_mode,
+           eval_benchmark_repo_id=args.eval_benchmark_repo_id,
+           eval_benchmark_subset=args.eval_benchmark_subset,
+           headless=args.headless,
+           show_control_gui=args.control_gui,
+           in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
+           in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
+           sync_physics_to_client=args.sync_physics_to_client,
+           physics_substeps_per_command=args.physics_substeps_per_command,
+           strict_goal_tolerances=args.strict_goal_tolerances,
+           phantom_obstacles=args.phantom_obstacles,
         )
 
     elif args.robot in ("sim_pybullet_planar_oracle_interactive",
@@ -400,6 +524,8 @@ def launch_robot_server(args: Args):
            port=port, host=args.hostname, serve_mode=serve_mode,
            camera_names=["base_rgb"], robot_name=args.robot_name, use_gripper=use_gripper,
            render_mode=resolved_render_mode,
+           splat_shadows=args.splat_shadows,
+           debug_fast_control=args.debug_fast_control,
            debug_mode=args.debug_mode,
            eval_benchmark_repo_id=args.eval_benchmark_repo_id,
            eval_benchmark_subset=args.eval_benchmark_subset,
@@ -409,6 +535,8 @@ def launch_robot_server(args: Args):
            in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
            sync_physics_to_client=args.sync_physics_to_client,
            physics_substeps_per_command=args.physics_substeps_per_command,
+           strict_goal_tolerances=args.strict_goal_tolerances,
+           phantom_obstacles=args.phantom_obstacles,
         )
 
     elif args.robot == "sim_ur_pybullet_small_engine_new_interactive_stretchimg":
@@ -552,9 +680,71 @@ def launch_robot_server(args: Args):
             from splatsim.utils.config_io import update_dataclass_json
             update_dataclass_json(gen.config, args.traj_config_file, warn=print)
             print(f"[launch] Applied traj config from {args.traj_config_file}")
+            # Env-owned fields (task goal, skip pairs, DOF-checked q_*) always
+            # win over the file — a config exported from a different env must
+            # not rewrite this env's identity (same guard as the GUI Import).
+            reassert = getattr(server, "reassert_env_traj_config_fields", None)
+            if reassert is not None:
+                reasserted = reassert(gen.config)
+                if reasserted:
+                    print(
+                        "[launch] re-asserted env-owned traj fields over the "
+                        f"file: {sorted(reasserted)}"
+                    )
         else:
             print(f"[launch] --traj_config_file set but '{args.robot}' has no trajectory "
                   f"generator; ignoring.")
+
+    # Scenario cache: load BEFORE serving so the first reset does not run the
+    # randomize/solvability search, and optionally dump the current scene for
+    # reuse. Same oracle format as episode metadata / get_env_config.
+    # Scenario cache path, INFERRED from --robot unless given explicitly.
+    # Keyed on the robot variant (and --robot_name when set) because those
+    # select the scene and the robot URDF respectively, so a cache from one
+    # must never be applied to another.
+    _scenario_path = None
+    if args.scenario_file:
+        _scenario_path = Path(args.scenario_file)
+    elif not args.no_scenario_cache:
+        # Only for INTERACTIVE serving: GENERATE_DEMOS needs fresh
+        # randomization per episode, and EVAL_BENCHMARK pins scenarios from
+        # its own dataset — pinning would silently defeat both.
+        _mode = getattr(server, "serve_mode", None)
+        _interactive = (_mode is not None
+                        and getattr(_mode, "name", "") == "INTERACTIVE")
+        if _interactive and args.eval_benchmark_repo_id is None:
+            _stem = args.robot + (f"__{args.robot_name}" if args.robot_name else "")
+            _scenario_path = SPLATSIM_ROOT / "data" / "scenarios" / f"{_stem}.json"
+        elif not _interactive:
+            print(f"[scenario] cache off: serve_mode={getattr(_mode, 'name', _mode)} "
+                  f"needs fresh randomization (use --scenario_file to force)")
+
+    if _scenario_path is not None:
+        if _scenario_path.exists():
+            try:
+                server.load_scenario_file(_scenario_path)
+            except Exception as exc:                    # noqa: BLE001
+                print(f"[scenario] FAILED to load {_scenario_path}: {exc}\n"
+                      f"[scenario] continuing with normal randomization")
+        else:
+            # Prime it from a VALIDATED scene: reset() runs the randomize /
+            # solvability search once, so what gets cached is an arrangement
+            # that passed the check — not the construction-time defaults.
+            # Pinning afterwards stops serve()'s own reset re-running it.
+            print(f"[scenario] {_scenario_path} not found — randomizing once, "
+                  f"then caching the result")
+            try:
+                server.reset()
+                server.save_scenario_file(_scenario_path)
+                server._pinned_scenario = server.scenario_dict()
+            except Exception as exc:                    # noqa: BLE001
+                print(f"[scenario] could not prime cache: {exc}")
+
+    if getattr(args, "save_scenario", None):
+        try:
+            server.save_scenario_file(Path(args.save_scenario))
+        except Exception as exc:                        # noqa: BLE001
+            print(f"[scenario] could not save: {exc}")
 
     try:
         server.serve()

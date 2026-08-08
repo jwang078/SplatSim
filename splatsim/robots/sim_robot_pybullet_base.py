@@ -77,7 +77,7 @@ from splatsim.configs.env_config import (
 )
 from splatsim.configs.mode_config import TrajectoryGenModeConfig, ImageResizeMode, RenderMode
 from splatsim.utils import rrt_path_utils
-from splatsim.utils.rrt_path_utils import _COLLISION_CLEARANCE
+from splatsim.utils.rrt_path_utils import _COLLISION_CLEARANCE, RuckigCloudUnavailableError
 from collections import defaultdict
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -206,6 +206,8 @@ class ZMQRobotServer:
                         result = {"error": "check_metrics not supported"}
                 elif method == "get_env_config":
                     result = self._robot.get_env_config()
+                elif method == "set_eval_benchmark_indices":
+                    result = self._robot.set_eval_benchmark_indices(**args)
                 else:
                     result = {"error": "Invalid method"}
                     print(result)
@@ -475,18 +477,77 @@ class PybulletRobotServerBase:
                 self.splatsim_robot.sim_id, j, jointDamping=self.JOINT_DAMPING
             )
 
+    # Headroom multiplier applied when CONTROL_MAX_VELOCITY is None (servo cap
+    # tied to the plan's max_joint_vel). MUST be > 1: with a 1.0x tie the servo
+    # is velocity-clamped to exactly the reference speed, so any tracking error
+    # accumulated during a sustained max-velocity section can NEVER close — it
+    # plateaus until the plan decelerates. Observed in planar_3joint_3 ep33: a
+    # 9 s single-joint max-speed sweep held a constant 0.24 rad (14 deg) lag.
+    # 1.25x lets the servo catch up during cruise while still preventing the
+    # violent waypoint-chasing overshoot the tie exists to avoid.
+    CONTROL_VELOCITY_HEADROOM: ClassVar[float] = 1.25
+
+    # DEBUG (--debug_fast_control): near-unlimited servo caps so the arm snaps
+    # to each commanded target within a physics tick or two. Makes latency
+    # artifacts (shadow-vs-splat lag, wrist-camera pose staleness, obs-vs-state
+    # skew) visible: at debug speed a one-tick lag is a large pose error
+    # instead of sub-millimeter. NEVER for data collection — the dynamics are
+    # completely unrealistic.
+    DEBUG_FAST_CONTROL_FORCE: ClassVar[float] = 1e5
+    DEBUG_FAST_CONTROL_MAX_VELOCITY: ClassVar[float] = 1e3  # rad/s
+    # The gripper mimic fingers are coupled to the drive joint only by
+    # JOINT_GEAR constraints (normally maxForce=10 — see setup_gripper) and
+    # the drive joint by its URDF effort limit. Debug-speed arm snaps swing
+    # the finger links with inertial torques far above 10 N·m, so the
+    # follower finger visibly flaps; scale both up in lockstep with the arm.
+    DEBUG_FAST_CONTROL_GRIPPER_FORCE: ClassVar[float] = 1e4
+
+    # NORMAL-mode mimic rigidity (real 2F-85 fingers are STRUCTURALLY rigid —
+    # they never flap). When > 0, move_gripper position-holds every mimic
+    # child at its gear-consistent angle with this force, targets refreshed
+    # on every call so the holds can never jam the mimic at a stale target.
+    # Measured effect: free-space arm motion is ≤5 deg asymmetry either way,
+    # but CONTACT (fingers brushing an obstacle) bends the fingers 50+ deg at
+    # the historical gear-only coupling — with strong holds the fingers stay
+    # rigid and the ARM (CONTROL_FORCE) stalls against the obstacle instead,
+    # matching real-robot behavior. TRADEOFF: while closing ON a grasped
+    # object, finger force is capped by this value instead of the gear's
+    # 10 N·m, so envs where realistic crush force matters should keep 0
+    # (historical behavior). Approach/no-grasp envs can set it high.
+    GRIPPER_MIMIC_HOLD_FORCE: ClassVar[float] = 0.0
+
+    def _control_force(self) -> float:
+        """POSITION_CONTROL force for the arm joints: `CONTROL_FORCE`, or the
+        near-unlimited debug value when `debug_fast_control` is on."""
+        if getattr(self, "debug_fast_control", False):
+            return self.DEBUG_FAST_CONTROL_FORCE
+        return self.CONTROL_FORCE
+
+    # NOTE: debug_fast_control deliberately does NOT raise positionGain on the
+    # hold motors. A gain-1.0 servo was tried and is UNSTABLE after kinematic
+    # teleports: the teleported pose isn't a gravity equilibrium, so small
+    # errors appear each tick and the stiff servo pumps energy into the
+    # linkage — measured as sustained 30-100 deg finger-flap ringing. The
+    # teleport in command_joint_state provides the speed; the motors (default
+    # gain) only hold against gravity, which is stable.
+
     def _control_max_velocity(self) -> float:
         """Resolve the POSITION_CONTROL maxVelocity: an explicit
         `CONTROL_MAX_VELOCITY` float, or — when it's None — the trajectory
-        generator's planned `max_joint_vel`, so the servo tracks the plan
-        without overshooting it. Falls back to 3.14 before the generator exists
-        (construction-time teleports snap via resetJointState, so the cap is moot
-        there anyway)."""
+        generator's planned `max_joint_vel` times CONTROL_VELOCITY_HEADROOM
+        (see that attr: an exact 1.0x tie turns transient lag into a
+        persistent offset on long max-speed sections). Falls back to 3.14
+        before the generator exists (construction-time teleports snap via
+        resetJointState, so the cap is moot there anyway).
+        `debug_fast_control` overrides everything with the near-unlimited
+        debug cap."""
+        if getattr(self, "debug_fast_control", False):
+            return self.DEBUG_FAST_CONTROL_MAX_VELOCITY
         if self.CONTROL_MAX_VELOCITY is not None:
             return self.CONTROL_MAX_VELOCITY
         tg = getattr(self, "trajectory_generator", None)
         if tg is not None:
-            return tg.config.max_joint_vel
+            return tg.config.max_joint_vel * self.CONTROL_VELOCITY_HEADROOM
         return 3.14
 
     # Robot splat / URDF name used to look up gaussians + collision assets
@@ -623,6 +684,57 @@ class PybulletRobotServerBase:
     PYBULLET_CAMERA_WIDTH = 224
     PYBULLET_CAMERA_HEIGHT = 224
 
+    # ── Splat shadow compositing (--splat_shadows / GUI checkbox) ─────────────
+    # Depth-cue aid for the SPLAT render mode: shadows are computed from
+    # PyBullet collision geometry (a camera-frustum ray per pixel finds
+    # each surface point, a reversed light ray tests occlusion — see
+    # `_raycast_splat_shadow_mask` for why it's raycast rather than a
+    # shadow-mapped render) and multiplied into the splat image, so the arm
+    # casts a visible contact shadow onto the engine/table, making "about to
+    # crash" readable. The shadow lands on URDF collision geometry, not the
+    # splat surface, so it can be off by the URDF-vs-splat mismatch — fine for
+    # a proximity cue. NOTE: this modifies the images policies see/record;
+    # keep it OFF for dataset recording and eval unless the covariate shift
+    # is intentional.
+    # World-frame position of the point light rays are cast toward. Overhead
+    # and slightly to the side so the shadow separates from the caster
+    # instead of hiding directly beneath it.
+    SPLAT_SHADOW_LIGHT_DIRECTION: ClassVar = (0.4, 0.8, 3.0)
+    # 0..1 — how dark a fully-shadowed pixel gets (0 = invisible, 1 = black).
+    # Tuned by eye on the small-engine table: a subtle cue, not a lighting
+    # effect.
+    SPLAT_SHADOW_STRENGTH: ClassVar[float] = 0.20
+    # Per-episode multiplicative jitter on SPLAT_SHADOW_STRENGTH: every
+    # env.reset() resamples the EFFECTIVE strength as
+    # STRENGTH * U(1 - J, 1 + J) (so 0.1 = +/-10%), via
+    # `_resample_splat_shadow_strength` (called from _reset_episode_state,
+    # so it applies to every env subclass sharing that reset path). Mild
+    # visual domain randomization so a policy trained with shadows on
+    # doesn't overfit to one exact shadow darkness. Draws from np.random,
+    # which reset() seeds first — reproducible under seeded resets. 0
+    # disables (fixed strength). Constant WITHIN an episode.
+    SPLAT_SHADOW_STRENGTH_JITTER: ClassVar[float] = 0.1
+    # False (default): EVERY body casts shadows — robot, engine, boxes —
+    # including convex-hull self-shadowing, at IDENTICAL ray cost (only the
+    # hit classification differs). True restores the original robot-only
+    # casting: useful if scene shadows double-darken regions where the splat
+    # already baked in the real capture-time shadows, or to keep the shadow
+    # cue exclusively about the robot.
+    SPLAT_SHADOW_ROBOT_ONLY: ClassVar[bool] = False
+    # Camera rays that look through MORE robot collision thickness than this
+    # (metres) are robot pixels — the splat shows the arm there, so they never
+    # receive shadows. Thinner traversals are the silhouette band (collision
+    # hulls fatter than the visuals) where shadows must continue across.
+    # ~half a UR5 link diameter: grazing chords measure < ~3 cm, a straight
+    # pass through one link ~8 cm. See the thickness filter in
+    # _raycast_splat_shadow_mask — this replaced a layer-count cutoff that
+    # made curled-arm self-overlap pixels flicker.
+    SPLAT_SHADOW_MAX_ROBOT_THICKNESS: ClassVar[float] = 0.05
+    # Contrast gain on the shade term before STRENGTH caps it. The raycast
+    # mask is already full-contrast (a pixel is either lit or robot-shadowed),
+    # so 1.0 = neutral; kept as a knob for envs layering softer masks.
+    SPLAT_SHADOW_GAIN: ClassVar[float] = 1.0
+
     # Master switch for all Gaussian-splat assets. When True (default), the
     # constructor loads the robot's per-point labels, the robot + background
     # splats, and the base camera — everything needed to render. When False,
@@ -641,6 +753,16 @@ class PybulletRobotServerBase:
 
     # This sets up the camera. None if it is the same as background_splat_name
     base_camera_splat_name = None
+
+    # Hand-measured base-camera extrinsics override (SIM world frame; see
+    # setup_camera_from_dataset docstring). Historically hardcoded at the
+    # call site — values below reproduce that exactly for the engine envs.
+    # Scene-specific envs (e.g. the vine env) override these class attrs to
+    # frame their own scene. None disables the corresponding override and
+    # falls back to the dataset camera's own extrinsics.
+    BASE_CAMERA_OVERRIDE_XYZ: ClassVar = (0, 1.20, 0.61)
+    BASE_CAMERA_OVERRIDE_RPY: ClassVar = (np.pi / 2 - 15 * np.pi / 180, np.pi, 0)
+    BASE_CAMERA_OVERRIDE_DIST_INC: ClassVar = 0.55
 
     # COLMAP PINHOLE (undistorted sparse), camera_id=3 — intrinsics only; no wrist splat folder needed.
     wrist_colmap_camera_id = 3
@@ -707,10 +829,59 @@ class PybulletRobotServerBase:
     #   ORACLE_STATE_INCLUDE_QUAT  — also record each object's (x,y,z,w) quaternion.
     #   ORACLE_OBJECT_NAMES        — explicit object subset (None = all
     #     ENV_CONFIG.objects, in that STABLE order so the layout is fixed).
+    #   ORACLE_STATE_INCLUDE_EE_POS — ALSO append the end-effector's position
+    #     (via get_current_ee_pose, wrist_camera_link frame) AFTER the object
+    #     coords, so the object layout stays a stable prefix. The EE pos is
+    #     redundant with observation.state's joint angles (FK), but giving
+    #     it to a state-only policy explicitly removes the need to learn FK —
+    #     goal-reaching becomes a direct env_state comparison.
+    #   ORACLE_STATE_EE_COORD_INDICES — which position axes the EE entry uses.
+    #     None (default) = same as ORACLE_STATE_COORD_INDICES. Override when
+    #     objects and EE need DIFFERENT dimensionality — e.g. small_engine's
+    #     boxes sit ON the table (z constant → record x,y only) while the EE
+    #     moves in full 3D (record x,y,z).
+    #   ORACLE_STATE_INCLUDE_LINK_OBSTACLE_DIST — ALSO append per-link SIGNED
+    #     minimum distances to any obstacle. For each link index in
+    #     ORACLE_LINK_OBSTACLE_DIST_LINKS (or auto-detected movable arm links
+    #     when None), we compute min over obstacles of PyBullet's getClosestPoints
+    #     signed distance and append the resulting scalar. Negative values mean
+    #     "the link is INSIDE the obstacle's inflated volume by this much" (out-
+    #     of-the-box PyBullet semantics — see check_links_in_collision for the
+    #     same signal). Obstacles here are the objects named in
+    #     ORACLE_LINK_OBSTACLE_DIST_OBSTACLE_NAMES; if None we auto-select any
+    #     ENV_CONFIG object whose name matches ORACLE_LINK_OBSTACLE_NAME_PATTERN
+    #     (default: starts with "obstacle"). Missing obstacles or no-obstacle
+    #     scenes get sentinel value ORACLE_LINK_OBSTACLE_DIST_SENTINEL (default
+    #     1.0 m — "very far, safe") per link so the env_state layout stays a
+    #     fixed width across scenarios that vary obstacle count.
+    #     Positioned LAST in the env_state layout so the pre-existing prefix
+    #     (objects + optional EE) stays intact for older checkpoints/datasets.
+    #     Motivation: with EE xy in env_state, policies often shortcut-learn
+    #     an EE-space controller that ignores obstacle geometry — because
+    #     obstacles collide with ARM LINKS (not the EE), and joint-space
+    #     reasoning about link poses is harder than "move EE toward goal".
+    #     Adding link-obstacle distances directly gives the policy a
+    #     salient obstacle signal it can't ignore.
     ORACLE_RECORD_ENV_STATE: ClassVar[bool] = True
     ORACLE_STATE_COORD_INDICES: ClassVar[tuple] = (0, 1, 2)
     ORACLE_STATE_INCLUDE_QUAT: ClassVar[bool] = False
     ORACLE_OBJECT_NAMES: ClassVar[Optional[List[str]]] = None
+    ORACLE_STATE_INCLUDE_EE_POS: ClassVar[bool] = False
+    ORACLE_STATE_EE_COORD_INDICES: ClassVar[Optional[tuple]] = None
+    ORACLE_STATE_INCLUDE_LINK_OBSTACLE_DIST: ClassVar[bool] = False
+    # Per-env tolerances applied when a caller passes strict_goal_tolerances=True
+    # to __init__. See `_apply_strict_goal_tolerances`. Defaults match the
+    # historical `UprightRobotSmallEngineNewStrictPybulletRobotServer` values
+    # (5 mm / 2°) — precise-manipulation appropriate. Reacher-style envs
+    # should override up (e.g. planar → 1 cm) since the arm can't converge
+    # to millimeters without unstable oscillation at the goal.
+    STRICT_POS_TOLERANCE_M: ClassVar[float] = 0.005
+    STRICT_QUAT_TOLERANCE_DEG: ClassVar[float] = 2.0
+    ORACLE_LINK_OBSTACLE_DIST_LINKS: ClassVar[Optional[Tuple[int, ...]]] = None
+    ORACLE_LINK_OBSTACLE_DIST_OBSTACLE_NAMES: ClassVar[Optional[List[str]]] = None
+    ORACLE_LINK_OBSTACLE_NAME_PATTERN: ClassVar[str] = "obstacle"
+    ORACLE_LINK_OBSTACLE_DIST_SENTINEL: ClassVar[float] = 1.0
+    ORACLE_LINK_OBSTACLE_DIST_MAX_QUERY: ClassVar[float] = 1.0
 
     def __init__(
         self,
@@ -733,11 +904,55 @@ class PybulletRobotServerBase:
         headless: bool = False,
         render_from_splat: bool = True,
         render_mode: Optional['RenderMode'] = None,
+        # Composite PyBullet-rendered shadows onto the SPLAT render as a depth
+        # cue (see SPLAT_SHADOW_* class attrs). Default OFF — alters the images
+        # policies see, so opt in per launch (--splat_shadows) or via the GUI
+        # "Splat shadows" checkbox.
+        splat_shadows: bool = False,
+        # DEBUG: near-unlimited servo force + maxVelocity (see the
+        # DEBUG_FAST_CONTROL_* class attrs) so the arm snaps to commanded
+        # targets — for exposing latency artifacts (a one-tick lag becomes a
+        # large visible pose error). Default OFF; never for data collection.
+        debug_fast_control: bool = False,
         show_control_gui: bool = False,
         sync_physics_to_client: bool = False,
         physics_substeps_per_command: int = 8,
+        # Tighten the success-tolerance thresholds so RRT-style corrections
+        # (which converge to the exact goal pose) don't terminate the episode
+        # under the loose eval-time thresholds — e.g. small_engine at 3 cm /
+        # 10° would consider the arm "done" while the RRT is still 2 cm and
+        # 8° from the target, cutting the recorded intervention chunk short
+        # and starving the trained policy of the last-mile corrections.
+        # Applied via `_apply_strict_goal_tolerances()` after ENV_CONFIG is
+        # materialized; each env class picks its own strict values via
+        # `STRICT_POS_TOLERANCE_M` / `STRICT_QUAT_TOLERANCE_DEG` class-vars
+        # (defaults below match the historical small_engine strict variant).
+        # Set True unconditionally in intervention-recording sim launches
+        # (e.g. dagger_orchestrate); leave False for eval / freerun where
+        # the loose thresholds are the intended success semantics.
+        strict_goal_tolerances: bool = False,
+        # DEBUG: make every non-robot object PHYSICS-transparent to the robot
+        # (setCollisionFilterPair robot<->object = 0) while keeping it fully
+        # present everywhere else: rendered, in oracle env_state, and in the
+        # distance-based `in_collision` near-miss metrics (getClosestPoints
+        # ignores collision filters). Lets closed-loop debugging (e.g. blend
+        # ratio comparisons) run without contact dynamics confounding the
+        # trajectories — the robot passes through obstacles, but the policy
+        # still SEES them and metrics still report the would-be collisions.
+        phantom_obstacles: bool = False,
     ):
         self._splatsim_gui = None
+        # Monotonic env-mutation clock. Bumped by every discrete mutation of
+        # sim state (commanded control ticks, teleports, resets, object
+        # add/move/delete) and stamped into every get_observations() result
+        # as obs["state_version"]. Mutating RPCs that clients need to order
+        # against observations (teleport_joint_state) RETURN the post-bump
+        # value, so a client can tell whether an observation in hand was
+        # captured before or after its mutation — without trusting call
+        # ordering in its own control loop. The ZMQ REP socket serializes
+        # requests, so bump/stamp ordering is well-defined cross-process.
+        self._state_version: int = 0
+        self._phantom_obstacles = bool(phantom_obstacles)
         self._serve_mode = serve_mode
         self._eval_benchmark_repo_id = eval_benchmark_repo_id or ""
         self._eval_benchmark_subset: Optional[List[int]] = eval_benchmark_subset
@@ -773,10 +988,42 @@ class PybulletRobotServerBase:
         self._sync_step_lock: threading.Lock = threading.Lock()
         self._sync_step_pending_event: threading.Event = threading.Event()
         self._sync_step_done_event: threading.Event = threading.Event()
+        # Sync-render primitives: mirror sync_step above, but for camera image
+        # rendering. In headless (DIRECT) mode, PyBullet's camera path uses the
+        # EGL plugin — and EGL contexts are bound to the thread that INITIALIZED
+        # them (the main thread that first called p.getCameraImage). Calling
+        # p.getCameraImage from the ZMQ handler thread returns a null GL vendor
+        # on NVIDIA drivers and can segfault mid-render (observed as
+        # `ven = (null)` in the sim log followed by SIGSEGV).
+        # Fix: marshal the render call to the main serve loop via a signal
+        # handshake, same shape as _sync_step_*. The handler thread posts a
+        # request, blocks on _sync_render_done_event; the main loop consumes
+        # the request in _consume_sync_render_request(), runs the render
+        # inline on the main thread, and signals completion.
+        # `_main_thread` is captured in serve() so _render_pybullet_camera can
+        # skip the marshaling round-trip when it's already called on the main
+        # thread (e.g. trajectory generation, in-process gym env step).
+        self._sync_render_request_camera: Optional[str] = None
+        # What the marshaled call should do: "rgb" (PyBullet camera render) or
+        # "snapshot_masks" (atomic link-state + shadow-mask capture). See
+        # _sync_main_thread_call.
+        self._sync_render_request_kind: str = "rgb"
+        # Link-state snapshot accompanying the render request, so the marshaled
+        # wrist render uses the pose captured with the observation instead of
+        # the live pose at main-thread consume time (see _render_pybullet_camera).
+        self._sync_render_request_link_states = None
+        self._sync_render_result: Optional[np.ndarray] = None
+        self._sync_render_error: Optional[BaseException] = None
+        self._sync_render_lock: threading.Lock = threading.Lock()
+        self._sync_render_pending_event: threading.Event = threading.Event()
+        self._sync_render_done_event: threading.Event = threading.Event()
+        self._main_thread: Optional[threading.Thread] = None
         # Headless mode: connect pybullet in DIRECT (no GUI) for fast
         # physics-only use cases like trajectory replay + collision filtering.
-        # Splat rendering and any GUI-dependent features are unavailable;
-        # callers needing those should leave this False.
+        # The pybullet 3D window is suppressed and the PYBULLET-camera path
+        # switches to EGL (TINY fallback). Gaussian-SPLAT rendering is
+        # CUDA-side (gsplat, no pybullet GL dependency) and keeps working —
+        # pick the image source with --render_mode.
         self._headless = headless
         # Decouple the pybullet 3D WINDOW from the Tkinter CONTROL panel: when set
         # alongside headless, pybullet still connects DIRECT (no OpenGL window,
@@ -786,6 +1033,9 @@ class PybulletRobotServerBase:
         # Requires a display for Tkinter (a workstation, not a display-less node);
         # no-op unless headless (a GUI connection already shows the panel).
         self._show_control_gui = show_control_gui
+        self._strict_goal_tolerances = bool(strict_goal_tolerances)
+        if self._strict_goal_tolerances:
+            self._apply_strict_goal_tolerances()
         self.robot_name = robot_name
         self.camera_names = camera_names
         self.cam_i = cam_i
@@ -820,6 +1070,10 @@ class PybulletRobotServerBase:
         self.splatsim_robot = None
         self.splatsim_background = None
         self.scene_gaussian = None
+        # Set by load_scenario_file(pin=True): reset() reuses this
+        # arrangement instead of re-running the randomize/solvability
+        # search. None = randomise as before.
+        self._pinned_scenario = None
         self.base_camera = None
         self.wrist_camera = None
         self._lerobot_saver = None
@@ -889,6 +1143,36 @@ class PybulletRobotServerBase:
         self._initial_render_mode = render_mode
         self._render_from_splat_default = (render_mode == RenderMode.SPLAT)
 
+        # Composite PyBullet shadows onto the splat render (see SPLAT_SHADOW_*
+        # class attrs). Runtime-toggleable via the GUI "Splat shadows" checkbox,
+        # polled each serve-loop tick in _check_camera_rendering_toggle.
+        self.splat_shadows = bool(splat_shadows)
+        # DEBUG servo override — read by _control_force/_control_max_velocity.
+        self.debug_fast_control = bool(debug_fast_control)
+        if self.debug_fast_control:
+            print(
+                "[control] DEBUG_FAST_CONTROL ON: servo force "
+                f"{self.DEBUG_FAST_CONTROL_FORCE:g}, maxVelocity "
+                f"{self.DEBUG_FAST_CONTROL_MAX_VELOCITY:g} rad/s — latency "
+                "debugging only, dynamics are unrealistic."
+            )
+        # Per-tick shadow masks keyed by camera name, captured atomically with
+        # the link-state snapshot by _capture_obs_snapshot_and_masks and
+        # popped by _composite_splat_shadows during the same tick's renders.
+        self._tick_shadow_masks: Dict[str, np.ndarray] = {}
+        # Per-tick robot screen silhouettes (mask resolution), written by
+        # _protect_robot_silhouette and consumed by _composite_splat_shadows
+        # to re-assert the protection at full render resolution.
+        self._tick_shadow_robot_silhouettes: Dict[str, np.ndarray] = {}
+        # Static-scene shadow cache keyed by camera name (see the cache block
+        # in _raycast_splat_shadow_mask). Validated per computation against
+        # scene/view signatures — never needs explicit invalidation.
+        self._shadow_static_cache: Dict[str, dict] = {}
+        # This episode's effective shadow strength, resampled per reset by
+        # _resample_splat_shadow_strength. None (pre-first-reset) falls back
+        # to the class SPLAT_SHADOW_STRENGTH.
+        self._splat_shadow_strength_current: Optional[float] = None
+
         # Placeholder object for rendering purposes
         self.scene_gaussian = GaussianModel(3)
 
@@ -904,9 +1188,9 @@ class PybulletRobotServerBase:
 
         # GUI connection by default; DIRECT (headless) when `headless=True`.
         # DIRECT skips OpenGL context creation entirely, so the process can run
-        # without a display and physics-only operations (collision queries,
-        # joint state teleport) are unaffected. Splat rendering won't work in
-        # this mode.
+        # without a display; physics-only operations (collision queries,
+        # joint state teleport) and the CUDA-side splat render are unaffected
+        # (the PYBULLET-camera path switches to EGL/TINY — see below).
         self._pb_client_id = self.pybullet_client.connect(
             p.DIRECT if self._headless else p.GUI
         )
@@ -938,6 +1222,14 @@ class PybulletRobotServerBase:
         self.pybullet_client.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
         self.pybullet_client.configureDebugVisualizer(p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0)
         self.pybullet_client.configureDebugVisualizer(p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0)
+        # Align the GUI visualizer's light with the splat-shadow light so the
+        # shadows in the pybullet 3D window fall in the SAME direction as the
+        # raycast shadows composited onto the splat render — with the pybullet
+        # default light the two disagreed, which reads as a bug when comparing
+        # views. No-op in headless DIRECT mode (no visualizer).
+        self.pybullet_client.configureDebugVisualizer(
+            lightPosition=list(self.SPLAT_SHADOW_LIGHT_DIRECTION)
+        )
 
         # set time step
         self.pybullet_client.setTimeStep(1 / 240)
@@ -998,6 +1290,9 @@ class PybulletRobotServerBase:
             splatsim_objects=self.splatsim_objects,
             wrist_camera_link_name=self.splatsim_robot.config.wrist_camera_link_name,
             trajectory_gen_config=self._get_default_trajectory_gen_config(),
+            # Envs with a soft-cost field (EnvConfig.soft_cost) get cost-aware
+            # trajectory generation; None for binary-obstacle envs (no-op).
+            soft_cost_payload=getattr(self.ENV_CONFIG, "soft_cost", None),
         )
 
         self._setup_interactive_gui()
@@ -1070,9 +1365,9 @@ class PybulletRobotServerBase:
                 )
             self.base_camera = self.setup_camera_from_dataset(
                 self.splatsim_base_camera.config, cam_i=self.cam_i, use_train=True,
-                override_xyz=(0, 1.20, 0.61),
-                override_rpy=(np.pi/2 - 15*np.pi/180, np.pi, 0),
-                override_dist_inc=0.55
+                override_xyz=self.BASE_CAMERA_OVERRIDE_XYZ,
+                override_rpy=self.BASE_CAMERA_OVERRIDE_RPY,
+                override_dist_inc=self.BASE_CAMERA_OVERRIDE_DIST_INC,
             )
             if self.splatsim_base_camera is not self.splatsim_background:
                 self.delete_object(self.splatsim_base_camera.config.name)
@@ -1130,6 +1425,55 @@ class PybulletRobotServerBase:
         and normalize the two feature types independently."""
         return self.num_dofs() + 1
 
+    def _apply_strict_goal_tolerances(self) -> None:
+        """Tighten the success-tolerance thresholds to the STRICT_* class-vars.
+
+        Called once at __init__ when the caller passes
+        `strict_goal_tolerances=True`. Motivation: RRT-style intervention
+        recording plans until the arm reaches the EXACT goal pose (mm-scale),
+        but the loose eval-time thresholds (e.g. 3 cm / 10° for small_engine,
+        6 cm for planar) mark the episode "successful" long before RRT
+        converges — the recorded chunk gets cut short and the trained policy
+        never sees the last-mile corrections it will need to actually finish
+        the task. Enabling strict tolerances at record time forces RRT to
+        run until it truly reaches the goal, giving cleaner demonstration
+        data. Env-time success semantics are unaffected: only the recording
+        sim tightens, and only when the caller asks.
+
+        Default handles both tolerance-representation patterns in the
+        codebase:
+
+          (1) `ENV_CONFIG.task: TaskConfig` (small_engine, vine) — replaced
+              via `dataclasses.replace` at the instance level, shadowing the
+              class ENV_CONFIG so sibling instances aren't affected.
+          (2) `self.pos_tolerance_m` class attribute (planar) — reassigned
+              at the instance level; the class attribute (and other
+              instances) is left untouched.
+
+        Envs that don't use either pattern (or want custom tightening logic
+        beyond pos+quat) can override this method entirely.
+        """
+        # Pattern 1: TaskConfig-based tolerances.
+        task = getattr(self.ENV_CONFIG, "task", None)
+        if task is not None:
+            import dataclasses as _dc
+            new_task = _dc.replace(
+                task,
+                pos_tolerance_m=float(self.STRICT_POS_TOLERANCE_M),
+                quat_tolerance_deg=float(self.STRICT_QUAT_TOLERANCE_DEG),
+            )
+            # Instance-shadow so we don't mutate the class-level ENV_CONFIG.
+            self.ENV_CONFIG = _dc.replace(self.ENV_CONFIG, task=new_task)
+        # Pattern 2: raw `pos_tolerance_m` class attribute (planar-style).
+        # `hasattr` catches both class-attr and instance-attr; the assignment
+        # creates an instance shadow either way.
+        if hasattr(self, "pos_tolerance_m"):
+            self.pos_tolerance_m = float(self.STRICT_POS_TOLERANCE_M)
+        print(
+            f"[strict_goal] tolerances tightened: "
+            f"pos={self.STRICT_POS_TOLERANCE_M} m, quat={self.STRICT_QUAT_TOLERANCE_DEG}°"
+        )
+
     def _oracle_object_names(self) -> List[str]:
         """Scene objects whose poses go into observation.environment_state, in a
         STABLE order (ENV_CONFIG.objects order, or the explicit ORACLE_OBJECT_NAMES
@@ -1144,20 +1488,192 @@ class PybulletRobotServerBase:
             return []
         return [obj.name for obj in env_config.objects]
 
+    def _oracle_ee_coord_indices(self) -> tuple:
+        """Axes recorded for the trailing EE entry: the explicit override, or
+        the per-object indices when None (historical behavior — planar's (0,2)
+        EE stays unchanged)."""
+        if self.ORACLE_STATE_EE_COORD_INDICES is not None:
+            return tuple(self.ORACLE_STATE_EE_COORD_INDICES)
+        return tuple(self.ORACLE_STATE_COORD_INDICES)
+
     def _oracle_per_object_dim(self) -> int:
         """Number of scalars recorded per object: position coords + optional quat."""
         return len(self.ORACLE_STATE_COORD_INDICES) + (4 if self.ORACLE_STATE_INCLUDE_QUAT else 0)
 
     def env_state_dim(self) -> int:
         """Width of observation.environment_state (a FeatureType.ENV feature):
-        privileged object poses for oracle/state-based policies. Computed from the
-        recorded objects × per-object dim, so it always matches
+        privileged object poses for oracle/state-based policies, plus the
+        trailing EE position when ORACLE_STATE_INCLUDE_EE_POS, plus the
+        trailing per-link min-obstacle distances when
+        ORACLE_STATE_INCLUDE_LINK_OBSTACLE_DIST. Computed from the recorded
+        objects × per-object dim, so it always matches
         oracle_environment_state(). 0 → no environment_state feature."""
-        return len(self._oracle_object_names()) * self._oracle_per_object_dim()
+        dim = len(self._oracle_object_names()) * self._oracle_per_object_dim()
+        if self.ORACLE_RECORD_ENV_STATE and self.ORACLE_STATE_INCLUDE_EE_POS:
+            dim += len(self._oracle_ee_coord_indices())
+        if self.ORACLE_RECORD_ENV_STATE and self.ORACLE_STATE_INCLUDE_LINK_OBSTACLE_DIST:
+            # One scalar per link — width doesn't depend on obstacle count
+            # (we take min-over-obstacles per link).
+            dim += len(self._resolve_link_obstacle_dist_links())
+        return dim
+
+    def _resolve_link_obstacle_dist_links(self) -> Tuple[int, ...]:
+        """Which PyBullet link indices to compute per-link obstacle distances for.
+
+        Explicit ORACLE_LINK_OBSTACLE_DIST_LINKS wins; otherwise auto-detect
+        the movable arm links via `pybullet.getJointInfo(...).jointType != FIXED`
+        on the robot body (matches "actually-controllable arm segments"). Falls
+        back to num_dofs() distinct link indices [1..num_dofs] when the robot
+        isn't loaded yet (e.g. width query before serve()).
+        Auto-detect skips the base link (index -1) which never moves and would
+        always return the same static distance to obstacles.
+        """
+        if self.ORACLE_LINK_OBSTACLE_DIST_LINKS is not None:
+            return tuple(int(i) for i in self.ORACLE_LINK_OBSTACLE_DIST_LINKS)
+        # Auto-detect: enumerate movable joints on the robot body.
+        robot_obj = getattr(self, "splatsim_robot", None)
+        if robot_obj is None or not hasattr(robot_obj, "sim_id"):
+            # Robot not loaded yet — env_state_dim() may be called during
+            # config validation before serve(). Use num_dofs() as the width
+            # (matches typical arm-joint count).
+            return tuple(range(self.num_dofs()))
+        movable = []
+        n_joints = self.pybullet_client.getNumJoints(robot_obj.sim_id)
+        for j in range(n_joints):
+            info = self.pybullet_client.getJointInfo(robot_obj.sim_id, j)
+            joint_type = info[2]
+            # p.JOINT_FIXED = 4; anything else is movable (revolute, prismatic, ...)
+            if joint_type != 4:
+                movable.append(j)
+        # Cap at num_dofs() so a gripper joint (JOINT_PRISMATIC) doesn't sneak
+        # in — the callers care about arm-segment collision, not gripper.
+        return tuple(movable[: self.num_dofs()])
+
+    def _resolve_link_obstacle_dist_obstacles(self) -> List[str]:
+        """Which scene objects count as 'obstacles' for the link-obstacle
+        distance feature. Explicit ORACLE_LINK_OBSTACLE_DIST_OBSTACLE_NAMES
+        wins; otherwise auto-select any object whose name starts with
+        ORACLE_LINK_OBSTACLE_NAME_PATTERN. Returns an empty list for envs
+        with no matching objects (e.g. the obstacle-free simple planar variant)
+        — the caller then emits the sentinel for every link, keeping layout
+        width fixed across envs at the cost of an uninformative signal in
+        those envs.
+        """
+        if self.ORACLE_LINK_OBSTACLE_DIST_OBSTACLE_NAMES is not None:
+            return list(self.ORACLE_LINK_OBSTACLE_DIST_OBSTACLE_NAMES)
+        env_config = getattr(self, "ENV_CONFIG", None)
+        if env_config is None:
+            return []
+        pattern = self.ORACLE_LINK_OBSTACLE_NAME_PATTERN
+        return [obj.name for obj in env_config.objects if obj.name.startswith(pattern)]
+
+    def _compute_link_obstacle_min_distances(self) -> List[float]:
+        """Per-link signed minimum distance to any obstacle, in the order
+        returned by _resolve_link_obstacle_dist_links().
+
+        For each (link, obstacle) pair, runs `pybullet.getClosestPoints` with
+        a query distance of ORACLE_LINK_OBSTACLE_DIST_MAX_QUERY (1 m default)
+        and takes the smallest `contactDistance` (index 8) — signed such that
+        negative means the link is INSIDE the obstacle's inflated volume by
+        that amount (see check_links_in_collision for the same signal). Per
+        link we take the min across obstacles. When no closest-point info is
+        returned (obstacles farther than MAX_QUERY) OR when there are no
+        obstacles at all (obstacle-free variants), returns the sentinel value
+        ORACLE_LINK_OBSTACLE_DIST_SENTINEL for that link — "very far, safe."
+        Layout width stays fixed at len(links) regardless of scene state.
+        """
+        links = self._resolve_link_obstacle_dist_links()
+        obstacle_names = self._resolve_link_obstacle_dist_obstacles()
+        sentinel = float(self.ORACLE_LINK_OBSTACLE_DIST_SENTINEL)
+        if not obstacle_names:
+            return [sentinel] * len(links)
+
+        # Resolve obstacle names → PyBullet body ids via self.splatsim_objects
+        # (canonical scene registry populated by create_object / load_urdf; the
+        # same list check_links_in_collision reads through when the caller
+        # passes obstacle_names). O(N_objects) per frame; N is tiny.
+        name_to_sim_id = {
+            obj.config.name: obj.sim_id
+            for obj in getattr(self, "splatsim_objects", [])
+            if hasattr(obj, "config") and hasattr(obj, "sim_id")
+        }
+        obstacle_ids = [name_to_sim_id[n] for n in obstacle_names if n in name_to_sim_id]
+        if not obstacle_ids:
+            return [sentinel] * len(links)
+
+        robot_obj = getattr(self, "splatsim_robot", None)
+        if robot_obj is None or not hasattr(robot_obj, "sim_id"):
+            return [sentinel] * len(links)
+
+        robot_id = robot_obj.sim_id
+        cid = getattr(self.pybullet_client, "_client", 0)
+        max_q = float(self.ORACLE_LINK_OBSTACLE_DIST_MAX_QUERY)
+
+        out: List[float] = []
+        for link_i in links:
+            min_d = sentinel
+            for obs_id in obstacle_ids:
+                pts = self.pybullet_client.getClosestPoints(
+                    bodyA=robot_id, bodyB=obs_id, distance=max_q,
+                    linkIndexA=int(link_i), linkIndexB=-1,
+                )
+                for pt in pts:
+                    d = float(pt[8])  # contactDistance (signed)
+                    if d < min_d:
+                        min_d = d
+            out.append(min_d)
+        return out
 
     def _get_default_trajectory_gen_config(self) -> TrajectoryGenModeConfig:
         # Use all the default values
         return TrajectoryGenModeConfig()
+
+    def _traj_env_asserted_fields(self) -> Dict[str, Any]:
+        """Trajectory-gen config fields THIS ENV owns: every field where the
+        env's `_get_default_trajectory_gen_config()` differs from the plain
+        TrajectoryGenModeConfig defaults. These encode environment IDENTITY
+        (task goal pose, q_goal_bias, self-collision skip pairs, scene-tuned
+        clearances/soft-cost) — not generation tuning — so an imported config
+        file must never override them (see reassert_env_traj_config_fields).
+        Computed by diff, so nothing is hardcoded per env."""
+        import dataclasses as _dc
+
+        env_cfg = self._get_default_trajectory_gen_config()
+        plain = TrajectoryGenModeConfig()
+        return {
+            f.name: getattr(env_cfg, f.name)
+            for f in _dc.fields(env_cfg)
+            if getattr(env_cfg, f.name) != getattr(plain, f.name)
+        }
+
+    def reassert_env_traj_config_fields(self, cfg) -> List[str]:
+        """Re-assert env-owned fields on a trajectory-gen config IN PLACE and
+        return the names of fields that were changed.
+
+        Call after applying an imported config file (GUI Import button,
+        --traj_config_file). Motivation: config files are exported per
+        SESSION, and importing one exported from a DIFFERENT env silently
+        wipes this env's identity fields — observed as a planar-arm export
+        (3-joint q_start, null goal) nulling the small-engine lever goal, so
+        generation quietly produced random-goal episodes. Imports keep their
+        generation TUNING (speeds, smoothing, counts); env identity always
+        wins. Additionally clears q_start/q_goal/q_goal_bias whose length
+        doesn't match this robot's DOF (cross-env files carry those as plain
+        user tuning, so the ownership diff can't catch them)."""
+        import copy as _copy
+
+        changed: List[str] = []
+        for name, val in self._traj_env_asserted_fields().items():
+            if getattr(cfg, name) != val:
+                setattr(cfg, name, _copy.deepcopy(val))
+                changed.append(name)
+        nd = self.num_dofs()
+        for name in ("q_start", "q_goal", "q_goal_bias"):
+            v = getattr(cfg, name, None)
+            if v is not None and len(v) != nd:
+                setattr(cfg, name, None)
+                changed.append(f"{name}(cleared: {len(v)} joints != {nd} DOF)")
+        return changed
 
     def get_joint_state(self) -> np.ndarray:
         # return self._joint_state
@@ -1338,6 +1854,7 @@ class PybulletRobotServerBase:
             tg._cached_base_traj = None
 
     def delete_object(self, object_name):
+        self._bump_state_version()
         index = [splatsim_obj.config.name for splatsim_obj in self.splatsim_objects].index(
             object_name
         )
@@ -1354,6 +1871,7 @@ class PybulletRobotServerBase:
         self._invalidate_reset_trajectory_cache()
 
     def clear_temp_objects(self):
+        self._bump_state_version()
         non_temp_object_names = [
             self.splatsim_robot.config.name,
         ] + (
@@ -1375,6 +1893,7 @@ class PybulletRobotServerBase:
         """
         Create a splatsim object from configs
         """
+        self._bump_state_version()
         splatsim_obj = SplatSimObject(
             gaussians=GaussianModel(3),
             config=object_config,
@@ -1501,6 +2020,7 @@ class PybulletRobotServerBase:
         use_gravity: bool = True,
     ) -> None:
         """Set the pose of an object in the simulation."""
+        self._bump_state_version()
         # if object_name not in [
         #     splatsim_obj.splat_name for splatsim_obj in self.splatsim_objects
         # ]:
@@ -1534,10 +2054,44 @@ class PybulletRobotServerBase:
         # An object moved → any reset-validated path is stale.
         self._invalidate_reset_trajectory_cache()
 
+    def _apply_phantom_obstacles(self) -> None:
+        """Disable robot<->object PHYSICS collision for every loaded object.
+
+        No-op unless the server was constructed with phantom_obstacles=True.
+        Distance queries (near-miss `in_collision`, planner clearances) are
+        unaffected — getClosestPoints ignores collision filters — so metrics
+        keep reporting would-be collisions while the robot passes through.
+        Idempotent; call after objects are (re)created.
+        """
+        if not getattr(self, "_phantom_obstacles", False):
+            return
+        rid = self.splatsim_robot.sim_id
+        n_links = self.pybullet_client.getNumJoints(rid)
+        for obj in self.splatsim_objects:
+            if obj is self.splatsim_robot or obj.sim_id is None or obj.sim_id == rid:
+                continue
+            for link in range(-1, n_links):
+                self.pybullet_client.setCollisionFilterPair(
+                    obj.sim_id, rid, -1, link, enableCollision=0
+                )
+
+    def _bump_state_version(self) -> int:
+        """Advance the env-mutation clock; returns the new version.
+
+        Call from every code path that mutates sim state. Observations are
+        stamped with the current value at capture (see get_observations), so
+        `obs["state_version"] < version_returned_by_a_mutation` ⇔ the obs
+        predates that mutation.
+        """
+        self._state_version += 1
+        return int(self._state_version)
+
     def teleport_joint_state(
         self, splatsim_obj: SplatSimObject, joint_state: Tuple[float, ...]
-    ) -> None:
-        """Set the joint states of an articulated object in the simulation and hold position."""
+    ) -> int:
+        """Set the joint states of an articulated object in the simulation and
+        hold position. Returns the post-teleport state_version so the caller
+        can detect observations captured before this teleport (stale)."""
         if not splatsim_obj.config.is_articulated:
             raise ValueError(f"Object {splatsim_obj.config.name} is not articulated.")
         if splatsim_obj.config.articulation_config is None:
@@ -1578,7 +2132,7 @@ class PybulletRobotServerBase:
                 i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
                 p.POSITION_CONTROL,
                 targetPosition=joint_state[i] * signs[i],
-                force=self.CONTROL_FORCE,
+                force=self._control_force(),
                 maxVelocity=self._control_max_velocity(),
             )
         # step_physics=False keeps the teleport ATOMIC. Without this the
@@ -1587,6 +2141,9 @@ class PybulletRobotServerBase:
         # letting the position controller pull the arm off the teleport
         # target — the exact opposite of what a teleport should do.
         self.command_joint_state(splatsim_obj, np.array(joint_state), step_physics=False)
+        # Returned over ZMQ to the teleporting client (the RRT source), which
+        # uses it to recognize observations captured before this teleport.
+        return self._bump_state_version()
 
     def command_joint_state(
         self,
@@ -1594,6 +2151,7 @@ class PybulletRobotServerBase:
         joint_state: np.ndarray,
         step_physics: bool = True,
     ) -> None:
+        self._bump_state_version()
         # Only drive the arm DOFs (joints 1..num_dofs). Anything beyond that is
         # the fixed ee/gripper-mount joints and the gripper's mimic joints.
         # Driving the gripper's mimic CHILD joints here with independent
@@ -1602,6 +2160,20 @@ class PybulletRobotServerBase:
         # gripper — so the gripper is actuated ONLY via move_gripper below.
         # (joint_state may carry 18 entries at init; the extra trailing values
         # must not be applied as per-joint position targets on gripper links.)
+        if self.debug_fast_control:
+            # KINEMATIC snap: teleport the arm straight to the target, then
+            # the position holds below just maintain it. Servo-only "fast"
+            # settings (huge force/maxVelocity/positionGain) still take ~3
+            # ticks to converge and slam the linkage hard enough that the
+            # constraint solver visibly flaps the gripper fingers (25-65 deg
+            # transients, measured) — resetJointState sidesteps the dynamics
+            # entirely: exact target next tick, zero inertial transient.
+            # Contact physics during the motion is skipped (the arm can pass
+            # through objects between commands) — debug only, never for data.
+            for i in range(0, min(len(joint_state), self.num_dofs())):
+                self.pybullet_client.resetJointState(
+                    splatsim_obj.sim_id, i + 1, joint_state[i]
+                )
         for i in range(0, min(len(joint_state), self.num_dofs())):
             self.pybullet_client.setJointMotorControl2(
                 splatsim_obj.sim_id,
@@ -1609,7 +2181,7 @@ class PybulletRobotServerBase:
                 p.POSITION_CONTROL,
                 targetPosition=joint_state[i],
                 # Set a more realistic force for the robot
-                force=self.CONTROL_FORCE,
+                force=self._control_force(),
                 maxVelocity=self._control_max_velocity(),
             )
 
@@ -2028,14 +2600,20 @@ class PybulletRobotServerBase:
                         output_slices=output_slices,
                     )
 
-    def get_pybullet_debug_camera_as_splat_camera(self) -> SplatSimCamera:
-        """Convert PyBullet's debug camera to a Camera object for Gaussian splatting."""
+    def get_pybullet_debug_camera_as_splat_camera(self) -> Optional[SplatSimCamera]:
+        """Convert PyBullet's debug camera to a Camera object for Gaussian
+        splatting. Returns None when no live visualizer camera exists —
+        headless (DIRECT) connections have no debug visualizer, and
+        getDebugVisualizerCamera then returns an all-zero (singular) view
+        matrix; callers fall back to the normal base camera."""
         # This function is the inverse of this post: https://stackoverflow.com/a/75355212
 
         # Get PyBullet camera info
         camera_info = p.getDebugVisualizerCamera()
         # Pybullet view matrix is major-column order
         view_matrix = np.array(camera_info[2]).reshape(4, 4).T
+        if abs(np.linalg.det(view_matrix)) < 1e-9:
+            return None
 
         Tc = np.array(
             [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]]
@@ -2194,9 +2772,16 @@ class PybulletRobotServerBase:
 
     def render_image(self, camera_name, cached_link_states=None):
         if camera_name == "base_rgb":
+            camera = None
             if self.debug_mode != DebugModes.OFF:
+                # Mirror the pybullet debug-visualizer camera in debug modes.
+                # None in headless (DIRECT) runs — no visualizer exists, so
+                # debug modes there keep their OTHER effects (e.g.
+                # no_background hiding the background splat) but render from
+                # the normal base camera instead of crashing on the
+                # visualizer's zero view matrix.
                 camera = self.get_pybullet_debug_camera_as_splat_camera()
-            else:
+            if camera is None:
                 camera = self.base_camera
         elif camera_name == "wrist_rgb":
             camera = self.get_wrist_camera(cached_link_states=cached_link_states)
@@ -2238,8 +2823,105 @@ class PybulletRobotServerBase:
             # import pdb; pdb.set_trace()
             rendering = self._rectify_fisheye_image(rendering, camera)
 
+        # Optional depth cue: darken the splat with PyBullet's shadow mask (see
+        # SPLAT_SHADOW_* class attrs). AFTER rectification on purpose — the
+        # pybullet mirror of a fisheye wrist is its rectified pinhole view, so
+        # that's the geometry the mask matches. Skipped while the base view
+        # tracks the pybullet debug-visualizer camera (debug mode): the mask is
+        # computed from the normal base-camera pose and wouldn't line up.
+        if self.splat_shadows and not (
+            camera_name == "base_rgb" and self.debug_mode != DebugModes.OFF
+        ):
+            rendering = self._composite_splat_shadows(
+                rendering, camera_name, cached_link_states=cached_link_states
+            )
+
         # save the image (always as numpy array)
         return rendering
+
+    def _compute_tick_shadow_masks(self, cached_link_states) -> Dict[str, np.ndarray]:
+        """This tick's shadow masks for every active camera, consumed by
+        `_composite_splat_shadows` during the same get_observations pass.
+
+        MUST run back-to-back with the `get_curr_link_states` snapshot AND
+        without physics stepping in between — the ray tests read live body
+        poses, and any steps between snapshot and rays lag the shadow behind
+        the rendered arm. `_capture_obs_snapshot_and_masks` guarantees this
+        by running both inside one marshaled main-thread block."""
+        masks: Dict[str, np.ndarray] = {}
+        if not self.splat_shadows:
+            return masks
+        for camera_name in self.camera_names:
+            if camera_name == "base_rgb" and self.debug_mode != DebugModes.OFF:
+                continue  # render_image skips compositing for the debug camera
+            try:
+                masks[camera_name] = self._raycast_splat_shadow_mask(
+                    camera_name, cached_link_states=cached_link_states
+                )
+            except Exception as e:
+                print(
+                    f"[render] splat shadow mask failed for {camera_name} "
+                    f"({e}); frame will be unshadowed."
+                )
+        return masks
+
+    def _composite_splat_shadows(
+        self, rendering: np.ndarray, camera_name: str, cached_link_states=None
+    ) -> np.ndarray:
+        """Multiply the robot-shadow mask into a (C, H, W) splat render.
+
+        Prefers the mask stashed by `_capture_obs_snapshot_and_masks` (computed at
+        the exact link-state-capture instant of this tick — no lag vs the
+        rendered robot). Direct `render_image` calls outside get_observations
+        have no stash; those compute the mask now, pinning the CAMERA pose to
+        `cached_link_states` while rays read live body poses. Any failure
+        returns the frame unshadowed rather than killing the observation."""
+        mask = self._tick_shadow_masks.pop(camera_name, None)
+        if mask is None:
+            try:
+                mask = self._raycast_splat_shadow_mask(
+                    camera_name, cached_link_states=cached_link_states
+                )
+            except Exception as e:
+                print(f"[render] splat shadow mask failed ({e}); frame left unshadowed.")
+                return rendering
+        _, H, W = rendering.shape
+        sil = self._tick_shadow_robot_silhouettes.pop(camera_name, None)
+        if mask.shape != (H, W):
+            upscale = H / float(mask.shape[0])
+            mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_LINEAR)
+            # Re-assert the robot silhouette AT FULL RESOLUTION. The upscale
+            # above smears every mask edge over ~`upscale` pixels, which is
+            # what let shadows computed for surfaces behind the arm bleed onto
+            # the arm and flicker as the caster moved (see
+            # _protect_robot_silhouette). ERODED by roughly the smear width so
+            # the protection covers the arm itself without punching a lit halo
+            # around it — the collision hull is already fatter than the arm's
+            # splat visual, so shadows still run right up to the visible edge.
+            if sil is not None and sil.any():
+                sil_up = cv2.resize(
+                    sil.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST
+                )
+                k = max(3, int(round(upscale)) | 1)  # odd kernel >= 3
+                sil_up = cv2.erode(sil_up, np.ones((k, k), np.uint8))
+                mask[sil_up.astype(bool)] = 1.0
+        # shade: 0 = lit, 1 = fully shadowed. The 0.02 deadband keeps
+        # near-lit mask values (blur fringes, any future soft mask source)
+        # from tinting whole surfaces once SPLAT_SHADOW_GAIN scales the term;
+        # the per-episode strength then caps how dark a fully-shadowed pixel
+        # gets (SPLAT_SHADOW_STRENGTH, jittered per reset — see
+        # _resample_splat_shadow_strength).
+        shade = np.clip(
+            float(self.SPLAT_SHADOW_GAIN) * np.maximum(0.0, (1.0 - mask) - 0.02),
+            0.0, 1.0,
+        )
+        strength = (
+            self._splat_shadow_strength_current
+            if self._splat_shadow_strength_current is not None
+            else float(self.SPLAT_SHADOW_STRENGTH)
+        )
+        atten = 1.0 - strength * shade
+        return (rendering * atten[None, :, :]).astype(np.float32, copy=False)
 
     def _rectify_fisheye_image(self, img: np.ndarray, camera: SplatSimCamera) -> np.ndarray:
         """Undistort a fisheye-rendered image to a pinhole view at the same
@@ -2537,12 +3219,18 @@ class PybulletRobotServerBase:
         return int(self.wrist_camera.tracked_link_index)
 
     def get_current_ee_pose(self):
+        """Current EE pose as the URDF LINK FRAME (getLinkState indices 4/5),
+        not the link COM (0/1). Task targets captured from this method are fed
+        to the RRT planner, whose IK + FK-accuracy gate operate in the link
+        frame (pybullet's calculateInverseKinematics convention) — mixing the
+        two silently breaks on any robot whose EE link has a COM offset.
+        Identical values for all current robots (wrist_camera_link COM ==
+        frame)."""
         ee_link = self._get_ee_link_index()
-        dummy_ee_pos, dummy_ee_quat = (
-            self.pybullet_client.getLinkState(self.splatsim_robot.sim_id, ee_link)[0],
-            self.pybullet_client.getLinkState(self.splatsim_robot.sim_id, ee_link)[1],
+        link_state = self.pybullet_client.getLinkState(
+            self.splatsim_robot.sim_id, ee_link
         )
-        return dummy_ee_pos, dummy_ee_quat
+        return link_state[4], link_state[5]
 
     def get_current_object_pose(self, object_name=None, object_id=None):
         if object_name is not None:
@@ -2624,7 +3312,7 @@ class PybulletRobotServerBase:
             current_ee_pos = None
             current_ee_quat = None
 
-        return {
+        env_config_dict = {
             "name": cfg.name,
             "task": task,
             "task_description": cfg.task_description,
@@ -2644,7 +3332,17 @@ class PybulletRobotServerBase:
             # An explicit SA-config-level override still wins if the user
             # wants to add more pairs per-run.
             "self_collision_skip_pairs": list(self.SELF_COLLISION_SKIP_PAIRS),
+            # Physics-stepping mode, so remote clients (viz / blend scripts)
+            # can warn when they're talking to a wallclock-stepped sim — a
+            # slow policy against an unsynced sim produces "jumpy" rollouts.
+            "sync_physics_to_client": bool(self._sync_physics_to_client),
         }
+        # Soft-cost payload (cost-aware RRT over pushable vegetation). Only
+        # added when the env declares one so binary-obstacle envs publish a
+        # byte-identical dict (planner-side config hashing stays stable).
+        if getattr(cfg, "soft_cost", None):
+            env_config_dict["soft_cost"] = cfg.soft_cost
+        return env_config_dict
 
     def _produces_images(self) -> bool:
         """True if this env emits image observations from ANY source — the
@@ -2812,22 +3510,192 @@ class PybulletRobotServerBase:
         )
         return view, proj, W, H
 
-    def _render_pybullet_camera(self, camera_name: Optional[str] = None) -> np.ndarray:
-        """Render one camera view with PyBullet's getCameraImage.
+    def render_video_fallback_frame(
+        self, obs: Optional[Dict[str, np.ndarray]] = None, camera_name: str = "base_rgb"
+    ) -> Optional[np.ndarray]:
+        """One-off CHW float [0,1] frame for eval videos when no policy
+        cameras are configured (camera_names=[], e.g. a state-only policy).
+
+        Honors the env's render mode: SPLAT renders the Gaussian splat from
+        the base camera (same imagery an image policy would see); PYBULLET —
+        or SPLAT with assets unavailable (RENDER_SPLATS=False subclasses) —
+        falls back to the fixed PyBullet debug camera. `obs` is accepted so
+        callers that already hold a get_observations() dict don't pay for a
+        second one; prep_image_rendering reads poses from PyBullet either way.
+        """
+        if self.do_render_from_splat and self.base_camera is not None:
+            if obs is None:
+                obs = self.get_observations(render_images=False)
+            cached_link_states, self._tick_shadow_masks = (
+                self._capture_obs_snapshot_and_masks()
+            )
+            self.prep_image_rendering(data=obs, cached_link_states=cached_link_states)
+            with torch.no_grad():
+                img = self.render_image(camera_name=camera_name, cached_link_states=cached_link_states)
+            if img is not None:
+                return img
+        return self._render_pybullet_camera(camera_name)
+
+    def _render_pybullet_camera(
+        self, camera_name: Optional[str] = None, cached_link_states=None
+    ) -> np.ndarray:
+        """Thread-safe wrapper around the PyBullet camera render.
+
+        `cached_link_states` (from `get_curr_link_states` at observation-
+        capture time) pins the WRIST camera pose to that snapshot instead of
+        the live link state at render time. Without it, the marshal round-trip
+        below means the wrist pose is derived on the main thread up to a
+        physics tick (or more) AFTER the rest of the observation was captured
+        — a small but real wrist-view latency vs the state vector. The image
+        content still shows live body poses (GL renders the current world);
+        only the camera pose can be snapshot-pinned.
+
+        Callers on the MAIN serve-loop thread run the render inline (fast
+        path — matches previous behavior byte-for-byte).
+
+        Callers on any OTHER thread (typically the ZMQ handler thread
+        dispatching a get_observations request) marshal the render call to
+        the main thread via the _sync_render_* handshake. Necessary because
+        in headless (DIRECT) mode PyBullet's camera path uses the EGL plugin,
+        and the EGL context is bound to whichever thread first called
+        p.getCameraImage — subsequent calls from a different thread return a
+        null GL vendor and segfault on NVIDIA drivers (observed as
+        `ven = (null)` in sim logs immediately preceding SIGSEGV).
+
+        The marshaling round-trip is a no-op when either (a) serve() hasn't
+        run yet — `_main_thread` is None, no serve loop to marshal to; or
+        (b) we ARE the main thread; or (c) there's no ZMQ server thread /
+        it isn't alive. In those cases we just execute directly.
+        """
+        return self._sync_main_thread_call("rgb", camera_name, cached_link_states)
+
+    def _capture_obs_snapshot_and_masks(self):
+        """(cached_link_states, shadow_masks) captured as ONE ATOMIC block on
+        the main serve-loop thread.
+
+        Atomicity is the point: in async mode the MAIN thread steps physics
+        at 240 Hz. If the link-state snapshot and the shadow-mask raycasts run
+        on the ZMQ handler thread, physics advances between (and during) them
+        — the rays then see a robot a few ticks AHEAD of the pose the splat
+        renders from, and at speed the shadow visibly deforms away from the
+        rendered arm. Marshaled to the main thread, the serve loop is busy
+        executing this block and cannot step physics until it returns, so the
+        snapshot, the rays, and therefore the rendered robot and its shadow
+        all describe the same instant. (sync_physics_to_client mode gets this
+        for free — physics only steps on command — and main-thread callers
+        run inline, which is equally atomic.)"""
+        return self._sync_main_thread_call("snapshot_masks")
+
+    def _sync_main_thread_call(self, kind: str, camera_name=None, cached_link_states=None):
+        """Run a sync-render-family request on the main serve-loop thread,
+        marshaling via the _sync_render_* handshake when called from another
+        thread while the serve loop is live. `kind` is "rgb" (PyBullet camera
+        render) or "snapshot_masks" (link-state + shadow-mask capture)."""
+        current = threading.current_thread()
+        needs_marshal = (
+            self._main_thread is not None
+            and current is not self._main_thread
+            and getattr(self, "_zmq_server_thread", None) is not None
+            and self._zmq_server_thread.is_alive()
+        )
+        if not needs_marshal:
+            return self._dispatch_sync_render(kind, camera_name, cached_link_states)
+
+        # Post the request; single-slot design mirrors _sync_step_* — safe
+        # because ZMQ REP serializes handler-thread requests one at a time,
+        # so no two requests can race for the slot.
+        with self._sync_render_lock:
+            self._sync_render_request_kind = kind
+            self._sync_render_request_camera = camera_name
+            self._sync_render_request_link_states = cached_link_states
+            self._sync_render_result = None
+            self._sync_render_error = None
+            self._sync_render_done_event.clear()
+            self._sync_render_pending_event.set()
+
+        # Timeout matches _sync_step_* (5 s). The main loop wakes every
+        # 1/240 s and consumes the request immediately; a missed signal
+        # (loop dead / GUI hang) surfaces as a warning rather than blocking
+        # the ZMQ thread indefinitely.
+        completed = self._sync_render_done_event.wait(timeout=5.0)
+        if not completed:
+            with self._sync_render_lock:
+                self._sync_render_request_kind = "rgb"
+                self._sync_render_request_camera = None
+                self._sync_render_request_link_states = None
+                self._sync_render_pending_event.clear()
+            raise RuntimeError(
+                "sync_render: main-thread render timeout (5 s). Serve loop may "
+                "be blocked; skipping render and continuing."
+            )
+
+        with self._sync_render_lock:
+            err = self._sync_render_error
+            result = self._sync_render_result
+            self._sync_render_result = None
+            self._sync_render_error = None
+
+        if err is not None:
+            # Re-raise on the calling thread so the ZMQ handler surfaces the
+            # error to the client rather than silently returning None.
+            raise err
+        return result
+
+    def _dispatch_sync_render(self, kind: str, camera_name, cached_link_states):
+        """Execute a sync-render-family request. Runs on whichever thread owns
+        the GL/EGL context (the marshal target, or the caller when inline)."""
+        if kind == "snapshot_masks":
+            snap = get_curr_link_states(
+                self.splatsim_robot.sim_id, use_link_centers=True
+            )
+            return snap, self._compute_tick_shadow_masks(snap)
+        return self._render_pybullet_camera_direct(camera_name, cached_link_states)
+
+    def _render_pybullet_camera_direct(
+        self, camera_name: Optional[str] = None, cached_link_states=None
+    ) -> np.ndarray:
+        """Actual PyBullet camera render — MUST run on the thread that owns the
+        EGL context (main serve-loop thread in headless mode). Callers should go
+        through `_render_pybullet_camera`, which marshals cross-thread requests
+        here via the sync-render handshake.
 
         Fast, splat-free image source usable by any env. For a wrist camera key
         (see `_is_wrist_camera`) it renders the WRIST-MOUNTED view derived from
-        `get_wrist_camera()`; for a base/third-person key it mirrors `base_camera`
+        `get_wrist_camera(cached_link_states=...)` — pass the observation's
+        link-state snapshot to pin the wrist pose to capture time (None reads
+        live state); for a base/third-person key it mirrors `base_camera`
         when a splat base camera exists (matching the splat view's pose + FoV +
         aspect), else the fixed PYBULLET_CAMERA_* pose. Returns a CHW float32 RGB
         image in [0, 1] at the per-view render resolution (resize_image then maps
         it to 224). Uses the GPU OpenGL renderer under a GUI connection, the CPU
         tiny renderer when headless (DIRECT)."""
+        view, proj, W, H = self._resolve_pybullet_view_proj(
+            camera_name, cached_link_states=cached_link_states
+        )
+        _, _, rgba, _, _ = self.pybullet_client.getCameraImage(
+            W, H, view, proj,
+            renderer=self._pybullet_camera_renderer(),
+            flags=p.ER_NO_SEGMENTATION_MASK,
+        )
+        rgb = np.reshape(np.asarray(rgba, dtype=np.uint8), (H, W, 4))[:, :, :3]
+        # HWC uint8 [0,255] -> CHW float32 [0,1] (the format resize_image expects).
+        return np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))
+
+    def _resolve_pybullet_view_proj(
+        self, camera_name: Optional[str], cached_link_states=None
+    ) -> Tuple[list, list, int, int]:
+        """(view, proj, W, H) for a PyBullet render of `camera_name` — the
+        camera-resolution logic shared by the RGB render and the shadow mask.
+
+        `cached_link_states` pins the WRIST camera pose to a link-state
+        snapshot (same contract as `render_image`) so a shadow mask lines up
+        with the splat frame rendered from that snapshot; None reads the live
+        wrist pose (the pybullet RGB path's historical behavior)."""
         view_proj = None
         if self._is_wrist_camera(camera_name):
-            # Wrist view from the live wrist-camera pose + FoV (a fisheye lens
+            # Wrist view from the wrist-camera pose + FoV (a fisheye lens
             # renders as its RECTIFIED pinhole equivalent, matching the splat).
-            wrist_cam = self.get_wrist_camera()
+            wrist_cam = self.get_wrist_camera(cached_link_states=cached_link_states)
             if wrist_cam is not None:
                 view_proj = self._splatsim_camera_to_pybullet_view(wrist_cam)
         elif self.base_camera is not None:
@@ -2839,21 +3707,544 @@ class PybulletRobotServerBase:
             # No SplatSimCamera to mirror (e.g. the planar env has no base
             # camera): fall back to the fixed PYBULLET_CAMERA_* third-person pose.
             view_proj = self._fixed_pybullet_view_proj()
-        view, proj, W, H = view_proj
+        return view_proj
 
+    def _pybullet_camera_renderer(self) -> int:
         # Hardware GL whenever we have a GL context — a GUI connection, or a
         # headless DIRECT client with the EGL plugin loaded. Only fall back to the
         # CPU software renderer when headless AND EGL was unavailable.
         use_hardware_gl = (not self._headless) or (getattr(self, "_egl_plugin_id", None) is not None)
-        renderer = p.ER_BULLET_HARDWARE_OPENGL if use_hardware_gl else p.ER_TINY_RENDERER
-        _, _, rgba, _, _ = self.pybullet_client.getCameraImage(
-            W, H, view, proj,
-            renderer=renderer,
-            flags=p.ER_NO_SEGMENTATION_MASK,
+        return p.ER_BULLET_HARDWARE_OPENGL if use_hardware_gl else p.ER_TINY_RENDERER
+
+    def _raycast_splat_shadow_mask(
+        self, camera_name: Optional[str], cached_link_states=None
+    ) -> np.ndarray:
+        """Shadow mask (1 = lit, 0 = in the ROBOT's shadow) for splat shadow
+        compositing (see SPLAT_SHADOW_* class attrs).
+
+        PURE RAYCAST — no getCameraImage. PyBullet's renderers can't do this
+        job (the EGL hardware plugin silently ignores getCameraImage's
+        `shadow`/`lightDirection` args, and once loaded it intercepts even
+        explicit ER_TINY_RENDERER requests), and a render would also drag in
+        the EGL thread-affinity marshaling, delaying the mask several physics
+        ticks past the observation snapshot. Ray tests have neither problem:
+        callable from any thread, immediately. Two batches:
+
+          1. Camera rays: near->far frustum ray per quarter-res pixel;
+             the first collision hit gives each pixel's surface point + body
+             (collision geometry — consistent with what the shadow caster
+             uses, and with what actually determines crashes).
+          2. Light rays: from each non-robot surface point (nudged 5 mm off
+             the surface) to the light position; a pixel is shadowed iff the
+             ROBOT body blocks its ray.
+
+        SNAPSHOT SEMANTICS: pass the SAME `cached_link_states` given to
+        `render_image` — the wrist camera pose then matches the splat frame
+        exactly. The ray tests read live body poses, so call this
+        back-to-back with the link-state capture (get_observations stashes
+        masks via `_capture_obs_snapshot_and_masks` right at that point) — then the
+        caster pose the rays see is the pose the snapshot recorded, and the
+        shadow cannot lag the rendered robot.
+
+        All bodies cast shadows by default (SPLAT_SHADOW_ROBOT_ONLY=True
+        restores robot-only casting) — the reversed light rays make the
+        occlusion test a plain first-hit-distance check, so scene-on-scene
+        shadows cost nothing extra. Robot PIXELS are still excluded as
+        RECEIVERS: the robot is one multibody of adjacent convex hulls, and
+        shadows landing on it would mostly be acne from sibling links.
+
+        Returns (h, w) float32 in [0, 1] at quarter camera resolution,
+        lightly blurred for soft edges; the compositor resizes to the splat
+        resolution (shadow masks are low-frequency)."""
+        view, proj, W, H = self._resolve_pybullet_view_proj(
+            camera_name, cached_link_states=cached_link_states
         )
-        rgb = np.reshape(np.asarray(rgba, dtype=np.uint8), (H, W, 4))[:, :, :3]
-        # HWC uint8 [0,255] -> CHW float32 [0,1] (the format resize_image expects).
-        return np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))
+        w, h = max(1, W // 4), max(1, H // 4)
+        mask = np.ones((h, w), dtype=np.float32)
+        robot = getattr(self, "splatsim_robot", None)
+        robot_id = getattr(robot, "sim_id", None)
+        if robot_id is None:
+            return mask
+
+        def _ray_batch(froms: np.ndarray, tos: np.ndarray) -> list:
+            hits: list = []
+            BATCH = 16000  # pybullet MAX_RAY_INTERSECTION_BATCH_SIZE is 16384
+            for s in range(0, len(froms), BATCH):
+                hits.extend(
+                    self.pybullet_client.rayTestBatch(
+                        froms[s : s + BATCH].tolist(),
+                        tos[s : s + BATCH].tolist(),
+                        numThreads=0,
+                    )
+                )
+            return hits
+
+        light = np.asarray(self.SPLAT_SHADOW_LIGHT_DIRECTION, dtype=np.float64)
+
+        # ── STATIC-SCENE CACHE ────────────────────────────────────────────
+        # Receivers, their surface points, and the static-geometry shadow
+        # state depend only on (camera pose, non-robot scene state, light).
+        # Both are hashed into signatures checked on EVERY mask computation —
+        # any moved body, moved articulated part (e.g. the engine's
+        # prismatic cap), created/removed object, or light change misses the
+        # cache and triggers a full rebuild; nothing is hardcoded about
+        # which bodies count as static. On a hit, only the ROBOT's occlusion
+        # needs fresh rays — and only for static-lit receivers whose light
+        # segment passes through the robot's (inflated) AABB. The base
+        # camera is fixed, so it hits every tick; the wrist camera moves
+        # with the arm, so its view signature misses and it rebuilds (same
+        # cost as the uncached path).
+        # The wrist camera rides the arm — its view signature changes every
+        # frame, so it can never hit the cache; skip the signature work AND
+        # the cache-building extras in the rebuild below (the continuation
+        # rays that resolve static occluders hidden behind the robot are
+        # only needed to keep a stored cache correct for later frames).
+        cacheable = not self._is_wrist_camera(camera_name)
+        scene_sig = view_sig = None
+        cache = None
+        if cacheable:
+            scene_sig = self._static_scene_signature()
+            view_sig = (w, h) + tuple(
+                np.round(np.asarray(view, dtype=np.float64), 6).tolist()
+            )
+            cache = self._shadow_static_cache.get(camera_name)
+        if (
+            cache is not None
+            and cache["scene_sig"] == scene_sig
+            and cache["view_sig"] == view_sig
+        ):
+            recv_idx = cache["recv_idx"]
+            surface = cache["surface"]
+            shadowed = cache["static_shadowed"].copy()
+            test = np.nonzero(~shadowed)[0]
+            if len(test):
+                lo, hi = self._robot_shadow_aabb()
+                test = test[self._segments_intersect_aabb(light, surface[test], lo, hi)]
+            if len(test):
+                sub = surface[test]
+                dirs = sub - light[None, :]
+                dirs /= np.maximum(np.linalg.norm(dirs, axis=1, keepdims=True), 1e-9)
+                hits = _ray_batch(np.broadcast_to(light, sub.shape), sub + 0.002 * dirs)
+                if self.SPLAT_SHADOW_ROBOT_ONLY:
+                    robot_hit = np.fromiter(
+                        (hh[0] == robot_id for hh in hits), dtype=bool, count=len(hits)
+                    )
+                else:
+                    # Scene is unchanged, so for a static-lit receiver the
+                    # only possible NEW first hit before the surface is the
+                    # robot; same 8 mm slack as the rebuild path.
+                    hit_pts = np.array(
+                        [hh[3] if hh[0] >= 0 else (0.0, 0.0, 0.0) for hh in hits],
+                        dtype=np.float64,
+                    )
+                    gaps = np.linalg.norm(hit_pts - sub, axis=1)
+                    robot_hit = np.fromiter(
+                        (hh[0] == robot_id for hh in hits), dtype=bool, count=len(hits)
+                    ) & (gaps > 0.008)
+                shadowed[test] = robot_hit
+            mask.ravel()[recv_idx[shadowed]] = 0.0
+            return self._protect_robot_silhouette(
+                cv2.GaussianBlur(mask, (3, 3), 0), camera_name, view, proj
+            )
+
+        # ── FULL REBUILD (cache miss) ─────────────────────────────────────
+        # Frustum rays: unproject every pixel at the near and far planes.
+        # pybullet view/proj are COLUMN-major.
+        V = np.asarray(view, dtype=np.float64).reshape(4, 4).T
+        P = np.asarray(proj, dtype=np.float64).reshape(4, 4).T
+        inv_vp = np.linalg.inv(P @ V)
+        xs_ndc = 2.0 * (np.arange(w) + 0.5) / w - 1.0
+        ys_ndc = 1.0 - 2.0 * (np.arange(h) + 0.5) / h  # pixel row 0 = NDC y +1
+        gx, gy = np.meshgrid(xs_ndc, ys_ndc)  # (h, w)
+        flat_x, flat_y = gx.ravel(), gy.ravel()
+
+        def _unproject(z_ndc: float) -> np.ndarray:
+            ndc = np.stack(
+                [flat_x, flat_y, np.full_like(flat_x, z_ndc), np.ones_like(flat_x)],
+                axis=1,
+            )
+            pts = ndc @ inv_vp.T
+            return pts[:, :3] / pts[:, 3:4]
+
+        cam_tos = _unproject(1.0)  # far plane
+        # Rays start at the camera EYE (from the view matrix: eye = -R^T t),
+        # NOT at the near plane (_unproject(-1.0)). Near-plane starts have a
+        # 5 cm blind zone: with a box pressed right up against the wrist
+        # camera, the rays began INSIDE the box hull (which PyBullet rays
+        # never register), passed through, and landed on the TABLE behind it
+        # — so the mask composited the table's shadow pattern onto the
+        # close-up box pixels. From the eye, the first hit is the box face
+        # the splat is actually showing.
+        eye = -V[:3, :3].T @ V[:3, 3]
+        cam_froms = np.broadcast_to(eye, cam_tos.shape)
+
+        # Camera pass with ROBOT PASS-THROUGH: a ray whose first hit is the
+        # robot is continued past that hit (up to 3 layers) so the surface
+        # BEHIND the robot still receives shadow. Without this, shadows get
+        # visible holes: collision hulls are fatter than the splat visuals,
+        # so with a curled arm a band of pixels around/behind the arm hits
+        # robot collision geometry even though the SPLAT shows the table
+        # there — those pixels were excluded from receiving, cutting the
+        # arm's shadow into disconnected blobs. Pixels that are still robot
+        # after 3 layers stay lit (genuinely deep inside the robot's
+        # silhouette, where the splat shows the robot itself anyway).
+        n_rays = len(cam_froms)
+        ray_dirs = cam_tos - cam_froms
+        ray_dirs /= np.maximum(np.linalg.norm(ray_dirs, axis=1, keepdims=True), 1e-9)
+        surf_ids = np.full(n_rays, -1, dtype=np.int64)
+        surf_pts = np.zeros((n_rays, 3), dtype=np.float64)
+        first_entry = np.zeros((n_rays, 3), dtype=np.float64)
+        has_entry = np.zeros(n_rays, dtype=bool)
+        froms = cam_froms
+        active = np.arange(n_rays)
+        for _layer in range(3):
+            hits = _ray_batch(froms, cam_tos[active])
+            ids = np.fromiter((h[0] for h in hits), dtype=np.int64, count=len(hits))
+            surf_ids[active] = ids
+            hit_sel = ids >= 0
+            hit_rows = active[hit_sel]
+            surf_pts[hit_rows] = np.array([hits[i][3] for i in np.nonzero(hit_sel)[0]],
+                                          dtype=np.float64)
+            through = ids == robot_id
+            thru_rows = active[through]
+            newly = thru_rows[~has_entry[thru_rows]]
+            first_entry[newly] = surf_pts[newly]  # first robot-hull entry point
+            has_entry[newly] = True
+            active = thru_rows
+            if len(active) == 0:
+                break
+            # Re-cast from just past the robot surface toward the far plane.
+            froms = surf_pts[active] + 1e-3 * ray_dirs[active]
+
+        # Shadow receivers: pixels whose (pass-through) camera ray reached a
+        # non-robot body.
+        recv = (surf_ids >= 0) & (surf_ids != robot_id)
+
+        # ROBOT-THICKNESS filter on pass-through pixels: pass-through exists
+        # for the thin silhouette band where collision hulls are fatter than
+        # the splat visuals — there the ray only GRAZES a hull (a chord of a
+        # couple cm). A pixel whose ray traverses a THICK robot stack (curled
+        # arm: upper link over lower link) is deep inside the silhouette,
+        # where the splat shows the ROBOT — shadowing the surface behind it
+        # painted dark blotches on the rendered arm, and because the layer
+        # cutoff sat right at curled-arm depths the blotches FLICKERED as the
+        # pose crept. Thickness = first hull entry -> last hull back-face
+        # (one reverse ray from the receiving surface toward the entry; rays
+        # never register the body they start in, so the back-face is the
+        # first reverse hit). Thicker than SPLAT_SHADOW_MAX_ROBOT_THICKNESS
+        # => reclassify as robot pixel (stably lit).
+        # NOT applied to the wrist (uncacheable) camera: its near field IS
+        # robot — the gripper right in front of the lens measures ~4-6 cm of
+        # hull, riding exactly on the threshold, and filtering there made
+        # thousands of pixels flip-flop (measured 4 -> 5544 flickery px).
+        # The wrist view showed no curled-arm flicker without the filter.
+        thru_recv = recv & has_entry if cacheable else np.zeros_like(recv)
+        if thru_recv.any():
+            rows = np.nonzero(thru_recv)[0]
+            rev_hits = _ray_batch(
+                surf_pts[rows] - 0.001 * ray_dirs[rows], first_entry[rows]
+            )
+            max_t = float(self.SPLAT_SHADOW_MAX_ROBOT_THICKNESS)
+            for i, hh in enumerate(rev_hits):
+                if hh[0] == robot_id:
+                    t = np.linalg.norm(np.asarray(hh[3]) - first_entry[rows[i]])
+                    if t > max_t:
+                        recv[rows[i]] = False
+
+        if not recv.any():
+            return mask
+        recv_idx = np.nonzero(recv)[0]
+        surface = surf_pts[recv_idx]
+
+        # Cast REVERSED — from the light down to each surface point — never
+        # surface-to-light. A surface-to-light ray needs a nudge off the
+        # receiver (or it re-hits its own body), and any nudge creates a
+        # dead zone: with the gripper hovering within the nudge distance of
+        # the table (plus collision-hull fat), the ray STARTS INSIDE the
+        # gripper's hull, which PyBullet rays never register — so exactly at
+        # near-contact the shadow vanished in a gripper-shaped hole. From
+        # the light (open air) the ray cleanly hits whatever is first:
+        # robot => shadowed; the receiver's own surface or any other body
+        # => lit. Targets extend 2 mm past the surface so a robot hull
+        # already penetrating the receiver (touching contact) still
+        # registers as the first hit.
+        to_surf = surface - light[None, :]
+        dirs = to_surf / np.maximum(np.linalg.norm(to_surf, axis=1, keepdims=True), 1e-9)
+        light_hits = _ray_batch(
+            np.broadcast_to(light, surface.shape), surface + 0.002 * dirs
+        )
+        n_recv = len(surface)
+        hit_ids_l = np.fromiter(
+            (hit[0] for hit in light_hits), dtype=np.int64, count=n_recv
+        )
+        static_shadowed = np.zeros(n_recv, dtype=bool)
+        if self.SPLAT_SHADOW_ROBOT_ONLY:
+            robot_shadowed = hit_ids_l == robot_id
+        else:
+            # EVERY body casts: shadowed iff the light's first hit lands
+            # meaningfully BEFORE the receiver point — no matter whose
+            # surface blocks. For convex hulls this also yields correct
+            # self-shadowing (a point visible from the light IS the first
+            # intersection of its own hull; a far-side point is occluded by
+            # its own near side). The 8 mm slack absorbs the hit landing a
+            # hair early on the receiver's own face at grazing light angles.
+            hit_pts_l = np.array(
+                [hit[3] if hit[0] >= 0 else (0.0, 0.0, 0.0) for hit in light_hits],
+                dtype=np.float64,
+            )
+            gap = np.linalg.norm(hit_pts_l - surface, axis=1)
+            occluded = (hit_ids_l >= 0) & (gap > 0.008)
+            robot_first = hit_ids_l == robot_id
+            robot_shadowed = occluded & robot_first
+            static_shadowed = occluded & ~robot_first
+            # Resolve static occlusion currently HIDDEN BEHIND the robot, so
+            # the cached static state stays correct once the robot moves
+            # away: continue robot-first rays past the robot (2 layers).
+            # Cache-only work — skipped for uncacheable (wrist) views.
+            pend = np.nonzero(robot_first)[0] if cacheable else np.empty(0, dtype=np.int64)
+            froms2 = hit_pts_l[pend] + 1e-3 * dirs[pend]
+            for _layer in range(2):
+                if len(pend) == 0:
+                    break
+                hits2 = _ray_batch(froms2, surface[pend] + 0.002 * dirs[pend])
+                ids2 = np.fromiter(
+                    (hh[0] for hh in hits2), dtype=np.int64, count=len(hits2)
+                )
+                pts2 = np.array(
+                    [hh[3] if hh[0] >= 0 else (0.0, 0.0, 0.0) for hh in hits2],
+                    dtype=np.float64,
+                )
+                gap2 = np.linalg.norm(pts2 - surface[pend], axis=1)
+                static_shadowed[pend[(ids2 >= 0) & (ids2 != robot_id) & (gap2 > 0.008)]] = True
+                again = ids2 == robot_id
+                froms2 = pts2[again] + 1e-3 * dirs[pend[again]]
+                pend = pend[again]
+
+        if cacheable:
+            self._shadow_static_cache[camera_name] = {
+                "scene_sig": scene_sig,
+                "view_sig": view_sig,
+                "recv_idx": recv_idx,
+                "surface": surface,
+                "static_shadowed": static_shadowed,
+            }
+
+        mask.ravel()[recv_idx[static_shadowed | robot_shadowed]] = 0.0
+        # Soften edges; the compositor's strength cap sets final darkness.
+        return self._protect_robot_silhouette(
+            cv2.GaussianBlur(mask, (3, 3), 0), camera_name, view, proj
+        )
+
+    def _protect_robot_silhouette(
+        self, mask: np.ndarray, camera_name: Optional[str], view, proj
+    ) -> np.ndarray:
+        """Force the mask LIT wherever the robot currently occludes the camera,
+        and stash that silhouette for the compositor to re-apply at full
+        resolution.
+
+        Why this exists: the mask is computed at a fraction of the splat
+        render's resolution (measured 56x99 mask vs 359x640 render = 6.4x),
+        so the mask's own blur plus the compositor's bilinear upscale smear
+        every shadow edge across ~6-13 splat pixels. Shadows legitimately
+        computed for surfaces BEHIND the arm therefore bleed forward onto the
+        arm, and as the caster moves that bleed switches on and off — read as
+        "a shadow flickering on the shoulder link, cast from a metre away".
+        The cached path makes it structural rather than occasional: its
+        receiver set is deliberately robot-independent (camera rays pass
+        THROUGH the arm so the cache stays valid as the arm moves), so nothing
+        downstream knew where the arm was at all.
+
+        Fixing it needs the arm's CURRENT screen coverage, which can't be
+        cached — hence a small dedicated ray pass, restricted to the robot's
+        projected AABB so it stays cheap enough to run every frame on the
+        cached path too.
+
+        Note this only enforces a decision already made elsewhere: robot
+        pixels are excluded as shadow RECEIVERS (see the receiver mask in
+        `_raycast_splat_shadow_mask`), because the robot is a chain of
+        adjacent convex hulls whose sibling links would shadow-acne each
+        other. Without this, that exclusion held at mask resolution but was
+        undone by the upscale."""
+        sil = self._robot_screen_silhouette(camera_name, view, proj, mask.shape)
+        if sil is None:
+            return mask
+        self._tick_shadow_robot_silhouettes[camera_name] = sil
+        mask = mask.copy()
+        mask[sil] = 1.0  # crisp at mask res — applied AFTER the blur
+        return mask
+
+    def _robot_screen_silhouette(
+        self, camera_name: Optional[str], view, proj, shape
+    ) -> Optional[np.ndarray]:
+        """Boolean (h, w) of mask pixels whose camera ray hits the robot first.
+
+        Casts only within the robot's projected world-AABB bounding box (the
+        arm covers a modest slice of frame), so this stays affordable on the
+        per-frame cached path."""
+        h, w = shape
+        robot = getattr(self, "splatsim_robot", None)
+        robot_id = getattr(robot, "sim_id", None)
+        if robot_id is None:
+            return None
+        lo, hi = self._robot_shadow_aabb()
+
+        V = np.asarray(view, dtype=np.float64).reshape(4, 4).T
+        P = np.asarray(proj, dtype=np.float64).reshape(4, 4).T
+        VP = P @ V
+        # Project the 8 AABB corners to NDC -> pixel box (clipped to frame).
+        corners = np.array([[x, y, z, 1.0] for x in (lo[0], hi[0])
+                            for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+        clip = corners @ VP.T
+        wclip = clip[:, 3]
+        if np.all(wclip <= 1e-9):
+            return None
+        # Corners behind the camera can't be projected meaningfully; when any
+        # is, fall back to the whole frame rather than a bogus (tiny) box.
+        if np.any(wclip <= 1e-9):
+            x0, x1, y0, y1 = 0, w, 0, h
+        else:
+            ndc = clip[:, :3] / wclip[:, None]
+            px = (ndc[:, 0] * 0.5 + 0.5) * w
+            py = (0.5 - ndc[:, 1] * 0.5) * h
+            x0 = max(0, int(np.floor(px.min())) - 1)
+            x1 = min(w, int(np.ceil(px.max())) + 1)
+            y0 = max(0, int(np.floor(py.min())) - 1)
+            y1 = min(h, int(np.ceil(py.max())) + 1)
+        sil = np.zeros((h, w), dtype=bool)
+        if x1 <= x0 or y1 <= y0:
+            return sil
+
+        inv_vp = np.linalg.inv(VP)
+        ys, xs = np.mgrid[y0:y1, x0:x1]
+        xs = xs.ravel(); ys = ys.ravel()
+        ndc_x = 2.0 * (xs + 0.5) / w - 1.0
+        ndc_y = 1.0 - 2.0 * (ys + 0.5) / h
+        far = np.stack([ndc_x, ndc_y, np.ones_like(ndc_x), np.ones_like(ndc_x)], axis=1)
+        far = far @ inv_vp.T
+        far = far[:, :3] / far[:, 3:4]
+        eye = -V[:3, :3].T @ V[:3, 3]
+        froms = np.broadcast_to(eye, far.shape)
+        hit_ids = []
+        BATCH = 16000
+        for s0 in range(0, len(far), BATCH):
+            hits = self.pybullet_client.rayTestBatch(
+                froms[s0 : s0 + BATCH].tolist(), far[s0 : s0 + BATCH].tolist(),
+                numThreads=0,
+            )
+            hit_ids.extend(hh[0] for hh in hits)
+        sil[ys, xs] = np.fromiter(
+            (i == robot_id for i in hit_ids), dtype=bool, count=len(hit_ids)
+        )
+        return sil
+
+    def _resample_splat_shadow_strength(self) -> None:
+        """Resample this episode's effective shadow strength:
+        SPLAT_SHADOW_STRENGTH * U(1 - JITTER, 1 + JITTER), clipped to [0, 1].
+        Called on every env.reset() (via _reset_episode_state) AFTER reset
+        seeds np.random, so seeded resets reproduce the same strength."""
+        base_strength = float(self.SPLAT_SHADOW_STRENGTH)
+        jitter = float(self.SPLAT_SHADOW_STRENGTH_JITTER)
+        if jitter > 0:
+            base_strength *= float(np.random.uniform(1.0 - jitter, 1.0 + jitter))
+        self._splat_shadow_strength_current = float(np.clip(base_strength, 0.0, 1.0))
+
+    def _static_scene_signature(self) -> tuple:
+        """Pose + joint-state signature of every NON-robot body (plus the
+        light position), rounded to 0.1 mm / 1e-4 rad. Compared on every
+        shadow-mask computation: any moved body, moved articulated part
+        (e.g. the engine's prismatic cap), created/removed object, or light
+        change invalidates the static shadow cache. Nothing is hardcoded
+        about which bodies count as static — a body IS static exactly while
+        its signature entry doesn't change."""
+        pc = self.pybullet_client
+        robot_id = getattr(getattr(self, "splatsim_robot", None), "sim_id", None)
+        sig = [tuple(round(float(v), 6) for v in self.SPLAT_SHADOW_LIGHT_DIRECTION)]
+        for bi in range(pc.getNumBodies()):
+            uid = pc.getBodyUniqueId(bi)
+            if uid == robot_id:
+                continue
+            # 3 decimals (1 mm / ~0.06 deg): coarse enough that RESTING-contact
+            # micro-jitter (sub-mm solver noise on objects sitting on the
+            # table) can't flip the signature — a per-frame flip means a full
+            # rebuild every tick, whose layer decisions visibly flicker.
+            # Real object motion exceeds 1 mm immediately.
+            pos, orn = pc.getBasePositionAndOrientation(uid)
+            entry = (uid,) + tuple(round(v, 3) for v in pos) + tuple(
+                round(v, 3) for v in orn
+            )
+            nj = pc.getNumJoints(uid)
+            if nj:
+                entry += tuple(
+                    round(js[0], 3) for js in pc.getJointStates(uid, list(range(nj)))
+                )
+            sig.append(entry)
+        return tuple(sig)
+
+    def _robot_shadow_aabb(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Union AABB over every robot link, inflated 3 cm — a cheap bound
+        for 'could the robot possibly block this light segment'."""
+        pc = self.pybullet_client
+        rid = self.splatsim_robot.sim_id
+        lo = np.full(3, np.inf)
+        hi = np.full(3, -np.inf)
+        for link in range(-1, pc.getNumJoints(rid)):
+            a, b = pc.getAABB(rid, link)
+            lo = np.minimum(lo, a)
+            hi = np.maximum(hi, b)
+        return lo - 0.03, hi + 0.03
+
+    @staticmethod
+    def _segments_intersect_aabb(
+        start: np.ndarray, ends: np.ndarray, lo: np.ndarray, hi: np.ndarray
+    ) -> np.ndarray:
+        """Vectorized slab test: for each i, does the segment start->ends[i]
+        intersect the AABB [lo, hi]? `start` is a single (3,) point (the
+        light); `ends` is (N, 3). Returns an (N,) bool array."""
+        d = ends - start[None, :]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t1 = (lo[None, :] - start[None, :]) / d
+            t2 = (hi[None, :] - start[None, :]) / d
+        # Axis-parallel segments (d==0): intersect that slab iff start lies
+        # inside it — encode as an always/never-true t-interval.
+        d0 = d == 0
+        inside = (start >= lo) & (start <= hi)  # (3,)
+        t1 = np.where(d0, np.where(inside[None, :], -np.inf, np.inf), t1)
+        t2 = np.where(d0, np.where(inside[None, :], np.inf, -np.inf), t2)
+        tmin = np.minimum(t1, t2).max(axis=1)
+        tmax = np.maximum(t1, t2).min(axis=1)
+        return (tmax >= np.maximum(tmin, 0.0)) & (tmin <= 1.0)
+
+    def _consume_sync_render_request(self) -> None:
+        """Main-thread consumer for the sync-to-main-thread camera-render
+        handshake. Mirrors `_consume_sync_step_request` — non-blocking check;
+        if no request pending, returns immediately. When a request IS pending,
+        runs the render on THIS thread (which owns the EGL context in headless
+        mode), stores result / exception, signals done.
+
+        Called from the main serve loop next to `_consume_sync_step_request`,
+        so a ZMQ handler-thread `get_observations(render_images=True)` sees at
+        most a 1/240 s round-trip latency (loop's sleep granularity) per camera.
+        """
+        if not self._sync_render_pending_event.is_set():
+            return
+        with self._sync_render_lock:
+            kind = self._sync_render_request_kind
+            camera_name = self._sync_render_request_camera
+            cached_link_states = self._sync_render_request_link_states
+            self._sync_render_request_kind = "rgb"
+            self._sync_render_request_camera = None
+            self._sync_render_request_link_states = None
+            self._sync_render_pending_event.clear()
+        try:
+            result = self._dispatch_sync_render(kind, camera_name, cached_link_states)
+            err = None
+        except BaseException as e:
+            result = None
+            err = e
+        with self._sync_render_lock:
+            self._sync_render_result = result
+            self._sync_render_error = err
+        self._sync_render_done_event.set()
 
     def oracle_environment_state(self, observations: Dict[str, Any]) -> list:
         """Privileged world state (object poses) for oracle/state-based policies,
@@ -2884,6 +4275,16 @@ class PybulletRobotServerBase:
             if self.ORACLE_STATE_INCLUDE_QUAT:
                 quat = observations.get(name + "_orientation") or (0.0, 0.0, 0.0, 1.0)
                 coords.extend(float(q) for q in quat)
+        # EE position LAST so the per-object layout above stays a stable prefix
+        # (old recordings without it are the first len-N slice of new ones).
+        if self.ORACLE_RECORD_ENV_STATE and self.ORACLE_STATE_INCLUDE_EE_POS:
+            ee_pos, _ = self.get_current_ee_pose()
+            coords.extend(float(ee_pos[i]) for i in self._oracle_ee_coord_indices())
+        # Per-link min-obstacle distances AFTER EE, so the (objects + EE)
+        # prefix stays intact for older checkpoints/datasets. Sentinel value
+        # for envs with no obstacles keeps layout width fixed.
+        if self.ORACLE_RECORD_ENV_STATE and self.ORACLE_STATE_INCLUDE_LINK_OBSTACLE_DIST:
+            coords.extend(self._compute_link_obstacle_min_distances())
         return coords
 
     def get_observations(self, render_images: bool = True) -> Dict[str, np.ndarray]:
@@ -2963,9 +4364,16 @@ class PybulletRobotServerBase:
             # Fast PyBullet-native camera path (no splat). Rendered PER camera:
             # a wrist key ("wrist_rgb") gets the wrist-mounted view (from the
             # wrist link pose via SplatSimCamera); others get the fixed
-            # third-person view.
+            # third-person view. One link-state snapshot is captured up front
+            # and threaded through every render (incl. the cross-thread
+            # marshal), pinning the wrist camera pose to THIS observation's
+            # capture instant — matching the splat path's cached_link_states
+            # contract instead of reading a live pose a tick or more later.
+            cached_link_states = get_curr_link_states(
+                self.splatsim_robot.sim_id, use_link_centers=True
+            )
             for camera_name in self.camera_names:
-                raw_img = self._render_pybullet_camera(camera_name)
+                raw_img = self._render_pybullet_camera(camera_name, cached_link_states)
                 for mode in self.image_resize_modes:
                     key = f"{camera_name}_{mode.value}"
                     observations[key] = resize_image(raw_img, (224, 224), mode=mode)
@@ -2975,10 +4383,13 @@ class PybulletRobotServerBase:
             and self.base_camera is not None  # splat render needs a base camera
             and len(self.camera_names) > 0
         ):
-            # Capture link state snapshot for synchronized rendering
-            cached_link_states = get_curr_link_states(
-                self.splatsim_robot.sim_id,
-                use_link_centers=True
+            # Capture the link-state snapshot AND the shadow masks in one
+            # atomic main-thread block (see _capture_obs_snapshot_and_masks):
+            # the shadow rays read live body poses, so any physics stepping
+            # between snapshot and rays would deform the shadow away from the
+            # rendered arm at speed.
+            cached_link_states, self._tick_shadow_masks = (
+                self._capture_obs_snapshot_and_masks()
             )
 
             self.prep_image_rendering(data=observations, cached_link_states=cached_link_states)
@@ -3006,6 +4417,13 @@ class PybulletRobotServerBase:
                 key = f"{camera_name}_{mode.value}"
                 if key not in observations:
                     observations[key] = None
+
+        # Monotonic env-mutation clock stamped at capture time. Consumers
+        # holding the version returned by a mutation (e.g. the SA wrapper's
+        # teleport_joint_state) compare: obs with state_version < that value
+        # was captured BEFORE the mutation and is stale with respect to it.
+        # See _bump_state_version for the bump sites.
+        observations["state_version"] = int(self._state_version)
 
         return observations
 
@@ -3299,33 +4717,28 @@ class PybulletRobotServerBase:
             # goal-directed envs; goal-config-exists otherwise).
             able_to_solve = self._check_scenario_solvable(self.get_joint_state())
     
-    def restore_episode_scenario(self, episode_index: int) -> None:
-        """Restore the environment to the exact state recorded at the start of a LeRobot episode.
+    SCENARIO_FIELDS = ("splatsim_robot_config", "splatsim_object_configs",
+                       "splatsim_background_config")
 
-        Reads the splatsim_robot_config, splatsim_object_configs, and splatsim_background_config
-        fields saved in the episode metadata and applies the recorded initial_position,
-        initial_quat, and initial_scale to each matching live object.
+    def apply_scenario(self, scenario: dict) -> None:
+        """Put the scene into a recorded ORACLE SCENARIO.
 
-        For the robot, the saved initial_joint_positions from the articulation_config are
-        teleported directly. For scene objects, the recorded pose is set via PyBullet and the
-        scale is restored by adjusting the Gaussian splat and reloading the URDF.
-
-        Args:
-            episode_index: The episode whose saved scenario should be restored.
+        ``scenario`` uses the same three fields the episode metadata and
+        ``get_env_config()`` already publish — robot config (whose
+        ``articulation_config.initial_joint_positions`` is teleported to) and
+        per-object ``initial_position`` / ``initial_quat`` / ``initial_scale``.
+        One format for recorded episodes, ZMQ oracle info, and cached launch
+        scenarios, so they cannot drift apart.
         """
-        if self._lerobot_saver is None:
-            raise RuntimeError("No LeRobot dataset loaded. Call _init_lerobot_dataset() first.")
-
-        ep = self._lerobot_saver.meta.episodes[episode_index]
-
         def _parse_ep_field(val):
-            """Parquet stores these as JSON strings; parse back to dict/list if needed."""
+            """Parquet stores these as JSON strings; parse back if needed."""
             if isinstance(val, str):
                 return json.loads(val)
             return val
 
-        # Restore robot joint positions
-        robot_cfg = _parse_ep_field(ep.get("splatsim_robot_config"))
+        robot_cfg = _parse_ep_field(scenario.get("splatsim_robot_config"))
+        object_configs = _parse_ep_field(
+            scenario.get("splatsim_object_configs")) or []
         if robot_cfg is not None:
             initial_joints = robot_cfg["articulation_config"]["initial_joint_positions"]
             self.teleport_joint_state(self.splatsim_robot, initial_joints)
@@ -3335,10 +4748,8 @@ class PybulletRobotServerBase:
         obj_by_name = {obj.config.name: obj for obj in self.splatsim_objects}
 
         # Restore each non-robot, non-background object
-        object_configs = _parse_ep_field(ep.get("splatsim_object_configs")) or []
-
         if robot_cfg is None and len(object_configs) == 0:
-            raise ValueError(f"No robot config or object configs found for episode {episode_index}")
+            raise ValueError("scenario has neither a robot config nor object configs")
         for obj_cfg_dict in object_configs:
             name = obj_cfg_dict["name"]
             splatsim_obj = obj_by_name.get(name)
@@ -3385,6 +4796,45 @@ class PybulletRobotServerBase:
         #     self.pybullet_client.stepSimulation()
         # print("step simulation done")
         
+
+
+    def scenario_dict(self) -> dict:
+        """Current scene as an oracle scenario (the format apply_scenario eats)."""
+        meta = self._get_splatsim_episode_metadata()
+        return {k: meta[k] for k in self.SCENARIO_FIELDS if k in meta}
+
+    def save_scenario_file(self, path) -> None:
+        """Write the current scene to a JSON scenario file.
+
+        Point `launch_nodes.py --scenario_file` at it to start the simulator
+        directly in this arrangement, skipping the randomize/solvability
+        search — which costs up to `randomize_objects`' 100 attempts, each
+        running goal IK, and dominates launch time on hard scenes.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.scenario_dict(), indent=1))
+        print(f"[scenario] saved -> {path}")
+
+    def load_scenario_file(self, path, pin: bool = True) -> dict:
+        """Apply a saved scenario file. ``pin`` also makes every later
+        reset() reuse it instead of re-randomising."""
+        scenario = json.loads(Path(path).read_text())
+        self.apply_scenario(scenario)
+        if pin:
+            self._pinned_scenario = scenario
+        print(f"[scenario] loaded <- {path}"
+              + (" (pinned: resets reuse it)" if pin else ""))
+        return scenario
+
+    def restore_episode_scenario(self, episode_index: int) -> None:
+        """Restore the environment to the state recorded at the start of a
+        LeRobot episode. Thin wrapper over `apply_scenario` — see it for the
+        format."""
+        if self._lerobot_saver is None:
+            raise RuntimeError("No LeRobot dataset loaded. Call _init_lerobot_dataset() first.")
+        ep = self._lerobot_saver.meta.episodes[episode_index]
+        self.apply_scenario({k: ep.get(k) for k in self.SCENARIO_FIELDS})
 
     def randomize_ee_pose(self, max_attempts=100) -> Optional[Tuple[float, ...]]:
         # generating random initial joint state using random end effector position and orientation
@@ -3745,6 +5195,16 @@ class PybulletRobotServerBase:
     def _enter_mode(self, mode: 'PybulletRobotServerBase.SERVE_MODES'):
         """Called when entering a new serve mode. Override in subclasses for custom behavior."""
         if mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+            # Invalidate any cached planner so the next plan() call rebuilds
+            # RRTToGoalPlanner with the CURRENT config values. Without this,
+            # a user who ran trajgen once (planner built with defaults), then
+            # tweaked config values in the GUI (e.g. Trajopt Passes), then
+            # restarted trajgen — would see the OLD cached planner with OLD
+            # values, because `_ensure_planner` at trajectory_generation.py
+            # :361 caches on first use and never invalidates. Explicit reset
+            # here at mode-entry makes the "Start Trajectory Generation"
+            # button a hard reset of the planner too.
+            self.trajectory_generator._planner = None
             # Update active resize modes from traj config before creating the dataset
             traj_config = self.trajectory_generator.config
             active_modes = []
@@ -3896,6 +5356,51 @@ class PybulletRobotServerBase:
             )
             self._splatsim_gui.set_eval_episode_index(episode_id)
         return self.get_observations()
+
+    def set_eval_benchmark_indices(self, indices):
+        """Replace the eval-benchmark playlist and rewind the counter.
+
+        The playlist is a SEQUENCE (not a set): duplicates ARE preserved
+        AND played in the order given. Example — passing ``[2, 2, 3, 10, 10]``
+        makes the next five ``env.reset()`` calls in EVAL_BENCHMARK mode
+        replay scenarios 2, 2, 3, 10, 10 in that order (then wrap to 2).
+
+        Use case: the blending script needs to replay each source-intervention
+        episode in the SAME obstacle configuration it was recorded from. It
+        builds a playlist matching ``source_scenario_idx`` per source episode
+        (with duplicates for multi-episodes-per-scenario) and calls this
+        once; each subsequent reset advances one slot forward.
+
+        This differs from the ``options={"benchmark_start_index": N}`` knob on
+        ``_handle_reset`` — that jumps the counter per-reset (still indexing
+        into the CURRENT playlist), and doesn't allow the caller to rewrite
+        the playlist. Use this method when your rollout order is data-driven
+        (playlist known up front); use ``benchmark_start_index`` for ad-hoc
+        jumps within a fixed subset.
+
+        Resets ``self._eval_benchmark_episode_index = -1`` so the very next
+        ``_eval_benchmark_next_episode()`` (i.e. the next ``env.reset()``)
+        lands on ``indices[0]``, not ``indices[1]`` — matching the counter's
+        "pre-first-reset" invariant used everywhere else on this class.
+        """
+        if not isinstance(indices, list):
+            raise TypeError(f"indices must be a list, got {type(indices).__name__}")
+        if not indices:
+            raise ValueError("indices must be non-empty")
+        for i, x in enumerate(indices):
+            if not isinstance(x, int) or isinstance(x, bool):
+                raise TypeError(f"indices[{i}] must be int, got {type(x).__name__}")
+        # Store as-is: order + duplicates preserved. Do NOT dedup, do NOT sort.
+        self._eval_benchmark_subset = list(indices)
+        self._eval_benchmark_episode_index = -1
+        if self._splatsim_gui is not None:
+            self._splatsim_gui.set_status(
+                f"Playlist set: {len(self._eval_benchmark_subset)} episodes — ready (next reset = playlist[0])"
+            )
+            # GUI dropdown will show duplicates as duplicate entries; that's a
+            # UX quirk of duplicates, not a functional issue (playback is
+            # counter-driven, not dropdown-driven, in playlist mode).
+            self._splatsim_gui.set_eval_episode_options(self._eval_benchmark_subset)
 
     def _eval_benchmark_replay_episode(self):
         """Replay the current episode's recorded observation.state via motor control.
@@ -4146,15 +5651,47 @@ class PybulletRobotServerBase:
                 if not self._headless:
                     self.pybullet_client.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
+    # Config sub-fields that are STATIC per robot/scene (identical in every
+    # episode) and are never read back by any consumer. They are stripped from
+    # the payload built below — see `_strip_static_config_fields`.
+    #
+    # `segmented_list` (the per-link gaussian point-index segmentation) is by
+    # far the worst: ~865 KB. Written once per episode it made a 500-episode
+    # LeRobot `meta/episodes` table ~500 MB / ~1 MB per row, and a single row
+    # read ~19 ms. LeRobot's video-decode path reads that row once per camera
+    # per sample, so it dominated dataloader time for video-backed training
+    # (measured: data_s 0.85 s/batch, GPU idle ~90% of the time). It also rode
+    # along in every `get_env_config` ZMQ reply to the SA wrapper.
+    #
+    # What scenario restore + the analysis scripts actually consume is only
+    # `articulation_config.initial_joint_positions` (which genuinely varies per
+    # episode) and the per-object initial pose/scale — all kept, all tiny.
+    _STATIC_ARTICULATION_FIELDS = ("segmented_list",)
+
+    @classmethod
+    def _strip_static_config_fields(cls, d: dict) -> dict:
+        """Drop static, never-read bulk from a serialized object config.
+
+        Kept deliberately narrow: only the named articulation sub-fields are
+        removed, so every other field survives for provenance/debuggability.
+        """
+        art = d.get("articulation_config")
+        if isinstance(art, dict):
+            for key in cls._STATIC_ARTICULATION_FIELDS:
+                art.pop(key, None)
+        return d
+
     def _get_splatsim_episode_metadata(self) -> dict:
         """Build the splatsim-specific episode metadata dict for LeRobot save_episode().
 
         Contains JSON-serialisable configs for the robot, background, and all
-        non-robot/non-background objects currently in the scene.
+        non-robot/non-background objects currently in the scene, minus the
+        static bulk listed in `_STATIC_ARTICULATION_FIELDS`.
         """
         def _config_to_dict(cfg):
             d = asdict(cfg)
-            return json.loads(json.dumps(d, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
+            d = json.loads(json.dumps(d, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
+            return self._strip_static_config_fields(d)
 
         return {
             "splatsim_robot_config": _config_to_dict(self.splatsim_robot.config),
@@ -4358,6 +5895,9 @@ class PybulletRobotServerBase:
 
         In all other modes, delegates to the subclass reset().
         """
+        # Reset is a mutation: bump BEFORE so the obs captured during/after
+        # the reset are stamped ≥ this version, invalidating pre-reset obs.
+        self._bump_state_version()
         if self.serve_mode == self.SERVE_MODES.EVAL_BENCHMARK:
             if (
                 options is not None
@@ -4393,6 +5933,13 @@ class PybulletRobotServerBase:
         # benchmark state.
         self._enter_mode(self.serve_mode)
 
+        # Capture the main serve-loop thread BEFORE ZMQ starts. Used by
+        # _render_pybullet_camera to decide whether it needs to marshal its
+        # GL call to us (headless-EGL context is bound to this thread) or
+        # can execute directly. `threading.current_thread()` here IS the
+        # thread that will run the while-True loop below.
+        self._main_thread = threading.current_thread()
+
         # start the zmq server only after benchmark state is ready
         self._zmq_server_thread.start()
 
@@ -4405,8 +5952,11 @@ class PybulletRobotServerBase:
 
                 # Reset env button — available in all modes
                 if self._splatsim_gui.check_button(SplatSimGui.BTN_RESET_ENV):
-                    print("[GUI] Reset Env pressed — resetting environment.")
-                    self._handle_reset()
+                    print("[GUI] Reset Env pressed — resetting environment (randomized).")
+                    # A user pressing Reset wants a FRESH scene: bypass any
+                    # pinned --scenario_file arrangement (see the small-engine
+                    # reset's pin gate).
+                    self._handle_reset(options={"force_randomize": True})
 
                 # Check debug mode dropdown for changes
                 self._check_debug_mode()
@@ -4433,10 +5983,17 @@ class PybulletRobotServerBase:
                         self._consume_sync_step_request()
                     else:
                         self.pybullet_client.stepSimulation()
+                    # Also consume any pending camera-render request. Always
+                    # active (not gated on _sync_physics_to_client) because
+                    # the EGL-context-thread-affinity issue is unconditional
+                    # in headless mode — we always want camera renders to
+                    # execute on this thread.
+                    self._consume_sync_render_request()
                     time.sleep(1 / 240)
                 elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
                     # Idle mode - just step simulation while user configures settings
                     self.pybullet_client.stepSimulation()
+                    self._consume_sync_render_request()
                     time.sleep(1 / 240)
                 elif current_mode == self.SERVE_MODES.GENERATE_DEMOS:
                     raise NotImplementedError()
@@ -4455,7 +6012,29 @@ class PybulletRobotServerBase:
                         self.serve_mode = self.SERVE_MODES.INTERACTIVE
                 elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
                     # Generate trajectories, render images, and save to LeRobot + Zarr
-                    self._generate_and_render_one_episode()
+                    try:
+                        self._generate_and_render_one_episode()
+                    except RuckigCloudUnavailableError as e:
+                        # ruckig backend's cloud API down / daily rate limit hit: every
+                        # further episode would fail identically. Stop
+                        # generation gracefully (per-episode dataset state
+                        # was already finalized by the failing episode's own
+                        # cleanup) and drop to idle so the server + GUI stay
+                        # alive.
+                        msg = (
+                            "Trajectory generation STOPPED: ruckig-backend cloud "
+                            f"unavailable ({e}). Generated "
+                            f"{self.trajectory_generator.trajectory_count} episode(s) "
+                            "before stopping; the dataset up to here is intact. "
+                            "Resume generation after the rate limit resets."
+                        )
+                        print(f"[serve] {msg}")
+                        if self._splatsim_gui is not None:
+                            self._splatsim_gui.set_status(
+                                "STOPPED: ruckig-backend cloud rate-limited/unreachable"
+                            )
+                        self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
+                        continue
 
                     # Update GUI status with current progress
                     tgen = self.trajectory_generator
@@ -4475,6 +6054,7 @@ class PybulletRobotServerBase:
                         self._consume_sync_step_request()
                     else:
                         self.pybullet_client.stepSimulation()
+                    self._consume_sync_render_request()
                     time.sleep(1 / 240)
                 elif current_mode == self.SERVE_MODES.EVAL_BENCHMARK:
                     # See INTERACTIVE branch above for sync-to-client rationale.
@@ -4482,6 +6062,7 @@ class PybulletRobotServerBase:
                         self._consume_sync_step_request()
                     else:
                         self.pybullet_client.stepSimulation()
+                    self._consume_sync_render_request()
                     time.sleep(1 / 240)
                     # Handle Next/Prev/dropdown buttons from the eval benchmark panel
                     from splatsim.utils.splatsim_gui import EvalBenchmarkModePanel
@@ -4501,9 +6082,22 @@ class PybulletRobotServerBase:
                         self._splatsim_gui.set_value(EvalBenchmarkModePanel.EPISODE_SELECT_KEY, "—")
                         try:
                             episode_id = int(selected)
-                            if episode_id in self._eval_benchmark_subset:
+                            current_pos = self._eval_benchmark_episode_index
+                            current_id = (
+                                self._eval_benchmark_subset[current_pos]
+                                if 0 <= current_pos < len(self._eval_benchmark_subset)
+                                else None
+                            )
+                            # The position-mismatch guard below is not enough when the
+                            # subset contains DUPLICATE ids (e.g. a blend-replay playlist
+                            # like [6, 17, 40, 40, 41, ...] from set_eval_benchmark_indices):
+                            # .index() maps the echo to the FIRST duplicate, which differs
+                            # from the counter on every later occurrence — rewinding the
+                            # counter mid-run on each reset. An echo always carries the
+                            # CURRENT episode's id, so only treat differing ids as a jump.
+                            if episode_id != current_id and episode_id in self._eval_benchmark_subset:
                                 subset_pos = self._eval_benchmark_subset.index(episode_id)
-                                if subset_pos != self._eval_benchmark_episode_index:
+                                if subset_pos != current_pos:
                                     self._eval_benchmark_goto_episode(subset_pos)
                         except (ValueError, TypeError):
                             pass
@@ -4696,6 +6290,14 @@ class PybulletRobotServerBase:
                 parentFramePosition=[0, 0, 0],
                 childFramePosition=[0, 0, 0],
             )
+            # maxForce stays 10 in EVERY mode, including debug_fast_control.
+            # Stiffening the gears for debug mode was tried and is actively
+            # harmful: the gear's erp term tracks an internal reference that
+            # does NOT follow resetJointState, so after a debug-mode teleport
+            # a stiff gear drives the fingers at a sustained ~15 rad/s
+            # against the position holds (measured). At maxForce=10 that
+            # residual fight is negligible, and debug mode doesn't need the
+            # gears anyway — move_gripper position-holds every mimic child.
             self.pybullet_client.changeConstraint(
                 c, gearRatio=-multiplier, maxForce=10, erp=1
             )  # Note: the mysterious `erp` is of EXTREME importance
@@ -4756,15 +6358,67 @@ class PybulletRobotServerBase:
             -1,
             1
         ))  # angle calculation
-        # Control the mimic gripper joint(s)
+        # Control the mimic gripper joint(s). Debug-fast mode raises the hold
+        # force so arm-snap inertia can't back-drive the finger drive joint
+        # (the gear constraints are stiffened to match in setup_gripper).
+        drive_force = self.joints[self.mimic_parent_id].maxForce
+        if self.debug_fast_control:
+            drive_force = max(drive_force, self.DEBUG_FAST_CONTROL_GRIPPER_FORCE)
+            # Debug mode: the whole gripper snaps like the arm does — the
+            # realistic per-call `velocity` cap (2 rad/s) is far too slow to
+            # reject arm-snap disturbances on the finger links.
+            velocity = self.DEBUG_FAST_CONTROL_MAX_VELOCITY
         self.pybullet_client.setJointMotorControl2(
             self.splatsim_robot.sim_id,
             self.mimic_parent_id,
             self.pybullet_client.POSITION_CONTROL,
             targetPosition=open_angle,
-            force=self.joints[self.mimic_parent_id].maxForce,
+            force=drive_force,
             maxVelocity=velocity,
         )
+        if self.debug_fast_control:
+            # KINEMATIC snap + hold for every mimic CHILD, mirroring the
+            # arm's debug path in command_joint_state: teleport each finger
+            # joint to its gear-consistent angle and position-hold it there.
+            # The JOINT_GEAR coupling alone is a velocity-level constraint —
+            # even at DEBUG_FAST_CONTROL_GRIPPER_FORCE it lets the fingers
+            # flap 25-65 deg during a debug-speed arm snap (measured;
+            # transient, self-recovering, but visually a twitching finger).
+            # Normally children MUST stay motor-free (a position hold at a
+            # STALE target jams the mimic — see the teleport/setup notes);
+            # here it's safe because parent and child targets are set
+            # TOGETHER from the same open_angle on every call, so the
+            # motors and gears always agree.
+            self.pybullet_client.resetJointState(
+                self.splatsim_robot.sim_id, self.mimic_parent_id, open_angle
+            )
+            for child_id, mult in self.mimic_child_multiplier.items():
+                self.pybullet_client.resetJointState(
+                    self.splatsim_robot.sim_id, child_id, mult * open_angle
+                )
+                self.pybullet_client.setJointMotorControl2(
+                    self.splatsim_robot.sim_id,
+                    child_id,
+                    self.pybullet_client.POSITION_CONTROL,
+                    targetPosition=mult * open_angle,
+                    force=self.DEBUG_FAST_CONTROL_GRIPPER_FORCE,
+                    maxVelocity=velocity,
+                )
+        elif self.GRIPPER_MIMIC_HOLD_FORCE > 0:
+            # NORMAL-mode mimic rigidity (see the class attr): position-hold
+            # the mimic children at their gear-consistent angles so contact
+            # can't bend the follower fingers away from the drive joint.
+            # Targets refresh on every call — always in agreement with the
+            # parent target and the gears, so no stale-target jam.
+            for child_id, mult in self.mimic_child_multiplier.items():
+                self.pybullet_client.setJointMotorControl2(
+                    self.splatsim_robot.sim_id,
+                    child_id,
+                    self.pybullet_client.POSITION_CONTROL,
+                    targetPosition=mult * open_angle,
+                    force=self.GRIPPER_MIMIC_HOLD_FORCE,
+                    maxVelocity=velocity,
+                )
 
     def get_current_gripper_state(self):
         # Snap the gripper state to 0 or 1 if they're very close
@@ -5216,6 +6870,14 @@ class PybulletRobotServerBase:
             # options this env can't do (SPLAT needs loaded splat assets).
             initial_render_mode=self._initial_render_mode,
             available_render_modes=self._available_render_modes(),
+            # Seed the "Splat shadows" checkbox from the launch --splat_shadows
+            # so GUI state matches server state; polled alongside render mode.
+            initial_splat_shadows=self.splat_shadows,
+            # Called by the Traj Gen panel after "Import Config" so env-owned
+            # fields (task goal, skip pairs, DOF-checked q_*) survive a config
+            # file exported from a different env. Reads only env class state —
+            # safe from the GUI thread.
+            traj_env_reassert_fn=self.reassert_env_traj_config_fields,
         )
         if self._headless and not self._show_control_gui:
             # Fully headless (batch / display-less): skip the Tkinter mainloop
@@ -5253,6 +6915,15 @@ class PybulletRobotServerBase:
         """
         if self._splatsim_gui is None:
             return
+        # Sync the "Splat shadows" checkbox (same poll cadence as the render
+        # mode). Track whether it changed so we can refresh the thumbnails
+        # below — but only when splat imagery is what's on screen.
+        shadows_changed = False
+        new_shadows = self._splatsim_gui.get_splat_shadows()
+        if new_shadows is not None and bool(new_shadows) != self.splat_shadows:
+            print(f"[GUI] Splat shadows: {self.splat_shadows} -> {bool(new_shadows)}")
+            self.splat_shadows = bool(new_shadows)
+            shadows_changed = True
         new_mode = self._splatsim_gui.get_render_mode()
         if new_mode is None:
             return  # GUI not yet initialized
@@ -5271,11 +6942,22 @@ class PybulletRobotServerBase:
                 # GUI thumbnails right away, so switching to Splat/PyBullet updates
                 # the images immediately instead of waiting for the next
                 # observation request. get_observations() renders per the active
-                # mode and calls display_observations() internally.
+                # mode and calls display_observations() internally. (Also covers
+                # a shadows toggle landing on the same tick — one render, not two.)
                 try:
                     self.get_observations()
                 except Exception as e:
                     print(f"[GUI] Render on switch to {new_mode.value} failed: {e}")
+        elif shadows_changed and self.render_mode == RenderMode.SPLAT:
+            # Shadows toggled while splat imagery is displayed: re-render the
+            # current sim state immediately (same pattern as the mode switch
+            # above) so the thumbnails reflect the checkbox without waiting for
+            # the next observation request. Other modes need no refresh — the
+            # shadow composite only exists on the splat path.
+            try:
+                self.get_observations()
+            except Exception as e:
+                print(f"[GUI] Render on splat-shadows toggle failed: {e}")
 
     def shutdown(self):
         """Clean up resources.

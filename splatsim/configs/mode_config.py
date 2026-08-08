@@ -38,6 +38,7 @@ class RenderMode(enum.Enum):
 from splatsim.utils.rrt_to_goal import (  # noqa: E402,F401
     IkGoalSelectionStrategy,
     PathSelectionStrategy,
+    SoftCostMode,
 )
 
 
@@ -69,13 +70,19 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     time_per_traj: float = 6.0
     robot_update_rate: int = 30
     rrt_vis_fps: int = 10
-    # Ruckig kinematic limits for the planned/smoothed trajectory (per joint).
+    # Kinematic limits for the planned/smoothed trajectory (per joint).
     # Previously hardcoded in TrajectoryGenerator._ensure_planner; exposed here
     # so envs can tune the PLANNED motion, and so the robot server can tie its
     # execution-time CONTROL_MAX_VELOCITY to max_joint_vel (a servo that tracks
     # a T-Hz reference must be allowed to move at ~the planned velocity — see
     # PybulletRobotServerBase.CONTROL_MAX_VELOCITY). Defaults match the old
     # hardcoded 0.5 / 1.0 / 10.0, so behavior is unchanged unless overridden.
+    #
+    # NOTE: max_joint_jerk is IGNORED by the default TOPP-RA time
+    # parametrization backend — TOPP-RA optimizes path velocity subject to
+    # velocity/acceleration bounds and has no third-order term. It is still
+    # honored by the ruckig backend (SPLATSIM_TRAJ_BACKEND=ruckig). See the
+    # "TOPP-RA time parametrization" comment block in rrt_path_utils.py.
     max_joint_vel: float = 0.5
     max_joint_acc: float = 1.0
     max_joint_jerk: float = 10.0
@@ -105,7 +112,7 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     path_perturbation_scale: float = 0.05
     # Random-shortcut smoothing iterations applied to each raw BiRRT path
     # (pybullet_planning smooth_path inside rrt_path_utils.get_path). This is
-    # the pass that straightens RRT's characteristic detours/zigzags — ruckig
+    # the pass that straightens RRT's characteristic detours/zigzags — the parametrizer
     # downstream only smooths the TIME parametrization (vel/acc/jerk), never
     # the geometric path, so erratic-looking trajectories are fixed here.
     # Iterations past convergence are cheap (candidate segments are
@@ -113,15 +120,91 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # planner's legacy 50) noticeably straightens paths at modest planning
     # cost; raise further if trajectories still look wandery.
     rrt_smooth_iterations: int = 200
-    # Scale applied to `obstacle_clearance` for the RUCKIG-SMOOTHED trajectory
+    # Corner-ROUNDING relaxation applied after shortcut smoothing
+    # (rrt_path_utils.elastic_smooth_path). Shortcutting only removes a
+    # corner when the straight line past it is collision-free; in cluttered
+    # scenes (vine canopy) those shortcuts collide, the RRT's jagged
+    # 50-90 deg joint-space corners survive, and the parametrizer renders them as
+    # oscillatory wobble throughout the trajectory. This pass bends corners
+    # into gentle arcs that hug the corridor instead. Default 30 (on) since
+    # the vine-env wobble diagnosis (2026-07-28); it converges early and adds
+    # little cost in open scenes. 0 = off (historical behavior).
+    elastic_smooth_passes: int = 30
+    # CHOMP-lite trajectory optimizer with SOFT collision cost + smoothness
+    # (rrt_path_utils.trajopt_smooth_path). Runs AFTER shortcut smoothing and
+    # elastic corner-rounding, BEFORE parametrization time-parametrization. Extends
+    # elastic_smooth_path by adding an EXPLICIT REPULSIVE collision cost — a
+    # hinge on min-signed-distance-to-obstacles that activates when a waypoint
+    # is within `trajopt_collision_threshold` m of any obstacle. Combined with
+    # Laplacian smoothness this pushes waypoints AWAY from obstacles (not just
+    # refusing to step INTO them), giving paths with genuinely wider clearance
+    # that trace the SAME homotopy class more consistently across small
+    # obstacle-position variations. Beneficial for imitation learning: reduces
+    # "boundary flip-flop" data noise where nearly-identical scenarios pick
+    # opposite sides of an obstacle purely due to RRT randomness.
+    # Cost: ~1.5-2.5 s per trajectory at passes=15 on a 3-DoF arm.
+    # Default 15 passes — most of the clearance-widening benefit at half the
+    # cost of the fully-converged 30 (the GUI Traj Gen panel initializes its
+    # "Trajopt Passes" slider from this value). Set to 0 to disable.
+    # NOTE: envs with large concave collision meshes should override to 0 —
+    # the FD min-distance gradient is minutes-to-hours per trajectory
+    # against e.g. the vine's 40k-tri mesh (the vine env does this). It
+    # dominates planning time by a wide margin: one distance query is ~10 ms
+    # vs ~0.4 ms for a binary collision check, and the gradient needs
+    # 2*DOF of them per waypoint per pass.
+    trajopt_passes: int = 15
+    trajopt_lr: float = 0.02
+    trajopt_smoothness_weight: float = 1.0
+    trajopt_collision_weight: float = 5.0
+    # Distance below which the soft cost activates (meters). Roughly ½ the
+    # link diameter is a good starting value; smaller = tighter paths that
+    # hug obstacles, larger = wider berth (may be blocked in dense scenes).
+    trajopt_collision_threshold: float = 0.10
+    trajopt_fd_step: float = 0.01
+    # How a loaded soft-cost field (EnvConfig.soft_cost — pushable vegetation
+    # in vine-style envs) is used by the planner. Values are
+    # SoftCostMode: "off" = ignore field; "score" = candidates generated
+    # cost-blind, field only ranks them; "guided" = cost-aware GENERATION —
+    # T-RRT transition test on tree growth + cost-gated
+    # shortcut/elastic/trajopt smoothing, so paths actively route around the
+    # field instead of merely being ranked by it.
+    # Default OFF: envs without a soft_cost payload (small_engine,
+    # planar_3joint, ...) are cost-blind by construction, not just by
+    # accident of the field being absent. Envs WITH a field opt in via their
+    # trajectory-gen config override (the vine env defaults to "guided").
+    soft_cost_mode: str = SoftCostMode.OFF.value
+    # Scale of the soft-cost term added to the candidate score in
+    # score/guided modes (fields are normalized to max=1, so this is
+    # commensurate with arc-length scores).
+    #
+    # Calibration note (vine bench, 2026-08-01): the base term is joint arc
+    # length, which runs 6-15 rad on this scene, while a path's soft-cost
+    # integral runs 0.003-0.015. At weight 5 the soft term moved the score by
+    # ~1%, so the scorer just picked the SHORTEST path — which was also the
+    # dirtiest of 7 candidates. The weight has to be in the hundreds before
+    # foliage exposure actually outranks path length. Envs with a field
+    # should set this explicitly (the vine env does).
+    soft_cost_weight: float = 1.0
+    # Number of ring points sampled around the arm's centerline at each
+    # sample point, at the local link radius, when evaluating the soft-cost
+    # field. The field's influence_radius (3 cm on the vine scene) is much
+    # smaller than UR5 link radii (4.4-7.0 cm), so centerline-only sampling
+    # is blind to foliage brushing the link SURFACE. 0 = centerline only
+    # (historical). See RRTToGoalPlanner._config_soft_cost_points.
+    soft_cost_surface_samples: int = 6
+    # How per-sample-point field costs reduce to one number per configuration:
+    # "max" (worst-brushing point on the arm) or "mean" (historical, dilutes
+    # a real brush by ~1/N over the arm's sample points).
+    soft_cost_aggregation: str = "max"
+    # Scale applied to `obstacle_clearance` for the TIME-PARAMETRIZED trajectory
     # collision check (raw RRT/densify checks always use the full clearance).
-    # The planner's own default is 0.5 ("RRT-clean at 2 cm, ruckig-clean at
-    # 1 cm") to tolerate ruckig's cornering bulge past the linear chord — but
+    # The planner's own default is 0.5 ("RRT-clean at 2 cm, parametrizer-clean at
+    # 1 cm") to tolerate the parametrizer's cornering bulge past the linear chord — but
     # that let the wrist camera pass visibly close to obstacles in generated
     # demos. 0.9 keeps the smoothed check nearly as strict as planning
     # (0.02 → 1.8 cm) at the cost of more rejects at sharp corners.
-    ruckig_obstacle_clearance_factor: float = 0.9
-    # Final-approach taper (see ruckig_parametrize_path): the trajectory
+    obstacle_clearance_factor: float = 0.9
+    # Final-approach taper (see parametrize_path): the trajectory
     # brakes to a stop this many rad (joint-space L2) before the goal, then
     # creeps the remainder at final_approach_{vel,acc}_scale × the normal
     # limits. Rationale: the time-optimal profile brakes at max deceleration
@@ -134,13 +217,15 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     final_approach_vel_scale: float = 0.5
     final_approach_acc_scale: float = 0.25
     # When True, equalize joint-space PATH SPEED across trajectory sections (see
-    # ruckig_parametrize_path / rrt_path_utils). Per-joint box velocity limits
+    # parametrize_path / rrt_path_utils). Per-joint box velocity limits
     # are direction-anisotropic, so the time-optimal profile SPRINTS through
     # multi-joint sections and BRAKES for single-joint ones — surging the PD
     # controller tracks as overshoot / ringing. Capping each section's L2 path
     # speed to a uniform value removes that surge. Complements final_approach_*
-    # (which only tapers the very last leg). False = time-optimal (historical).
-    uniform_path_speed: bool = False
+    # (which only tapers the very last leg). Default True since the vine-env
+    # wobble diagnosis (2026-07-28): the surging read as oscillatory wobble in
+    # recorded demos. False = time-optimal (historical, faster but surgy).
+    uniform_path_speed: bool = True
     # Pad the END of each generated trajectory by holding the last joint config
     # frozen for ~1 second (robot_update_rate frames). Historically always on;
     # now default OFF. Useful when a downstream consumer expects the arm to
@@ -192,9 +277,9 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     #     `path_selection` (e.g. camera_scoring) pick the winner across them
     #     (historical multi-candidate behavior).
     ik_goal_selection: str = IkGoalSelectionStrategy.JOINT_DISTANCE.value
-    # Ruckig segmentation. True: split the trajectory at sharp (>45°) corners
+    # Corner segmentation. True: split the trajectory at sharp (>45°) corners
     # with a forced zero-velocity STOP at each — safer but produces bursty
-    # "start-stop" motion. False (default for trajectory-gen): a single ruckig
+    # "start-stop" motion. False (default for trajectory-gen): a single
     # pass with intermediate positions → continuous motion through corners.
     # Forwarded to RRTToGoalPlanner(segment_at_sharp_corners=).
     segment_at_sharp_corners: bool = False
