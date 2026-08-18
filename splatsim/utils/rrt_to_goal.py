@@ -2083,13 +2083,27 @@ class RRTToGoalPlanner:
             # the pre-optimization pair on failure — never worse than not
             # having run them, and never a wasted rejection.
             if self._postprocess_after_ranking:
+                # Moving handoffs: the straightened prefix (braking lead-in /
+                # curved redirect, up to ~1.1 rad of arc) may legitimately
+                # sit at contact-level clearance — exempt that zone from the
+                # full-planning-clearance re-gates or they veto the very
+                # geometry straightening placed (see
+                # _densify_and_check_collision's rationale).
+                _hz_arc = (
+                    1.2
+                    if (start_vel is not None
+                        and float(np.linalg.norm(np.asarray(start_vel, dtype=np.float64))) > 1e-6)
+                    else 0.0
+                )
                 _opt_path = self._postprocess_path(path, start_vel=start_vel)
                 if _opt_path is not path:
                     _opt_traj = None
-                    _, _opt_coll = self._densify_and_check_collision(_opt_path)
+                    _, _opt_coll = self._densify_and_check_collision(
+                        _opt_path, start_contact_arc=_hz_arc
+                    )
                     if _opt_coll is None:
                         _opt_traj, _opt_coll = self._smooth_and_check_collision(
-                            _opt_path, start_vel,
+                            _opt_path, start_vel, start_contact_arc=_hz_arc,
                         )
                     if _opt_coll is None and _opt_traj is not None:
                         path, traj = _opt_path, _opt_traj
@@ -2104,14 +2118,28 @@ class RRTToGoalPlanner:
                             path, start_vel=start_vel, straighten_only=True
                         )
                         if _st_path is not path:
-                            _, _st_coll = self._densify_and_check_collision(_st_path)
+                            _, _st_coll = self._densify_and_check_collision(
+                                _st_path, start_contact_arc=_hz_arc
+                            )
                             _st_traj = None
                             if _st_coll is None:
                                 _st_traj, _st_coll = self._smooth_and_check_collision(
-                                    _st_path, start_vel,
+                                    _st_path, start_vel, start_contact_arc=_hz_arc,
                                 )
                             if _st_coll is None and _st_traj is not None:
                                 path, traj = _st_path, _st_traj
+                            else:
+                                # This USED to happen silently — the executed
+                                # chunk was the raw candidate's trajectory,
+                                # without the redirect/lead-in, launching at
+                                # the raw geometry's (often tiny) tangential
+                                # carry (ep0 T=329: 0.085 of 0.5 rad/s).
+                                logger.warning(
+                                    "straighten-only fallback ALSO rejected "
+                                    "(collision at %s) — executing the RAW "
+                                    "candidate; handoff carry may be degraded.",
+                                    _st_coll,
+                                )
 
             # `traj` is already populated from the per-IK loop above
             # (_smooth_and_check_collision was called there per path
@@ -2320,6 +2348,7 @@ class RRTToGoalPlanner:
     def _densify_and_check_collision(
         self,
         rrt_waypoints: np.ndarray,
+        start_contact_arc: float = 0.0,
     ) -> tuple[np.ndarray, int | None]:
         """Cheap per-candidate collision validation WITHOUT time parametrization. Linearly
         densifies the raw BiRRT path (so collision checks don't tunnel between
@@ -2347,7 +2376,31 @@ class RRTToGoalPlanner:
         total_joint_travel = float(np.sum(np.abs(np.diff(rrt_waypoints, axis=0))))
         n_points = int(np.clip(total_joint_travel / 0.02, rrt_waypoints.shape[0], 2000))
         dense = np.asarray(resample_path_by_distance(rrt_waypoints, n_points), dtype=np.float64)
+        # start_contact_arc > 0 (moving handoffs): configs within that much
+        # joint arc of the start are checked at CONTACT level (2 mm) instead
+        # of the planning clearance. The straightened handoff prefix
+        # (braking lead-in / curved redirect) is DELIBERATELY allowed to
+        # consume clearance margin — the braking/redirect sweep happens
+        # physically whether or not we plan it — and re-gating it at full
+        # planning clearance here silently vetoed the very geometry
+        # straightening just placed (the chunk then executed WITHOUT the
+        # redirect, launching at the raw path's tangential; ep0 T=329,
+        # 2026-08-18). Beyond the zone the full planning clearance applies
+        # unchanged.
+        _contact_kw = None
+        if start_contact_arc > 0.0:
+            _contact_kw = dict(self._collision_kwargs)
+            _contact_kw["obstacle_clearance"] = 0.002
+            _contact_kw["self_collision_clearance"] = 0.0
+        _cum = np.concatenate(
+            [[0.0], np.cumsum(np.linalg.norm(np.diff(dense, axis=0), axis=1))]
+        )
         for k in range(dense.shape[0]):
+            _kw = (
+                _contact_kw
+                if (_contact_kw is not None and _cum[k] < start_contact_arc)
+                else self._collision_kwargs
+            )
             if check_links_in_collision(
                 self._robot_id,
                 self._joint_indices,
@@ -2358,7 +2411,7 @@ class RRTToGoalPlanner:
                 verbose=False,
                 physics_client_id=self._pb_client,
                 link_indices_to_check=self._planner_link_indices_to_check,
-                **self._collision_kwargs,
+                **_kw,
             ):
                 return rrt_waypoints, k
         return rrt_waypoints, None
@@ -2535,7 +2588,13 @@ class RRTToGoalPlanner:
                 _sv = None
 
         def _bridge_free(a: np.ndarray, b: np.ndarray) -> bool:
-            n = max(1, int(np.ceil(np.max(np.abs(b - a)) / 0.05)))
+            # 0.02 rad steps — MUST match _densify_and_check_collision's
+            # resolution: geometry accepted here is re-gated there, and a
+            # coarser acceptance (the old 0.05) let near-clearance bridges/
+            # arcs pass straightening only to be silently vetoed by the
+            # finer downstream gate (executed chunk then lost the redirect;
+            # ep0 T=329, 2026-08-18).
+            n = max(1, int(np.ceil(np.max(np.abs(b - a)) / 0.02)))
             return not any(collision_fn(a + (b - a) * (k / n)) for k in range(1, n + 1))
 
         def _cut_index(pts: np.ndarray) -> int:
@@ -3079,6 +3138,7 @@ class RRTToGoalPlanner:
         self,
         rrt_waypoints: np.ndarray,
         start_vel: np.ndarray | None,
+        start_contact_arc: float = 0.0,
     ) -> tuple[np.ndarray, int | None]:
         """Time-parametrize a raw RRT path (TOPP-RA by default; see
         rrt_path_utils.parametrize_path) and dense-check the smoothed
@@ -3151,8 +3211,25 @@ class RRTToGoalPlanner:
         # factor 0.5 (RRT ≥2 cm ⇒ parametrized ≥1 cm) — still catches real
         # penetration.
         _kwargs = self._smoothed_collision_kwargs()
+        # Same start-zone contact exemption as _densify_and_check_collision
+        # (see rationale there): the handoff prefix may legitimately sit at
+        # contact-level clearance.
+        _contact_kw = None
+        _cum_t = None
+        if start_contact_arc > 0.0:
+            _contact_kw = dict(_kwargs)
+            _contact_kw["obstacle_clearance"] = 0.002
+            _contact_kw["self_collision_clearance"] = 0.0
+            _cum_t = np.concatenate(
+                [[0.0], np.cumsum(np.linalg.norm(np.diff(traj, axis=0), axis=1))]
+            )
         _dbg_wp0 = os.environ.get("SPLATSIM_RRT_DEBUG_WP0")
         for k in range(traj.shape[0]):
+            _kw_k = (
+                _contact_kw
+                if (_contact_kw is not None and _cum_t[k] < start_contact_arc)
+                else _kwargs
+            )
             if check_links_in_collision(
                 self._robot_id,
                 self._joint_indices,
@@ -3163,7 +3240,7 @@ class RRTToGoalPlanner:
                 verbose=False,
                 physics_client_id=self._pb_client,
                 link_indices_to_check=self._planner_link_indices_to_check,
-                **_kwargs,
+                **_kw_k,
             ):
                 # Waypoint 0 == q_start (the just-escaped, supposedly-safe frame).
                 # Its collision here contradicts the escape's own safety check, so

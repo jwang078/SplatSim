@@ -294,6 +294,7 @@ def section_b_planner():
           pl.is_brake_feasible(q0, np.zeros(3)))
     check("C2 toward obstacle infeasible", not pl.is_brake_feasible(q0, v_toward))
 
+
     # C3: `is_handoff_runway_free` is the planning-clearance sibling of
     # `is_brake_feasible` (same spur, 0.02 vs 0.01 clearance) — the shield
     # micro-rewind prefers runway-free states so handoffs launch with real
@@ -327,6 +328,55 @@ def section_b_planner():
     check("C3 runway check stricter than brake check (clearance band exists)",
           band is not None and far_ok,
           f"band at offset {band}, far state {states[-1]}")
+
+    # B7: start-zone contact exemption in the plan-level re-gate. The
+    # straightened handoff prefix (lead-in / redirect) may legitimately sit
+    # at contact-level clearance; re-gating it at full planning clearance
+    # silently vetoed it and the chunk executed WITHOUT the redirect (ep0
+    # T=329, 2026-08-18). Scan a lateral obstacle toward a straight path's
+    # PREFIX to find the band where planning clearance fails but contact
+    # level passes; the gate must fail without the exemption and pass with
+    # it. A violation placed BEYOND the zone must still fail either way.
+    # Mirror production clearances (the bare test planner has none — the
+    # exemption is only meaningful when planning clearance > contact).
+    pl._collision_kwargs["obstacle_clearance"] = 0.02
+    d7 = np.array([0.4, -0.1, 0.2]); d7 /= np.linalg.norm(d7)
+    path7 = np.array([q0 + d7 * (0.12 * k) for k in range(15)])  # ~1.68 rad (> the 1.2 zone)
+    def _ee_mid(frac):
+        return _ee_at(q0 + d7 * (1.68 * frac))
+    w7 = np.array([0.0, 1.0, 0.0])
+    band_off = None
+    for off in np.arange(0.02, 0.12, 0.002):
+        sp7 = client.createMultiBody(
+            0, client.createCollisionShape(pb.GEOM_SPHERE, radius=0.02),
+            basePosition=(_ee_mid(0.1) + w7 * off).tolist(),
+        )
+        pl._loaded_obstacle_ids.append(sp7)
+        pl._obstacle_names[sp7] = "b7_sphere"
+        _, strict_coll = pl._densify_and_check_collision(path7)
+        _, zone_coll = pl._densify_and_check_collision(path7, start_contact_arc=1.2)
+        pl._loaded_obstacle_ids.remove(sp7)
+        del pl._obstacle_names[sp7]
+        client.removeBody(sp7)
+        if strict_coll is not None and zone_coll is None:
+            band_off = float(off)
+            break
+    check("B7 start-zone contact exemption admits prefix-margin geometry",
+          band_off is not None, f"band at offset {band_off}")
+    if band_off is not None:
+        sp7b = client.createMultiBody(
+            0, client.createCollisionShape(pb.GEOM_SPHERE, radius=0.02),
+            basePosition=(_ee_mid(0.9) + w7 * band_off).tolist(),
+        )
+        pl._loaded_obstacle_ids.append(sp7b)
+        pl._obstacle_names[sp7b] = "b7_sphere_far"
+        _, far_coll = pl._densify_and_check_collision(path7, start_contact_arc=1.2)
+        pl._loaded_obstacle_ids.remove(sp7b)
+        del pl._obstacle_names[sp7b]
+        client.removeBody(sp7b)
+        check("B7b beyond-zone violations still gated",
+              far_coll is not None, f"coll idx {far_coll}")
+    pl._collision_kwargs.pop("obstacle_clearance", None)
 
 
 def section_d_ctor_drift():
