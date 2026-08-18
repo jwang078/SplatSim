@@ -118,7 +118,8 @@ def section_a_parametrizer():
         sp = np.linalg.norm(np.diff(tr, axis=0), axis=1) * FPS
         d1 = tr[1] - tr[0]
         al = float(np.dot(d1 / max(np.linalg.norm(d1), 1e-12), vhat))
-        vmax = float(lims[0].max())
+        # Legal L2 ceiling under uniform_path_speed = per-joint cap * sqrt(dof)
+        vmax = float(lims[0].max()) * float(np.sqrt(dof))
         over = sp > vmax * 1.001
         shed_tick = int(np.argmin(over)) if not over.all() else len(sp)
         mono = bool(np.all(np.diff(sp[: shed_tick + 1]) <= 1e-6)) if shed_tick > 0 else True
@@ -131,10 +132,10 @@ def section_a_parametrizer():
             f"ticks mono={mono} post-shed max {sp[shed_tick:].max():.2f}",
         )
 
-    run_overspeed(d0u, 1.00, "overspeed aligned 2.0x vmax")
-    run_overspeed(d0u, 0.70, "overspeed aligned 1.4x vmax")
-    run_overspeed(-d0u, 0.80, "overspeed reversal brake-out 1.6x vmax",
-                  cusp_lead=d_lead(0.80))
+    run_overspeed(d0u, 1.30, "overspeed aligned 1.5x L2 ceiling")
+    run_overspeed(d0u, 1.00, "overspeed aligned 1.15x L2 ceiling")
+    run_overspeed(-d0u, 1.00, "overspeed reversal brake-out 1.15x ceiling",
+                  cusp_lead=d_lead(1.00))
 
 
 def section_b_planner():
@@ -192,6 +193,21 @@ def section_b_planner():
     # B4: end-to-end no-stop — the redirect's parametrized profile must
     # CARRY speed through the turn (dip allowed at the curvature ceiling,
     # never a stop), at 30 and 90 deg of joint-space misalignment.
+    # B5: contact-clearance second pass — when the planning-clearance sweep
+    # is fully blocked (shield handoffs fire NEAR obstacles by construction)
+    # but contact level is free, the arc must still be placed instead of
+    # falling back to the straight lead-in's cusp (the post-fix 2026-08-17
+    # run still logged 26 lead-in fallbacks vs 24 placed arcs).
+    mock_full5 = lambda q: True      # planning clearance: everything collides
+    mock_contact5 = lambda q: False  # contact clearance: free
+    out5 = pl._straighten_terminal(
+        path.copy(), mock_full5, start_vel=vh * 0.4, contact_fn=mock_contact5
+    )
+    first5 = (out5[1] - out5[0]) / max(np.linalg.norm(out5[1] - out5[0]), 1e-12)
+    check("B5 arc placed via contact-clearance pass",
+          len(out5) > len(path) and float(np.dot(first5, vh)) > 0.97 and _no_cusp(out5),
+          f"vertices {len(path)}->{len(out5)} cusp-free={_no_cusp(out5)}")
+
     # Speed floor scales with turn depth (mirrors _curved_redirect's
     # depth-scaled carry floor): mild turns barely dent cruise; a hairpin
     # legitimately slows hard through the apex — but NEVER stops.

@@ -1666,7 +1666,11 @@ def _prepare_section_limits(
             seg_norm = float(np.linalg.norm(d))
             if seg_norm > 1e-12:
                 dir_abs = np.abs(d) / seg_norm
-                v_path = float(np.min(sec_cap))
+                # sqrt(dof) target: see the toppra-native block's rationale —
+                # the equalized L2 speed is the box limits' diagonal maximum,
+                # not the single-joint cap (which pinned every trajectory to
+                # a degenerate exactly-v_max speed distribution).
+                v_path = float(np.min(sec_cap)) * float(np.sqrt(waypoints.shape[1]))
                 sec_cap = np.minimum(sec_cap, v_path * np.maximum(dir_abs, 0.1))
             uniformed.append(sec_cap.tolist())
         per_section_vel = uniformed
@@ -2394,11 +2398,26 @@ def toppra_parametrize_path(
     per_section_path_speed = None
     if uniform_path_speed and waypoints.shape[0] >= 2:
         n_sections = waypoints.shape[0] - 1
+        # L2 target = per-joint cap * sqrt(dof) — the largest path speed the
+        # per-joint boxes can possibly allow (all joints at cap, fully
+        # diagonal motion). With the target at the bare per-joint cap, EVERY
+        # trajectory pinned to exactly that speed: the planar_3joint_11 base
+        # (500 eps) measured speed median = p90 = max = 0.500 — a degenerate
+        # distribution ~30% slower than the pre-uniform era (per-joint boxes
+        # only: median 0.537, p90 0.701, max 0.866 = 0.5*sqrt(3)), and the
+        # policy trained on it never sees legitimate speed variation. The
+        # sqrt(dof) target restores that era's speed range: the L2 bound
+        # only bites where the per-joint boxes would not already bind, and
+        # per-joint limits still cap axis-aligned motion at the joint cap.
+        _l2_scale = float(np.sqrt(waypoints.shape[1]))
         if per_section_vel is None:
-            per_section_path_speed = [float(np.min(max_joint_vel))] * n_sections
+            per_section_path_speed = [
+                float(np.min(max_joint_vel)) * _l2_scale
+            ] * n_sections
         else:
             per_section_path_speed = [
-                float(np.min(np.asarray(v, dtype=np.float64))) for v in per_section_vel
+                float(np.min(np.asarray(v, dtype=np.float64))) * _l2_scale
+                for v in per_section_vel
             ]
 
     def _tangential_speed(vel: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:

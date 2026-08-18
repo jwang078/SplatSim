@@ -154,8 +154,13 @@ def check_case(name, waypoints, kwargs, backend):
         fails.append(f"|a| {metrics['amax']:.3f} > {acc}")
     if metrics["jmax"] > jerk * JERK_TOL:
         fails.append(f"|j| {metrics['jmax']:.2f} > {jerk}")
-    if uniform and metrics["l2max"] > vel * VEL_TOL:
-        fails.append(f"L2 speed {metrics['l2max']:.3f} > path cap {vel} (uniform_path_speed)")
+    # uniform_path_speed equalizes L2 path speed at the box limits' diagonal
+    # maximum vel*sqrt(dof) (0.866 for 3 dof) — the bare per-joint cap as the
+    # L2 target pinned every trajectory to a degenerate exactly-v_max speed
+    # distribution (2026-08-18 planar_5-era comparison).
+    l2_cap = vel * float(np.sqrt(dof))
+    if uniform and metrics["l2max"] > l2_cap * VEL_TOL:
+        fails.append(f"L2 speed {metrics['l2max']:.3f} > path cap {l2_cap:.3f} (uniform_path_speed)")
 
     # endpoints + overshoot
     goal = waypoints[-1]

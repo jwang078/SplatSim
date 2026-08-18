@@ -71,6 +71,12 @@ class PlannerDefaults:
 
     # Equalize joint-space path speed across sections — removes the
     # direction-anisotropy surging of per-joint box velocity limits.
+    # The equalized L2 target is max_joint_vel * sqrt(num_dofs) (the box
+    # limits' diagonal maximum, 0.866 for 3 dof), NOT the bare per-joint
+    # cap: the latter pinned every trajectory to a degenerate exactly-v_max
+    # speed distribution ~30% slower than the pre-uniform era, and the
+    # 94%-success planar_5 lineage was trained on the faster, varied one
+    # (measured 2026-08-18). Per-joint caps still bind axis-aligned motion.
     uniform_path_speed: bool = True
 
     # Final-approach taper: brake over the last `dist` rad of joint-space arc
