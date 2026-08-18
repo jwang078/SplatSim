@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import itertools
 import logging
+import os
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,6 +29,8 @@ import numpy as np
 import pybullet as p
 
 from lerobot.policies.guidance.base import GuidanceMode
+
+from splatsim.utils.planner_defaults import PLANNER_DEFAULTS as _PD
 
 
 class PathSelectionStrategy(Enum):
@@ -123,6 +126,14 @@ class IkGoalSelectionStrategy(Enum):
     # `_ik_goal_selection is None` branch. Exposed as an enum member so config
     # dropdowns (SplatSim GUI) can offer it alongside JOINT_DISTANCE.
     NONE = "none"
+
+
+# Absolute slack (meters of EE arc) added to the ik_accept_arc_chord_ratio
+# early-exit gate: accept when arc <= ratio * chord + slack. Keeps the gate
+# usable for near-goal plans, where the chord is a few centimeters and a
+# bare ratio would reject every physically reasonable path (small detours
+# around the gripper's own geometry dwarf a tiny chord).
+_IK_ACCEPT_CHORD_SLACK_M = 0.05
 
 
 class SoftCostMode(Enum):
@@ -255,6 +266,44 @@ def _hash_config(cfg: dict) -> str:
 
 
 
+def planner_kwargs_from_traj_config(env_name: str) -> dict:
+    """LOWEST-priority planner kwargs from an env's trajectory-generation
+    config (configs/traj_configs/<env_name>.json).
+
+    Lets interventions inherit the same per-env tuning that demo generation
+    uses (camera scoring weights, camera shaping, ...) without duplicating
+    numbers: the caller merges these UNDER its own explicit kwargs
+    (`{**planner_kwargs_from_traj_config(name), **explicit}`), so anything
+    the intervention code or the user sets wins.
+
+    Keys that don't correspond to a planner ctor param are dropped, and
+    `plan_rng_seed` is EXCLUDED deliberately — per-(start,goal) deterministic
+    replans would make a shared-autonomy retry loop repeat the same failing
+    plan forever. Returns {} when the config file doesn't exist or can't be
+    read (non-SplatSim envs, real robots).
+    """
+    import inspect
+    import json as _json
+
+    try:
+        from splatsim.utils.paths import traj_config_path
+
+        cfg_file = traj_config_path(env_name)
+        with open(cfg_file) as f:
+            cfg = _json.load(f)
+    except Exception:
+        return {}
+    # Config keys and planner ctor params share names by convention (any
+    # divergence is a bug to fix at the source, not to translate here —
+    # a rename table lived here briefly and was removed on that principle).
+    exclude = {"plan_rng_seed"}
+    params = set(inspect.signature(RRTToGoalPlanner.__init__).parameters)
+    return {
+        k: v for k, v in cfg.items()
+        if k in params and k not in exclude and v is not None
+    }
+
+
 class RRTToGoalPlanner:
     """Plans a joint-space trajectory to a fixed goal using SplatSim's RRT.
 
@@ -274,37 +323,57 @@ class RRTToGoalPlanner:
         lower_limits: np.ndarray | None = None,
         upper_limits: np.ndarray | None = None,
         num_ik_candidates: int = 16,
-        max_joint_vel: float = 0.5,
-        max_joint_acc: float = 1.0,
-        max_joint_jerk: float = 10.0,
+        max_joint_vel: float = _PD.max_joint_vel,
+        max_joint_acc: float = _PD.max_joint_acc,
+        max_joint_jerk: float = _PD.max_joint_jerk,
         parametrize_per_candidate: bool = True,
         path_selection: PathSelectionStrategy = PathSelectionStrategy.EE_ARC_LENGTH,
+        path_score_joint_arc_weight: float = 0.0,
         velocity_match_window: int = 3,
-        segment_at_sharp_corners: bool = True,
+        segment_at_sharp_corners: bool = _PD.segment_at_sharp_corners,
         ik_goal_selection: IkGoalSelectionStrategy | str | None = None,
         num_path_candidates_per_ik: int = 1,
         max_path_attempts_per_ik: int = 5,
         path_perturbation_scale: float = 0.001,
-        rrt_smooth_iterations: int = 50,
-        elastic_smooth_passes: int = 0,
+        # Acceptance gate on the ik_goal_selection early exit. When set (and
+        # ik_goal_selection orders the candidates), the first IK's winning
+        # path is accepted immediately ONLY if its EE arc length is at most
+        # `ratio * chord + 0.05 m` (chord = straight-line EE distance from
+        # start to goal). A path failing the gate is kept as the running
+        # best-by-path-score but the loop continues to later IK candidates —
+        # so a giant loop-around (e.g. a mirrored-elbow IK branch reached
+        # because the direct branch failed planning) only wins when NO better
+        # branch exists, instead of via first-success-wins. None = legacy
+        # unconditional early exit.
+        ik_accept_arc_chord_ratio: float | None = None,
+        rrt_smooth_iterations: int = _PD.rrt_smooth_iterations,
+        # Corner-rounding relaxation on the winning path, AFTER trajopt and
+        # BEFORE time parametrization (rrt_path_utils.elastic_smooth_path).
+        # Default 30 since 2026-08-14 (was 0): trajopt's FD repulsion leaves
+        # waypoint-scale jitter — pathological when its RDP decimation falls
+        # back to raw dense output — and the parametrizer renders that as
+        # 5-8 Hz speed judder plus up to ~3x longer chunks. 30 passes matches
+        # TrajectoryGenModeConfig, whose trajopt->elastic ordering exists for
+        # exactly this reason. Runs once per plan (deferred postprocess).
+        elastic_smooth_passes: int = _PD.elastic_smooth_passes,
         # CHOMP-lite trajopt smoothing (soft collision + smoothness). 0 = off.
         # See trajopt_smooth_path in rrt_path_utils.py for cost formulation.
         # Default 15 matches both SharedAutonomyConfig and
         # TrajectoryGenModeConfig (which passes it through explicitly).
-        trajopt_passes: int = 15,
-        trajopt_lr: float = 0.02,
-        trajopt_smoothness_weight: float = 1.0,
-        trajopt_collision_weight: float = 5.0,
-        trajopt_collision_threshold: float = 0.10,
-        trajopt_fd_step: float = 0.01,
+        trajopt_passes: int = _PD.trajopt_passes,
+        trajopt_lr: float = _PD.trajopt_lr,
+        trajopt_smoothness_weight: float = _PD.trajopt_smoothness_weight,
+        trajopt_collision_weight: float = _PD.trajopt_collision_weight,
+        trajopt_collision_threshold: float = _PD.trajopt_collision_threshold,
+        trajopt_fd_step: float = _PD.trajopt_fd_step,
         # Run trajopt + elastic smoothing on the SELECTED candidate only,
         # instead of on every candidate before ranking. See
         # `_postprocess_path` for the cost/fidelity trade-off.
         postprocess_after_ranking: bool = True,
-        final_approach_dist: float = 0.0,
-        final_approach_vel_scale: float = 0.3,
-        final_approach_acc_scale: float = 0.25,
-        uniform_path_speed: bool = False,
+        final_approach_dist: float = _PD.final_approach_dist,
+        final_approach_vel_scale: float = _PD.final_approach_vel_scale,
+        final_approach_acc_scale: float = _PD.final_approach_acc_scale,
+        uniform_path_speed: bool = _PD.uniform_path_speed,
         freeze_visualizer_during_plan: bool = False,
         obstacle_clearance: float | None = None,
         self_collision_clearance: float | None = None,
@@ -318,6 +387,21 @@ class RRTToGoalPlanner:
         camera_k_exp: float = 5.0,
         camera_k_sig: float = 15.0,
         camera_threshold: float = 0.4,
+        # Hybrid selection terms (see _score_candidate / _score_ik_candidate).
+        # camera_score_weight ADDS weight * (negated goal-proximity-weighted
+        # camera alignment) to the base path score: sized right it does not
+        # bend geometry, but deterministically breaks the near-symmetric-route
+        # ties where pure arc length flips on RRT sampling noise (and prefers
+        # goal-facing approaches, which is what makes a wrist camera useful).
+        # ik_camera_weight does the same for the IK GOAL choice — different
+        # wrist branches put the camera facing toward vs away from the grasp.
+        # plan_rng_seed makes each plan() reproducible: the RNG is seeded from
+        # (seed, start, goal) for the duration of the call and restored after,
+        # so identical scenes replan identically without correlating the
+        # caller's scene randomization.
+        camera_score_weight: float = 0.0,
+        ik_camera_weight: float = 0.0,
+        plan_rng_seed: int | None = None,
         soft_cost_mode: str = "score",
         soft_cost_weight: float = 1.0,
         soft_cost_sample_spacing: float = 0.05,
@@ -375,6 +459,9 @@ class RRTToGoalPlanner:
         # makes `_path_camera_score` a no-op (returns 0), so the intervention
         # side never needs to supply camera params.
         self._wrist_camera_link_index = wrist_camera_link_index
+        self._camera_score_weight = float(camera_score_weight)
+        self._ik_camera_weight = float(ik_camera_weight)
+        self._plan_rng_seed = plan_rng_seed
         self._camera_k_exp = float(camera_k_exp)
         self._camera_k_sig = float(camera_k_sig)
         self._camera_threshold = float(camera_threshold)
@@ -450,6 +537,13 @@ class RRTToGoalPlanner:
             else np.pi * np.ones(num_dofs)
         )
         self._num_ik_candidates = num_ik_candidates
+        self._ik_accept_arc_chord_ratio = (
+            float(ik_accept_arc_chord_ratio) if ik_accept_arc_chord_ratio is not None else None
+        )
+        # Condensed record of the most recent successful plan() (IK candidate
+        # counts, chosen rank/scores, arc/chord, gate outcome). Read by
+        # callers (e.g. RRTGuidanceSource) for per-scenario diagnostics.
+        self.last_plan_diagnostics: dict | None = None
         self._max_joint_vel = max_joint_vel
         self._max_joint_acc = max_joint_acc
         self._max_joint_jerk = max_joint_jerk
@@ -463,6 +557,17 @@ class RRTToGoalPlanner:
         # ruckig fallback backend, doesn't hit its cloud API that often).
         self._parametrize_per_candidate = bool(parametrize_per_candidate)
         self._path_selection = path_selection
+        # Joint-arc regularizer added to EVERY path-selection strategy's base
+        # score (units: base-score-units per rad — m/rad for the arc-length
+        # strategies). 0 (default) = off. Motivation: EE_ARC_LENGTH is blind
+        # to joint-space distance, so near the goal — where a redundant DOF
+        # lets candidates differ by radians of joint travel while their EE
+        # arcs differ by millimeters — it picks slow, joint-churny winners
+        # (execution time under the parametrizer scales with JOINT arc, not
+        # EE arc). A small weight (~0.02-0.05 m/rad) acts as a near-tie
+        # breaker toward the fast-to-execute candidate without disturbing
+        # the EE-arc ordering elsewhere.
+        self._path_score_joint_arc_weight = float(path_score_joint_arc_weight)
         # MIN_PAIR_CLEARANCE diagnostic toggle (validated upstream by the
         # SA config's __post_init__). Controls the structural-offender
         # probe inside `_path_min_pair_clearance`. See the SA config for
@@ -690,6 +795,34 @@ class RRTToGoalPlanner:
                 "(auto-detected link indices: %s)",
                 self._gripper_finger_link_indices,
             )
+
+        # One line naming everything that shapes the returned trajectory, so a
+        # log is enough to tell which time-parametrization backend and which
+        # smoothing settings produced it. These are mostly defaults that no
+        # caller passes explicitly, which previously made them invisible: the
+        # jerk limit in particular is IGNORED by the toppra backend, and a log
+        # showing max_jerk=10 alongside backend=toppra makes that legible
+        # instead of surprising.
+        from splatsim.utils.rrt_path_utils import DEFAULT_TRAJ_BACKEND, TRAJ_BACKEND_ENV
+
+        _backend = os.environ.get(TRAJ_BACKEND_ENV, DEFAULT_TRAJ_BACKEND).strip().lower()
+        logger.info(
+            "RRTToGoalPlanner: backend=%s%s | limits vel=%.3g acc=%.3g jerk=%.3g @%gHz | "
+            "smoothing: shortcut=%d elastic=%d trajopt=%d (%s) | "
+            "candidates: ik=%d path=%d | clearance obs=%.4g self=%.4g | "
+            "taper=%.3g (v x%.2g a x%.2g) uniform_speed=%s segment_corners=%s",
+            _backend,
+            " (IGNORES max_joint_jerk)" if _backend == "toppra" else "",
+            self._max_joint_vel, self._max_joint_acc, self._max_joint_jerk, self._fps,
+            self._rrt_smooth_iterations, self._elastic_smooth_passes, self._trajopt_passes,
+            "after ranking" if self._postprocess_after_ranking else "per candidate",
+            self._num_ik_candidates, self._num_path_candidates_per_ik,
+            self._collision_kwargs.get("obstacle_clearance", -1),
+            self._collision_kwargs.get("self_collision_clearance", -1),
+            self._final_approach_dist, self._final_approach_vel_scale,
+            self._final_approach_acc_scale,
+            self._uniform_path_speed, self._segment_at_sharp_corners,
+        )
 
     def _discover_gripper_finger_link_indices(self) -> list[int]:
         """Enumerate URDF link indices whose name contains 'finger' or 'knuckle'.
@@ -1367,7 +1500,32 @@ class RRTToGoalPlanner:
     #  Planning                                                          #
     # ------------------------------------------------------------------ #
 
-    def plan(
+    def plan(self, q_start, target_ee_pos, target_ee_quat, *args, **kwargs):
+        """Thin RNG-scoping wrapper around `_plan_inner` (the real planner —
+        see its docstring). With `plan_rng_seed` set, the global numpy RNG is
+        seeded from (seed, start, goal) for the DURATION of this call and
+        restored afterward: identical scenes replan identically (RRT sampling,
+        shortcutting and perturbation all draw from np.random), while the
+        caller's stream — e.g. scene randomization between episodes — is
+        untouched. With plan_rng_seed=None this is a plain delegation."""
+        if self._plan_rng_seed is None:
+            return self._plan_inner(q_start, target_ee_pos, target_ee_quat, *args, **kwargs)
+        import zlib
+
+        key = np.concatenate([
+            np.asarray(q_start, dtype=np.float64).reshape(-1),
+            np.asarray(target_ee_pos, dtype=np.float64).reshape(-1),
+            np.asarray(target_ee_quat, dtype=np.float64).reshape(-1),
+        ]).round(6)
+        seed = zlib.crc32(key.tobytes()) ^ (self._plan_rng_seed & 0xFFFFFFFF)
+        state = np.random.get_state()
+        np.random.seed(seed & 0x7FFFFFFF)
+        try:
+            return self._plan_inner(q_start, target_ee_pos, target_ee_quat, *args, **kwargs)
+        finally:
+            np.random.set_state(state)
+
+    def _plan_inner(
         self,
         q_start: np.ndarray,
         target_ee_pos: np.ndarray,
@@ -1616,6 +1774,11 @@ class RRTToGoalPlanner:
             best_path_score = float("inf")
             chosen_ik_score: float | None = None
             traj: np.ndarray | None = None  # cached smoothed path of the winning IK
+            # Diagnostics for last_plan_diagnostics + the early-exit acceptance gate.
+            chosen_ik_rank = 0
+            chosen_ee_arc = float("nan")
+            chosen_chord = float("nan")
+            gate_result: str | None = None
             _loop_ordered = ordered  # alias kept so logging uses a stable name
             for tried, (orig_i, q_goal) in enumerate(ordered, start=1):
                 ik_score = (
@@ -1789,12 +1952,45 @@ class RRTToGoalPlanner:
                     traj = local_best_traj  # cache the smoothed path so we don't re-parametrize below
                     chosen_q_goal = q_goal
                     chosen_ik_score = ik_score
+                    chosen_ik_rank = tried
+                    # EE arc of the winning path + straight-line EE chord from
+                    # start to goal ([q_start, q_goal] FK'd as a 2-point path).
+                    # Used by the acceptance gate below and last_plan_diagnostics.
+                    chosen_ee_arc = self._path_ee_arc_length(np.asarray(local_best_path, dtype=np.float64))
+                    chosen_chord = self._path_ee_arc_length(
+                        np.asarray([q_start, q_goal], dtype=np.float64)
+                    )
                     if early_exit_on_first_ik:
-                        # IK-goal-selection contract: best IK with ANY successful
-                        # plan wins. Within that IK, path_selection picked the
-                        # best of its candidate paths above. Other IKs aren't
-                        # tried.
-                        break
+                        if self._ik_accept_arc_chord_ratio is None:
+                            # IK-goal-selection contract: best IK with ANY successful
+                            # plan wins. Within that IK, path_selection picked the
+                            # best of its candidate paths above. Other IKs aren't
+                            # tried.
+                            break
+                        # Acceptance gate: early-exit only when the path is a
+                        # reasonably direct route to the goal. Otherwise keep
+                        # this candidate as the running best-by-score and try
+                        # the remaining IK branches — a loop-around wins only
+                        # when nothing better exists.
+                        _gate_limit = (
+                            self._ik_accept_arc_chord_ratio * chosen_chord + _IK_ACCEPT_CHORD_SLACK_M
+                        )
+                        if chosen_ee_arc <= _gate_limit:
+                            gate_result = "pass"
+                            break
+                        gate_result = "reject"
+                        logger.info(
+                            "IK candidate %d/%d: path EE arc %.3f m exceeds acceptance "
+                            "gate %.3f m (%.1fx chord %.3f m + %.2f m slack) — keeping as "
+                            "fallback, trying remaining IK branches for a more direct path.",
+                            tried,
+                            len(_loop_ordered),
+                            chosen_ee_arc,
+                            _gate_limit,
+                            self._ik_accept_arc_chord_ratio,
+                            chosen_chord,
+                            _IK_ACCEPT_CHORD_SLACK_M,
+                        )
 
             if path is None or chosen_q_goal is None:
                 raise RRTPlanningError(f"RRT failed for all {len(_loop_ordered)} IK goal candidate(s)")
@@ -1837,6 +2033,25 @@ class RRTToGoalPlanner:
                     _disp_units,
                 )
 
+            # Condensed one-plan record for external diagnostics (e.g. the
+            # intervention controller's per-scenario CSV). `gate` is None when
+            # the acceptance gate is off / no IK ordering, else "pass"
+            # (early-exited on a direct-enough path) or "reject" (the winner
+            # never passed — it's the global best-by-score fallback).
+            self.last_plan_diagnostics = {
+                "n_ik": int(n_before_exclude),
+                "ik_dropped": int(n_before_exclude - len(candidates)),
+                "ik_rank": int(chosen_ik_rank),
+                "ik_tried": int(tried),
+                "ik_score": round(float(chosen_ik_score), 4) if chosen_ik_score is not None else None,
+                "path_score": round(float(best_path_score), 4),
+                "ee_arc": round(float(chosen_ee_arc), 4),
+                "chord": round(float(chosen_chord), 4),
+                "arc_chord": round(float(chosen_ee_arc) / max(float(chosen_chord), 1e-6), 2),
+                "gate": gate_result,
+                "escape": escape_path is not None,
+            }
+
             # Publish the chosen IK goal so callers (RRTGuidanceSource) can
             # track it across plan() calls without having to scrape the
             # trajectory's terminal pose. Set BEFORE parametrization so the value
@@ -1856,7 +2071,7 @@ class RRTToGoalPlanner:
             # the pre-optimization pair on failure — never worse than not
             # having run them, and never a wasted rejection.
             if self._postprocess_after_ranking:
-                _opt_path = self._postprocess_path(path)
+                _opt_path = self._postprocess_path(path, start_vel=start_vel)
                 if _opt_path is not path:
                     _opt_traj = None
                     _, _opt_coll = self._densify_and_check_collision(_opt_path)
@@ -1869,9 +2084,22 @@ class RRTToGoalPlanner:
                     else:
                         logger.info(
                             "trajopt/elastic output collides at waypoint %d — "
-                            "keeping the pre-optimization path.",
+                            "keeping the pre-optimization path (re-applying "
+                            "terminal straightening only).",
                             _opt_coll,
                         )
+                        _st_path = self._postprocess_path(
+                            path, start_vel=start_vel, straighten_only=True
+                        )
+                        if _st_path is not path:
+                            _, _st_coll = self._densify_and_check_collision(_st_path)
+                            _st_traj = None
+                            if _st_coll is None:
+                                _st_traj, _st_coll = self._smooth_and_check_collision(
+                                    _st_path, start_vel,
+                                )
+                            if _st_coll is None and _st_traj is not None:
+                                path, traj = _st_path, _st_traj
 
             # `traj` is already populated from the per-IK loop above
             # (_smooth_and_check_collision was called there per path
@@ -2123,7 +2351,349 @@ class RRTToGoalPlanner:
                 return rrt_waypoints, k
         return rrt_waypoints, None
 
-    def _postprocess_path(self, path: np.ndarray) -> np.ndarray:
+    def _straighten_terminal(
+        self,
+        path: np.ndarray,
+        collision_fn,
+        start_vel: np.ndarray | None = None,
+        contact_fn=None,
+    ) -> np.ndarray:
+        """Replace each end's last stretch with a straight chord when free.
+
+        `zone` = 2x the final-approach taper distance, so the straightened
+        stretch fully covers the region the taper slows. The bridge is checked
+        at the RRT resolution (0.05 rad steps); on collision the original
+        geometry is kept. Endpoints never move.
+        """
+        zone = 2.0 * float(self._final_approach_dist)
+        if zone <= 0 or path.shape[0] < 3:
+            return path
+        # Moving-handoff gate for the START-side rules ONLY (start fold rule,
+        # taut bridge, monotone trim). The GOAL-side treatments — goal fold
+        # trimming and the goal zone bridge — run unconditionally before the
+        # gate's early-return and are NEVER affected by start velocity.
+        # Threshold is float-noise level, not a physical speed: ANY genuinely
+        # carried velocity means the start geometry is braking physics, and
+        # the recorded data should show the robot slowing down (that
+        # slowing-down behavior is something the policy must learn).
+        _sv = None
+        if start_vel is not None:
+            _sv = np.asarray(start_vel, dtype=np.float64).reshape(-1)[: path.shape[1]]
+            if float(np.linalg.norm(_sv)) < 1e-6:
+                _sv = None
+
+        def _bridge_free(a: np.ndarray, b: np.ndarray) -> bool:
+            n = max(1, int(np.ceil(np.max(np.abs(b - a)) / 0.05)))
+            return not any(collision_fn(a + (b - a) * (k / n)) for k in range(1, n + 1))
+
+        def _cut_index(pts: np.ndarray) -> int:
+            """Last index whose remaining arc to the end exceeds `zone`."""
+            arc = 0.0
+            for i in range(pts.shape[0] - 2, -1, -1):
+                arc += float(np.linalg.norm(pts[i + 1] - pts[i]))
+                if arc > zone:
+                    return i
+            return 0
+
+        out = np.asarray(path, dtype=np.float64)
+
+        def _turn_deg(a, b, c) -> float:
+            d1, d2 = b - a, c - b
+            n1, n2 = np.linalg.norm(d1), np.linalg.norm(d2)
+            if n1 < 1e-9 or n2 < 1e-9:
+                return 0.0
+            return float(np.degrees(np.arccos(np.clip(np.dot(d1 / n1, d2 / n2), -1.0, 1.0))))
+
+        # Terminal FOLD trimming first — the case zone-bridging misses. The
+        # observed pathology (smoke batch 5, dumped waypoints): the path ends
+        # ... --1.24--> A --0.13--> B --0.037--> GOAL with a 142 deg turn at
+        # B: a micro-fold pinned against the fixed endpoint. Blending is
+        # chord-capped to ~nothing there, the taper's scaled accel drops the
+        # crossing speed to ~0.01-0.05 (the recorded pre-goal "stop"), and the
+        # zone bridge above/below spans the whole preceding 1.24 rad chord —
+        # too long, usually blocked. Deleting JUST the fold vertex needs only
+        # the short A->GOAL bridge. Iterate from each end while the last
+        # interior vertex turns sharply, sits close to the endpoint, and its
+        # bypass is collision-free.
+        def _trim_folds(pts: np.ndarray) -> np.ndarray:
+            changed = True
+            while changed and pts.shape[0] >= 3:
+                changed = False
+                goal_fold = (np.linalg.norm(pts[-1] - pts[-2]) < 0.2
+                             and _turn_deg(pts[-3], pts[-2], pts[-1]) > 60.0)
+                if goal_fold and not _bridge_free(pts[-3], pts[-1]):
+                    # Log the blocked case too: a fold whose bypass collides is
+                    # COLLISION-MANDATED (typically the goal object itself) —
+                    # the speed dip there is not removable by path smoothing,
+                    # and this line is how a log distinguishes that from a bug.
+                    logger.info("terminal straightening: goal-side fold bypass BLOCKED "
+                                "(turn %.0f deg, %.3f rad from goal) — dip is collision-mandated",
+                                _turn_deg(pts[-3], pts[-2], pts[-1]),
+                                float(np.linalg.norm(pts[-1] - pts[-2])))
+                if (goal_fold and _bridge_free(pts[-3], pts[-1])):
+                    logger.info("terminal straightening: trimmed goal-side fold vertex "
+                                "(turn %.0f deg, %.3f rad from goal)",
+                                _turn_deg(pts[-3], pts[-2], pts[-1]),
+                                float(np.linalg.norm(pts[-1] - pts[-2])))
+                    pts = np.vstack([pts[:-2], pts[-1]])
+                    changed = True
+                if (_sv is None
+                        and pts.shape[0] >= 3
+                        and np.linalg.norm(pts[1] - pts[0]) < 0.2
+                        and _turn_deg(pts[0], pts[1], pts[2]) > 60.0
+                        and _bridge_free(pts[0], pts[2])):
+                    logger.info("terminal straightening: trimmed start-side fold vertex")
+                    pts = np.vstack([pts[0][None], pts[2:]])
+                    changed = True
+            return pts
+
+        out = _trim_folds(out)
+        # goal side
+        i = _cut_index(out)
+        if i < out.shape[0] - 2:
+            if _bridge_free(out[i], out[-1]):
+                logger.info("terminal straightening: goal-side bridged (%d waypoints removed)",
+                            out.shape[0] - i - 2)
+                out = np.vstack([out[: i + 1], out[-1]])
+            else:
+                logger.info("terminal straightening: goal-side bridge BLOCKED — keeping curved approach")
+        # Moving handoff (shared autonomy): the start-side treatments below
+        # are FOR from-rest starts — they delete initial motion that doesn't
+        # head toward the goal, which is exactly what a startup oscillation
+        # is at rest, and exactly what PHYSICS requires when the robot is
+        # handed over MOVING (it must brake along its current velocity
+        # before it can turn). With a significant start velocity: skip the
+        # trims, and when the path's first segment disagrees with the
+        # velocity direction, PREPEND a collision-checked braking lead-in
+        # along v-hat (arc = the braking distance v^2/2a), so the plan
+        # genuinely continues the robot's motion, decelerates through the
+        # cusp, and then heads the correct way — instead of the tangential
+        # handoff clamping to zero and yanking the robot at the seam.
+        if _sv is not None:
+            nv = float(np.linalg.norm(_sv))
+            vhat = _sv / nv
+            # VELOCITY-AWARE taut bridge: still remove start-side slack —
+            # skipping slack removal entirely let a shield replan execute a
+            # 2.05x arc/chord loop (the raw RRT slack a taut bridge would
+            # have cut) — but only accept bridges whose direction CONTINUES
+            # the current motion (dot > 0.5), so the straightened start
+            # never creates a velocity redirect.
+            if out.shape[0] >= 3:
+                seg_arcs = np.linalg.norm(np.diff(out, axis=0), axis=1)
+                cum = np.concatenate([[0.0], np.cumsum(seg_arcs)])
+                half_idx = int(np.searchsorted(cum, 0.5 * cum[-1]))
+                for j in range(min(half_idx, out.shape[0] - 2), 1, -1):
+                    dj = out[j] - out[0]
+                    ndj = float(np.linalg.norm(dj))
+                    if ndj > 1e-9 and float(np.dot(vhat, dj / ndj)) > 0.5 and _bridge_free(out[0], out[j]):
+                        logger.info(
+                            "terminal straightening: velocity-aware start taut bridge "
+                            "to vertex %d/%d (%.3f rad of slack removed, motion-aligned)",
+                            j, out.shape[0] - 1,
+                            float(cum[j] - ndj))
+                        out = np.vstack([out[:1], out[j:]])
+                        break
+            d0 = out[1] - out[0]
+            n0 = float(np.linalg.norm(d0))
+            # 0.95, not 0.7: an aligned-looking first CHORD can still curve
+            # hard immediately after the start, choking toppra's controllable
+            # window (measured: aligned handoff carried 0.04 of 0.49 with no
+            # lead-in). A near-collinear lead-in is a harmless straight run,
+            # so place one unless alignment is essentially exact.
+            if n0 > 1e-9 and float(np.dot(vhat, d0 / n0)) < 0.95:
+                acc = float(np.max(np.atleast_1d(self._max_joint_acc)))
+                jerk = float(np.min(np.atleast_1d(self._max_joint_jerk)))
+                # Jerk-limited braking distance: v^2/2a for the constant-
+                # decel core PLUS ~v*a/j for the jerk ramps — the ramp term
+                # DOMINATES at low speeds (at v=0.15, a=1, j=10 it is as
+                # large as the core; sizing without it left ruckig unable to
+                # stop inside the lead-in, measured accel 1.5/jerk 34 from
+                # the resulting overshoot). 0.7 headroom on the core; capped;
+                # below 0.01 rad the cusp sits inside the corner-blend
+                # tolerance and the tangential handoff absorbs the braking
+                # without explicit geometry.
+                d_lead = min(
+                    nv * nv / (2.0 * 0.7 * max(acc, 1e-6))
+                    + nv * max(acc, 1e-6) / max(jerk, 1e-6),
+                    0.3,
+                )
+                for attempt in range(2 if d_lead >= 0.01 else 0):
+                    p_lead = out[0] + vhat * d_lead
+                    if (self._lower_limits is not None
+                            and not (np.all(p_lead >= self._lower_limits[: out.shape[1]])
+                                     and np.all(p_lead <= self._upper_limits[: out.shape[1]]))):
+                        d_lead *= 0.5
+                        continue
+                    if _bridge_free(out[0], p_lead) and _bridge_free(p_lead, out[1]):
+                        logger.info(
+                            "terminal straightening: prepended braking lead-in along "
+                            "start velocity (%.2f rad/s, %.3f rad excursion)", nv, d_lead)
+                        out = np.vstack([out[:1], p_lead[None], out[1:]])
+                        break
+                    d_lead *= 0.5
+                else:
+                    # Both full-clearance attempts collided. Fall back to the
+                    # LONGEST CONTACT-FREE runway along v-hat (binary search
+                    # at 2 mm contact clearance): the braking sweep happens
+                    # physically regardless, so plan it — the parametrizer's
+                    # brake-out escalates its decel limits to stop within
+                    # whatever runway exists, and the chunk starts at the
+                    # policy's true velocity instead of resting-start.
+                    placed = False
+                    if contact_fn is not None:
+                        def _contact_bridge_free(a2, b2):
+                            n2 = max(1, int(np.ceil(np.max(np.abs(b2 - a2)) / 0.02)))
+                            return not any(
+                                contact_fn(a2 + (b2 - a2) * (k2 / n2)) for k2 in range(1, n2 + 1)
+                            )
+                        d_full = min(
+                            nv * nv / (2.0 * 0.7 * max(acc, 1e-6))
+                            + nv * max(acc, 1e-6) / max(jerk, 1e-6),
+                            0.3,
+                        )
+                        lo_r, hi_r = 0.0, d_full
+                        for _ in range(6):
+                            mid = 0.5 * (lo_r + hi_r)
+                            pm = out[0] + vhat * mid
+                            ok_lim = (self._lower_limits is None
+                                      or (np.all(pm >= self._lower_limits[: out.shape[1]])
+                                          and np.all(pm <= self._upper_limits[: out.shape[1]])))
+                            if ok_lim and _contact_bridge_free(out[0], pm):
+                                lo_r = mid
+                            else:
+                                hi_r = mid
+                        if lo_r >= 0.01:
+                            p_lead = out[0] + vhat * lo_r
+                            if _contact_bridge_free(p_lead, out[1]):
+                                logger.info(
+                                    "terminal straightening: EMERGENCY braking lead-in at "
+                                    "contact clearance (%.2f rad/s over %.3f rad runway, "
+                                    "full braking needs %.3f)", nv, lo_r, d_full)
+                                out = np.vstack([out[:1], p_lead[None], out[1:]])
+                                placed = True
+                    if not placed:
+                        logger.info(
+                            "terminal straightening: braking lead-in BLOCKED even at "
+                            "contact clearance — keeping raw start geometry "
+                            "(handoff will brake in place)")
+            return out  # moving handoff: no start-side trims
+
+        # Start side: TAUT BRIDGE — from the start, bridge directly to the
+        # FURTHEST collision-free vertex, capped at half the path's arc.
+        # Stronger than the goal-side zone rule on purpose: random
+        # shortcutting rarely samples start-anchored pairs and trajopt's
+        # collision repulsion pushes the path sideways near the pinned start
+        # vertex, so generated episodes measurably launch PERPENDICULAR to
+        # the direction of travel (a visible "wrong way" curl, plus a slow
+        # start because the curvature ceiling correctly brakes for the
+        # curl). Bridging to the furthest free vertex makes the initial
+        # tangent point where the path is actually going; obstacle-mandated
+        # arcs are preserved exactly (their bridges collide).
+        if out.shape[0] >= 3:
+            seg_arcs = np.linalg.norm(np.diff(out, axis=0), axis=1)
+            cum = np.concatenate([[0.0], np.cumsum(seg_arcs)])
+            half_idx = int(np.searchsorted(cum, 0.5 * cum[-1]))
+            for j in range(min(half_idx, out.shape[0] - 2), 1, -1):
+                if _bridge_free(out[0], out[j]):
+                    if j > 1:
+                        logger.info(
+                            "terminal straightening: start-side taut bridge to vertex %d/%d "
+                            "(%.3f rad of curl removed)", j, out.shape[0] - 1,
+                            float(cum[j] - np.linalg.norm(out[j] - out[0])))
+                        out = np.vstack([out[:1], out[j:]])
+                    break
+
+        # Start-side MONOTONE-PROGRESS trim. The vertex rule above only sees
+        # sharp folds (>60 deg at one vertex); after trajopt/elastic round a
+        # start-side fold into a gentle multi-vertex curve, the robot still
+        # visibly backs away from the goal before turning around (measured
+        # in 6% of generated episodes, excursions to -0.33 rad). The robust
+        # signature is PROGRESS: projection onto the net start->goal
+        # direction going negative. Bridge from the start to the first
+        # vertex past the excursion when that shortcut is collision-free;
+        # a blocked bridge means the retreat is obstacle-mandated — keep it.
+        net = out[-1] - out[0]
+        net_norm = float(np.linalg.norm(net))
+        if net_norm > 1e-9 and out.shape[0] >= 3:
+            proj = (out - out[0]) @ (net / net_norm)
+            # First vertex from which progress never goes behind the start
+            # plane again (suffix-min) — cutting there removes the WHOLE
+            # excursion even when it spans many vertices or dips repeatedly
+            # (measured folds cover up to 7 of 12 vertices).
+            suffix_min = np.minimum.accumulate(proj[::-1])[::-1]
+            if proj[1:].min() < -5e-3:
+                j = int(np.argmax(suffix_min[1:] >= -5e-3)) + 1
+                if 1 < j < out.shape[0] - 1 and _bridge_free(out[0], out[j]):
+                    logger.info(
+                        "terminal straightening: start-side backward excursion "
+                        "bridged (%.3f rad deep, %d vertices removed)",
+                        float(-proj[1:].min()), j - 1)
+                    out = np.vstack([out[:1], out[j:]])
+                else:
+                    logger.info(
+                        "terminal straightening: start-side backward excursion "
+                        "bypass BLOCKED (%.3f rad) — retreat is obstacle-mandated",
+                        float(-proj[1:].min()))
+        return out
+
+    def is_brake_feasible(self, q: np.ndarray, v_vec: np.ndarray) -> bool:
+        """Can the robot, at config `q` moving with joint velocity `v_vec`
+        (rad/s), brake to rest along its velocity direction WITHIN NOMINAL
+        limits and the planner's configured clearances?
+
+        Used by the shared-autonomy shield's brake-feasible micro-rewind: in
+        simulation the trigger can rewind a few frames to the most recent
+        state where an ordinary (non-emergency) brake still fits, and plan
+        from there — recorded chunks then always start at the policy's true
+        velocity without escalated limits or contact-level clearances.
+        Checks the jerk-aware braking spur q -> q + v_hat * (v^2/1.4a + v*a/j)
+        for joint limits and collisions at 0.02 rad resolution.
+        """
+        from splatsim.utils.rrt_path_utils import check_links_in_collision
+
+        v = np.asarray(v_vec, dtype=np.float64).reshape(-1)[: self._num_dofs]
+        nv = float(np.linalg.norm(v))
+        qq = np.asarray(q, dtype=np.float64).reshape(-1)[: self._num_dofs]
+        if nv < 1e-6:
+            return True  # at rest — a from-rest plan is exactly right here
+        vhat = v / nv
+        acc = float(np.max(np.atleast_1d(self._max_joint_acc)))
+        jerk = float(np.min(np.atleast_1d(self._max_joint_jerk)))
+        d_full = min(nv * nv / (2.0 * 0.7 * max(acc, 1e-6))
+                     + nv * max(acc, 1e-6) / max(jerk, 1e-6), 0.3)
+        tgt = qq + vhat * d_full
+        if self._lower_limits is not None and not (
+            np.all(tgt >= self._lower_limits[: len(tgt)])
+            and np.all(tgt <= self._upper_limits[: len(tgt)])
+        ):
+            return False
+        # Braking spur checked at the EMERGENCY clearance (1 cm — the same
+        # standard the shield's replans use), not the full planning
+        # clearance: judging brake feasibility at 2 cm made the micro-rewind
+        # rewind further than physically necessary (user-observed: braking
+        # started well before the shield's own collision threshold).
+        kw = dict(self._collision_kwargs)
+        kw["obstacle_clearance"] = min(0.01, float(kw.get("obstacle_clearance") or 0.01))
+        n = max(1, int(np.ceil(d_full / 0.02)))
+        for k in range(0, n + 1):
+            qi = qq + vhat * (d_full * k / n)
+            if check_links_in_collision(
+                self._robot_id, self._joint_indices, qi,
+                self._loaded_obstacle_ids, obstacle_names=self._obstacle_names,
+                skip_pairs=self._skip_pairs, verbose=False,
+                physics_client_id=self._pb_client,
+                link_indices_to_check=self._planner_link_indices_to_check,
+                **kw,
+            ):
+                return False
+        return True
+
+    def _postprocess_path(
+        self,
+        path: np.ndarray,
+        start_vel: np.ndarray | None = None,
+        straighten_only: bool = False,
+    ) -> np.ndarray:
         """Run trajopt + elastic smoothing on ONE path, outside `get_path`.
 
         These two passes used to run inside `get_path`, i.e. on EVERY path
@@ -2188,10 +2758,47 @@ class RRTToGoalPlanner:
                 **self._collision_kwargs,
             )
 
+        def _contact_fn(q):
+            # CONTACT-level check (2 mm), not the planning clearance: used
+            # exclusively for the emergency braking lead-in. An intervention
+            # hands over a MOVING robot; its braking sweep happens whether or
+            # not we plan it (PD physics), and the planning clearance is
+            # margin — an emergency brake consuming margin is what margin is
+            # for. Checking the explicit brake geometry at contact level lets
+            # every plan start from the policy's true velocity instead of
+            # discarding it (a rest-start chunk is out-of-distribution for
+            # DAgger — the policy never sees such data at deployment).
+            kw = dict(self._collision_kwargs)
+            kw["obstacle_clearance"] = 0.002
+            kw["self_collision_clearance"] = 0.0
+            return check_links_in_collision(
+                self._robot_id,
+                self._joint_indices,
+                q,
+                self._loaded_obstacle_ids,
+                obstacle_names=self._obstacle_names,
+                skip_pairs=self._skip_pairs,
+                verbose=False,
+                physics_client_id=self._pb_client,
+                link_indices_to_check=self._planner_link_indices_to_check,
+                **kw,
+            )
+
         # "guided" soft-cost mode: same q -> cost lookup get_path would have
         # handed these passes, so the cost-gating behaves identically.
         _cost_fn = self._rrt_config_cost_fn()
         out = np.asarray(path, dtype=np.float64)
+        if straighten_only:
+            # Fallback mode for "trajopt/elastic output collides": re-apply
+            # ONLY the terminal straightening (goal bridges, start trims,
+            # moving-handoff lead-in). Its edits are individually collision-
+            # checked bridges, so unlike trajopt it cannot push the path
+            # into an obstacle — and losing it with the fallback measured a
+            # rewound 0.43 rad/s handoff launching at 0.05 because the
+            # braking lead-in vanished along with the optimization.
+            return self._straighten_terminal(
+                out, _collision_fn, start_vel=start_vel, contact_fn=_contact_fn
+            )
 
         if self._trajopt_passes:
             def _distance_fn(q):
@@ -2233,6 +2840,21 @@ class RRTToGoalPlanner:
                 dtype=np.float64,
             )
 
+        # Terminal straightening: bridge the last (and first) ~2x
+        # final_approach_dist of the path STRAIGHT to the endpoint when that
+        # chord is collision-free. Why: a corner inside the final-approach
+        # zone is the one place the parametrizer still near-stops — the taper
+        # scales acceleration down (x0.25), corner speed goes as
+        # sqrt(accel*radius), and blending cannot round a corner pinned
+        # against the fixed goal endpoint. Measured on a 20-episode batch:
+        # every remaining pre-goal dip (speeds 0.01-0.05) sat 22-28 frames
+        # before the end, at a turn inside the taper. A straight approach
+        # removes the corner outright, giving the monotone slow-down-into-goal
+        # profile a diffusion policy should imitate; blocked bridges (obstacle
+        # near the goal) keep the original geometry. The start side gets the
+        # same treatment for the symmetric launch-corner crawl.
+        out = self._straighten_terminal(out, _collision_fn, start_vel=start_vel, contact_fn=_contact_fn)
+
         # `min_distance_to_obstacles` goes through `set_robot_joint_positions`,
         # which forces the gripper OPEN and steps physics. Re-snap so the
         # collision gate below sees the env's actual gripper geometry — the
@@ -2263,6 +2885,7 @@ class RRTToGoalPlanner:
         Caller is responsible for joint-state restore (plan()'s finally).
         """
         from splatsim.utils.rrt_path_utils import (
+            TrajectoryParametrizationError,
             check_links_in_collision,
             parametrize_path,
         )
@@ -2280,30 +2903,42 @@ class RRTToGoalPlanner:
             _parametrize_kwargs["start_vel"] = np.asarray(start_vel, dtype=np.float64).reshape(-1)[
                 : self._num_dofs
             ]
-        traj = np.asarray(
-            parametrize_path(
-                rrt_waypoints,
-                max_vel,
-                max_acc,
-                max_jerk,
-                control_hz=self._fps,
-                segment_at_sharp_corners=self._segment_at_sharp_corners,
-                final_approach_dist=self._final_approach_dist,
-                final_approach_vel_scale=self._final_approach_vel_scale,
-                final_approach_acc_scale=self._final_approach_acc_scale,
-                uniform_path_speed=self._uniform_path_speed,
-                **_parametrize_kwargs,
-            ),
-            dtype=np.float64,
-        )
+        try:
+            traj = np.asarray(
+                parametrize_path(
+                    rrt_waypoints,
+                    max_vel,
+                    max_acc,
+                    max_jerk,
+                    control_hz=self._fps,
+                    segment_at_sharp_corners=self._segment_at_sharp_corners,
+                    final_approach_dist=self._final_approach_dist,
+                    final_approach_vel_scale=self._final_approach_vel_scale,
+                    final_approach_acc_scale=self._final_approach_acc_scale,
+                    uniform_path_speed=self._uniform_path_speed,
+                    **_parametrize_kwargs,
+                ),
+                dtype=np.float64,
+            )
+        except TrajectoryParametrizationError as e:
+            # Backend failed on THIS path (e.g. ruckig boundary-state solver
+            # error). Report it exactly like a colliding candidate — the
+            # per-candidate loops in plan() log it and move to the next path,
+            # and if every candidate fails the usual RRTPlanningError flow
+            # resamples the scenario. NOT caught: RuckigCloudUnavailableError,
+            # which is systemic and must keep propagating so generation stops.
+            logger.warning(
+                "time-parametrization failed for this candidate — rejecting "
+                "it like a collision: %s", e,
+            )
+            return rrt_waypoints, 0
         # Parametrizer-scaled clearance: the smoothed C² spline naturally curves
         # outside the linear chord at sharp corners, so a stricter-than-raw
         # obstacle_clearance would reject too many good candidates. Default
         # factor 0.5 (RRT ≥2 cm ⇒ parametrized ≥1 cm) — still catches real
         # penetration.
         _kwargs = self._smoothed_collision_kwargs()
-        import os as _os
-        _dbg_wp0 = _os.environ.get("SPLATSIM_RRT_DEBUG_WP0")
+        _dbg_wp0 = os.environ.get("SPLATSIM_RRT_DEBUG_WP0")
         for k in range(traj.shape[0]):
             if check_links_in_collision(
                 self._robot_id,
@@ -2410,6 +3045,21 @@ class RRTToGoalPlanner:
             base = self._path_camera_score(path)
         else:
             raise ValueError(f"Unknown PathSelectionStrategy: {strategy!r}")
+        if self._camera_score_weight > 0.0 and strategy != PathSelectionStrategy.CAMERA_SCORING:
+            cam = self._path_camera_score(path)  # negated alignment: lower = better-aimed
+            logger.debug(
+                "_score_candidate: base(%s)=%.4f + camera=%.4f (weight=%.3f)",
+                strategy, base, self._camera_score_weight * cam, self._camera_score_weight,
+            )
+            base = base + self._camera_score_weight * cam
+        if self._path_score_joint_arc_weight > 0.0 and strategy != PathSelectionStrategy.JOINT_ARC_LENGTH:
+            joint_arc = self._path_joint_arc_length(path)
+            logger.debug(
+                "_score_candidate: base(%s)=%.4f + joint_arc=%.4f (weight=%.3f)",
+                strategy, base, self._path_score_joint_arc_weight * joint_arc,
+                self._path_score_joint_arc_weight,
+            )
+            base = base + self._path_score_joint_arc_weight * joint_arc
         if not self._soft_cost_active():
             return base
         soft = self._path_soft_cost(path)
@@ -2599,8 +3249,8 @@ class RRTToGoalPlanner:
         )
         num_samples = min(len(path), 10)
         idxs = np.linspace(0, len(path) - 1, num_samples, dtype=int)
-        scores = []
-        for k in idxs:
+        scores, weights = [], []
+        for j, k in enumerate(idxs):
             cam_pos, cam_rot = self._get_camera_link_pose(path[k])
             cam_forward = cam_rot[:, 2]  # camera +Z local axis
             scores.append(
@@ -2613,7 +3263,16 @@ class RRTToGoalPlanner:
                     self._camera_threshold,
                 )
             )
-        return -float(np.mean(scores)) if scores else 0.0
+            # Goal-proximity weighting (0.3 -> 1.0 along the path): early in a
+            # trajectory, aiming at the goal is often kinematically awkward
+            # and behaviorally unimportant; on the final approach it is both
+            # natural and exactly where wrist-camera visibility matters for a
+            # policy consuming these demos.
+            frac = j / max(num_samples - 1, 1)
+            weights.append(0.3 + 0.7 * frac)
+        if not scores:
+            return 0.0
+        return -float(np.average(scores, weights=weights))
 
     def _score_ik_candidate(
         self,
@@ -2625,7 +3284,27 @@ class RRTToGoalPlanner:
         """
         strategy = self._ik_goal_selection
         if strategy == IkGoalSelectionStrategy.JOINT_DISTANCE:
-            return float(np.linalg.norm(np.asarray(q_candidate) - np.asarray(q_start)))
+            base = float(np.linalg.norm(np.asarray(q_candidate) - np.asarray(q_start)))
+            if self._ik_camera_weight > 0.0 and self._wrist_camera_link_index is not None:
+                # All IK candidates put the EE at the same world pose; what
+                # differs by wrist branch is where the CAMERA ends up looking.
+                # Reward branches whose camera faces the grasp point at the
+                # goal config — the frame a policy most needs to see.
+                from splatsim.utils.rrt_path_utils import compute_camera_alignment_score
+
+                q_arr = np.asarray(q_candidate, dtype=np.float64).reshape(-1)
+                for idx, qi in zip(self._joint_indices, q_arr):
+                    p.resetJointState(self._robot_id, idx, float(qi), physicsClientId=self._pb_client)
+                ee_pos = np.asarray(
+                    p.getLinkState(self._robot_id, self._ee_link_index,
+                                   computeForwardKinematics=True,
+                                   physicsClientId=self._pb_client)[0], dtype=np.float64)
+                cam_pos, cam_rot = self._get_camera_link_pose(q_arr)
+                align = compute_camera_alignment_score(
+                    cam_pos, cam_rot[:, 2], ee_pos,
+                    self._camera_k_exp, self._camera_k_sig, self._camera_threshold)
+                base = base - self._ik_camera_weight * float(align)
+            return base
         raise ValueError(f"Unknown IkGoalSelectionStrategy: {strategy!r}")
 
     def _generate_paths_for_ik(

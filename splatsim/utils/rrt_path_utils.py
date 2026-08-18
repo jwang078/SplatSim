@@ -22,6 +22,10 @@ try:
 except Exception:
     SCIPY_AVAILABLE = False
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def load_cuboids(cuboid_path):
     data = np.load(cuboid_path, allow_pickle=True)
@@ -1203,6 +1207,16 @@ class RuckigCloudUnavailableError(RuntimeError):
     PybulletRobotServerBase.serve)."""
 
 
+class TrajectoryParametrizationError(RuntimeError):
+    """A parametrization backend failed on THIS path (e.g. ruckig's step-1
+    solver throwing on a boundary state). Unlike RuckigCloudUnavailableError
+    the failure is input-specific, not systemic: the right response is to
+    discard the candidate path and try another, exactly as for a candidate
+    whose smoothed form collides (see RRTPlanner._smooth_and_check_collision).
+    Raised instead of the raw ruckig.RuckigError so callers can be selective
+    without importing ruckig."""
+
+
 def _rdp_joint_path(points: np.ndarray, epsilon: float) -> np.ndarray:
     """Ramer-Douglas-Peucker on an (N, DOF) joint path. Returns kept indices."""
     if len(points) < 3:
@@ -1973,6 +1987,160 @@ def _toppra_path_speed_constraint(vpath_func):
     return _PathSpeed()
 
 
+# Pre-blend decimation tolerance (rad, joint-space). See the call sites: on a
+# DENSE path (trajopt/elastic output, chords ~0.04 rad) corner blending is
+# chord-limited — its cut is capped at 45% of the adjacent chord — so even a
+# 30 deg corner gets a ~0.01 rad rounding radius and the parametrizer brakes
+# to ~sqrt(accel*0.01) ~= 0.1 rad/s at it. Measured on planar_3joint_10: 69%
+# of mid-trajectory stop-dips sat at corners GENTLER than 60 deg. Decimating
+# to the polyline shape first restores long chords, so blending can round
+# those corners enough to carry cruise speed through them.
+DEFAULT_PREBLEND_DECIMATE_EPS = 0.02
+
+
+def _decimate_for_blending(waypoints: np.ndarray, eps: float) -> np.ndarray:
+    """RDP-decimate so consecutive chords are long enough for corner blending.
+
+    Deviation from the original polyline is bounded by `eps`, which stacks
+    with the blend budget (0.05) to at most ~0.07 rad — still far below every
+    collision clearance, and the parametrized trajectory is re-checked against
+    collisions downstream regardless.
+    """
+    wp = np.asarray(waypoints, dtype=np.float64)
+    if wp.shape[0] < 3 or eps <= 0:
+        return wp
+    # NOTE: RDP's perpendicular-distance metric deletes collinear REVERSAL
+    # spurs (out-and-back along one line = zero deviation from the bypass
+    # chord). For mid-path spurs that is desirable — they are RRT noise and
+    # keeping them measured 1.2x durations. The one LOAD-BEARING reversal —
+    # a braking lead-in prepended for a moving handoff — never reaches this
+    # code: retimed_parametrize_path splits it off into a 1-D ruckig brake
+    # segment before preprocessing (see the brake-out split there).
+    return wp[_rdp_joint_path(wp, eps)]
+
+
+# Joint-space deviation budget (rad, L2) for rounding path corners before
+# time parametrization. See `_blend_corners`.
+DEFAULT_CORNER_BLEND_RAD = 0.05
+
+
+def _blend_corners(
+    waypoints: np.ndarray,
+    budget: float,
+    keep_sharp_deg: float | None = None,
+    passes: int = 2,
+) -> np.ndarray:
+    """Round path corners by chamfering, within a joint-space deviation budget.
+
+    Why: a trajectory pinned to the waypoint polyline CANNOT carry speed
+    through a sharp joint-space corner — any joint whose velocity reverses
+    there must pass through zero, so the parametrizer (correctly) brakes to
+    ~0 at the waypoint no matter what `segment_at_sharp_corners` says.
+    Measured on real planner output: corners at 0.000 rad/s with the flag
+    False. Carrying speed requires geometry that actually turns, i.e. a
+    bounded deviation from the polyline.
+
+    Each pass replaces every interior corner V with two points on its chords
+    at cut distance d, chosen so the chamfer's deviation from the original
+    polyline (d*sin(theta/2), theta = turn angle) never exceeds the per-pass
+    budget; repeated passes round the sub-corners. Endpoints never move, and
+    cut distances are capped at 45% of the adjacent chord so neighbouring
+    chamfers cannot cross.
+
+    Near-reversals get blended too: a chamfered reversal becomes a small
+    U-turn the parametrizer can ROLL through at ~sqrt(accel * radius) instead
+    of braking to a dead stop mid-trajectory. (An earlier version skipped
+    corners >150 deg on the theory that a reversal must brake anyway; that
+    turned every leftover RRT reversal into a recorded full stop — the
+    "robot pauses at waypoints" artifact. Full speed through a reversal is
+    still impossible, but ~0.15 rad/s through a budget-radius U-turn beats
+    0.) The excursion tip is shortened by at most the budget, and the
+    parametrized trajectory is re-checked against collisions downstream.
+    When `keep_sharp_deg` is set (the segment_at_sharp_corners=True mode),
+    corners sharper than it are left alone so they still come to the
+    intended full stop.
+
+    The blended path deviates from the collision-CHECKED chords by at most
+    `budget`; the parametrized trajectory is re-checked downstream
+    (`_smooth_and_check_collision`), so a blend that cuts into an obstacle
+    rejects that candidate rather than reaching the robot.
+    """
+    wp = np.asarray(waypoints, dtype=np.float64)
+    if wp.shape[0] < 3 or budget <= 0:
+        return wp
+    per_pass = float(budget) / max(1, passes)
+    keep_sharp = (np.deg2rad(keep_sharp_deg) if keep_sharp_deg is not None else None)
+
+    for _ in range(passes):
+        if wp.shape[0] < 3:
+            break
+        out = [wp[0]]
+        for i in range(1, wp.shape[0] - 1):
+            prev_pt, v, next_pt = out[-1], wp[i], wp[i + 1]
+            d_in, d_out = v - prev_pt, next_pt - v
+            n_in, n_out = float(np.linalg.norm(d_in)), float(np.linalg.norm(d_out))
+            if n_in < 1e-9 or n_out < 1e-9:
+                out.append(v)
+                continue
+            cos = float(np.clip(np.dot(d_in / n_in, d_out / n_out), -1.0, 1.0))
+            theta = float(np.arccos(cos))
+            wants_stop = keep_sharp is not None and theta > keep_sharp
+            if theta < np.deg2rad(3.0) or wants_stop:
+                out.append(v)
+                continue
+            half_sin = float(np.sin(0.5 * theta))
+            cut = min(per_pass / max(half_sin, 1e-6), 0.45 * n_in, 0.45 * n_out)
+            if cut < 1e-9:
+                out.append(v)
+                continue
+            out.append(v - d_in / n_in * cut)
+            out.append(v + d_out / n_out * cut)
+        out.append(wp[-1])
+        wp = np.asarray(out, dtype=np.float64)
+    return wp
+
+
+# Max joint-space L2 gap (rad) between waypoints handed to a time
+# parametrization. Matches the RRT collision-check resolution (`resolutions =
+# [0.05] * dof`), i.e. the spacing at which the path was actually validated.
+DEFAULT_PARAM_DENSIFY_STEP = 0.05
+
+
+def _densify_waypoints(waypoints: np.ndarray, max_step: float) -> np.ndarray:
+    """Insert collinear points so no segment is longer than `max_step` (L2, rad).
+
+    Both parametrization backends interpolate BETWEEN waypoints, and neither
+    reproduces the straight chord exactly: toppra fits a cubic spline (measured
+    up to 0.41 rad off the polyline), and chained ruckig uses
+    `Synchronization.Time`, which matches each segment's duration across joints
+    but not its shape (up to 0.10 rad). That bow is unvalidated geometry — the
+    collision gate cleared the CHORDS — so it shows up as the parametrized path
+    colliding where the linear densify check passed, which forces the planner
+    onto a farther IK goal and a much longer chunk.
+
+    Deviation shrinks with segment length, so subdividing bounds it directly
+    while changing nothing about the geometry: the inserted points lie exactly
+    on the chords that were already checked.
+
+    This is NOT redundant with the densify inside `trajopt_smooth_path` /
+    `elastic_smooth_path`. Those densify to optimise, then RDP-DECIMATE back
+    down (to `decimate_eps` 0.04 / 0.015) before returning, so the parametrizer
+    still receives a sparse path. The decimation exists because the ruckig
+    CLOUD API warns above ~15 intermediate waypoints — a constraint that does
+    not apply to the chained backend (independent single-section solves) or to
+    toppra (one spline fit).
+    """
+    wp = np.asarray(waypoints, dtype=np.float64)
+    if wp.shape[0] < 2 or max_step <= 0:
+        return wp
+    out = [wp[0]]
+    for a, b in zip(wp[:-1], wp[1:]):
+        n = int(np.ceil(np.linalg.norm(b - a) / max_step))
+        for k in range(1, max(n, 1) + 1):
+            out.append(a + (b - a) * (k / max(n, 1)))
+    return np.asarray(out, dtype=np.float64)
+
+
 def _dedupe_waypoints(waypoints: np.ndarray, tol: float = 1e-9) -> np.ndarray:
     """Drop consecutive waypoints closer than `tol` (L2, rad).
 
@@ -2121,6 +2289,8 @@ def toppra_parametrize_path(
     final_approach_acc_scale: float = 0.25,
     end_vel: np.ndarray | None = None,
     uniform_path_speed: bool = False,
+    densify_step: float = DEFAULT_PARAM_DENSIFY_STEP,
+    corner_blend_rad: float = DEFAULT_CORNER_BLEND_RAD,
 ) -> np.ndarray:
     """Time-optimal path parametrization using TOPP-RA. Local, no network.
 
@@ -2130,11 +2300,20 @@ def toppra_parametrize_path(
     (`max_joint_jerk` and `start_acc` are accepted and IGNORED; `start_vel` /
     `end_vel` are honored only tangentially to the path).
 
-    `segment_at_sharp_corners=True` splits at corners sharper than
-    `sharp_angle_threshold_deg` and stops at zero path speed on each internal
-    boundary, matching the ruckig backend's legacy mode. False (the config
-    default) parametrizes the whole path in one problem, letting TOPP-RA slow
-    for corners as the spline curvature demands rather than stopping dead.
+    `segment_at_sharp_corners` decides what happens at path corners:
+
+      * False (the config default) — CARRY SPEED. Corners are rounded within
+        a `corner_blend_rad` joint-space deviation budget (`_blend_corners`)
+        and the whole path is parametrized as one problem, so the trajectory
+        flows through waypoints near cruise speed. Splitting was never the
+        only thing standing between a waypoint and a stop: a polyline-pinned
+        trajectory must brake to ~0 at any sharp corner regardless, which is
+        why blending — not just not-splitting — is what implements this
+        flag's intent. Near-reversals (>150 deg) still brake: a joint whose
+        velocity changes sign must pass through zero.
+      * True — STOP at corners sharper than `sharp_angle_threshold_deg`
+        (split into separate problems with zero boundary speed); milder
+        corners are still blended and carried.
     """
     global _TOPPRA_LOGGING_CONFIGURED
     if not _TOPPRA_LOGGING_CONFIGURED:
@@ -2160,6 +2339,31 @@ def toppra_parametrize_path(
     waypoints = _dedupe_waypoints(waypoints)
     if waypoints.shape[0] < 2:
         return waypoints
+    # Strip redundant dense waypoints FIRST so blending is not chord-limited
+    # (see DEFAULT_PREBLEND_DECIMATE_EPS), then round corners (bounded
+    # deviation) so speed can be CARRIED through them — a polyline-pinned
+    # trajectory must brake to ~0 at any sharp corner. With
+    # segment_at_sharp_corners=True, corners past the threshold stay sharp so
+    # they still stop; everything milder is blended either way.
+    waypoints = _decimate_for_blending(waypoints, DEFAULT_PREBLEND_DECIMATE_EPS)
+    waypoints = _blend_corners(
+        waypoints, corner_blend_rad,
+        keep_sharp_deg=sharp_angle_threshold_deg if segment_at_sharp_corners else None,
+    )
+    # Merge near-duplicate knots the blend can leave around a SHORT reversal
+    # chord (its cut is capped at 45% of the chord, so a ~0.01 rad reversal
+    # hop yields knots ~0.004 rad apart across a fold). A cubic spline through
+    # such a cluster develops a huge |dq/ds| spike, and the joint-velocity
+    # constraint (sd*|q'| <= vmax) then pins the path speed to ~0 across it —
+    # observed as the robot PARKED for hundreds of samples mid-trajectory or
+    # at the goal (planar_3joint_9 ep75: ~600 frames). Merging at 0.4x the
+    # densify spacing (~20 mrad at defaults, still far below every clearance)
+    # removes the pathology at its source; 0.1x proved too fine once
+    # REVERSAL corners started being blended, whose residue pairs land in the
+    # 5-20 mrad gap (1/300 random fold geometries re-pinched).
+    waypoints = _dedupe_waypoints(waypoints, tol=max(1e-9, 0.4 * densify_step))
+    # Bound how far the spline can bow off the (now corner-blended) chords.
+    waypoints = _densify_waypoints(waypoints, densify_step)
 
     # uniform_path_speed is handled NATIVELY below (as an exact path-speed
     # bound), not by the parametrizer's per-joint chord-direction approximation — see
@@ -2213,18 +2417,34 @@ def toppra_parametrize_path(
     if not segment_at_sharp_corners:
         sd_start = _tangential_speed(start_vel, waypoints[0], waypoints[1])
         sd_end = _tangential_speed(end_vel, waypoints[-2], waypoints[-1])
-        samples, _ = _toppra_run_segment(
-            waypoints,
-            sd_start=sd_start,
-            sd_end=sd_end,
-            max_joint_vel=max_joint_vel,
-            max_joint_acc=max_joint_acc,
-            control_hz=control_hz,
-            per_section_max_velocity=per_section_vel,
-            per_section_max_acceleration=per_section_acc,
-            per_section_path_speed=per_section_path_speed,
-        )
-        return samples
+        # A hot handoff velocity can make the instance uncontrollable (TOPP-RA
+        # cannot continue at that entry speed along this geometry — e.g. a
+        # sharp turn right after the start). Old cloud-ruckig accepted such
+        # starts, so no-lookback intervention plans would otherwise crash
+        # here. Halve the entry speed and retry, ending at a full stop: the
+        # trajectory then begins slower than the robot's true velocity, which
+        # the follower backend absorbs smoothly (it tracks from the TRUE
+        # state) and a PD controller merely brakes into.
+        last_err: Exception | None = None
+        for attempt in range(4):
+            try:
+                samples, _ = _toppra_run_segment(
+                    waypoints,
+                    sd_start=sd_start * (0.5 ** attempt) if attempt < 3 else 0.0,
+                    sd_end=sd_end,
+                    max_joint_vel=max_joint_vel,
+                    max_joint_acc=max_joint_acc,
+                    control_hz=control_hz,
+                    per_section_max_velocity=per_section_vel,
+                    per_section_max_acceleration=per_section_acc,
+                    per_section_path_speed=per_section_path_speed,
+                )
+                return samples
+            except RuntimeError as e:
+                last_err = e
+                if sd_start <= 1e-9:
+                    break  # not an entry-speed problem — retrying cannot help
+        raise last_err
 
     # Legacy per-segment mode: zero path speed at each sharp corner. Mirrors
     # the ruckig backend's split, including the per-section limit slicing.
@@ -2263,28 +2483,1211 @@ def toppra_parametrize_path(
     return np.concatenate(all_samples, axis=0)
 
 
-# Backend selection for `parametrize_path`. "toppra" (default) runs locally;
-# "ruckig" restores the jerk-limited profile at the cost of a ~0.5 s cloud API
-# round trip per call and a 1000/day quota.
+# ---------------------------------------------------------------------------
+# Chained offline ruckig (jerk-limited, local)
+# ---------------------------------------------------------------------------
+#
+# Why a third backend. The other two each give up something:
+#
+#   ruckig (cloud)  jerk-limited and time-optimal through the intermediate
+#                   waypoints, but the community build solves any
+#                   intermediate-waypoint problem via a network call — ~500 ms
+#                   each, capped at 1000/day.
+#   toppra          local and fast, but has no third-order term: the optimal
+#                   s(t) is bang-bang in acceleration, so `max_joint_jerk` is
+#                   silently ignored. Measured on real planner output: jerk up
+#                   to 44 against a limit of 10, which a PD-tracked robot
+#                   renders as ringing around the goal.
+#
+# This backend gets both by decomposing the problem: ONE single-section ruckig
+# solve per waypoint pair. With zero intermediate positions ruckig stays local
+# (~0.02 ms), and each section is a proper jerk-limited third-order profile.
+# The cost is optimality — velocities at interior waypoints are chosen by a
+# local heuristic instead of a global optimisation, so trajectories run a bit
+# longer than the cloud's. On this repo's planner output:
+#
+#   toppra   vel 0.5 acc 1.00   5.32 s   jerk 44.13   RINGS
+#   toppra   vel 1.0 acc 0.25   8.15 s   jerk  9.49   clean (the cheapest way
+#                                                      to make toppra clean)
+#   chained  vel 1.0 acc 1.00   6.60 s   jerk 10.00   clean
+#
+# NOTE: the table above predates the densify/lookahead rework; measured on
+# real planner output afterwards, chained pays 2-5x duration for its
+# construction-guaranteed jerk limit. The "follower" backend (toppra pacing +
+# online-ruckig tracking, further down) reaches the same limits at toppra
+# speed and is the default; chained remains for callers that want the jerk
+# guarantee to hold by construction rather than by tracking.
+
+
+def _polyline_speed_targets(
+    points: np.ndarray,
+    sec_of_gap: list[int],
+    sec_vel: list[np.ndarray],
+    sec_acc: list[np.ndarray],
+    start_vel: np.ndarray,
+    end_vel: np.ndarray,
+    stop_indices: set[int],
+    max_joint_jerk: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Dynamically consistent (velocity, acceleration) targets at every point
+    of a densified polyline — the lookahead pass that makes chained ruckig
+    fast on dense waypoints.
+
+    Chaining single-section ruckig solves needs a target STATE at each interior
+    point. The first version targeted a central-difference velocity and ZERO
+    acceleration; on a sparse path that is merely suboptimal, but on a
+    densified one (a point every 0.05 rad) it forbids sustaining acceleration
+    across points, so the arm saw-tooths and the duration blew up 2.6x the
+    moment densification was enabled.
+
+    This computes a classic forward/backward speed profile along the polyline
+    instead (the CNC-lookahead pattern):
+
+      * per-point direction u_k: normalized central difference (chord bisector
+        at corners, the chord itself on collinear densified runs);
+      * per-point caps: V_k = min_j vel_cap_j/|u_kj| and likewise A_k — the
+        exact path-speed/path-accel the per-joint box limits allow along u_k,
+        honouring per-SECTION limits (final-approach taper, uniform speed);
+      * corner cap: v <= sqrt(A * l / theta) for turn angle theta over blend
+        length l (the two adjacent gaps), so direction changes get absorbed
+        within the acceleration budget instead of demanding an accel spike;
+      * forward then backward pass with v_{k+1}^2 <= v_k^2 + 2*A*ds, seeded
+        with the projections of the true start/end velocities;
+      * acceleration target from the finished profile:
+        a_k = u_k * (v_{k+1}^2 - v_k^2) / (2*ds_k), clamped to +-A_k.
+
+    Jerk is deliberately absent here: each ruckig section enforces it exactly,
+    stretching its own duration when a target is jerk-tight. The pass only has
+    to be accel-consistent for that to stay near-optimal.
+
+    Returns (vel_targets, acc_targets), each (N, dof). Callers should override
+    the final row with the true end state (the projection loses any component
+    of a nonzero handoff velocity normal to the last chord).
+    """
+    n_pts = points.shape[0]
+    chords = np.diff(points, axis=0)
+    ds = np.linalg.norm(chords, axis=1)
+    u_gap = chords / np.maximum(ds[:, None], 1e-12)
+
+    u_pt = np.empty_like(points)
+    u_pt[0], u_pt[-1] = u_gap[0], u_gap[-1]
+    for k in range(1, n_pts - 1):
+        m = u_gap[k - 1] + u_gap[k]
+        nm = float(np.linalg.norm(m))
+        u_pt[k] = m / nm if nm > 1e-9 else u_gap[k]
+
+    V = np.empty(n_pts)
+    A = np.empty(n_pts)
+    for k in range(n_pts):
+        gaps = [g for g in (k - 1, k) if 0 <= g < n_pts - 1]
+        vel_cap = np.min([sec_vel[sec_of_gap[g]] for g in gaps], axis=0)
+        acc_cap = np.min([sec_acc[sec_of_gap[g]] for g in gaps], axis=0)
+        au = np.maximum(np.abs(u_pt[k]), 1e-9)
+        V[k] = float(np.min(vel_cap / au))
+        A[k] = float(np.min(acc_cap / au))
+
+    for k in range(1, n_pts - 1):
+        cos = float(np.clip(np.dot(u_gap[k - 1], u_gap[k]), -1.0, 1.0))
+        theta = float(np.arccos(cos))
+        if theta > 1e-6:
+            blend = float(min(ds[k - 1], ds[k]))
+            V[k] = min(V[k], float(np.sqrt(max(A[k], 1e-9) * blend / theta)))
+    for k in stop_indices:
+        if 0 <= k < n_pts:
+            V[k] = 0.0
+
+    v = V.copy()
+    v[0] = min(V[0], max(0.0, float(np.dot(start_vel, u_pt[0]))))
+    v[-1] = min(V[-1], max(0.0, float(np.dot(end_vel, u_pt[-1]))))
+    for k in range(n_pts - 1):                     # forward
+        a = min(A[k], A[k + 1])
+        v[k + 1] = min(v[k + 1], float(np.sqrt(v[k] ** 2 + 2.0 * a * ds[k])))
+    for k in range(n_pts - 2, -1, -1):             # backward
+        a = min(A[k], A[k + 1])
+        v[k] = min(v[k], float(np.sqrt(v[k + 1] ** 2 + 2.0 * a * ds[k])))
+
+    a_s = np.zeros(n_pts)
+    for k in range(n_pts - 1):
+        if ds[k] > 1e-12:
+            a_s[k] = float(np.clip(
+                (v[k + 1] ** 2 - v[k] ** 2) / (2.0 * ds[k]), -A[k], A[k]))
+    vel_t = u_pt * v[:, None]
+    acc_t = u_pt * a_s[:, None]
+
+    # Ruckig VALIDATES target states, not just trajectories: any target with
+    # |v| + a^2/(2*jerk) > v_cap on some joint is rejected outright,
+    # WHICHEVER way the acceleration points. Toward the cap, the jerk-limited
+    # ramp-down of `a` would overshoot the velocity past the cap AFTER the
+    # target; away from the cap (a decelerating joint arriving at cap speed),
+    # reaching that acceleration means the velocity was beyond the cap just
+    # BEFORE it ("will inevitably have reached a velocity ... that will
+    # undercut its minimum velocity limit"). Both directions bind, so clamp
+    # unconditionally: |a| <= sqrt(2 * jerk * (v_cap - |v|)). The visible cost
+    # is that a joint cruising exactly at its cap gets a zero-acceleration
+    # target — ruckig then shapes the entry/exit inside the section instead.
+    for k in range(n_pts):
+        gaps = [g for g in (k - 1, k) if 0 <= g < n_pts - 1]
+        vel_cap = np.min([sec_vel[sec_of_gap[g]] for g in gaps], axis=0)
+        headroom = np.maximum(vel_cap - np.abs(vel_t[k]), 0.0)
+        a_allow = np.sqrt(2.0 * max_joint_jerk * headroom)
+        acc_t[k] = np.clip(acc_t[k], -a_allow, a_allow)
+    return vel_t, acc_t
+
+
+def _chained_solve_section(
+    p0, p1, v0, a0, v1, a1, vmax, amax, jmax, control_hz,
+):
+    """One ruckig section, zero intermediate waypoints — always solved LOCALLY.
+
+    `Synchronization.Time` rather than `Phase`: phase sync locks every joint to
+    one scaled profile, which cannot represent a boundary velocity that is not
+    parallel to the section's displacement — exactly the case at a blended
+    interior waypoint.
+    """
+    from ruckig import (  # type: ignore
+        ControlInterface, InputParameter, Ruckig, Synchronization, Trajectory,
+    )
+
+    dof = len(p0)
+    otg = Ruckig(dof, 1.0 / control_hz, 0)
+    inp = InputParameter(dof)
+    inp.control_interface = ControlInterface.Position
+    inp.synchronization = Synchronization.Time
+    inp.current_position = list(p0)
+    inp.current_velocity = list(v0)
+    inp.current_acceleration = list(a0)
+    inp.target_position = list(p1)
+    inp.target_velocity = list(v1)
+    inp.target_acceleration = list(a1)
+    inp.max_velocity = list(vmax)
+    inp.max_acceleration = list(amax)
+    inp.max_jerk = list(jmax)
+    traj = Trajectory(dof)
+    result = otg.calculate(inp, traj)
+    if result < 0:
+        raise RuntimeError(
+            f"chained ruckig section failed (result {result}): "
+            f"|dp|={np.linalg.norm(np.asarray(p1) - np.asarray(p0)):.4f}"
+        )
+    return traj
+
+
+def _sample_chain_on_global_grid(trajs, total_duration, dof, control_hz):
+    """Sample a list of (start_time, Trajectory) on ONE uniform time grid.
+
+    Sampling each section separately and concatenating is wrong: a section's
+    duration is almost never a multiple of dt, so every join ends up with two
+    samples less than dt apart. Anything that differentiates the result (a
+    controller, or a jerk metric) reads that spacing as dt and reports a spike
+    the trajectory does not actually contain. One global grid removes the
+    artifact by construction.
+    """
+    dt = 1.0 / control_hz
+    ts = np.append(np.arange(0.0, total_duration, dt), total_duration)
+    out = np.empty((len(ts), dof), dtype=np.float64)
+    idx = 0
+    for i, t in enumerate(ts):
+        while idx + 1 < len(trajs) and t > trajs[idx][0] + trajs[idx][1].duration + 1e-12:
+            idx += 1
+        t0, traj = trajs[idx]
+        out[i] = traj.at_time(float(np.clip(t - t0, 0.0, traj.duration)))[0]
+    return out
+
+
+def chained_ruckig_parametrize_path(
+    waypoints: np.ndarray,
+    max_joint_vel: np.ndarray,
+    max_joint_acc: np.ndarray,
+    max_joint_jerk: np.ndarray,
+    control_hz: float,
+    sharp_angle_threshold_deg: float = 45.0,
+    segment_at_sharp_corners: bool = True,
+    start_vel: np.ndarray | None = None,
+    start_acc: np.ndarray | None = None,
+    final_approach_dist: float = 0.0,
+    final_approach_vel_scale: float = 0.3,
+    final_approach_acc_scale: float = 0.25,
+    end_vel: np.ndarray | None = None,
+    uniform_path_speed: bool = False,
+    densify_step: float = DEFAULT_PARAM_DENSIFY_STEP,
+    corner_blend_rad: float = DEFAULT_CORNER_BLEND_RAD,
+) -> np.ndarray:
+    """Jerk-limited time parametrization, solved locally. Drop-in for the others.
+
+    Unlike the toppra backend this honours `max_joint_jerk`, and unlike the
+    ruckig backend it never touches the network: the path is densified to
+    `densify_step` and each gap becomes ONE zero-intermediate ruckig section
+    (always solved locally), with the section boundary states supplied by a
+    forward/backward lookahead pass (`_polyline_speed_targets`). Densification
+    bounds how far the Time-synchronized profile can bow off the
+    collision-checked chords — the inserted points lie exactly ON those chords
+    — and the lookahead is what keeps a dense chain fast: it lets acceleration
+    carry across section boundaries instead of resetting to zero at each one.
+
+    `segment_at_sharp_corners=True` forces a full stop at corners sharper
+    than `sharp_angle_threshold_deg`; with False (the config default) corners
+    are blended within `corner_blend_rad` and the lookahead's corner cap
+    slows only as much as the (now shallow) turn demands.
+    """
+    waypoints = np.asarray(waypoints, dtype=np.float64)
+    dof = waypoints.shape[1]
+    zeros = np.zeros(dof)
+    max_joint_vel = np.asarray(max_joint_vel, dtype=np.float64)
+    max_joint_acc = np.asarray(max_joint_acc, dtype=np.float64)
+    max_joint_jerk = np.asarray(max_joint_jerk, dtype=np.float64)
+    start_vel = zeros if start_vel is None else np.clip(
+        np.asarray(start_vel, dtype=np.float64), -max_joint_vel, max_joint_vel
+    )
+    start_acc = zeros if start_acc is None else np.asarray(start_acc, dtype=np.float64)
+    end_vel = zeros if end_vel is None else np.asarray(end_vel, dtype=np.float64)
+
+    waypoints = _dedupe_waypoints(waypoints)
+    if waypoints.shape[0] < 2:
+        return waypoints
+    # Decimate-then-round (see toppra backend): dense waypoints chord-limit
+    # the blend, so strip them to the polyline shape first; the lookahead's
+    # corner cap then sees shallow turns instead of braking at every waypoint.
+    waypoints = _decimate_for_blending(waypoints, DEFAULT_PREBLEND_DECIMATE_EPS)
+    waypoints = _blend_corners(
+        waypoints, corner_blend_rad,
+        keep_sharp_deg=sharp_angle_threshold_deg if segment_at_sharp_corners else None,
+    )
+    # Merge blend residue around short reversal chords — see the toppra
+    # backend for the parked-robot pathology this prevents.
+    waypoints = _dedupe_waypoints(waypoints, tol=max(1e-9, 0.4 * densify_step))
+
+    # Taper / uniform-speed section limits on the SPARSE waypoints first, so
+    # section indices line up with the geometry they describe; densify after,
+    # tracking which original section every mini-gap belongs to.
+    (
+        waypoints,
+        max_joint_vel,
+        max_joint_acc,
+        per_section_vel,
+        per_section_acc,
+    ) = _prepare_section_limits(
+        waypoints,
+        max_joint_vel,
+        max_joint_acc,
+        final_approach_dist,
+        final_approach_vel_scale,
+        final_approach_acc_scale,
+        uniform_path_speed,
+    )
+    waypoints = np.asarray(waypoints, dtype=np.float64)
+    n_orig_sections = waypoints.shape[0] - 1
+    sec_vel = [
+        np.asarray(per_section_vel[i], dtype=np.float64) if per_section_vel is not None
+        else max_joint_vel
+        for i in range(n_orig_sections)
+    ]
+    sec_acc = [
+        np.asarray(per_section_acc[i], dtype=np.float64) if per_section_acc is not None
+        else max_joint_acc
+        for i in range(n_orig_sections)
+    ]
+
+    sharp = set(
+        _find_sharp_waypoint_indices(waypoints, sharp_angle_threshold_deg)
+        if segment_at_sharp_corners else []
+    )
+
+    # Densify each original section, remembering (a) the original section of
+    # every mini-gap (for per-section limits) and (b) where the original
+    # waypoints landed (for sharp-corner stops).
+    step = float(densify_step) if densify_step and densify_step > 0 else np.inf
+    pts: list[np.ndarray] = [waypoints[0]]
+    sec_of_gap: list[int] = []
+    orig_index_of: list[int] = [0]
+    for i in range(n_orig_sections):
+        a, b = waypoints[i], waypoints[i + 1]
+        n_sub = max(1, int(np.ceil(np.linalg.norm(b - a) / step)))
+        for k in range(1, n_sub + 1):
+            pts.append(a + (b - a) * (k / n_sub))
+            sec_of_gap.append(i)
+        orig_index_of.append(len(pts) - 1)
+    points = np.asarray(pts, dtype=np.float64)
+    stop_indices = {orig_index_of[i] for i in sharp}
+
+    vel_targets, acc_targets = _polyline_speed_targets(
+        points, sec_of_gap, sec_vel, sec_acc, start_vel, end_vel, stop_indices,
+        max_joint_jerk,
+    )
+    # True end state, not its projection onto the last chord.
+    vel_targets[-1] = np.clip(end_vel, -max_joint_vel, max_joint_vel)
+    acc_targets[-1] = zeros
+
+    trajs: list = []
+    t_start = 0.0
+    v_cur, a_cur = start_vel, start_acc
+    for g in range(points.shape[0] - 1):
+        sec = sec_of_gap[g]
+        traj = _chained_solve_section(
+            points[g], points[g + 1], v_cur, a_cur,
+            vel_targets[g + 1], acc_targets[g + 1],
+            sec_vel[sec], sec_acc[sec], max_joint_jerk, control_hz,
+        )
+        trajs.append((t_start, traj))
+        t_start += traj.duration
+        v_cur = np.asarray(traj.at_time(traj.duration)[1], dtype=np.float64)
+        a_cur = np.asarray(traj.at_time(traj.duration)[2], dtype=np.float64)
+
+    return _sample_chain_on_global_grid(trajs, t_start, dof, control_hz)
+
+
+def follower_parametrize_path(
+    waypoints: np.ndarray,
+    max_joint_vel: np.ndarray,
+    max_joint_acc: np.ndarray,
+    max_joint_jerk: np.ndarray,
+    control_hz: float,
+    settle_timeout_s: float = 3.0,
+    target_lead_ticks: int = 2,
+    **toppra_kwargs,
+) -> np.ndarray:
+    """TOPP-RA pacing + a LOCAL online-ruckig follower for the jerk limit.
+
+    Decomposition: toppra already produces the near-time-optimal, chord-tight
+    schedule — its one defect is stepwise acceleration (jerk spikes of ~44
+    against a limit of 10, which a PD-tracked robot renders as ringing).
+    Rather than re-deriving the schedule under a jerk limit (the chained
+    backend; measured 2-8x slower trajectories), track toppra's samples with
+    ruckig in ONLINE mode: one `update()` per control tick toward the current
+    reference sample, target velocity from the reference's finite difference.
+    Single-target updates are solved locally by community ruckig — only
+    intermediate-waypoint problems use its cloud API — and each tick replans
+    MPC-style, so the follower lags the reference only where the reference
+    itself violates the jerk limit and rejoins immediately after.
+
+    Two details keep the follower tight to the reference (measured 24 mm ->
+    14 mm of worst-case EE deviation from the collision-checked chords on real
+    planner output): the target leads the clock by `target_lead_ticks` so the
+    follower is not systematically a step behind, and the reference's own
+    finite-difference acceleration is fed as the target acceleration, clamped
+    per joint to sqrt(2*jerk*(v_cap-|v|)) — the largest value ruckig's
+    target-state validation admits at that speed.
+
+    After the reference ends, the follower keeps stepping toward the final
+    sample until it settles (position within ~1e-4 rad, velocity ~0), bounded
+    by `settle_timeout_s`; the tail is typically a few ticks.
+
+    All `toppra_kwargs` (densify_step, taper, uniform_path_speed, start_vel,
+    ...) pass straight through to `toppra_parametrize_path`.
+    """
+    from ruckig import (  # type: ignore
+        ControlInterface, InputParameter, OutputParameter, Result, Ruckig,
+        RuckigError,
+    )
+
+    ref = toppra_parametrize_path(
+        waypoints, max_joint_vel, max_joint_acc, max_joint_jerk, control_hz,
+        **toppra_kwargs,
+    )
+    ref = np.asarray(ref, dtype=np.float64)
+    if ref.shape[0] < 3:
+        return ref
+    n_ref, dof = ref.shape
+    dt = 1.0 / control_hz
+    vel_cap = np.asarray(max_joint_vel, dtype=np.float64)
+
+    # Reference velocity by central difference, clamped inside the cap so the
+    # target state always passes ruckig's validation.
+    v_ref = np.zeros_like(ref)
+    v_ref[1:-1] = (ref[2:] - ref[:-2]) * (0.5 * control_hz)
+    v_ref = np.clip(v_ref, -vel_cap, vel_cap)
+    acc_cap = np.asarray(max_joint_acc, dtype=np.float64)
+    jerk_cap = np.asarray(max_joint_jerk, dtype=np.float64)
+    a_ref = np.zeros_like(ref)
+    a_ref[1:-1] = (ref[2:] - 2.0 * ref[1:-1] + ref[:-2]) * (control_hz ** 2)
+    a_allow = np.minimum(
+        np.sqrt(2.0 * jerk_cap * np.maximum(vel_cap - np.abs(v_ref), 0.0)),
+        acc_cap,
+    )
+    a_ref = np.clip(a_ref, -a_allow, a_allow)
+
+    # The follower's own state is pinned strictly INSIDE the caps: a current
+    # velocity exactly AT max_velocity to the last bit (which out.new_velocity
+    # can legitimately produce, and a caller-supplied start_vel can hit) makes
+    # ruckig's step-1 synchronization throw RuckigError on some targets. The
+    # margin is orders of magnitude below anything physical.
+    vel_feed_cap = vel_cap * (1.0 - 1e-6)
+    acc_feed_cap = acc_cap * (1.0 - 1e-6)
+
+    start_vel = toppra_kwargs.get("start_vel")
+    otg = Ruckig(dof, dt)
+    inp = InputParameter(dof)
+    out = OutputParameter(dof)
+    inp.control_interface = ControlInterface.Position
+    inp.current_position = ref[0].tolist()
+    inp.current_velocity = (
+        np.clip(np.asarray(start_vel, dtype=np.float64), -vel_feed_cap, vel_feed_cap)
+        if start_vel is not None else np.zeros(dof)
+    ).tolist()
+    inp.current_acceleration = [0.0] * dof
+    inp.max_velocity = vel_cap.tolist()
+    inp.max_acceleration = np.asarray(max_joint_acc, dtype=np.float64).tolist()
+    inp.max_jerk = np.asarray(max_joint_jerk, dtype=np.float64).tolist()
+
+    samples = [ref[0].copy()]
+    max_ticks = n_ref + int(settle_timeout_s * control_hz)
+    # KNOWN DEFECT (deliberate, bounded): clocked targets give the follower a
+    # schedule to race. Jerk-lag at accel transients -> catch-up at full
+    # per-joint caps -> overshooting the schedule -> the clocked target lands
+    # behind -> brief brake toward ~0 while the clock catches up. On real
+    # paths this appears as ~0.5 speed dips per episode (to 0.01-0.3 rad/s,
+    # 3-6 frames) at positions uncorrelated with path geometry, plus L2
+    # overspeed bursts to ~0.7 (per-joint limits still exact). Two quick
+    # fixes were tried and REVERTED after failing validation on the dumped
+    # real-path corpus: (a) nearest-sample progress targeting deadlocks the
+    # moment the follower reaches its nearest sample; (b) capping the tick
+    # velocity at ~the reference's local speed starves catch-up, compounds
+    # lag, and ends in settle-timeout teleports. A correct fix is a proper
+    # arc-length pure-pursuit target (lookahead by distance, monotone
+    # projection) — a design change, not a patch; see session notes.
+    for tick in range(1, max_ticks):
+        k = min(tick + int(target_lead_ticks), n_ref - 1)
+        inp.target_position = ref[k].tolist()
+        inp.target_velocity = v_ref[k].tolist()
+        inp.target_acceleration = a_ref[k].tolist()
+        try:
+            result = otg.update(inp, out)
+        except RuckigError:
+            # Input-specific solver failure (seen at exactly-at-limit boundary
+            # states, and on some corner-blended reference targets). Before
+            # giving up on the path, degrade THIS tick to a position-only
+            # target: dropping the velocity/acceleration targets is ruckig's
+            # most robust problem form, and the next tick's targets resume
+            # normally — one softened tick is invisible in the output. Only
+            # if even that fails is the path abandoned, and as a
+            # TrajectoryParametrizationError (candidate-discard semantics),
+            # never a raw RuckigError — that killed a whole generation
+            # worker once.
+            inp.target_velocity = [0.0] * dof
+            inp.target_acceleration = [0.0] * dof
+            try:
+                result = otg.update(inp, out)
+            except RuckigError as e:
+                raise TrajectoryParametrizationError(
+                    f"follower ruckig update threw at tick {tick} "
+                    f"(position-only retry also failed): {e}"
+                ) from e
+        if result < 0:
+            raise TrajectoryParametrizationError(
+                f"follower ruckig update failed (result {result})"
+            )
+        samples.append(np.asarray(out.new_position, dtype=np.float64))
+        inp.current_position = out.new_position
+        inp.current_velocity = np.clip(
+            np.asarray(out.new_velocity, dtype=np.float64),
+            -vel_feed_cap, vel_feed_cap,
+        ).tolist()
+        inp.current_acceleration = np.clip(
+            np.asarray(out.new_acceleration, dtype=np.float64),
+            -acc_feed_cap, acc_feed_cap,
+        ).tolist()
+        if k == n_ref - 1:
+            pos_err = float(np.max(np.abs(samples[-1] - ref[-1])))
+            vel_mag = float(np.max(np.abs(out.new_velocity)))
+            if result == Result.Finished or (pos_err < 1e-4 and vel_mag < 1e-3):
+                break
+    samples[-1] = ref[-1].copy()  # pin the exact goal
+    return np.asarray(samples)
+
+
+def _erode_box_same(u: np.ndarray, W: int) -> np.ndarray:
+    """Trailing sliding-min then centered box-average (same length). Fallback
+    smoother for `_jerk_limited_minorant` when scipy's LP is unavailable:
+    bounded jerk and never above the input, but charges a fixed W-tick
+    plateau at every feature — measurably slower than the LP result."""
+    e = np.lib.stride_tricks.sliding_window_view(
+        np.concatenate([np.full(W - 1, u[0]), u]), W
+    ).min(axis=1)
+    lp = W // 2
+    up = np.concatenate([np.full(lp, e[0]), e, np.full(W - 1 - lp, e[-1])])
+    return np.convolve(up, np.full(W, 1.0 / W), mode="valid")
+
+
+def _jerk_limited_minorant(
+    v: np.ndarray,
+    seg: np.ndarray,
+    acc_bound: float,
+    jerk_cap: float,
+    dt: float,
+    factor: np.ndarray | None = None,
+    v_start: float = 0.0,
+    v_end: float = 0.0,
+    strict_onset: bool | None = None,
+) -> np.ndarray:
+    """Largest speed profile <= `v` with bounded first/second differences.
+
+    This is the exact object the retimer needs, posed as a small sparse LP
+    (HiGHS, ~ms at corpus sizes): maximize arc-weighted speed subject to
+      * 0 <= u_i <= v_i           — the reference is a hard ceiling
+        (time-optimality: exceeding it at a corner breaks accel as v^2/r);
+      * |u_{i+1} - u_i| <= acc_bound*dt;
+      * |u_{i+1} - 2u_i + u_{i-1}| <= jerk_cap*dt^2, including boundary rows
+        with virtual rest states so the launch onset and terminal stop are
+        jerk-limited too.
+    Compared to fixed-window morphology this rounds each valley/onset with
+    the MINIMAL time cost (no plateau-width vs jerk-width coupling), leaves
+    already-feasible spans (cruise, taper) untouched, and needs no tuning.
+    """
+    from scipy.optimize import linprog
+    from scipy.sparse import lil_matrix
+
+    n = len(v)
+    jd = jerk_cap * dt * dt
+    ad = acc_bound * dt
+    # Optional per-interval budget factor (e.g. 0.5 near curvature so the
+    # tangential transient cannot stack with the normal one on the same
+    # joints — the LP otherwise brakes bang-bang-late INTO a corner at full
+    # budget exactly where curvature onset spends the rest of it).
+    f = np.ones(n) if factor is None else np.asarray(factor, dtype=np.float64)
+
+    def loc(idx_list):
+        vals = [f[i] for i in idx_list if 0 <= i < n]
+        return min(vals) if vals else 1.0
+
+    def virt(i):
+        # Boundary states OUTSIDE the profile: the speed the system arrives
+        # with (v_start — a shared-autonomy handoff hands over a MOVING
+        # robot) and leaves at (v_end, normally rest). Hard-coding these to
+        # zero clamped every handoff plan to a from-rest launch ramp
+        # (measured: plan starts near 0 speed regardless of policy speed).
+        return v_start if i < 0 else v_end
+    rows_a, rows_j = n + 1, n + 2  # D1 incl. boundary states; D2 incl. onset row
+    # boundary pairs — the (-2,-1,0) row constrains u0 against the virtual
+    # pre-state pair (|u0 - v_start| <= jd), without which the LP may take
+    # full accel in the very first tick (onset jerk ~3x the cap, measured
+    # 24 at a brake-out junction); symmetrically (n-1,n,n+1) for the end.
+    A = lil_matrix((2 * (rows_a + rows_j), n))
+    b = np.empty(2 * (rows_a + rows_j))
+    r = 0
+    # First differences over the rest-extended profile [0, u..., 0].
+    ext = [(i, i + 1) for i in range(-1, n)]
+    for i, k in ext:
+        for sign in (1.0, -1.0):
+            rhs = ad * loc((i, k))
+            if 0 <= i < n:
+                A[r, i] = -sign
+            else:
+                rhs += sign * virt(i)
+            if 0 <= k < n:
+                A[r, k] = sign
+            else:
+                rhs -= sign * virt(k)
+            b[r] = rhs
+            r += 1
+    # Second differences over the same extension.
+    # The (-2,-1,0) boundary pair row jerk-limits the ONSET against the
+    # virtual pre-state (|u0 - v_start| <= jd). Applied only for moving
+    # handoffs and brake-out suffixes (strict_onset): a blanket application
+    # taxed every from-rest launch a few ticks and cost 1.2x duration on
+    # short paths, while plain launches already onset gently because the LP
+    # hugs the toppra ceiling's own soft ramp. The symmetric END pair row is
+    # never added — it forces a ~0.01 rad/s terminal crawl; the trajectory
+    # ENDS at the goal (env holds there) and the taper bounds terminal decel.
+    _strict = strict_onset if strict_onset is not None else (v_start > 0.0)
+    for m in range(-2 if _strict else -1, n - 1):
+        idx = (m, m + 1, m + 2)
+        for sign in (1.0, -1.0):
+            rhs = jd * loc(idx)
+            for pos, coef in zip(idx, (1.0, -2.0, 1.0)):
+                if 0 <= pos < n:
+                    A[r, pos] = sign * coef
+                else:
+                    rhs -= sign * coef * virt(pos)
+            b[r] = rhs
+            r += 1
+    res = linprog(
+        c=-np.asarray(seg),  # maximize arc-weighted speed ~ minimize duration
+        A_ub=A.tocsr()[:r], b_ub=b[:r],
+        bounds=list(zip(np.zeros(n), v)),
+        method="highs",
+    )
+    if not res.success:
+        raise RuntimeError(f"speed-minorant LP failed: {res.message}")
+    return np.maximum(res.x, 0.0)
+
+
+# Curvature-ceiling margins for the retimed backend: the fraction of the
+# accel / jerk budget granted to the NORMAL (curvature) component when
+# capping speed over the smoothed geometry. 0.8/0.8 is the corpus-calibrated
+# optimum (tests/follower_acceptance.py: 37/37); the tangential side's own
+# headroom lives in `acc_bound` and the LP's 0.85 jerk allocation.
+_RT_VACC = 0.8
+_RT_VJRK = 0.8
+
+
+def _brake_out_prefix(
+    q0: np.ndarray,
+    q1: np.ndarray,
+    v0_tangential: float,
+    max_joint_vel: np.ndarray,
+    max_joint_acc: np.ndarray,
+    max_joint_jerk: np.ndarray,
+    control_hz: float,
+) -> np.ndarray | None:
+    """Jerk-limited 1-D braking run from (q0, moving at v0 toward q1) to
+    rest at q1, sampled at control_hz. One LOCAL single-target ruckig solve
+    (community build solves single-target offline without the cloud).
+
+    EMERGENCY ESCALATION: when the runway is shorter than the nominal-limit
+    braking distance (a shield trigger hands over a robot heading toward an
+    obstacle with little free space), the solve retries at escalating
+    decel/jerk scales — up to 3x accel / 5x jerk. This DELIBERATELY exceeds
+    the nominal caps for the braking segment only: the alternative (a
+    rest-start chunk) commands the PD to brake even harder implicitly while
+    recording out-of-distribution data that starts from zero velocity. An
+    explicitly planned emergency brake keeps the chunk starting at the
+    robot's true velocity, which is the property DAgger needs. Escalated
+    solves are the exception path and the caller logs the runway shortfall.
+
+    Returns (K, dof) samples from q0 to q1 inclusive, or None if ruckig is
+    unavailable / no scale fits — callers fall back to the plain pipeline."""
+    try:
+        from ruckig import InputParameter, OutputParameter, Result, Ruckig
+    except Exception:
+        return None
+    d = q1 - q0
+    dist = float(np.linalg.norm(d))
+    if dist < 1e-9:
+        return None
+    u = d / dist
+    # 1-D limits: the tightest per-joint cap projected onto the run direction.
+    nz = np.abs(u) > 1e-9
+    vlim = float(np.min(np.asarray(max_joint_vel)[nz] / np.abs(u)[nz]))
+    alim = float(np.min(np.asarray(max_joint_acc)[nz] / np.abs(u)[nz]))
+    jlim = float(np.min(np.asarray(max_joint_jerk)[nz] / np.abs(u)[nz]))
+    v0 = float(np.clip(v0_tangential, 0.0, max(vlim, v0_tangential)))
+    dt = 1.0 / control_hz
+    for a_scale, j_scale in ((1.0, 1.0), (1.5, 2.0), (2.0, 3.0), (3.0, 5.0)):
+        otg = Ruckig(1, dt)
+        inp, out = InputParameter(1), OutputParameter(1)
+        inp.current_position, inp.current_velocity, inp.current_acceleration = [0.0], [v0], [0.0]
+        inp.target_position, inp.target_velocity, inp.target_acceleration = [dist], [0.0], [0.0]
+        inp.max_velocity = [max(vlim, v0 * (1 + 1e-6))]
+        inp.max_acceleration, inp.max_jerk = [alim * a_scale], [jlim * j_scale]
+        ss = [0.0]
+        failed = False
+        for _ in range(int(10 * control_hz)):  # 10 s hard cap
+            res = otg.update(inp, out)
+            if res == Result.Error:
+                failed = True
+                break
+            ss.append(float(out.new_position[0]))
+            out.pass_to_input(inp)
+            if res == Result.Finished:
+                break
+        else:
+            failed = True
+        if failed:
+            continue
+        ss = np.asarray(ss)
+        # Overshoot past the runway means this scale can't stop in time —
+        # clipping would corrupt the profile into an accel spike (measured
+        # 1.5/34); escalate to the next scale instead.
+        if float(ss.max()) > dist + 1e-6 or float(ss.min()) < -1e-6:
+            continue
+        prefix = q0[None, :] + ss[:, None] * u[None, :]
+        prefix[-1] = q1
+        return prefix
+    return None
+
+
+def retimed_parametrize_path(
+    waypoints: np.ndarray,
+    max_joint_vel: np.ndarray,
+    max_joint_acc: np.ndarray,
+    max_joint_jerk: np.ndarray,
+    control_hz: float,
+    **toppra_kwargs,
+) -> np.ndarray:
+    """TOPP-RA schedule + offline jerk-limited retiming of its SPEED PROFILE.
+
+    Why this exists: measured on the acceptance corpus (tests/data/
+    follower_corpus), toppra's output is already right in every axis the
+    trajectory criteria care about — uniform cruise speed, no dips, exact
+    endpoints, vel/acc limits — except one: its acceleration is piecewise
+    constant in time, so finite-difference jerk spikes to 17-40 against a
+    limit of 10, and those spikes are purely TANGENTIAL (on all 37 corpus
+    cases the joint-jerk peak coincides with the 1-D speed-profile jerk
+    peak; curvature contributes ~nothing at these speeds). The online-ruckig
+    "follower" fixed jerk but introduced a clocked-target limit cycle
+    (brief near-stops at waypoints — see its KNOWN DEFECT comment).
+
+    So fix ONLY the defective axis, offline and SURGICALLY: keep toppra's
+    samples as exact geometry AND its speed-vs-arc profile untouched except
+    inside the few spans where its own jerk violates the cap; there, blend
+    toward an eroded+box-filtered profile; then rebuild time by integrating
+    arc/speed. Three structural rules, each earned by a measured failure:
+
+      * The new speed is defined AS A FUNCTION OF ARC and is pointwise <=
+        the reference's speed at that arc (`_erode_box_same`, plus the
+        blend). The reference is a hard ceiling — toppra is time-optimal,
+        so exceeding it at an accel-limited corner breaks the accel cap as
+        v^2/r — and arc-indexing makes ceiling alignment exact by
+        construction. (Tick-indexed variants drifted: smoothing costs arc
+        mass, and ONE tick of misalignment at a corner already exceeds the
+        accel tolerance.) Slowing down only ever helps accel; and real-time
+        smoothness bounds tighten, since d/dt = (w/v <= 1) * d/d(index).
+      * Smooth ONLY around measured violations (mask dilated ~3W, blended
+        over W ticks so the splice is not itself a jerk step). Whole-profile
+        erosion shifts the final-approach taper against its own decay and
+        costs a harmonic-sum ~12 ticks of tail crawl; surgical application
+        leaves ramp and taper schedules as toppra wrote them.
+      * Cover the whole arc by integrating time over every interval — never
+        truncate or extend a schedule to "reach" the goal (the truncating
+        variant teleported; the extending variant crawled and embedded a
+        full stop).
+
+    Duration cost measured on the corpus: ~0-2%. All `toppra_kwargs` pass
+    through to `toppra_parametrize_path`. `start_vel` handoffs
+    (interventions): the toppra reference honors the handoff tangentially,
+    and its projection onto the first path segment feeds the LP's virtual
+    pre-start state, so the plan begins AT the robot's current speed
+    instead of ramping from rest.
+    """
+    # Leading BRAKE-OUT split (shared-autonomy moving handoffs). When the
+    # planner prepended a braking lead-in along the start velocity, the
+    # path begins q0 -> p_lead -> reversal -> rest-of-path. A blended
+    # reversal is the WRONG representation for toppra: the spline
+    # degenerates at the cusp (measured: controllable start-speed window
+    # collapsing to 0.016 rad/s, jerk 24) and the handoff speed is lost.
+    # The physically exact structure is a SPLIT: a 1-D jerk-limited braking
+    # run along the first segment (single local ruckig solve), then the
+    # remaining path parametrized from rest at the cusp — the two meet at
+    # zero velocity, so the concatenation is smooth by construction.
+    _strict_onset = bool(toppra_kwargs.pop("_strict_onset", False))
+    _sv = toppra_kwargs.get("start_vel")
+    wp_arr = np.asarray(waypoints, dtype=np.float64)
+    if _sv is not None and wp_arr.shape[0] >= 3:
+        sv = np.asarray(_sv, dtype=np.float64).reshape(-1)[: wp_arr.shape[1]]
+        d01 = wp_arr[1] - wp_arr[0]
+        d12 = wp_arr[2] - wp_arr[1]
+        n01, n12, nsv = (np.linalg.norm(d01), np.linalg.norm(d12), np.linalg.norm(sv))
+        if n01 > 1e-9 and n12 > 1e-9 and nsv > 1e-6:
+            aligned = float(np.dot(sv, d01)) / (nsv * n01) > 0.7
+            cusp = float(np.dot(d01, d12)) / (n01 * n12) < -0.5  # turn > 120 deg
+            if aligned and cusp:
+                prefix = _brake_out_prefix(
+                    wp_arr[0], wp_arr[1], float(np.dot(sv, d01) / n01),
+                    max_joint_vel, max_joint_acc, max_joint_jerk, control_hz,
+                )
+                if prefix is not None:
+                    kw2 = dict(toppra_kwargs)
+                    kw2.pop("start_vel", None)
+                    # The suffix meets the easing brake at REST — its onset
+                    # must be jerk-limited too or the junction accel steps
+                    # (measured 24 of jerk).
+                    kw2["_strict_onset"] = True
+                    suffix = retimed_parametrize_path(
+                        wp_arr[1:], max_joint_vel, max_joint_acc,
+                        max_joint_jerk, control_hz, **kw2,
+                    )
+                    return np.vstack([prefix[:-1], np.asarray(suffix)])
+
+    ref = toppra_parametrize_path(
+        waypoints, max_joint_vel, max_joint_acc, max_joint_jerk, control_hz,
+        **toppra_kwargs,
+    )
+    ref = np.asarray(ref, dtype=np.float64)
+    if ref.shape[0] < 3:
+        return ref
+    dt = 1.0 / control_hz
+
+    seg_all = np.linalg.norm(np.diff(ref, axis=0), axis=1)
+    # Drop zero-length intervals (settle/duplicate samples) — they carry no
+    # arc and would divide by zero in the time rebuild.
+    live = seg_all > 1e-12
+    if not live.any():
+        return ref
+    q_knots = np.concatenate([ref[:1], ref[1:][live]])
+    seg_orig = seg_all[live]
+
+    # Sample-scale geometric smoothing (endpoints fixed). Real planner output
+    # carries direction kinks of 2-8 deg PER KNOT (trajopt/elastic/chamfer
+    # residue); FD jerk crossing such a vertex is v*theta*hz^2 — LINEAR in
+    # speed, so no speed profile fixes it acceptably (meeting jerk 10 by
+    # slowing means near-stops at every kink, the exact behavior this
+    # backend exists to remove), while rounding the vertex geometrically is
+    # nearly free (~60 urad deviation per Laplacian pass at a 2.5 deg kink).
+    # Ten passes cost ~2-3 mrad total deviation — far under the 0.02 rad
+    # obstacle clearance — and are SAFE only because the speed license below
+    # is derived from this smoothed geometry itself: with the license taken
+    # from the ORIGINAL spacing alone, deeper smoothing misaligned license
+    # from curvature and measured fresh accel violations (that instability
+    # also killed the measure-and-iterate variants: ceiling scars create
+    # jerk at their own edges, becoming next round's violations).
+    for _ in range(12):
+        q_knots[1:-1] += 0.25 * (q_knots[:-2] - 2.0 * q_knots[1:-1] + q_knots[2:])
+    seg = np.linalg.norm(np.diff(q_knots, axis=0), axis=1)
+    keep2 = seg > 1e-12
+    seg, seg_orig = seg[keep2], seg_orig[keep2]
+    q_knots = np.concatenate([q_knots[:1], q_knots[1:][keep2]])
+    s_knots = np.concatenate([[0.0], np.cumsum(seg)])
+    total = s_knots[-1]
+    if total < 1e-9:
+        return ref
+    v = seg * control_hz  # schedule speed per (live) tick, smoothed geometry
+    # License alignment BY ARC, not index: smoothing shifts knot arcs, and an
+    # index-aligned license puts the reference's braking profile a knot or
+    # two away from where the (moved) corner actually is — at corner
+    # tolerances that misalignment is what capped global smoothing at ~12
+    # passes. Sample the original speed at the smoothed interval's
+    # fractional arc position instead.
+    s_orig = np.concatenate([[0.0], np.cumsum(seg_orig)])
+    mids_orig = 0.5 * (s_orig[:-1] + s_orig[1:]) / max(s_orig[-1], 1e-12)
+    mids_sm = 0.5 * (s_knots[:-1] + s_knots[1:]) / max(total, 1e-12)
+    v_lic_arc = np.interp(mids_sm, mids_orig, seg_orig * control_hz)
+
+    # Speed license: the original spacing (the schedule toppra proved
+    # feasible) further capped by two ANALYTIC ceilings measured on the
+    # SMOOTHED geometry, in the same finite-difference sense the controller
+    # (and the acceptance test) will see:
+    #   * accel: per-joint FD accel crossing knot k is ~ v^2 * |ddir_j| / h,
+    #     so v <= sqrt(0.95 * a_cap * h / max_j |ddir_j|);
+    #   * jerk: crossing a residual vertex concentrates a per-joint accel
+    #     change of ~ v * |d2dir_j| * hz in one tick, so
+    #     v <= 0.9 * J / (hz^2 * max_j |d2dir_j|).
+    acc_cap = float(np.max(np.asarray(max_joint_acc, dtype=np.float64)))
+    jerk_cap = float(np.min(np.asarray(max_joint_jerk, dtype=np.float64)))
+    v_ceil = v_lic_arc
+    dirs_k = np.diff(q_knots, axis=0) / np.maximum(seg[:, None], 1e-12)
+    if len(dirs_k) >= 7:
+        # Multi-scale: FD at output ticks spans ~1-3 knots (tick arc ~ v*dt
+        # vs knot spacing ~ v_ref*dt), and consecutive same-direction kinks
+        # ADD at tick scale — a per-knot (single-scale) cap measured 30-50%
+        # low. Continuum forms per scale m: accel = v^2 * |ddir_m|/(m h),
+        # jerk = v^3 * |d2dir_m|/(m h)^2; ceiling = min over scales.
+        cap_i = np.full(len(seg), np.inf)
+        for m in (1, 2, 3):
+            dd = np.abs(dirs_k[m:] - dirs_k[:-m]).max(axis=1)
+            d2 = np.abs(
+                dirs_k[2 * m:] - 2.0 * dirs_k[m:-m] + dirs_k[:-2 * m]
+            ).max(axis=1)
+            h_m = m * 0.5 * (seg[m:] + seg[:-m])
+            v_acc = np.sqrt(_RT_VACC * acc_cap * h_m / np.maximum(dd, 1e-9))
+            h2_m = m * 0.5 * (seg[2 * m:] + seg[:-2 * m])
+            v_jrk = np.cbrt(
+                _RT_VJRK * jerk_cap * h2_m * h2_m / np.maximum(d2, 1e-9)
+            )
+            # scatter knot-scale caps onto the intervals they straddle
+            for k in range(len(dd)):
+                sl = slice(k, min(k + m + 1, len(cap_i)))
+                cap_i[sl] = np.minimum(cap_i[sl], v_acc[k])
+            for k in range(len(d2)):
+                sl = slice(k, min(k + 2 * m + 1, len(cap_i)))
+                cap_i[sl] = np.minimum(cap_i[sl], v_jrk[k])
+        # Decouple tangential and normal transients: a centered sliding-min
+        # widens every CURVATURE dip by K ticks each side, so the LP
+        # finishes braking BEFORE curvature turns on and resumes after it
+        # ends. Without this the LP brakes bang-bang INTO the corner and
+        # the tangential brake-onset jerk lands on the same ticks as the
+        # curvature-onset jerk, adding per-joint (measured |a| 1.15-1.33,
+        # |j| 12-22 at corner entries with each component individually in
+        # budget). Applied to the corner caps ONLY — eroding the full
+        # license drags the taper's near-zero tail backward and the
+        # integrator crawls it (measured: duration blown on all 37).
+        # ...implemented as backward+forward accel propagation at HALF the
+        # accel budget: cap[k] = min(cap[k], sqrt(cap[k+1]^2 + 2*(a/2)*h)).
+        # Depth-adaptive (a fixed-width erosion left braking ending exactly
+        # AT the corner for deep caps), and the halved tangential accel near
+        # corners leaves per-joint headroom for the normal component.
+        cap_raw = cap_i.copy()
+        finite = np.isfinite(cap_i)
+        if finite.any():
+            brake = acc_cap * 0.5
+            capped = np.minimum(cap_i, np.max(v_ceil) * 2.0)
+            for k in range(len(capped) - 2, -1, -1):
+                capped[k] = min(capped[k], np.sqrt(capped[k + 1] ** 2 + 2.0 * brake * seg[k]))
+            for k in range(1, len(capped)):
+                capped[k] = min(capped[k], np.sqrt(capped[k - 1] ** 2 + 2.0 * brake * seg[k]))
+            cap_i = capped
+        v_ceil = np.minimum(v_ceil, np.maximum(cap_i, 0.02))
+
+    # Tangential accel must respect the true cap even where the reference's
+    # own slope exceeds it (curvature can help per-joint accel; a scalar
+    # profile gets no such help) — the LP simply brakes earlier, which is
+    # always feasible for an upper-bounded profile.
+    # 0.88: the LP otherwise accelerates at exactly the cap, and two
+    # measured amplifiers stack on it per-joint — a few percent of ambient
+    # curvature on nominally straight spans (1.057-1.066), and ~10%
+    # execution compression on launch ramps, where the arc-aligned license
+    # sits slightly above the index schedule on the convex sqrt(2as) ramp.
+    acc_bound = 0.88 * acc_cap
+    if len(dirs_k) < 7:
+        cap_raw = np.full(len(seg), np.inf)
+    turn_knots = np.zeros(max(len(seg) - 1, 0))
+    if len(dirs_k) >= 2:
+        turn_knots = np.arccos(
+            np.clip(np.sum(dirs_k[:-1] * dirs_k[1:], axis=1), -1.0, 1.0)
+        )
+    use_spline = len(s_knots) >= 4
+    if use_spline:
+        from scipy.interpolate import CubicSpline
+
+        pos_of_arc = CubicSpline(s_knots, q_knots, axis=0, bc_type="natural")
+
+    # The LP variables ARE the knot speeds — the executed field is their
+    # linear interpolation, nothing else. (An earlier variant solved the LP
+    # per-interval and derived node speeds afterward with a turn-aware
+    # mean/min rule; the switching created slope discontinuities the LP
+    # never saw, measured as accel -1.2 and jerk 22 at brake onsets whose
+    # LP profile was bounded at -1.0/8.5.) The turn-awareness lives in the
+    # knot CEILING instead — a constraint the LP smooths across: MIN of the
+    # adjacent interval licenses where the path turns (a mean exceeds the
+    # corner interval's ceiling and shows up as v^2/r accel), MEAN on
+    # straight-ish knots (the min costs a half-interval lag on every ramp).
+    # Executed FD slopes can only be GENTLER than the LP's index-domain
+    # design: crossing a knot interval takes h/u >= dt of real time.
+    # Curved-ramp coupling: normal jerk carries a 2*v*vdot*kappa term —
+    # tangential accel RAMPS the centripetal accel — which neither the
+    # curvature ceilings (kappa, dkappa terms at fixed speed) nor the LP
+    # (tangential only) see. Measured 14.8 of jerk on a launch that curves
+    # at 10 deg/tick. Bound the local tangential accel by a <= J/(2 v k)
+    # through the LP's per-row budget factor.
+    lp_factor = np.ones(len(s_knots))
+    if len(dirs_k) >= 2:
+        kappa_i = np.zeros(len(seg))
+        dd1 = np.linalg.norm(np.diff(dirs_k, axis=0), axis=1)
+        h1 = 0.5 * (seg[:-1] + seg[1:])
+        kappa_i[:-1] = np.maximum(kappa_i[:-1], dd1 / np.maximum(h1, 1e-9))
+        kappa_i[1:] = np.maximum(kappa_i[1:], dd1 / np.maximum(h1, 1e-9))
+        a_curv = 0.55 * jerk_cap / (
+            2.0 * np.maximum(v_ceil * kappa_i, 1e-9)
+        )
+        f_i = np.clip(a_curv / max(acc_bound, 1e-9), 0.25, 1.0)
+        lp_factor[:-1] = np.minimum(lp_factor[:-1], f_i)
+        lp_factor[1:] = np.minimum(lp_factor[1:], f_i)
+
+    c_kn = np.empty(len(s_knots))
+    c_kn[0], c_kn[-1] = v_ceil[0], v_ceil[-1]
+    if len(v_ceil) > 1:
+        pair_min = np.minimum(v_ceil[:-1], v_ceil[1:])
+        pair_mean = 0.5 * (v_ceil[:-1] + v_ceil[1:])
+        c_kn[1:-1] = np.where(turn_knots > 0.005, pair_min, pair_mean)
+    wgt = np.empty(len(s_knots))
+    wgt[0], wgt[-1] = 0.5 * seg[0], 0.5 * seg[-1]
+    wgt[1:-1] = 0.5 * (seg[:-1] + seg[1:])
+    # Tangential handoff speed: shared autonomy hands over a MOVING robot
+    # (start_vel = the policy's recent joint velocity, honored tangentially
+    # by the toppra reference). The LP's virtual pre-start state must carry
+    # it too, or its rest boundary row clamps the first knot to ~acc*dt and
+    # every intervention plan launches from zero.
+    sv = toppra_kwargs.get("start_vel")
+    v_handoff = 0.0
+    if sv is not None and len(q_knots) >= 2:
+        d0 = q_knots[1] - q_knots[0]
+        n0 = float(np.linalg.norm(d0))
+        if n0 > 1e-12:
+            v_handoff = max(0.0, float(np.dot(
+                np.asarray(sv, dtype=np.float64).reshape(-1)[: q_knots.shape[1]],
+                d0 / n0,
+            )))
+    # EXACT-CARRY CONTRACT (shared autonomy): the EXECUTED launch speed is
+    # v_handoff — never clamped, no exceptions. The LEGAL profile below is
+    # still solved from a clamped boundary state v_legal: on tight geometry
+    # the ceiling's first knot can be tiny (toppra's controllable window
+    # near a shield-triggered plan measured 0.013 rad/s) and an unclamped
+    # boundary makes the LP INFEASIBLE outright (u0 <= c_kn[0] vs
+    # u0 >= v_start - acc*dt cannot both hold). The surplus
+    # v_handoff - v_legal is carried by a BRAKE-IN OVERLAY in the time
+    # rebuild: the first ticks ride a decelerating overspeed profile
+    # (nominal decel, escalating only when the path is too short to shed
+    # the surplus) until it meets the legal profile, then follow it. The
+    # overlay deliberately exceeds the nominal ceilings while it lasts —
+    # the policy put the robot in that state, and a planned brake beats
+    # pretending the speed away (the clamped launch recorded a 4x speed
+    # discontinuity at the policy->RRT seam; eval planar_3joint scenario 2,
+    # 2026-08-17).
+    v_legal = min(v_handoff, float(c_kn[0]))
+    if sv is not None and v_handoff > 0.0:
+        logger.info(
+            "retimed handoff: |v_start|=%.3f rad/s, tangential=%.3f, start "
+            "license c_kn[0]=%.3f -> launch at %.3f",
+            float(np.linalg.norm(np.asarray(sv, dtype=np.float64))),
+            v_handoff, float(c_kn[0]), v_handoff,
+        )
+
+    def _fallback_smooth():
+        at_f = np.diff(v) * control_hz
+        jt_pk = float(np.abs(np.diff(at_f)).max() * control_hz) if len(at_f) > 1 else 0.0
+        W = max(2, int(np.ceil(1.5 * jt_pk / max(jerk_cap, 1e-9))))
+        return _erode_box_same(c_kn, W) if len(c_kn) > 2 * W else c_kn
+
+    try:
+        node_v = _jerk_limited_minorant(
+            c_kn, wgt, acc_bound, 0.85 * jerk_cap, dt, factor=lp_factor,
+            v_start=v_legal, strict_onset=(v_legal > 0.0 or _strict_onset),
+        )
+    except Exception:
+        if v_legal > 0.0:
+            # Infeasibility can also come from the handoff interacting with
+            # tight interior constraints — retry as a from-rest LEGAL
+            # profile before falling back to morphology. The executed
+            # launch still starts at v_handoff either way: the brake-in
+            # overlay below rides above whatever profile this produces.
+            try:
+                node_v = _jerk_limited_minorant(
+                    c_kn, wgt, acc_bound, 0.85 * jerk_cap, dt, factor=lp_factor,
+                )
+            except Exception:
+                node_v = _fallback_smooth()
+        else:
+            node_v = _fallback_smooth()
+
+    floor = 1e-3 * float(np.max(v))
+    # Brake-in overlay (exact-carry contract above): while w_over exceeds
+    # the legal profile the tick speed IS w_over, decaying at a_brake; the
+    # overlay ends the tick it dips under the legal profile (it always
+    # does: w_over decays toward 0, the legal profile is floored). Rung
+    # selection: smallest decel whose brake-to-rest arc fits in 90% of the
+    # path, so even a profile that never rises above the floor stops the
+    # surplus before the goal; the forced last resort handles a handoff
+    # hotter than any rung can shed on this runway.
+    w_over = v_handoff if v_handoff > float(node_v[0]) + 1e-9 else 0.0
+    a_brake = 0.0
+    if w_over > 0.0:
+        for _scale in (1.0, 1.5, 2.0, 3.0, 5.0):
+            a_brake = _scale * acc_cap
+            if w_over * w_over / (2.0 * a_brake) <= 0.9 * total:
+                break
+        else:
+            a_brake = w_over * w_over / (1.8 * total)
+        logger.info(
+            "retimed handoff: carrying %.3f rad/s launch over a %.3f rad/s "
+            "start license — brake-in overlay at %.2f rad/s^2 decel (%.1fx "
+            "nominal)", v_handoff, float(node_v[0]), a_brake,
+            a_brake / max(acc_cap, 1e-9),
+        )
+    s_list = [0.0]
+    arc = 0.0
+    max_ticks = int(
+        np.ceil(float(np.sum(seg / np.maximum(0.5 * (node_v[:-1] + node_v[1:]), 1e-9))) * control_hz)
+    ) + int(3.0 * control_hz)
+    while arc < total - 1e-4 and len(s_list) <= max_ticks:
+        v1 = max(float(np.interp(arc, s_knots, node_v)), floor)
+        vm = max(float(np.interp(arc + 0.5 * v1 * dt, s_knots, node_v)), floor)
+        if w_over > 0.0:
+            if w_over <= vm:
+                w_over = 0.0  # met the legal profile — overlay done
+            else:
+                vm = w_over
+                w_over = max(w_over - a_brake * dt, 0.0)
+        arc = min(arc + vm * dt, total)
+        s_list.append(arc)
+    # Land the last sample ON the goal rather than crawling the final
+    # fraction of a mrad at the speed floor (measured ~10 settle ticks).
+    s_list[-1] = total
+    s_ticks = np.asarray(s_list)
+    if use_spline:
+        out = pos_of_arc(s_ticks)
+    else:
+        out = np.empty((len(s_ticks), ref.shape[1]), dtype=np.float64)
+        for jnt in range(ref.shape[1]):
+            out[:, jnt] = np.interp(s_ticks, s_knots, q_knots[:, jnt])
+    out[0], out[-1] = ref[0], ref[-1]
+    return out
+
+
+# Backend selection for `parametrize_path`. Gate for the default: the
+# acceptance corpus (tests/follower_acceptance.py, 37 real planner paths) —
+# uniform cruise with no dips below the physics floors, no overshoot,
+# per-joint vel/acc/jerk within caps, duration within 1.03x + 0.4 s of the
+# time-optimal toppra reference.
+#
+#   backend     acceptance   character
+#   retimed     37/37        offline LP retiming of the toppra schedule;
+#                            deterministic, local, no ruckig     <- default
+#   follower     2/37        online-ruckig tracker; clocked-target limit
+#                            cycle dips to 0.01-0.3 rad/s ~0.5x/episode
+#                            (see its KNOWN DEFECT comment)
+#   toppra       0/37        time-optimal but IGNORES max_joint_jerk
+#                            (fails only jerk); accel steps ring under PD
+#   chained      (unused)    per-gap offline ruckig; jerk-limited but pays
+#                            2-8x duration
+#   ruckig       (unused)    community cloud API; networked, 1000/day
 TRAJ_BACKEND_ENV = "SPLATSIM_TRAJ_BACKEND"
+# Single source of truth for the fallback when the env var is unset — the
+# planner's startup log reads this too, so log and dispatch can't disagree.
+DEFAULT_TRAJ_BACKEND = "retimed"
+
+
+def _dump_parametrization(waypoints, traj, kwargs) -> None:
+    """Record one (waypoints -> trajectory) pair when SPLATSIM_TRAJ_DUMP is set.
+
+    Diagnostic only, and off unless the env var names a directory. Lets a
+    limits sweep run offline against the REAL geometry a closed-loop run
+    produced, instead of synthetic waypoints that may not share its
+    pathologies.
+    """
+    out_dir = os.environ.get("SPLATSIM_TRAJ_DUMP")
+    if not out_dir:
+        return
+    try:
+        import pathlib, pickle, threading, time as _t
+
+        d = pathlib.Path(out_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        # pid+thread+counter: several planners can share a directory.
+        global _DUMP_SEQ
+        _DUMP_SEQ += 1
+        name = f"wp_{os.getpid()}_{threading.get_ident()}_{_DUMP_SEQ:05d}.pkl"
+        with open(d / name, "wb") as fh:
+            pickle.dump({"waypoints": np.asarray(waypoints),
+                         "traj": np.asarray(traj),
+                         "kwargs": {k: v for k, v in kwargs.items()}}, fh)
+    except Exception:
+        pass  # a diagnostic must never break planning
+
+
+_DUMP_SEQ = 0
 
 
 def parametrize_path(*args, backend: str | None = None, **kwargs) -> np.ndarray:
     """Time-parametrize a geometric joint path. Dispatches on `backend`.
 
-    `backend`: "toppra" (default) or "ruckig". None reads the
-    `SPLATSIM_TRAJ_BACKEND` environment variable, defaulting to "toppra".
-    Both backends take the identical signature — see
+    `backend`: "follower" (default), "toppra", "chained", or "ruckig". None
+    reads the `SPLATSIM_TRAJ_BACKEND` environment variable, defaulting to
+    `DEFAULT_TRAJ_BACKEND`. All backends take the identical signature — see
     `toppra_parametrize_path` for the (small) semantic differences.
     """
     if backend is None:
-        backend = os.environ.get(TRAJ_BACKEND_ENV, "toppra").strip().lower()
-    if backend == "ruckig":
-        return ruckig_parametrize_path(*args, **kwargs)
-    if backend == "toppra":
-        return toppra_parametrize_path(*args, **kwargs)
+        backend = os.environ.get(TRAJ_BACKEND_ENV, DEFAULT_TRAJ_BACKEND).strip().lower()
+    try:
+        if backend == "ruckig":
+            traj = ruckig_parametrize_path(*args, **kwargs)
+        elif backend == "toppra":
+            traj = toppra_parametrize_path(*args, **kwargs)
+        elif backend in ("chained", "chained_ruckig"):
+            traj = chained_ruckig_parametrize_path(*args, **kwargs)
+        elif backend == "follower":
+            traj = follower_parametrize_path(*args, **kwargs)
+        elif backend == "retimed":
+            traj = retimed_parametrize_path(*args, **kwargs)
+        else:
+            traj = None
+    except (RuckigCloudUnavailableError, TrajectoryParametrizationError):
+        raise  # already classified — systemic vs. this-path-only
+    except Exception as e:
+        # A raw RuckigError escaping here once crashed a whole generation
+        # worker. Classify it as path-specific (the cloud/rate-limit case was
+        # converted to RuckigCloudUnavailableError at the call site) so
+        # planners treat it like any other rejected candidate. Matched by name
+        # to keep the ruckig import lazy.
+        if type(e).__name__ == "RuckigError":
+            raise TrajectoryParametrizationError(
+                f"{backend} backend ruckig failure: {e}"
+            ) from e
+        raise
+    if traj is not None:
+        if args:
+            _dump_parametrization(args[0], traj, kwargs)
+        return traj
     raise ValueError(
-        f"Unknown trajectory backend {backend!r} (set {TRAJ_BACKEND_ENV} to 'toppra' or 'ruckig')"
+        f"Unknown trajectory backend {backend!r} (set {TRAJ_BACKEND_ENV} to "
+        "'chained', 'toppra' or 'ruckig')"
     )
 
 
@@ -2407,10 +3810,11 @@ def get_path(q_start, q_goal, robot_id, joint_indices, obstacle_ids, ll, ul, rob
     # Random-shortcut smoothing (pybullet_planning): repeatedly pick two random
     # points on the path and replace the intermediate segment with a straight
     # joint-space connection when it is collision-free and shorter. This is
-    # what removes RRT's characteristic detours/zigzags — ruckig downstream
-    # only smooths the TIME parametrization (vel/acc/jerk), it does not
-    # straighten the geometric path, so erratic-looking waypoints must be
-    # fixed here. Iterations beyond convergence are cheap (a candidate is
+    # what removes RRT's characteristic detours/zigzags — time
+    # parametrization downstream only shapes the SPEED profile (vel/acc/jerk),
+    # it does not straighten the geometric path, so erratic-looking waypoints
+    # must be fixed here. Leftover zigzags survive as direction changes, each
+    # of which forces a decelerate/re-accelerate that surfaces as jerk. Iterations beyond convergence are cheap (a candidate is
     # collision-checked only when it would shorten the path).
     if config_cost_fn is None:
         smoothed_path = smooth_path(

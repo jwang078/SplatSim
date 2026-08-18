@@ -1,0 +1,338 @@
+#!/usr/bin/env python
+"""Acceptance suite for MOVING-HANDOFF behavior (shared-autonomy interventions).
+
+Complements tests/follower_acceptance.py (which gates the retimed backend's
+from-rest behavior on the recorded corpus). This file gates the handoff
+stack that kept regressing during development:
+
+  A. Parametrizer carry: for every handoff geometry class — aligned,
+     mid-band misaligned (lead-in, no cusp), reversal (brake-out split),
+     short-runway (escalated brake) — the trajectory's first tick must move
+     at ~the handoff speed, in the velocity direction, within limits
+     (escalation classes exempt from nominal caps by design).
+     EXACT-CARRY (no exceptions): handoffs ABOVE the planner's own speed
+     envelope (vmax, start license) must still launch at exactly the
+     handed speed — the brake-in overlay sheds the surplus along the path,
+     and the profile must be back inside vmax shortly after launch. A
+     clamped launch recorded a 4x speed discontinuity at the policy->RRT
+     seam (eval planar_3joint scenario 2, 2026-08-17).
+  B. Planner start treatment: the braking lead-in must be placed for any
+     misalignment beyond ~18 deg (dot < 0.95 — an aligned-looking chord can
+     still curve immediately and choke toppra's controllable window), must
+     fall back to CONTACT-level clearance when the planning-clearance spur
+     is blocked, and must SURVIVE the trajopt-collides fallback
+     (straighten_only re-application) — losing it there measured a 0.43
+     rad/s handoff launching at 0.05.
+  C. Brake feasibility: directional collision judgment used by the shield's
+     micro-rewind, at the emergency (1 cm) clearance.
+
+Run: python tests/handoff_acceptance.py
+"""
+from __future__ import annotations
+
+import os
+import pickle
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from splatsim.utils.rrt_path_utils import parametrize_path  # noqa: E402
+
+FPS = 30
+FAILS: list[str] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f"  [{detail}]" if detail else ""))
+    if not ok:
+        FAILS.append(name)
+
+
+def _load_corpus_case():
+    f = sorted(
+        os.path.join(d, x)
+        for d in [os.path.join(os.path.dirname(__file__), "data", "follower_corpus")]
+        for x in os.listdir(d)
+        if x.endswith(".pkl")
+    )[3]
+    d = pickle.load(open(f, "rb"))
+    return np.asarray(d["waypoints"], dtype=np.float64), dict(d["kwargs"])
+
+
+def section_a_parametrizer():
+    print("--- A: parametrizer velocity carry ---")
+    wp, kw = _load_corpus_case()
+    dof = wp.shape[1]
+    lims = (np.full(dof, 0.5), np.full(dof, 1.0), np.full(dof, 10.0))
+    d0 = wp[1] - wp[0]
+    d0u = d0 / np.linalg.norm(d0)
+    perp = np.array([-d0u[1], d0u[0], 0.0])
+    perp -= d0u * np.dot(perp, d0u)
+    perp /= np.linalg.norm(perp)
+
+    def run(vhat, v0, lead, label, exempt_caps=False, min_carry=0.9):
+        wp2 = wp if lead is None else np.vstack([wp[:1], (wp[0] + vhat * lead)[None], wp[1:]])
+        kw2 = dict(kw)
+        kw2["start_vel"] = vhat * v0
+        tr = parametrize_path(wp2, *lims, backend="retimed", **kw2)
+        vel0 = (tr[1] - tr[0]) * FPS
+        sp0 = float(np.linalg.norm(vel0))
+        al = float(np.dot(vel0 / max(sp0, 1e-9), vhat))
+        a = np.diff(np.diff(tr, axis=0) * FPS, axis=0) * FPS
+        j = np.diff(a, axis=0) * FPS
+        lim_ok = exempt_caps or (np.abs(a).max() <= 1.05 and np.abs(j).max() <= 11.5)
+        check(
+            label,
+            sp0 >= min_carry * v0 and al > 0.95 and lim_ok,
+            f"speed {sp0:.2f}/{v0} align {al:+.2f} amax {np.abs(a).max():.2f} jmax {np.abs(j).max():.1f}",
+        )
+
+    d_lead = lambda v: v * v / 1.4 + v / 10.0
+    run(d0u, 0.30, None, "aligned handoff")
+    for ang in (60, 90, 110):
+        th = np.radians(ang)
+        vh = np.cos(th) * d0u + np.sin(th) * perp
+        run(vh, 0.43, d_lead(0.43), f"mid-band {ang}deg lead-in")
+    for ang in (150, 180):
+        th = np.radians(ang)
+        vh = np.cos(th) * d0u + np.sin(th) * perp
+        run(vh, 0.40, d_lead(0.40), f"reversal {ang}deg brake-out")
+    # short runway: escalated brake (caps deliberately exceeded)
+    run(-d0u, 0.40, 0.5 * d_lead(0.40), "short-runway 0.5x (escalated)", exempt_caps=True)
+    run(-d0u, 0.40, 0.25 * d_lead(0.40), "short-runway 0.25x (escalated)", exempt_caps=True)
+
+    # EXACT-CARRY overspeed: handoff above vmax (0.5) and therefore above
+    # any start license. Launch must be AT the handed speed (no clamp), the
+    # overlay must brake monotonically, and the profile must be back inside
+    # vmax within a second (surplus shed early, remainder legal).
+    def run_overspeed(vhat, v0, label, cusp_lead=None):
+        wp2 = (
+            wp if cusp_lead is None
+            else np.vstack([wp[:1], (wp[0] + vhat * cusp_lead)[None], wp[1:]])
+        )
+        kw2 = dict(kw)
+        kw2["start_vel"] = vhat * v0
+        tr = parametrize_path(wp2, *lims, backend="retimed", **kw2)
+        sp = np.linalg.norm(np.diff(tr, axis=0), axis=1) * FPS
+        d1 = tr[1] - tr[0]
+        al = float(np.dot(d1 / max(np.linalg.norm(d1), 1e-12), vhat))
+        vmax = float(lims[0].max())
+        over = sp > vmax * 1.001
+        shed_tick = int(np.argmin(over)) if not over.all() else len(sp)
+        mono = bool(np.all(np.diff(sp[: shed_tick + 1]) <= 1e-6)) if shed_tick > 0 else True
+        legal_after = bool(np.all(sp[shed_tick:] <= vmax * 1.05))
+        check(
+            label,
+            abs(sp[0] - v0) <= 0.02 * v0 and al > 0.95 and mono
+            and legal_after and shed_tick <= FPS,
+            f"launch {sp[0]:.3f}/{v0} align {al:+.2f} shed@{shed_tick} "
+            f"ticks mono={mono} post-shed max {sp[shed_tick:].max():.2f}",
+        )
+
+    run_overspeed(d0u, 1.00, "overspeed aligned 2.0x vmax")
+    run_overspeed(d0u, 0.70, "overspeed aligned 1.4x vmax")
+    run_overspeed(-d0u, 0.80, "overspeed reversal brake-out 1.6x vmax",
+                  cusp_lead=d_lead(0.80))
+
+
+def section_b_planner():
+    print("--- B: planner start treatment ---")
+    import pybullet as pb
+    import pybullet_utils.bullet_client as bc
+
+    from splatsim.utils.rrt_to_goal import RRTToGoalPlanner
+
+    client = bc.BulletClient(pb.DIRECT)
+    urdf = os.path.join(
+        os.path.dirname(__file__), "..", "splatsim", "robot_definitions", "urdf", "planar_3joint.urdf"
+    )
+    robot = client.loadURDF(urdf, useFixedBase=True)
+    pl = RRTToGoalPlanner(
+        pb_client=client._client, robot_id=robot, joint_indices=[1, 2, 3],
+        ee_link_index=15, num_dofs=3, fps=30,
+    )
+    pl.load_obstacles({"objects": []})
+    free = lambda q: False
+
+    q0 = np.array([0.0, 0.5, -0.3])
+    path = np.array([q0, q0 + [0.4, -0.1, 0.2], q0 + [0.9, -0.3, 0.5]])
+    d0u = (path[1] - path[0]) / np.linalg.norm(path[1] - path[0])
+
+    # B1: lead-in placed even at mild misalignment (dot ~0.87 = 30 deg)
+    perp = np.array([-d0u[1], d0u[0], 0.0])
+    perp -= d0u * np.dot(perp, d0u)
+    perp /= np.linalg.norm(perp)
+    vh = np.cos(np.radians(30)) * d0u + np.sin(np.radians(30)) * perp
+    out = pl._straighten_terminal(path.copy(), free, start_vel=vh * 0.4)
+    first = (out[1] - out[0]) / max(np.linalg.norm(out[1] - out[0]), 1e-12)
+    check("B1 mild-misalign lead-in placed", len(out) > len(path) and float(np.dot(first, vh)) > 0.99,
+          f"vertices {len(path)}->{len(out)}")
+
+    # B2: straighten_only fallback preserves the lead-in
+    out2 = pl._postprocess_path(path.copy(), start_vel=vh * 0.4, straighten_only=True)
+    first2 = (out2[1] - out2[0]) / max(np.linalg.norm(out2[1] - out2[0]), 1e-12)
+    check("B2 straighten_only keeps lead-in", len(out2) > len(path) and float(np.dot(first2, vh)) > 0.99)
+
+    def _ee_at(q):
+        for j, qi in zip([1, 2, 3], q):
+            client.resetJointState(robot, j, float(qi))
+        return np.array(client.getLinkState(robot, 15, computeForwardKinematics=True)[0])
+
+    def _sweep_midpoint(vhat, v0):
+        """EE position halfway along the braking spur — obstacles get placed
+        relative to the COMPUTED sweep, not to guessed kinematics (two prior
+        test iterations failed purely on wrong sweep-direction guesses)."""
+        d = v0 * v0 / 1.4 + v0 / 10.0
+        return _ee_at(q0 + vhat * (0.5 * d)), d
+
+    # B3: emergency contact-clearance lead-in when plan clearance is
+    # blocked. MOCKED collision functions (a physically-placed blocker is
+    # brittle against the full arm-sweep geometry — three prior attempts
+    # failed on incidental finger/base contacts): full-clearance blocks the
+    # spur beyond 0.02 rad, contact level blocks beyond 0.08 — the
+    # emergency search must place a shortened lead-in (~0.08 < full 0.12).
+    vh2 = -d0u
+    proj = lambda q: float(np.dot(np.asarray(q) - q0, vh2))
+    mock_full = lambda q: proj(q) > 0.02
+    mock_contact = lambda q: proj(q) > 0.08
+    out3 = pl._straighten_terminal(
+        path.copy(), mock_full, start_vel=vh2 * 0.35, contact_fn=mock_contact
+    )
+    placed = len(out3) > len(path)
+    exc = float(np.linalg.norm(out3[1] - out3[0])) if placed else 0.0
+    first3 = (out3[1] - out3[0]) / max(np.linalg.norm(out3[1] - out3[0]), 1e-12) if placed else vh2 * 0
+    check("B3 emergency lead-in with shortened runway",
+          placed and 0.03 <= exc <= 0.085 and float(np.dot(first3, vh2)) > 0.99,
+          f"vertices {len(out3)} excursion {exc:.3f} (full braking needs 0.122)")
+
+    # C: brake feasibility directionality (emergency clearance)
+    print("--- C: brake feasibility ---")
+    v_toward = np.array([0.4, 0.0, 0.0])
+    mid_c, _ = _sweep_midpoint(v_toward / np.linalg.norm(v_toward), 0.4)
+    obs2 = client.createMultiBody(
+        0, client.createCollisionShape(pb.GEOM_SPHERE, radius=0.02),
+        basePosition=mid_c.tolist(),  # ON the computed sweep
+    )
+    pl._loaded_obstacle_ids.append(obs2)
+    pl._obstacle_names[obs2] = "c_sphere"
+    check("C1 rest is feasible... near obstacle on future sweep",
+          pl.is_brake_feasible(q0, np.zeros(3)))
+    check("C2 toward obstacle infeasible", not pl.is_brake_feasible(q0, v_toward))
+
+
+def section_d_ctor_drift():
+    """Guard: features added to RRTToGoalPlanner must be threaded into BOTH
+    call sites — SplatSim's TrajectoryGenerator (demo generation) and
+    lerobot's RRTGuidanceSource (interventions) — unless intentionally
+    exempted below. Camera scoring lived generation-only for a while and
+    intervention RRT silently lacked it; this section makes that class of
+    drift a test failure instead of a video-review surprise."""
+    print("--- D: generation<->intervention ctor drift ---")
+    import ast as _ast
+
+    def kwargs_of_call(path, funcname="RRTToGoalPlanner"):
+        tree = _ast.parse(open(path).read())
+        names = set()
+
+        def collect(call):
+            for kw in call.keywords:
+                if kw.arg:
+                    names.add(kw.arg)
+                else:  # **{...} of (name, value) pairs / dict-comprehensions
+                    for sub in _ast.walk(kw.value):
+                        if isinstance(sub, _ast.Constant) and isinstance(sub.value, str):
+                            names.add(sub.value)
+
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                f = node.func
+                if getattr(f, "id", getattr(f, "attr", None)) == funcname:
+                    collect(node)
+            # The SA source assembles its kwargs as `_explicit = dict(...)`
+            # and constructs via RRTToGoalPlanner(**{**env_base, **_explicit})
+            # (the env-config lowest-priority merge) — scan that dict too.
+            if isinstance(node, _ast.Assign) and len(node.targets) == 1:
+                t = node.targets[0]
+                if (getattr(t, "id", None) == "_explicit"
+                        and isinstance(node.value, _ast.Call)
+                        and getattr(node.value.func, "id", None) == "dict"):
+                    collect(node.value)
+        return names
+
+    gen = kwargs_of_call(os.path.join(os.path.dirname(__file__), "..", "splatsim", "utils", "trajectory_generation.py"))
+    sa_path = os.path.expanduser("~/code/lerobot/src/lerobot/policies/guidance/rrt_source.py")
+    if not os.path.isfile(sa_path):
+        check("D1 ctor drift (lerobot missing, skipped)", True)
+        return
+    sa = kwargs_of_call(sa_path)
+    # Intentional differences (justify each):
+    exempt = {
+        # generation-only by design:
+        "plan_rng_seed",            # per-scene determinism; would deadlock SA retries
+        "freeze_visualizer_during_plan",
+        "soft_cost_mode", "soft_cost_weight", "soft_cost_points_per_link",
+        "soft_cost_max_reduction", "soft_cost_surface_offsets",
+        "soft_cost_aggregation", "soft_cost_surface_samples",
+        # SA inherits the shared planner default (the None-inherit rule);
+        # only thread if a generation CONFIG starts overriding it:
+        "obstacle_clearance_factor",
+        "camera_k_exp", "camera_k_sig", "camera_threshold",  # SA inherits planner defaults
+        "parametrize_per_candidate",
+        # SA-only by design:
+        "in_progress_obstacle_clearance", "in_progress_self_collision_clearance",
+        "escape_clearance_factor", "rewind_clearance_factor",
+        "diagnostic_log_pairs", "ik_accept_arc_chord_ratio",
+        "velocity_match_window", "ik_goal_selection",
+        # construction plumbing (both pass, names may differ):
+        "pb_client", "robot_id", "joint_indices", "ee_link_index", "num_dofs",
+        "fps", "lower_limits", "upper_limits", "wrist_camera_link_index",
+    }
+    missing_in_sa = (gen - sa) - exempt
+    missing_in_gen = (sa - gen) - exempt
+    check("D1 generation-only planner kwargs threaded into SA", not missing_in_sa,
+          f"missing in SA: {sorted(missing_in_sa)}" if missing_in_sa else "")
+    check("D2 SA-only planner kwargs known to generation or exempt", not missing_in_gen,
+          f"missing in generation: {sorted(missing_in_gen)}" if missing_in_gen else "")
+
+
+def section_e_env_config_inherit():
+    """The env traj-config JSON is the LOWEST-priority defaults layer for
+    intervention planners: name-consistent keys pass through verbatim,
+    plan_rng_seed is excluded (deterministic replans would deadlock SA
+    retries), and explicit kwargs always win in the merge."""
+    print("--- E: env traj-config inheritance ---")
+    from splatsim.utils.rrt_to_goal import planner_kwargs_from_traj_config
+
+    base = planner_kwargs_from_traj_config("planar_3joint")
+    check("E1 camera scoring inherited from JSON",
+          base.get("camera_score_weight") == 0.5 and "camera_k_exp" in base)
+    check("E2 plan_rng_seed excluded", "plan_rng_seed" not in base)
+    check("E3 unknown env -> empty", planner_kwargs_from_traj_config("no_such_env") == {})
+    merged = {**base, **{"num_ik_candidates": 32, "camera_score_weight": 0.0}}
+    check("E4 explicit values win in merge",
+          merged["num_ik_candidates"] == 32 and merged["camera_score_weight"] == 0.0)
+    # Name consistency: every JSON key that LOOKS like a planner knob must
+    # BE a planner ctor param verbatim (the rename-table era is over).
+    import inspect, json as _json
+    from splatsim.utils.paths import traj_config_path
+    from splatsim.utils.rrt_to_goal import RRTToGoalPlanner
+    cfg = _json.load(open(traj_config_path("planar_3joint")))
+    params = set(inspect.signature(RRTToGoalPlanner.__init__).parameters)
+    legacy = {"k_exp", "k_sig", "threshold", "num_path_candidates"}
+    check("E5 no legacy divergent names in config", not (set(cfg) & legacy),
+          f"legacy keys present: {sorted(set(cfg) & legacy)}" if set(cfg) & legacy else "")
+
+
+def main():
+    section_a_parametrizer()
+    section_b_planner()
+    section_d_ctor_drift()
+    section_e_env_config_inherit()
+    print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILURE(S): ' + ', '.join(FAILS)}")
+    sys.exit(1 if FAILS else 0)
+
+
+if __name__ == "__main__":
+    main()
