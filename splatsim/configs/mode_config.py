@@ -1,4 +1,6 @@
 import enum
+
+from splatsim.utils.planner_defaults import PLANNER_DEFAULTS as _PD
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 import numpy as np
@@ -83,9 +85,9 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # velocity/acceleration bounds and has no third-order term. It is still
     # honored by the ruckig backend (SPLATSIM_TRAJ_BACKEND=ruckig). See the
     # "TOPP-RA time parametrization" comment block in rrt_path_utils.py.
-    max_joint_vel: float = 0.5
-    max_joint_acc: float = 1.0
-    max_joint_jerk: float = 10.0
+    max_joint_vel: float = _PD.max_joint_vel
+    max_joint_acc: float = _PD.max_joint_acc
+    max_joint_jerk: float = _PD.max_joint_jerk
     use_obstacles: bool = True
     q_start: Optional[List[float] | np.ndarray] = None
     q_goal: Optional[List[float] | np.ndarray] = None # ex: 7-dof-joint robot configuration goal
@@ -103,7 +105,7 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     render_images: bool = False
     save_base_trajectory: bool = True
     disable_camera_scoring_for_rrt: bool = False
-    num_path_candidates: int = 5
+    num_path_candidates_per_ik: int = 5
     max_path_attempts: int = 15
     # Radians to perturb the RRT start/goal endpoints between path candidates so
     # BiRRT explores distinct branches (path_selection then picks the best of
@@ -119,7 +121,7 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # collision-checked only when they would shorten the path). 200 (vs the
     # planner's legacy 50) noticeably straightens paths at modest planning
     # cost; raise further if trajectories still look wandery.
-    rrt_smooth_iterations: int = 200
+    rrt_smooth_iterations: int = _PD.rrt_smooth_iterations
     # Corner-ROUNDING relaxation applied after shortcut smoothing
     # (rrt_path_utils.elastic_smooth_path). Shortcutting only removes a
     # corner when the straight line past it is collision-free; in cluttered
@@ -129,7 +131,7 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # into gentle arcs that hug the corridor instead. Default 30 (on) since
     # the vine-env wobble diagnosis (2026-07-28); it converges early and adds
     # little cost in open scenes. 0 = off (historical behavior).
-    elastic_smooth_passes: int = 30
+    elastic_smooth_passes: int = _PD.elastic_smooth_passes
     # CHOMP-lite trajectory optimizer with SOFT collision cost + smoothness
     # (rrt_path_utils.trajopt_smooth_path). Runs AFTER shortcut smoothing and
     # elastic corner-rounding, BEFORE parametrization time-parametrization. Extends
@@ -152,15 +154,15 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # dominates planning time by a wide margin: one distance query is ~10 ms
     # vs ~0.4 ms for a binary collision check, and the gradient needs
     # 2*DOF of them per waypoint per pass.
-    trajopt_passes: int = 15
-    trajopt_lr: float = 0.02
-    trajopt_smoothness_weight: float = 1.0
-    trajopt_collision_weight: float = 5.0
+    trajopt_passes: int = _PD.trajopt_passes
+    trajopt_lr: float = _PD.trajopt_lr
+    trajopt_smoothness_weight: float = _PD.trajopt_smoothness_weight
+    trajopt_collision_weight: float = _PD.trajopt_collision_weight
     # Distance below which the soft cost activates (meters). Roughly ½ the
     # link diameter is a good starting value; smaller = tighter paths that
     # hug obstacles, larger = wider berth (may be blocked in dense scenes).
-    trajopt_collision_threshold: float = 0.10
-    trajopt_fd_step: float = 0.01
+    trajopt_collision_threshold: float = _PD.trajopt_collision_threshold
+    trajopt_fd_step: float = _PD.trajopt_fd_step
     # How a loaded soft-cost field (EnvConfig.soft_cost — pushable vegetation
     # in vine-style envs) is used by the planner. Values are
     # SoftCostMode: "off" = ignore field; "score" = candidates generated
@@ -213,9 +215,9 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # teach the policy to overshoot the goal. Braking from creep speed
     # tracks cleanly (no overshoot); intermediate waypoints keep full
     # limits. 0.0 disables.
-    final_approach_dist: float = 0.15
-    final_approach_vel_scale: float = 0.5
-    final_approach_acc_scale: float = 0.25
+    final_approach_dist: float = _PD.final_approach_dist
+    final_approach_vel_scale: float = _PD.final_approach_vel_scale
+    final_approach_acc_scale: float = _PD.final_approach_acc_scale
     # When True, equalize joint-space PATH SPEED across trajectory sections (see
     # parametrize_path / rrt_path_utils). Per-joint box velocity limits
     # are direction-anisotropic, so the time-optimal profile SPRINTS through
@@ -225,7 +227,7 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # (which only tapers the very last leg). Default True since the vine-env
     # wobble diagnosis (2026-07-28): the surging read as oscillatory wobble in
     # recorded demos. False = time-optimal (historical, faster but surgy).
-    uniform_path_speed: bool = True
+    uniform_path_speed: bool = _PD.uniform_path_speed
     # Pad the END of each generated trajectory by holding the last joint config
     # frozen for ~1 second (robot_update_rate frames). Historically always on;
     # now default OFF. Useful when a downstream consumer expects the arm to
@@ -256,7 +258,7 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # tightest non-adjacent link-pair gap is LARGEST, avoiding pretzeled / near-
     # self-collision poses that wedge during execution (matches the DAgger/SA
     # intervention side). `CAMERA_SCORING` picks the path whose wrist-camera view
-    # best satisfies `k_exp`/`k_sig`/`threshold` against the target EE pose;
+    # best satisfies `camera_k_exp`/`camera_k_sig`/`camera_threshold` against the target EE pose;
     # `EE_ARC_LENGTH` / `JOINT_ARC_LENGTH` minimize cartesian / joint path
     # length. See `PathSelectionStrategy` for full descriptions. Stored as the
     # enum value string; parsed back to enum at use.
@@ -264,6 +266,22 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # `disable_camera_scoring_for_rrt` below is DEPRECATED — only consulted when
     # `path_selection == CAMERA_SCORING`, forcing it to `EE_ARC_LENGTH`.
     path_selection: str = PathSelectionStrategy.MIN_PAIR_CLEARANCE.value
+    # Joint-arc regularizer ADDED to the base score of whichever
+    # `path_selection` strategy is active (skipped when the strategy is
+    # already `joint_arc_length`). Units: base-score-units per rad — m/rad
+    # for the arc-length strategies. 0 = off (historical scoring).
+    #
+    # Why: EE_ARC_LENGTH (and near-goal candidates generally) can't see
+    # joint-space distance, so candidates whose EE arcs differ by
+    # millimeters can differ by radians of joint travel — and execution
+    # time under the parametrizer scales with JOINT arc. Default 0.03
+    # breaks those near-ties toward the fast-to-execute path. Mirrors
+    # `SharedAutonomyConfig.rrt_path_score_joint_arc_weight` on the
+    # LeRobot DAgger/SA side (default 0 there; trajectory-gen opts in by
+    # default). NOTE: with `path_selection=min_pair_clearance` the base
+    # score is a negated clearance (~0.01-0.05 m spread), so 0.03/rad can
+    # dominate — drop the weight if clearance ranking must stay strict.
+    path_score_joint_arc_weight: float = 0.03
     # How to pick the IK GOAL among the candidates for the target EE pose,
     # BEFORE running RRT (orthogonal to `path_selection`, which picks the PATH).
     # Stored as the enum value string; parsed back at use.
@@ -277,12 +295,17 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     #     `path_selection` (e.g. camera_scoring) pick the winner across them
     #     (historical multi-candidate behavior).
     ik_goal_selection: str = IkGoalSelectionStrategy.JOINT_DISTANCE.value
-    # Corner segmentation. True: split the trajectory at sharp (>45°) corners
-    # with a forced zero-velocity STOP at each — safer but produces bursty
-    # "start-stop" motion. False (default for trajectory-gen): a single
-    # pass with intermediate positions → continuous motion through corners.
-    # Forwarded to RRTToGoalPlanner(segment_at_sharp_corners=).
-    segment_at_sharp_corners: bool = False
+    # What happens at path corners. False (default for trajectory-gen):
+    # CARRY SPEED — corners are rounded within a small joint-space deviation
+    # budget (rrt_path_utils._blend_corners, default 0.05 rad) and the whole
+    # path is parametrized as one continuous problem, so motion flows through
+    # waypoints near cruise speed. (Rounding is essential, not cosmetic: a
+    # trajectory pinned to the exact polyline must brake to ~0 at any sharp
+    # corner no matter how it is segmented.) True: split at sharp (>45°)
+    # corners with a forced zero-velocity STOP at each — bursty start-stop
+    # motion, but the executed path stays exactly on the checked chords at
+    # those corners. Forwarded to RRTToGoalPlanner(segment_at_sharp_corners=).
+    segment_at_sharp_corners: bool = _PD.segment_at_sharp_corners
     # Non-adjacent link pairs to EXCLUDE from self-collision checks. Use for
     # URDF link pairs that are structurally close at every reachable joint
     # config (e.g. UR's base_link(0) vs upper_arm_link(2), ~4 mm apart due
@@ -308,9 +331,20 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     # on the LeRobot side so SplatSim's env-side reset-time IK feasibility
     # check uses the same relaxation the runtime RRT does.
     ik_skip_gripper_obstacle_pairs: bool = True
-    k_exp: float = 5.0
-    k_sig: float = 15.0
-    threshold: float = 0.4
+    camera_k_exp: float = 5.0
+    camera_k_sig: float = 15.0
+    camera_threshold: float = 0.4
+    # Hybrid selection terms (RRTToGoalPlanner ctor — see its docstring).
+    # camera_score_weight ADDS weight * (negated goal-proximity-weighted wrist-
+    # camera alignment) to the base path score: keeps min-arc paths short while
+    # deterministically preferring goal-facing approaches (planar benchmark:
+    # alignment 0.14 -> 0.89 for +6% arc at 0.5). ik_camera_weight applies the
+    # same idea to the IK GOAL choice (which wrist branch faces the grasp).
+    # plan_rng_seed (when set) makes each plan reproducible per (start, goal)
+    # without touching the caller's scene-randomization RNG stream.
+    camera_score_weight: float = 0.0
+    ik_camera_weight: float = 0.0
+    plan_rng_seed: Optional[int] = None
     save_zarr: bool = False
     lerobot_repo_id: str = ""
     push_to_hub: bool = True

@@ -378,12 +378,13 @@ class TrajectoryGenerator:
                 parametrize_per_candidate=False,
                 segment_at_sharp_corners=self.config.segment_at_sharp_corners,
                 path_selection=PathSelectionStrategy(self.config.path_selection),
+                path_score_joint_arc_weight=self.config.path_score_joint_arc_weight,
                 # Config-driven (default "joint_distance"): pick the IK goal
                 # nearest q_start to avoid the far wrist-flipped branch that
                 # self-collides during execution. "none" falls back to scoring
                 # all IK candidates via path_selection. See TrajectoryGenModeConfig.
                 ik_goal_selection=self.config.ik_goal_selection,
-                num_path_candidates_per_ik=self.config.num_path_candidates,
+                num_path_candidates_per_ik=self.config.num_path_candidates_per_ik,
                 max_path_attempts_per_ik=self.config.max_path_attempts,
                 path_perturbation_scale=self.config.path_perturbation_scale,
                 rrt_smooth_iterations=self.config.rrt_smooth_iterations,
@@ -411,9 +412,12 @@ class TrajectoryGenerator:
                 # "No collision-free IK solution found" despite valid candidates.
                 ik_skip_gripper_obstacle_pairs=self.config.ik_skip_gripper_obstacle_pairs,
                 wrist_camera_link_index=self.camera_link_index,
-                camera_k_exp=self.config.k_exp,
-                camera_k_sig=self.config.k_sig,
-                camera_threshold=self.config.threshold,
+                camera_score_weight=getattr(self.config, "camera_score_weight", 0.0),
+                ik_camera_weight=getattr(self.config, "ik_camera_weight", 0.0),
+                plan_rng_seed=getattr(self.config, "plan_rng_seed", None),
+                camera_k_exp=self.config.camera_k_exp,
+                camera_k_sig=self.config.camera_k_sig,
+                camera_threshold=self.config.camera_threshold,
                 # Soft-cost usage ("off"/"score"/"guided") + scoring weight.
                 # Config default is "off" (small_engine/planar have no field
                 # and stay cost-blind by construction); envs with a field

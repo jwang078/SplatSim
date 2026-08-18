@@ -1,4 +1,7 @@
 {
+  "camera_k_exp": 5.0,
+  "camera_k_sig": 15.0,
+  "camera_threshold": 0.4,
   "cuboids_fn": null,
   "debug_visualize": false,
   "disable_camera_scoring_for_rrt": false,
@@ -13,9 +16,7 @@
   "freeze_visualizer_during_plan": true,
   "ik_goal_selection": "joint_distance",
   "ik_skip_gripper_obstacle_pairs": true,
-  "k_exp": 5.0,
-  "k_sig": 15.0,
-  "lerobot_repo_id": "JennyWWW/planar_3joint_3",
+  "lerobot_repo_id": "JennyWWW/splatsim_lever_15_regen",
   "max_fails": 2,
   "max_joint_acc": 1.0,
   "max_joint_jerk": 10.0,
@@ -24,9 +25,9 @@
   "max_obstacles": 3,
   "max_path_attempts": 15,
   "min_obstacles": 1,
-  "num_base_trajectories": 1000,
+  "num_base_trajectories": 500,
   "num_ik_candidates": 32,
-  "num_path_candidates": 5,
+  "num_path_candidates_per_ik": 5,
   "obstacle_clearance": 0.02,
   "obstacle_clearance_factor": 0.9,
   "obstacles_per_base_trajectory": 0,
@@ -37,11 +38,7 @@
   "push_to_hub": true,
   "q_goal": null,
   "q_goal_bias": null,
-  "q_start": [
-    -2.3519596003578616,
-    -2.938181729610028,
-    1.15203874030955
-  ],
+  "q_start": null,
   "render_images": false,
   "render_letterbox": true,
   "render_stretch": true,
@@ -52,41 +49,11 @@
   "save_zarr": false,
   "segment_at_sharp_corners": false,
   "self_collision_clearance": 0.01,
-  "self_collision_skip_pairs": [
-    [
-      7,
-      9
-    ],
-    [
-      8,
-      9
-    ],
-    [
-      12,
-      14
-    ],
-    [
-      13,
-      14
-    ],
-    [
-      5,
-      9
-    ],
-    [
-      10,
-      14
-    ],
-    [
-      6,
-      9
-    ],
-    [
-      11,
-      14
-    ]
-  ],
-  "threshold": 0.4,
+  "self_collision_skip_pairs": null,
+  "soft_cost_aggregation": "max",
+  "soft_cost_mode": "off",
+  "soft_cost_surface_samples": 6,
+  "soft_cost_weight": 1.0,
   "time_per_traj": 6.0,
   "trajopt_collision_threshold": 0.1,
   "trajopt_collision_weight": 5.0,

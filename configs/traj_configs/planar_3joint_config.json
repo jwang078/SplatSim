@@ -1,4 +1,7 @@
 {
+  "camera_k_exp": 5.0,
+  "camera_k_sig": 15.0,
+  "camera_threshold": 0.4,
   "cuboids_fn": null,
   "debug_visualize": false,
   "disable_camera_scoring_for_rrt": false,
@@ -12,8 +15,6 @@
   "freeze_visualizer_during_plan": true,
   "ik_goal_selection": "joint_distance",
   "ik_skip_gripper_obstacle_pairs": true,
-  "k_exp": 5.0,
-  "k_sig": 15.0,
   "lerobot_repo_id": "JennyWWW/planar_3joint",
   "max_fails": 2,
   "max_joint_acc": 1.0,
@@ -25,7 +26,7 @@
   "min_obstacles": 1,
   "num_base_trajectories": 1000,
   "num_ik_candidates": 32,
-  "num_path_candidates": 5,
+  "num_path_candidates_per_ik": 5,
   "obstacle_clearance": 0.02,
   "obstacle_clearance_factor": 0.9,
   "obstacles_per_base_trajectory": 0,
@@ -81,7 +82,6 @@
       14
     ]
   ],
-  "threshold": 0.4,
   "time_per_traj": 6.0,
   "uniform_path_speed": true,
   "use_obstacles": true,

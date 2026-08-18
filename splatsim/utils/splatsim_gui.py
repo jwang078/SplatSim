@@ -178,6 +178,15 @@ class ThreadedTkinterGui(ABC):
                 self._values.clear()
             self._root = None
 
+
+    def is_alive(self) -> bool:
+        """True while the Tk thread is running.
+
+        Lets a driver loop notice the user closing the window (which ends the
+        thread via `_on_close` -> `_destroy_window`) without polling privates.
+        """
+        return self._thread is not None and self._thread.is_alive()
+
     def _destroy_window(self):
         """Destroy window - must be called from GUI thread.
 
@@ -755,7 +764,14 @@ class TrajectoryGenModePanel(ModePanel):
     # Widget key for the export/import path. NOT a config field (leading "_"), so
     # save_to_config skips it and it never leaks into the exported JSON.
     CONFIG_PATH_KEY = "traj_gen._config_path"
-    DEFAULT_CONFIG_PATH = "configs/traj_config.json"
+    # Fallback only. The server passes the CURRENT env's conventional path via
+    # SplatSimGui(traj_config_default_path=...) — see paths.traj_config_path —
+    # so each env exports to its own file rather than every env overwriting one
+    # shared scratch config.
+    DEFAULT_CONFIG_PATH = "configs/traj_configs/traj_config.json"
+
+    def _default_config_path(self, gui: 'SplatSimGui') -> str:
+        return getattr(gui, "_traj_config_default_path", None) or self.DEFAULT_CONFIG_PATH
 
     def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
               style: GuiStyle, config: SplatSimModeConfig) -> None:
@@ -769,7 +785,7 @@ class TrajectoryGenModePanel(ModePanel):
             IntParam(f"{NS}.paths_per_obstacle", "Paths/Obstacle", 1, 5),
             IntParam(f"{NS}.min_obstacles", "Min Obstacles", 0, 5),
             IntParam(f"{NS}.max_obstacles", "Max Obstacles", 1, 10),
-            IntParam(f"{NS}.num_path_candidates", "Path Candidates", 1, 20),
+            IntParam(f"{NS}.num_path_candidates_per_ik", "Path Candidates", 1, 20),
             IntParam(f"{NS}.num_ik_candidates", "IK Candidates", 1, 64),
             IntParam(f"{NS}.max_path_attempts", "Max Path Attempts", 1, 50),
             # Corner-rounding relaxation after shortcut smoothing — bends the
@@ -792,9 +808,9 @@ class TrajectoryGenModePanel(ModePanel):
             builder.add_int_param(param, getattr(config, param.key.split(".", 1)[1]))
 
         float_params = [
-            FloatParam(f"{NS}.k_exp", "k_exp", 0.1, 20.0),
-            FloatParam(f"{NS}.k_sig", "k_sig", 0.1, 30.0),
-            FloatParam(f"{NS}.threshold", "threshold", 0.0, 1.0),
+            FloatParam(f"{NS}.camera_k_exp", "camera_k_exp", 0.1, 20.0),
+            FloatParam(f"{NS}.camera_k_sig", "camera_k_sig", 0.1, 30.0),
+            FloatParam(f"{NS}.camera_threshold", "camera_threshold", 0.0, 1.0),
             # RRT-planner clearance margins (meters). Defaults match
             # `_COLLISION_CLEARANCE` (0.01) and `check_links_in_collision`'s
             # `self_collision_clearance=0.0`, so leaving them alone keeps
@@ -805,6 +821,13 @@ class TrajectoryGenModePanel(ModePanel):
             FloatParam(f"{NS}.obstacle_clearance", "Obstacle Clearance (m)", 0.0, 0.1),
             FloatParam(f"{NS}.self_collision_clearance", "Self Coll Clearance (m)", 0.0, 0.1),
             FloatParam(f"{NS}.path_perturbation_scale", "Path Perturbation (rad)", 0.0, 0.2),
+            # Joint-arc regularizer on the path-selection score (m/rad).
+            # Breaks near-goal EE-arc ties toward candidates with less
+            # joint travel (= faster execution). 0 = off; default 0.03.
+            # Above ~0.5 the joint-arc term dominates the base score —
+            # at that point path_selection=joint_arc_length says it
+            # directly. See TrajectoryGenModeConfig.
+            FloatParam(f"{NS}.path_score_joint_arc_weight", "Joint-Arc Score Weight (m/rad)", 0.0, 0.5),
             # Final-approach taper. `final_approach_dist=0` disables (the parametrizer
             # runs at full limits right up to the goal; PD may overshoot 1-2
             # frames but no slow tail teaches "freeze near goal" into the
@@ -924,8 +947,8 @@ class TrajectoryGenModePanel(ModePanel):
         # config (see launch_nodes.py --traj_config_file). The path is a plain
         # text field (keeps the file op thread-safe — no cross-thread dialog).
         builder.add_str_param(
-            StrParam(self.CONFIG_PATH_KEY, "Config File (JSON)", self.DEFAULT_CONFIG_PATH, width=25),
-            self.DEFAULT_CONFIG_PATH,
+            StrParam(self.CONFIG_PATH_KEY, "Config File (JSON)", self._default_config_path(gui), width=25),
+            self._default_config_path(gui),
         )
         builder.add_button_row([
             ButtonConfig("Export Config", self.BTN_EXPORT_CONFIG),
@@ -947,7 +970,7 @@ class TrajectoryGenModePanel(ModePanel):
 
         if gui.check_button(self.BTN_EXPORT_CONFIG):
             gui.save_to_config(gui._config, prefix="traj_gen")  # sync widgets -> config
-            path = (gui.get_value(self.CONFIG_PATH_KEY) or self.DEFAULT_CONFIG_PATH).strip()
+            path = (gui.get_value(self.CONFIG_PATH_KEY) or self._default_config_path(gui)).strip()
             try:
                 skipped = save_dataclass_json(gui._config, path)
                 note = f" (skipped non-serializable: {skipped})" if skipped else ""
@@ -958,7 +981,7 @@ class TrajectoryGenModePanel(ModePanel):
                 print(f"[GUI] Export failed: {e}")
 
         if gui.check_button(self.BTN_IMPORT_CONFIG):
-            path = (gui.get_value(self.CONFIG_PATH_KEY) or self.DEFAULT_CONFIG_PATH).strip()
+            path = (gui.get_value(self.CONFIG_PATH_KEY) or self._default_config_path(gui)).strip()
             try:
                 update_dataclass_json(gui._config, path, warn=lambda m: print(f"[GUI] {m}"))
                 # Env-owned fields (task goal pose, q_goal_bias, skip pairs,
@@ -1200,6 +1223,7 @@ class SplatSimGui(ThreadedTkinterGui):
         initial_render_mode: Any = None,
         available_render_modes: Optional[List[Any]] = None,
         initial_splat_shadows: bool = False,
+        traj_config_default_path: Optional[str] = None,
         traj_env_reassert_fn=None,
     ):
         """Initialize the GUI.
@@ -1230,6 +1254,9 @@ class SplatSimGui(ThreadedTkinterGui):
         # an Import (see PybulletRobotServerBase.reassert_env_traj_config_fields).
         # None => imports apply verbatim (historical behavior).
         self._traj_env_reassert_fn = traj_env_reassert_fn
+        # Per-env default for the Traj Gen panel's "Config File (JSON)" box
+        # (paths.traj_config_path(env_name)). None => the panel's own fallback.
+        self._traj_config_default_path = traj_config_default_path
         self._available_render_modes = (
             list(available_render_modes) if available_render_modes else list(RenderMode)
         )
