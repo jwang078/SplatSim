@@ -10,6 +10,7 @@ from pybullet_planning import create_box, set_pose, Pose, RED, BLUE
 from splatsim.configs import TrajectoryGenModeConfig
 from splatsim.configs.mode_config import PathSelectionStrategy
 from splatsim.utils import rrt_path_utils
+from splatsim.utils.lerobot_utils import MIN_EPISODE_FRAMES
 from splatsim.utils.rrt_to_goal import RRTToGoalPlanner, RRTPlanningError
 from splatsim.configs.env_config import SplatSimObject
 
@@ -580,6 +581,21 @@ class TrajectoryGenerator:
             extra_steps = np.tile(last_q, (num_extra_steps, 1))
             base_traj = np.vstack((base_traj, extra_steps))
 
+        # Episode-length gate: a base plan shorter than MIN_EPISODE_FRAMES
+        # (a near-trivial reach — increasingly common since the speed-range
+        # restoration shortened short paths' frame counts) would save a
+        # degenerate training episode. Reject the whole batch WITHOUT
+        # incrementing trajectory_count: the serve loop retries with a fresh
+        # random goal, so the episode quota still fills with full-length
+        # episodes.
+        if base_traj.shape[0] < MIN_EPISODE_FRAMES:
+            print(
+                f"[TrajectoryGenerator] Base trajectory too short "
+                f"({base_traj.shape[0]} < {MIN_EPISODE_FRAMES} frames) — "
+                f"dropping and resampling a new goal."
+            )
+            return None
+
         # 3. Get EE trajectory for obstacle placement
         base_ee_traj = self._get_ee_trajectory(base_traj)
 
@@ -620,8 +636,14 @@ class TrajectoryGenerator:
                 else:
                     obs_target_ee_pos, obs_target_ee_quat = self._fk_ee_pose(q_goal)
 
-                # Generate multiple paths per obstacle configuration
-                for path_i in range(self.config.paths_per_obstacle):
+                # Generate multiple paths per obstacle configuration. Short
+                # plans (< MIN_EPISODE_FRAMES) don't count toward the target
+                # — retry with a fresh plan, bounded at 2x the target so a
+                # degenerate goal can't loop forever.
+                path_i = 0
+                attempts = 0
+                while path_i < self.config.paths_per_obstacle and attempts < 2 * self.config.paths_per_obstacle:
+                    attempts += 1
                     try:
                         modified_traj, _ = self._planner.plan(
                             q_start,
@@ -631,6 +653,14 @@ class TrajectoryGenerator:
                         )
                     except RRTPlanningError:
                         modified_traj = None
+
+                    if modified_traj is not None and modified_traj.shape[0] < MIN_EPISODE_FRAMES:
+                        print(
+                            f"[TrajectoryGenerator] Obstacle-variant path too short "
+                            f"({modified_traj.shape[0]} < {MIN_EPISODE_FRAMES} frames) — retrying."
+                        )
+                        modified_traj = None
+                        continue
 
                     if modified_traj is not None:
                         # Optionally hold the last position for a second (opt-in;
@@ -653,10 +683,17 @@ class TrajectoryGenerator:
                             "obstacle_info": obstacle_info,
                             "zarr_group": zarr_group,
                         })
+                        path_i += 1
+                    else:
+                        path_i += 1  # plan FAILURE consumes the slot (historical behavior)
 
                 # Remove obstacles for next iteration
                 self._remove_obstacles(obstacle_ids)
 
+        if not results:
+            # Nothing survived (base not saved and every variant failed/short)
+            # — don't consume a quota slot; the serve loop retries.
+            return None
         self.trajectory_count += 1
         return results
 

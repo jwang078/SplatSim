@@ -12,6 +12,16 @@ from typing import List, Optional
 
 import numpy as np
 
+# Minimum episode length, in frames, for any dataset meant for policy
+# training. Episodes shorter than this are degenerate (a near-trivial
+# reach that a diffusion chunk swallows whole) and are DROPPED — never
+# padded: last-frame-repeat padding trains "freeze near the goal" into the
+# policy. The lerobot side enforces the same value independently
+# (teleop_recording.min_episode_length = 60, blend/filter scripts'
+# --min_episode_length defaults) — lerobot's core cannot import splatsim,
+# so keep them numerically in sync when changing either.
+MIN_EPISODE_FRAMES = 60
+
 # Video encoding is chatty by default: SVT-AV1 prints its full config banner to
 # stderr on every episode (it writes straight from C, so Python logging can't
 # reach it -- only the SVT_LOG env var can), and libav prints muxer notes like

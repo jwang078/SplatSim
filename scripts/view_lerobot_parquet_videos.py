@@ -20,6 +20,7 @@ from collections import OrderedDict
 import cv2
 import imageio
 import numpy as np
+from splatsim.utils.lerobot_utils import MIN_EPISODE_FRAMES
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
@@ -330,7 +331,7 @@ class SlicedEpisodeVideoSource(LooseEpisodeVideoSource):
 
 def slice_fallback_by_intervention_csv(
     ep_videos: dict[int, list[tuple[str, str]]],
-    min_frames: int = 60,
+    min_frames: int = MIN_EPISODE_FRAMES,
 ) -> tuple[dict[int, tuple[int, int, int]], str] | None:
     """Build dataset-episode slices from an interventions run's CSV.
 
@@ -1195,7 +1196,7 @@ def main():
     parser.add_argument(
         "--fallback_min_episode_frames",
         type=int,
-        default=60,
+        default=MIN_EPISODE_FRAMES,
         help=(
             "Loose-video fallback for INTERVENTION datasets: cycles shorter than "
             "this many RRT frames are assumed dropped by the recorder's "
