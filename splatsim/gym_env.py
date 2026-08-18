@@ -592,14 +592,14 @@ class _ZMQBackend:
     # the simulator subprocess.
     splatsim_robot = object()
 
-    def teleport_joint_state(self, splatsim_robot, joint_state):
+    def teleport_joint_state(self, splatsim_robot, joint_state, joint_velocities=None):
         """Forward a teleport request over ZMQ. Mirrors the local
         ``PybulletRobotServerBase.teleport_joint_state`` signature so the
         seeding helper can call either backend the same way; the
         ``splatsim_robot`` arg is ignored (the simulator owns its own).
         """
         del splatsim_robot  # unused — server side picks self._robot.splatsim_robot
-        return self._client.teleport_joint_state(joint_state)
+        return self._client.teleport_joint_state(joint_state, joint_velocities)
 
     def set_eval_benchmark_indices(self, indices):
         """Forward playlist update to the remote server. See the client-side

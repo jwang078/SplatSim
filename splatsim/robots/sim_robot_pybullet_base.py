@@ -144,6 +144,14 @@ class ZMQRobotServer:
         self._stop_event = threading.Event()
         self._policy_guidance_action = None
         self._policy_guidance_lock = threading.Lock()
+        # Coordinator-only mode: launch_trajgen_pool.py sets this env var on
+        # its workers so that EVERY request must carry the pool's control
+        # token, not just the trajgen control methods. A pool worker shares
+        # the port range with ordinary sim servers, and a stray gym/teleop
+        # client (gello ZMQClientRobot, an eval script from an earlier
+        # session) resetting a worker mid-generation corrupts the run.
+        # Manual/interactive launches don't set the var and stay open.
+        self._coordinator_only = bool(os.environ.get("SPLATSIM_WORKER_LOCKDOWN"))
 
     def serve(self) -> None:
         """Serve the robot state and commands over ZMQ."""
@@ -156,6 +164,19 @@ class ZMQRobotServer:
                 # Call the appropriate method based on the request
                 method = request.get("method")
                 args = request.get("args", {})
+                # The pool client attaches the token to every request; pop it
+                # so handlers invoked with **args never see an unexpected
+                # kwarg. Control methods get it passed back explicitly below.
+                token = args.pop("token", None) if isinstance(args, dict) else None
+                if self._coordinator_only:
+                    denied = self._robot._authorize_control(token)
+                    if denied is not None:
+                        logger.warning(
+                            "rejected %r request without valid control token "
+                            "(SPLATSIM_WORKER_LOCKDOWN is set)", method,
+                        )
+                        self._socket.send(pickle.dumps(denied))
+                        continue
                 result: Any
                 # print(f"Received request: {method}, {args}")
                 if method == "num_dofs":
@@ -208,6 +229,16 @@ class ZMQRobotServer:
                     result = self._robot.get_env_config()
                 elif method == "set_eval_benchmark_indices":
                     result = self._robot.set_eval_benchmark_indices(**args)
+                # --- parallel trajectory generation (see
+                # splatsim/utils/trajgen_workers.py for the client half) ---
+                elif method == "set_traj_config":
+                    result = self._robot.set_traj_config(**args, token=token)
+                elif method == "set_serve_mode":
+                    result = self._robot.set_serve_mode_remote(**args, token=token)
+                elif method == "get_trajgen_status":
+                    result = self._robot.get_trajgen_status(**args, token=token)
+                elif method == "get_last_frames":
+                    result = self._robot.get_last_frames()
                 else:
                     result = {"error": "Invalid method"}
                     print(result)
@@ -221,6 +252,21 @@ class ZMQRobotServer:
                 # Timeout occurred, check if the stop event is set
             except (zmq.error.ContextTerminated, zmq.error.ZMQError):
                 break  # Socket/context was closed during shutdown
+            except Exception as e:
+                # A handler error must not kill the serve thread: the worker
+                # would silently become unreachable while its main loop keeps
+                # running (and a later SIGTERM can then land mid-save and
+                # corrupt the shard). Reply with the error to keep the REP
+                # state machine in sync and surface it on the client.
+                logger.exception("ZMQ handler error (serve loop continues)")
+                try:
+                    self._socket.send(
+                        pickle.dumps({"error": f"{type(e).__name__}: {e}"})
+                    )
+                except zmq.error.ZMQError:
+                    # recv itself failed, so there is no reply owed; the REP
+                    # socket is still in recv state and the loop can continue.
+                    pass
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -309,6 +355,35 @@ WRIST_CAM_FISHEYE_CALIBRATIONS: Dict[int, Dict[str, Any]] = {
 
 class PybulletRobotServerBase:
     MAX_TRAJECTORY_COUNT = 500
+
+    # ── Graceful shutdown (SIGTERM from launch_trajgen_pool) ─────────────────
+    # LeRobot's DatasetWriter streams episodes through open ParquetWriters
+    # whose file FOOTER is only written by finalize() — a process killed
+    # mid-run leaves every parquet without its magic bytes and the whole
+    # shard unreadable. So shutdown must always exit through serve()'s
+    # finally-finalize, never via the default SIGTERM kill.
+    #
+    # `_shutdown_requested` is set by request_shutdown() (called from the
+    # launch_nodes signal handler, which runs on the main thread) and polled
+    # at the top of the serve loop. `_in_dataset_critical_section` marks the
+    # windows where an interrupt would corrupt or orphan dataset state
+    # (save_episode, finalize); the signal handler defers its
+    # KeyboardInterrupt while it is True and the serve-loop poll picks the
+    # shutdown up at the next safe point instead.
+    _shutdown_requested = False
+    _in_dataset_critical_section = False
+
+    def request_shutdown(self) -> None:
+        """Ask the serve loop to exit at the next safe point.
+
+        Called from a signal handler; must stay trivial (flag write only).
+        """
+        self._shutdown_requested = True
+
+    @property
+    def safe_to_interrupt(self) -> bool:
+        """False while an interrupt would corrupt the LeRobot dataset."""
+        return not self._in_dataset_critical_section
     # ── URDF-specific self-collision skip pairs ──────────────────────────────
     # Non-adjacent link pairs to EXCLUDE from self-collision checks. Use for
     # URDF link pairs that are structurally close at every reachable joint
@@ -942,6 +1017,14 @@ class PybulletRobotServerBase:
         phantom_obstacles: bool = False,
     ):
         self._splatsim_gui = None
+        # Latest rendered camera frames, served by `get_last_frames` so a
+        # remote coordinator can watch this (possibly headless, GUI-less)
+        # worker generate. Written on the main thread by
+        # `display_observations`, read on the ZMQ dispatch thread — hence the
+        # lock. Holds at most one frame per camera; the reference is swapped,
+        # never mutated in place, so a reader can never see a torn dict.
+        self._last_preview_frames: Dict[str, Any] = {}
+        self._preview_frames_lock = threading.Lock()
         # Monotonic env-mutation clock. Bumped by every discrete mutation of
         # sim state (commanded control ticks, teleports, resets, object
         # add/move/delete) and stamped into every get_observations() result
@@ -1646,6 +1729,18 @@ class PybulletRobotServerBase:
             if getattr(env_cfg, f.name) != getattr(plain, f.name)
         }
 
+    def _default_traj_config_path(self) -> str | None:
+        """This env's conventional traj-config path, or None if it has no name.
+
+        Named after ``ENV_CONFIG.name`` so each env owns its own reproducible
+        export — see ``splatsim.utils.paths.traj_config_path``.
+        """
+        from splatsim.utils.paths import traj_config_path
+
+        env_cfg = getattr(self, "ENV_CONFIG", None)
+        name = getattr(env_cfg, "name", None)
+        return traj_config_path(name) if name else None
+
     def reassert_env_traj_config_fields(self, cfg) -> List[str]:
         """Re-assert env-owned fields on a trajectory-gen config IN PLACE and
         return the names of fields that were changed.
@@ -2087,7 +2182,10 @@ class PybulletRobotServerBase:
         return int(self._state_version)
 
     def teleport_joint_state(
-        self, splatsim_obj: SplatSimObject, joint_state: Tuple[float, ...]
+        self,
+        splatsim_obj: SplatSimObject,
+        joint_state: Tuple[float, ...],
+        joint_velocities: Tuple[float, ...] | None = None,
     ) -> int:
         """Set the joint states of an articulated object in the simulation and
         hold position. Returns the post-teleport state_version so the caller
@@ -2113,11 +2211,20 @@ class PybulletRobotServerBase:
         # Snap EVERY provided joint to its target with resetJointState — this
         # includes the gripper's mimic joints, so the gripper starts in the
         # correct (e.g. open) pose at init.
+        # `joint_velocities` (optional, rad/s, same indexing/signs as
+        # joint_state): restore joint VELOCITY along with position, so a
+        # lookback-rewind teleport puts the robot back into the MOVING state
+        # it was recorded in — without it, resetJointState zeroes velocity
+        # and every rewound intervention physically cold-starts from rest.
         for i in range(0, min(len(joint_state), num_joints - 1)):
+            vel_i = 0.0
+            if joint_velocities is not None and i < len(joint_velocities):
+                vel_i = float(joint_velocities[i]) * signs[i]
             self.pybullet_client.resetJointState(
                 splatsim_obj.sim_id,
                 i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
                 joint_state[i] * signs[i],
+                targetVelocity=vel_i,
             )
 
         # Hold ONLY the arm DOFs (joints 1..num_dofs) with POSITION_CONTROL.
@@ -3336,6 +3443,14 @@ class PybulletRobotServerBase:
             # can warn when they're talking to a wallclock-stepped sim — a
             # slow policy against an unsynced sim produces "jumpy" rollouts.
             "sync_physics_to_client": bool(self._sync_physics_to_client),
+            # Goal-tolerance mode, so remote clients can verify they're
+            # talking to a --strict_goal_tolerances server. Intervention
+            # recording and DAgger blend rollouts REQUIRE strict (loose
+            # eval-time thresholds terminate episodes "close enough" and cut
+            # off the last-mile corrections / state coverage they exist to
+            # capture) — augment_dataset_with_blending.py fails fast when
+            # this reports False.
+            "strict_goal_tolerances": bool(self._strict_goal_tolerances),
         }
         # Soft-cost payload (cost-aware RRT over pushable vegetation). Only
         # added when the env declares one so binary-obstacle envs publish a
@@ -3613,11 +3728,13 @@ class PybulletRobotServerBase:
             self._sync_render_done_event.clear()
             self._sync_render_pending_event.set()
 
-        # Timeout matches _sync_step_* (5 s). The main loop wakes every
-        # 1/240 s and consumes the request immediately; a missed signal
-        # (loop dead / GUI hang) surfaces as a warning rather than blocking
-        # the ZMQ thread indefinitely.
-        completed = self._sync_render_done_event.wait(timeout=5.0)
+        # Generous timeout: the main loop normally consumes the request
+        # within 1/240 s, but a long planning step (RRT/trajopt) can hold
+        # the main thread for tens of seconds, and a preview render posted
+        # during one must wait it out rather than time out. A missed signal
+        # (loop dead / GUI hang) still surfaces as an error rather than
+        # blocking the ZMQ thread indefinitely.
+        completed = self._sync_render_done_event.wait(timeout=30.0)
         if not completed:
             with self._sync_render_lock:
                 self._sync_render_request_kind = "rgb"
@@ -3625,8 +3742,8 @@ class PybulletRobotServerBase:
                 self._sync_render_request_link_states = None
                 self._sync_render_pending_event.clear()
             raise RuntimeError(
-                "sync_render: main-thread render timeout (5 s). Serve loop may "
-                "be blocked; skipping render and continuing."
+                "sync_render: main-thread render timeout (30 s). Serve loop "
+                "may be blocked; skipping render and continuing."
             )
 
         with self._sync_render_lock:
@@ -4430,12 +4547,13 @@ class PybulletRobotServerBase:
     def display_observations(self, observations: Dict[str, Any]) -> None:
         """Display rendered RGB observations in the SplatSim GUI.
 
+        Also caches them for `get_last_frames`, so a remote coordinator can
+        watch a headless worker without asking it to render anything extra —
+        this runs on every rendered frame of trajectory generation already.
+
         Args:
             observations: Dictionary containing rendered images as torch tensors (C, H, W)
         """
-        if self._splatsim_gui is None:
-            return
-
         frames_to_display = {}
         display_mode = self.image_resize_modes[0] if self.image_resize_modes else None
         for camera_name in self.camera_names:
@@ -4459,7 +4577,13 @@ class PybulletRobotServerBase:
             frames_to_display[camera_name] = frame
 
         if frames_to_display:
-            self._splatsim_gui.update_camera_images(frames_to_display)
+            # Cache FIRST and unconditionally: headless workers have no GUI
+            # (self._splatsim_gui is None), and they are exactly the processes
+            # a coordinator needs to watch.
+            with self._preview_frames_lock:
+                self._last_preview_frames = frames_to_display
+            if self._splatsim_gui is not None:
+                self._splatsim_gui.update_camera_images(frames_to_display)
 
     def randomize_object_pose(self, splatsim_obj: SplatSimObject):
         if splatsim_obj.sim_id is None:
@@ -5357,6 +5481,182 @@ class PybulletRobotServerBase:
             self._splatsim_gui.set_eval_episode_index(episode_id)
         return self.get_observations()
 
+    # =========================================================================
+    # Remote trajectory-generation control (parallel worker pool)
+    # =========================================================================
+    #
+    # These three run on the ZMQ DISPATCH THREAD, concurrently with the main
+    # serve loop. They therefore touch ONLY plain Python state — the config
+    # dataclass and the mode string — and never pybullet, whose client is not
+    # thread-safe and belongs to the main thread.
+    #
+    # The client half is `splatsim.utils.trajgen_workers`. Together they let
+    # ONE process holding the Tk control panel drive N headless generation
+    # workers, so the traj config no longer has to be baked in via
+    # --traj_config_file before the simulator starts.
+
+    def _control_token(self) -> str | None:
+        """The configured control secret, or None if there is none.
+
+        Resolution (env var, then ~/.cache/splatsim/control_token) lives in
+        `trajgen_workers` so both halves of the feature agree by construction.
+        Read lazily per request, never created here — a worker that minted its
+        own token would hand the pool a different secret per process.
+        """
+        override = getattr(self, "_control_token_override", None)
+        if override:
+            return str(override)
+        from splatsim.utils.trajgen_workers import control_token
+
+        return control_token()
+
+    def _authorize_control(self, token: str | None) -> dict | None:
+        """Gate the remote trajectory-gen controls. Returns an error dict, or None to allow.
+
+        The worker's ZMQ port is bound to 127.0.0.1, so it is unreachable from
+        the network — but ANY local process can still connect and drive a
+        worker (push a config, start/stop generation, redirect its dataset).
+        A shared secret restricts that to the coordinator.
+
+        DEFAULT-DENY: with no token configured these methods are disabled
+        outright, rather than silently accepting anyone. Set the same secret in
+        the shell that launches the workers AND the coordinator::
+
+            export SPLATSIM_CONTROL_TOKEN=$(openssl rand -hex 16)
+
+        This gate covers ONLY the three remote-control methods. It is not
+        authentication for the rest of the dispatch surface (the gym/eval
+        methods), which is unchanged and still open to any local process.
+        """
+        import hmac
+
+        expected = self._control_token()
+        if not expected:
+            return {
+                "error": (
+                    "remote trajgen control is disabled: this worker found no "
+                    "control token (checked $SPLATSIM_CONTROL_TOKEN and "
+                    "~/.cache/splatsim/control_token). Start the coordinator, "
+                    "which creates the file, then retry."
+                )
+            }
+        # Constant-time compare so a caller can't recover the token by timing.
+        if not token or not hmac.compare_digest(str(token), expected):
+            return {"error": "unauthorized: bad or missing control token"}
+        return None
+
+    def set_traj_config(self, config: dict, token: str | None = None) -> dict:
+        """Apply a trajectory-gen config pushed by the coordinator.
+
+        `config` is the plain-dict encoding produced by
+        `config_io.dataclass_to_dict` (the same payload the GUI's "Export
+        Config" writes), applied with `config_io.apply_dict` — so it is
+        tolerant of schema drift in both directions and no field is named
+        here.
+
+        REFUSED only while generation is actively RUNNING: the main loop reads
+        this config throughout an episode, and mutating it mid-flight would
+        produce an episode planned under two different settings. Every other
+        mode accepts it — in particular INTERACTIVE, which is what
+        `launch_nodes.py` starts a worker in, so a freshly-launched worker can
+        be configured without first being switched to idle.
+        """
+        from splatsim.utils.config_io import apply_dict
+
+        denied = self._authorize_control(token)
+        if denied:
+            return denied
+        gen = getattr(self, "trajectory_generator", None)
+        if gen is None:
+            return {"error": "this env has no trajectory_generator"}
+        if self.serve_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
+            return {
+                "error": (
+                    "refusing config push while generation is running — "
+                    "stop it first (the config is read throughout an episode)"
+                )
+            }
+
+        warnings: list[str] = []
+        apply_dict(gen.config, config, warn=warnings.append)
+        # Env-owned fields (task goal pose, skip pairs, DOF-mismatched q_*)
+        # win over anything pushed in, exactly as they do after the GUI's
+        # "Import Config" — a config authored against a different env would
+        # otherwise silently wipe them.
+        reasserted: list[str] = []
+        if hasattr(self, "reassert_env_traj_config_fields"):
+            reasserted = list(self.reassert_env_traj_config_fields(gen.config) or [])
+        # Drop any cached planner so the next plan() picks up the new values
+        # (mirrors the reset in _enter_mode's GENERATE_TRAJECTORIES branch).
+        gen._planner = None
+
+        print(
+            f"[trajgen-worker] config applied: repo_id={gen.config.lerobot_repo_id} "
+            f"n={gen.config.num_base_trajectories}"
+            + (f" reasserted={sorted(reasserted)}" if reasserted else "")
+        )
+        return {"ok": True, "warnings": warnings, "reasserted": reasserted}
+
+    def set_serve_mode_remote(self, mode: str, token: str | None = None) -> dict:
+        """Switch serve mode from the coordinator (start/stop generation).
+
+        Restricted to the two trajectory-generation modes. The general mode
+        machine has entry side effects that assume the main thread (dataset
+        init, pybullet reconfiguration); the trajgen pair is safe because the
+        main loop performs the transition itself on its next iteration — this
+        only sets the flag it polls.
+        """
+        denied = self._authorize_control(token)
+        if denied:
+            return denied
+        allowed = {
+            self.SERVE_MODES.GENERATE_TRAJECTORIES.value,
+            self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE.value,
+        }
+        if mode not in allowed:
+            return {"error": f"mode must be one of {sorted(allowed)}, got {mode!r}"}
+        self.serve_mode = self.SERVE_MODES(mode)
+        return {"ok": True, "mode": mode}
+
+    def get_last_frames(self) -> dict:
+        """The most recently RENDERED camera frames, or {} if none yet.
+
+        Lets a coordinator watch a headless worker mid-generation. Unlike
+        `get_observations` this renders NOTHING — it hands back the frames the
+        generation loop already produced for the dataset — so it is safe to
+        call while the main thread is busy and costs no GPU time.
+
+        Returns HxWx3 uint8 arrays keyed by camera name, the same normalization
+        the in-sim GUI displays. Empty while the worker is planning rather than
+        rendering, and permanently empty under RenderMode.NONE.
+        """
+        with self._preview_frames_lock:
+            return dict(self._last_preview_frames)
+
+    def get_trajgen_status(self, token: str | None = None) -> dict:
+        """Progress snapshot for the coordinator's status line.
+
+        Read-only over plain attributes, so it is safe to call at any time —
+        including mid-episode, which is the whole point (a worker that has
+        stopped contributing is otherwise indistinguishable from a slow one).
+        """
+        denied = self._authorize_control(token)
+        if denied:
+            return denied
+        gen = getattr(self, "trajectory_generator", None)
+        if gen is None:
+            return {"error": "this env has no trajectory_generator"}
+        env_cfg = getattr(self, "ENV_CONFIG", None)
+        return {
+            "mode": self.serve_mode.value,
+            "trajectory_count": int(gen.trajectory_count),
+            "total": int(gen.config.num_base_trajectories),
+            "lerobot_repo_id": gen.config.lerobot_repo_id,
+            # Lets the coordinator seed its Export/Import default with this
+            # env's conventional config path without being passed --env-name.
+            "env_name": getattr(env_cfg, "name", None),
+        }
+
     def set_eval_benchmark_indices(self, indices):
         """Replace the eval-benchmark playlist and rewind the counter.
 
@@ -5562,14 +5862,23 @@ class PybulletRobotServerBase:
             )
 
     def _finalize_lerobot_dataset(self, push_to_hub: bool = False):
-        """Finalize and optionally push the LeRobot dataset."""
+        """Finalize and optionally push the LeRobot dataset.
+
+        Critical section: finalize() is what writes the parquet footers —
+        interrupting it leaves the shard unreadable, so the launch_nodes
+        signal handler defers its KeyboardInterrupt while this runs.
+        """
         if self._lerobot_saver is None:
             return
         print("[LeRobot] Finalizing dataset...")
-        finalize_lerobot_dataset(self._lerobot_saver)
-        if push_to_hub:
-            push_lerobot_to_hub(self._lerobot_saver)
-        self._lerobot_saver = None
+        self._in_dataset_critical_section = True
+        try:
+            finalize_lerobot_dataset(self._lerobot_saver)
+            if push_to_hub:
+                push_lerobot_to_hub(self._lerobot_saver)
+            self._lerobot_saver = None
+        finally:
+            self._in_dataset_critical_section = False
 
     # =========================================================================
     # Scene State Save / Restore
@@ -5848,9 +6157,16 @@ class PybulletRobotServerBase:
                         img = (img * 255).astype(np.uint8)
                         image_buffers[key].append(img)
 
-        # Save episode to LeRobot (skip partial episodes from early stop)
+        # Save episode to LeRobot (skip partial episodes from early stop).
+        # Critical section: a SIGTERM landing between save_episode's video
+        # encode, data-parquet write, and episode-metadata write would orphan
+        # frames — the signal handler defers its interrupt while this is True.
         if not stopped_early and self._lerobot_saver is not None:
-            self._lerobot_saver.save_episode(episode_metadata=self._get_splatsim_episode_metadata())
+            self._in_dataset_critical_section = True
+            try:
+                self._lerobot_saver.save_episode(episode_metadata=self._get_splatsim_episode_metadata())
+            finally:
+                self._in_dataset_critical_section = False
 
         # Save images to Zarr (save even if partial — zarr is more forgiving)
         if zarr_group is not None:
@@ -5947,6 +6263,15 @@ class PybulletRobotServerBase:
 
         try:
             while True:
+                # Graceful-shutdown poll: reached when the signal handler
+                # DEFERRED its interrupt (signal arrived inside a dataset
+                # critical section — e.g. the mode-exit finalize triggered by
+                # the coordinator's stop). The finally below re-finalizes,
+                # which is an idempotent no-op if _exit_mode already did.
+                if self._shutdown_requested:
+                    print("[serve] shutdown requested — exiting serve loop")
+                    break
+
                 # Let the GUI handle all mode/button transitions
                 self._splatsim_gui.process_mode_transitions()
 
@@ -6878,6 +7203,10 @@ class PybulletRobotServerBase:
             # file exported from a different env. Reads only env class state —
             # safe from the GUI thread.
             traj_env_reassert_fn=self.reassert_env_traj_config_fields,
+            # Seed the panel's config-file box with THIS env's conventional
+            # path (configs/traj_configs/<env>.json) so Export/Import default
+            # per-env instead of every env clobbering one shared scratch file.
+            traj_config_default_path=self._default_traj_config_path(),
         )
         if self._headless and not self._show_control_gui:
             # Fully headless (batch / display-less): skip the Tkinter mainloop

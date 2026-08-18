@@ -6,10 +6,30 @@ Used by both the sim server's _render_and_save_episode and by run_env_sim.py
 (which may be running against the real UR robot instead of the simulator).
 """
 
+import os
 import shutil
 from typing import List, Optional
 
 import numpy as np
+
+# Video encoding is chatty by default: SVT-AV1 prints its full config banner to
+# stderr on every episode (it writes straight from C, so Python logging can't
+# reach it -- only the SVT_LOG env var can), and libav prints muxer notes like
+# "Starting second pass: moving the moov atom". Both fire once per encoded
+# camera per episode, which buries traj-gen output. Set SVT_LOG before the
+# first encoder is created; 1 = errors only. Override by exporting SVT_LOG.
+os.environ.setdefault("SVT_LOG", "1")
+
+try:  # av is a lerobot dependency; guard so this module still imports without it
+    import av as _av
+
+    # set_libav_level (not set_level) is what governs messages printed straight
+    # to the terminal, which is the path lerobot leaves active: it calls
+    # av.logging.restore_default_callback() after each encode, handing logging
+    # back to libav's native stderr printer.
+    _av.logging.set_libav_level(_av.logging.ERROR)
+except Exception:  # pragma: no cover - logging noise is not worth a hard failure
+    pass
 
 
 def build_lerobot_features(
