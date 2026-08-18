@@ -75,10 +75,20 @@ class PlannerDefaults:
 
     # Final-approach taper: brake over the last `dist` rad of joint-space arc
     # to scaled-down vel/acc so a PD-tracked robot doesn't carry momentum past
-    # the goal.
-    final_approach_dist: float = 0.15
+    # the goal. 0.05/0.5/0.4 from a 33-config corpus sweep (2026-08-17,
+    # tests/data/follower_corpus, acceptance criteria as the gate): the old
+    # 0.15/0.5/0.25 crawled the goal approach for 1.2 s mean / 2.0 s worst
+    # (below 70% of cruise) — long enough that policies trained on the demos
+    # learned to slow down far from the goal and stall. 0.05 + acc 0.4 cuts
+    # that to 0.69/1.27 s with terminal arrival unchanged (final-tick speed
+    # 0.021 vs 0.019 rad/s, worst tail decel 0.66 < the 1.0 cap). acc_scale
+    # is the dominant knob (taper depth is decel-limited); vel_scale is
+    # nearly inert alongside it; dist below 0.05 regresses the worst case;
+    # arc-proportional dist was a wash. NOTE: 0.4 acc at dist 0.15 fails one
+    # corpus case — these three values were validated as a set.
+    final_approach_dist: float = 0.05
     final_approach_vel_scale: float = 0.5
-    final_approach_acc_scale: float = 0.25
+    final_approach_acc_scale: float = 0.4
 
 
 PLANNER_DEFAULTS = PlannerDefaults()
