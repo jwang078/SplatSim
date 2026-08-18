@@ -2370,6 +2370,7 @@ class RRTToGoalPlanner:
         nv: float,
         acc: float,
         bridge_free,
+        contact_fn=None,
     ) -> np.ndarray | None:
         """Cubic-Bezier arc from the start (tangent = start velocity) into
         the path's own direction — the no-stop alternative to the straight
@@ -2409,6 +2410,25 @@ class RRTToGoalPlanner:
         v_floor = 0.10 + (min(0.6 * nv, 0.25) - 0.10) * depth
         K = 12
         ts = np.linspace(0.0, 1.0, K + 1)
+        turn_deg = float(np.degrees(np.arccos(np.clip(np.dot(vhat, chord / c), -1.0, 1.0))))
+
+        def _accept(pts, seg, v_kappa, clearance_label):
+            logger.info(
+                "terminal straightening: curved redirect at %s clearance "
+                "(%.2f rad/s handoff, %.0f deg joint-space turn, arc %.3f rad, "
+                "carry ceiling %.2f rad/s)",
+                clearance_label, nv, turn_deg, float(seg.sum()), v_kappa,
+            )
+            return np.vstack([pts, out[2:]]) if out.shape[0] > 2 else pts
+
+        def _contact_seg_free(a2, b2):
+            n2 = max(1, int(np.ceil(np.max(np.abs(b2 - a2)) / 0.02)))
+            return all(
+                not contact_fn(a2 + (b2 - a2) * (t / n2)) for t in range(n2 + 1)
+            )
+
+        n_curv = n_lim = n_coll = 0
+        survivors = []  # shapes passing curvature+limits but colliding at planning clearance
         for f in (0.33, 0.45, 0.22, 0.14):
             P1 = P0 + vhat * (f * c)
             P2 = P3 - d_next * (f * c)
@@ -2426,21 +2446,38 @@ class RRTToGoalPlanner:
             kappa = float((dd / np.maximum(h, 1e-9)).max()) if len(dd) else 0.0
             v_kappa = float(np.sqrt(0.8 * acc / max(kappa, 1e-9)))
             if v_kappa < v_floor:
+                n_curv += 1
                 continue
             if self._lower_limits is not None and not (
                 np.all(pts >= self._lower_limits[: pts.shape[1]])
                 and np.all(pts <= self._upper_limits[: pts.shape[1]])
             ):
+                n_lim += 1
                 continue
             if all(bridge_free(pts[i], pts[i + 1]) for i in range(K)):
-                logger.info(
-                    "terminal straightening: curved redirect (%.2f rad/s handoff, "
-                    "%.0f deg joint-space turn, arc %.3f rad, carry ceiling %.2f rad/s)",
-                    nv,
-                    float(np.degrees(np.arccos(np.clip(np.dot(vhat, chord / c), -1.0, 1.0)))),
-                    float(seg.sum()), v_kappa,
-                )
-                return np.vstack([pts, out[2:]]) if out.shape[0] > 2 else pts
+                return _accept(pts, seg, v_kappa, "planning")
+            n_coll += 1
+            survivors.append((pts, seg, v_kappa))
+        # CONTACT-CLEARANCE second pass. Shield handoffs fire NEAR obstacles
+        # by construction, so the planning-clearance (2 cm) sweep rejects
+        # arcs in exactly the situations that need them most (measured
+        # 2026-08-17 post-fix run: redirect placed 24x, but 26 handoffs
+        # still fell back to the straight lead-in -> cusp -> full stop).
+        # Same philosophy as the lead-in's emergency fallback: the redirect
+        # sweep happens physically regardless of what we plan, so a
+        # contact-level (~2 mm) arc that keeps the robot moving beats a
+        # planned full stop at higher clearance.
+        if contact_fn is not None:
+            for pts, seg, v_kappa in survivors:
+                if all(_contact_seg_free(pts[i], pts[i + 1]) for i in range(K)):
+                    return _accept(pts, seg, v_kappa, "CONTACT")
+        logger.info(
+            "terminal straightening: curved redirect failed (%d too-curved, "
+            "%d joint-limit, %d colliding of 4 shapes; contact retry %s) — "
+            "falling back to straight lead-in machinery",
+            n_curv, n_lim, n_coll,
+            "failed" if (contact_fn is not None and survivors) else "unavailable",
+        )
         return None
 
     def _straighten_terminal(
@@ -2616,7 +2653,9 @@ class RRTToGoalPlanner:
                 # cover it; the A-suite's 150/180 deg reversals stay cusps.)
                 _dot0 = float(np.dot(vhat, d0 / n0))
                 if _dot0 > -0.8 and nv > 0.05:
-                    arc_out = self._curved_redirect(out, vhat, nv, acc, _bridge_free)
+                    arc_out = self._curved_redirect(
+                        out, vhat, nv, acc, _bridge_free, contact_fn=contact_fn
+                    )
                     if arc_out is not None:
                         out = arc_out
                         return out
