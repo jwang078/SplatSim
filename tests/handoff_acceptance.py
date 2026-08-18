@@ -208,6 +208,28 @@ def section_b_planner():
           len(out5) > len(path) and float(np.dot(first5, vh)) > 0.97 and _no_cusp(out5),
           f"vertices {len(path)}->{len(out5)} cusp-free={_no_cusp(out5)}")
 
+    # B6: DENSE-path redirect — real planner output has chords of a few cm,
+    # and an arc forced to complete its turn within the chord to the raw
+    # next vertex is always too curved (2026-08-18 run: 26/26 arc failures
+    # "too-curved", zero colliding; every one fell back to the cusp/stop).
+    # The multi-target search must give the turn room by aiming at farther
+    # path vertices: dense near-perpendicular handoffs place a cusp-free
+    # redirect and the parametrized profile carries speed.
+    dpath = np.array([q0 + d0u * (0.04 * k) for k in range(26)])
+    for ang in (88, 110):
+        vh_d = np.cos(np.radians(ang)) * d0u + np.sin(np.radians(ang)) * perp
+        out_d = pl._straighten_terminal(dpath.copy(), free, start_vel=vh_d * 0.44)
+        tr = parametrize_path(
+            out_d, np.full(3, 0.5), np.full(3, 1.0), np.full(3, 10.0),
+            control_hz=30, backend="retimed", start_vel=vh_d * 0.44,
+            segment_at_sharp_corners=False, uniform_path_speed=True,
+        )
+        sp = np.linalg.norm(np.diff(np.asarray(tr), axis=0), axis=1) * 30.0
+        core = sp[: int(0.6 * len(sp))]
+        check(f"B6 dense-path {ang}deg redirect (no stop)",
+              _no_cusp(out_d) and float(sp[0]) > 0.3 and float(core.min()) > 0.1,
+              f"launch {sp[0]:.2f} min-through-turn {core.min():.2f}")
+
     # Speed floor scales with turn depth (mirrors _curved_redirect's
     # depth-scaled carry floor): mild turns barely dent cruise; a hairpin
     # legitimately slows hard through the apex — but NEVER stops.

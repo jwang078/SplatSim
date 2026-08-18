@@ -2376,27 +2376,37 @@ class RRTToGoalPlanner:
         the path's own direction — the no-stop alternative to the straight
         lead-in + brake-out cusp for mid-band misalignments.
 
-        P0 = start, P3 = first path vertex; start tangent along ``vhat``,
-        end tangent along the path's continuing segment, tangent lengths a
-        fraction ``f`` of the chord. The arc replaces the first path segment
-        so the parametrizer sees smooth geometry: its curvature ceilings
-        carry ~sqrt(0.8*a/kappa) through the turn instead of braking to
-        zero at a cusp. Tries several tangent lengths (wider = smoother =
-        faster carry, but longer excursion); each candidate is gated on the
-        curvature admitting a worthwhile carry speed, joint limits, and
-        collision freedom along the sampled polyline. Returns the reshaped
-        path, or None when no shape qualifies (caller falls back to the
-        straight lead-in machinery)."""
-        P0, P3 = out[0], out[1]
-        chord = P3 - P0
-        c = float(np.linalg.norm(chord))
-        if c < 0.02:
-            return None
-        d_next = out[2] - out[1] if out.shape[0] >= 3 else chord
-        nn = float(np.linalg.norm(d_next))
-        if nn < 1e-9:
-            d_next, nn = chord, c
-        d_next = d_next / nn
+        P0 = start; P3 iterates over path vertices at increasing arc
+        distance (~0.12/0.25/0.40 rad) so the turn has room to complete —
+        start tangent along ``vhat``, end tangent along the path's
+        continuing segment at the chosen vertex, tangent lengths a fraction
+        ``f`` of the chord. The arc replaces the path prefix up to that
+        vertex, so the parametrizer sees smooth geometry: its curvature
+        ceilings carry ~sqrt(0.8*a/kappa) through the turn instead of
+        braking to zero at a cusp. Every (target, tangent-length) shape is
+        gated on the curvature admitting a worthwhile carry speed, joint
+        limits, and collision freedom along the sampled polyline (planning
+        clearance first, contact-level retry for shapes that only fail
+        collision). Returns the reshaped path, or None when no shape
+        qualifies (caller falls back to the straight lead-in machinery)."""
+        P0 = out[0]
+        # Candidate arc TARGETS: the path's own vertices at increasing arc
+        # distance. Targeting only the raw next vertex starves the arc of
+        # room — real planner output is dense, so the chord is a few cm and
+        # the forced curvature sits far above any useful carry floor
+        # (2026-08-18 run: 26/26 arc failures were "too-curved", zero
+        # colliding). Farther targets give the same turn more room; the
+        # intermediate vertices they skip are safe to drop because every
+        # arc segment is collision-checked below.
+        seg_arcs = np.linalg.norm(np.diff(out, axis=0), axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(seg_arcs)])
+        half = max(0.5 * float(cum[-1]), float(cum[1]) if len(cum) > 1 else 0.0)
+        targets = []
+        for arc_min in (0.12, 0.25, 0.40):
+            j = int(np.searchsorted(cum, min(arc_min, half)))
+            j = max(1, min(j, out.shape[0] - 1))
+            if j not in targets:
+                targets.append(j)
         # Carry floor: the redirect must admit a speed that beats stopping.
         # Depth-scaled: a mild redirect should barely dent cruise (floor
         # ~0.6*nv), while a hairpin legitimately slows hard through the
@@ -2405,21 +2415,17 @@ class RRTToGoalPlanner:
         # elbow reconfiguration) the best Bezier admits ~0.13 rad/s; a
         # fixed 0.25 floor rejected it back to the stop this exists to
         # remove.
-        dot0 = float(np.dot(vhat, chord / c))
-        depth = float(np.clip((dot0 + 0.8) / 1.2, 0.0, 1.0))  # 0 @143deg .. 1 @~37deg
-        v_floor = 0.10 + (min(0.6 * nv, 0.25) - 0.10) * depth
         K = 12
         ts = np.linspace(0.0, 1.0, K + 1)
-        turn_deg = float(np.degrees(np.arccos(np.clip(np.dot(vhat, chord / c), -1.0, 1.0))))
 
-        def _accept(pts, seg, v_kappa, clearance_label):
+        def _accept(pts, seg, v_kappa, clearance_label, j, turn_deg):
             logger.info(
                 "terminal straightening: curved redirect at %s clearance "
-                "(%.2f rad/s handoff, %.0f deg joint-space turn, arc %.3f rad, "
-                "carry ceiling %.2f rad/s)",
-                clearance_label, nv, turn_deg, float(seg.sum()), v_kappa,
+                "(%.2f rad/s handoff, %.0f deg joint-space turn, arc %.3f rad "
+                "to vertex %d, carry ceiling %.2f rad/s)",
+                clearance_label, nv, turn_deg, float(seg.sum()), j, v_kappa,
             )
-            return np.vstack([pts, out[2:]]) if out.shape[0] > 2 else pts
+            return np.vstack([pts, out[j + 1:]]) if out.shape[0] > j + 1 else pts
 
         def _contact_seg_free(a2, b2):
             n2 = max(1, int(np.ceil(np.max(np.abs(b2 - a2)) / 0.02)))
@@ -2428,36 +2434,53 @@ class RRTToGoalPlanner:
             )
 
         n_curv = n_lim = n_coll = 0
+        n_shapes = 0
         survivors = []  # shapes passing curvature+limits but colliding at planning clearance
-        for f in (0.33, 0.45, 0.22, 0.14):
-            P1 = P0 + vhat * (f * c)
-            P2 = P3 - d_next * (f * c)
-            b0 = ((1 - ts) ** 3)[:, None]
-            b1 = (3 * (1 - ts) ** 2 * ts)[:, None]
-            b2 = (3 * (1 - ts) * ts ** 2)[:, None]
-            b3 = (ts ** 3)[:, None]
-            pts = b0 * P0 + b1 * P1 + b2 * P2 + b3 * P3
-            seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
-            if float(seg.min()) < 1e-9:
+        for j in targets:
+            P3 = out[j]
+            chord = P3 - P0
+            c = float(np.linalg.norm(chord))
+            if c < 0.02:
                 continue
-            dirs = np.diff(pts, axis=0) / seg[:, None]
-            dd = np.linalg.norm(np.diff(dirs, axis=0), axis=1)
-            h = 0.5 * (seg[:-1] + seg[1:])
-            kappa = float((dd / np.maximum(h, 1e-9)).max()) if len(dd) else 0.0
-            v_kappa = float(np.sqrt(0.8 * acc / max(kappa, 1e-9)))
-            if v_kappa < v_floor:
-                n_curv += 1
-                continue
-            if self._lower_limits is not None and not (
-                np.all(pts >= self._lower_limits[: pts.shape[1]])
-                and np.all(pts <= self._upper_limits[: pts.shape[1]])
-            ):
-                n_lim += 1
-                continue
-            if all(bridge_free(pts[i], pts[i + 1]) for i in range(K)):
-                return _accept(pts, seg, v_kappa, "planning")
-            n_coll += 1
-            survivors.append((pts, seg, v_kappa))
+            d_next = out[j + 1] - out[j] if out.shape[0] > j + 1 else chord
+            nn = float(np.linalg.norm(d_next))
+            if nn < 1e-9:
+                d_next, nn = chord, c
+            d_next = d_next / nn
+            dot0 = float(np.dot(vhat, chord / c))
+            depth = float(np.clip((dot0 + 0.8) / 1.2, 0.0, 1.0))  # 0 @143deg .. 1 @~37deg
+            v_floor = 0.10 + (min(0.6 * nv, 0.25) - 0.10) * depth
+            turn_deg = float(np.degrees(np.arccos(np.clip(dot0, -1.0, 1.0))))
+            for f in (0.33, 0.45, 0.22, 0.14):
+                n_shapes += 1
+                P1 = P0 + vhat * (f * c)
+                P2 = P3 - d_next * (f * c)
+                b0 = ((1 - ts) ** 3)[:, None]
+                b1 = (3 * (1 - ts) ** 2 * ts)[:, None]
+                b2 = (3 * (1 - ts) * ts ** 2)[:, None]
+                b3 = (ts ** 3)[:, None]
+                pts = b0 * P0 + b1 * P1 + b2 * P2 + b3 * P3
+                seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+                if float(seg.min()) < 1e-9:
+                    continue
+                dirs = np.diff(pts, axis=0) / seg[:, None]
+                dd = np.linalg.norm(np.diff(dirs, axis=0), axis=1)
+                h = 0.5 * (seg[:-1] + seg[1:])
+                kappa = float((dd / np.maximum(h, 1e-9)).max()) if len(dd) else 0.0
+                v_kappa = float(np.sqrt(0.8 * acc / max(kappa, 1e-9)))
+                if v_kappa < v_floor:
+                    n_curv += 1
+                    continue
+                if self._lower_limits is not None and not (
+                    np.all(pts >= self._lower_limits[: pts.shape[1]])
+                    and np.all(pts <= self._upper_limits[: pts.shape[1]])
+                ):
+                    n_lim += 1
+                    continue
+                if all(bridge_free(pts[i], pts[i + 1]) for i in range(K)):
+                    return _accept(pts, seg, v_kappa, "planning", j, turn_deg)
+                n_coll += 1
+                survivors.append((pts, seg, v_kappa, j, turn_deg))
         # CONTACT-CLEARANCE second pass. Shield handoffs fire NEAR obstacles
         # by construction, so the planning-clearance (2 cm) sweep rejects
         # arcs in exactly the situations that need them most (measured
@@ -2468,14 +2491,14 @@ class RRTToGoalPlanner:
         # contact-level (~2 mm) arc that keeps the robot moving beats a
         # planned full stop at higher clearance.
         if contact_fn is not None:
-            for pts, seg, v_kappa in survivors:
+            for pts, seg, v_kappa, j, turn_deg in survivors:
                 if all(_contact_seg_free(pts[i], pts[i + 1]) for i in range(K)):
-                    return _accept(pts, seg, v_kappa, "CONTACT")
+                    return _accept(pts, seg, v_kappa, "CONTACT", j, turn_deg)
         logger.info(
             "terminal straightening: curved redirect failed (%d too-curved, "
-            "%d joint-limit, %d colliding of 4 shapes; contact retry %s) — "
-            "falling back to straight lead-in machinery",
-            n_curv, n_lim, n_coll,
+            "%d joint-limit, %d colliding of %d shapes over %d targets; "
+            "contact retry %s) — falling back to straight lead-in machinery",
+            n_curv, n_lim, n_coll, n_shapes, len(targets),
             "failed" if (contact_fn is not None and survivors) else "unavailable",
         )
         return None
