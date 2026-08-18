@@ -401,6 +401,16 @@ class RRTToGoalPlanner:
         # caller's scene randomization.
         camera_score_weight: float = 0.0,
         ik_camera_weight: float = 0.0,
+        # start_align_weight ADDS weight * (1 - cos(v_start, opening dir)) *
+        # min(|v_start|/vmax, 1) to the path score: among candidates, prefer
+        # ones whose opening joint direction CONTINUES the handed velocity.
+        # A misaligned winner forces the moving-handoff machinery to redirect
+        # (mid-band: curved redirect; reversal: brake to zero and restart —
+        # ~1.5 s), so when an aligned route exists it should win outright.
+        # Units are the score's own (meters of EE arc for the default
+        # strategy): a full joint-space reversal at cruise costs 2*weight.
+        # Inert for from-rest plans (generation) — the speed factor is 0.
+        start_align_weight: float = 0.15,
         plan_rng_seed: int | None = None,
         soft_cost_mode: str = "score",
         soft_cost_weight: float = 1.0,
@@ -461,6 +471,7 @@ class RRTToGoalPlanner:
         self._wrist_camera_link_index = wrist_camera_link_index
         self._camera_score_weight = float(camera_score_weight)
         self._ik_camera_weight = float(ik_camera_weight)
+        self._start_align_weight = float(start_align_weight)
         self._plan_rng_seed = plan_rng_seed
         self._camera_k_exp = float(camera_k_exp)
         self._camera_k_sig = float(camera_k_sig)
@@ -1823,7 +1834,8 @@ class RRTToGoalPlanner:
                 # position — stash the goal so `_path_camera_score` can FK it.
                 self._score_goal_q = q_goal
                 _scored_cps: list[tuple[float, np.ndarray]] = [
-                    (self._score_candidate(cp, recent_vel), cp) for cp in candidate_paths
+                    (self._score_candidate(cp, recent_vel, start_vel=start_vel), cp)
+                    for cp in candidate_paths
                 ]
                 _scored_cps.sort(key=lambda x: x[0])
                 local_best_score = float("inf")
@@ -2351,6 +2363,86 @@ class RRTToGoalPlanner:
                 return rrt_waypoints, k
         return rrt_waypoints, None
 
+    def _curved_redirect(
+        self,
+        out: np.ndarray,
+        vhat: np.ndarray,
+        nv: float,
+        acc: float,
+        bridge_free,
+    ) -> np.ndarray | None:
+        """Cubic-Bezier arc from the start (tangent = start velocity) into
+        the path's own direction — the no-stop alternative to the straight
+        lead-in + brake-out cusp for mid-band misalignments.
+
+        P0 = start, P3 = first path vertex; start tangent along ``vhat``,
+        end tangent along the path's continuing segment, tangent lengths a
+        fraction ``f`` of the chord. The arc replaces the first path segment
+        so the parametrizer sees smooth geometry: its curvature ceilings
+        carry ~sqrt(0.8*a/kappa) through the turn instead of braking to
+        zero at a cusp. Tries several tangent lengths (wider = smoother =
+        faster carry, but longer excursion); each candidate is gated on the
+        curvature admitting a worthwhile carry speed, joint limits, and
+        collision freedom along the sampled polyline. Returns the reshaped
+        path, or None when no shape qualifies (caller falls back to the
+        straight lead-in machinery)."""
+        P0, P3 = out[0], out[1]
+        chord = P3 - P0
+        c = float(np.linalg.norm(chord))
+        if c < 0.02:
+            return None
+        d_next = out[2] - out[1] if out.shape[0] >= 3 else chord
+        nn = float(np.linalg.norm(d_next))
+        if nn < 1e-9:
+            d_next, nn = chord, c
+        d_next = d_next / nn
+        # Carry floor: the redirect must admit a speed that beats stopping.
+        # Depth-scaled: a mild redirect should barely dent cruise (floor
+        # ~0.6*nv), while a hairpin legitimately slows hard through the
+        # apex — anything comfortably above zero still beats the cusp's
+        # full stop + strict-onset restart. At dot ~ -0.7 (the scenario-6
+        # elbow reconfiguration) the best Bezier admits ~0.13 rad/s; a
+        # fixed 0.25 floor rejected it back to the stop this exists to
+        # remove.
+        dot0 = float(np.dot(vhat, chord / c))
+        depth = float(np.clip((dot0 + 0.8) / 1.2, 0.0, 1.0))  # 0 @143deg .. 1 @~37deg
+        v_floor = 0.10 + (min(0.6 * nv, 0.25) - 0.10) * depth
+        K = 12
+        ts = np.linspace(0.0, 1.0, K + 1)
+        for f in (0.33, 0.45, 0.22, 0.14):
+            P1 = P0 + vhat * (f * c)
+            P2 = P3 - d_next * (f * c)
+            b0 = ((1 - ts) ** 3)[:, None]
+            b1 = (3 * (1 - ts) ** 2 * ts)[:, None]
+            b2 = (3 * (1 - ts) * ts ** 2)[:, None]
+            b3 = (ts ** 3)[:, None]
+            pts = b0 * P0 + b1 * P1 + b2 * P2 + b3 * P3
+            seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+            if float(seg.min()) < 1e-9:
+                continue
+            dirs = np.diff(pts, axis=0) / seg[:, None]
+            dd = np.linalg.norm(np.diff(dirs, axis=0), axis=1)
+            h = 0.5 * (seg[:-1] + seg[1:])
+            kappa = float((dd / np.maximum(h, 1e-9)).max()) if len(dd) else 0.0
+            v_kappa = float(np.sqrt(0.8 * acc / max(kappa, 1e-9)))
+            if v_kappa < v_floor:
+                continue
+            if self._lower_limits is not None and not (
+                np.all(pts >= self._lower_limits[: pts.shape[1]])
+                and np.all(pts <= self._upper_limits[: pts.shape[1]])
+            ):
+                continue
+            if all(bridge_free(pts[i], pts[i + 1]) for i in range(K)):
+                logger.info(
+                    "terminal straightening: curved redirect (%.2f rad/s handoff, "
+                    "%.0f deg joint-space turn, arc %.3f rad, carry ceiling %.2f rad/s)",
+                    nv,
+                    float(np.degrees(np.arccos(np.clip(np.dot(vhat, chord / c), -1.0, 1.0)))),
+                    float(seg.sum()), v_kappa,
+                )
+                return np.vstack([pts, out[2:]]) if out.shape[0] > 2 else pts
+        return None
+
     def _straighten_terminal(
         self,
         path: np.ndarray,
@@ -2503,6 +2595,31 @@ class RRTToGoalPlanner:
             if n0 > 1e-9 and float(np.dot(vhat, d0 / n0)) < 0.95:
                 acc = float(np.max(np.atleast_1d(self._max_joint_acc)))
                 jerk = float(np.min(np.atleast_1d(self._max_joint_jerk)))
+                # MID-BAND CURVED REDIRECT (no stop). A joint-space
+                # misalignment short of a true reversal does not require the
+                # path speed to hit zero — only joints whose velocity changes
+                # sign pass through zero individually; the others can keep
+                # the motion flowing. The straight lead-in + brake-out cusp
+                # forces a FULL stop regardless (1-D path speed: a cusp stops
+                # every joint), which recorded as a ~1.5 s mid-episode pause
+                # on what was visually continuous EE motion (planar scenario
+                # 6, 2026-08-17: elbow reconfiguration, EE direction dot
+                # +0.49 across the "reversal"). So for dot in (-0.6, 0.95):
+                # replace the cusp with a cubic-Bezier arc from q0 (tangent =
+                # v_start) into the path's own direction — the retimed
+                # backend's curvature ceilings then carry speed through the
+                # turn (~sqrt(0.8*a/kappa)) instead of stopping. Reversals
+                # beyond ~143 deg keep the brake-out cusp: an arc that turns
+                # that far is a long detour, and braking through zero is the
+                # honest maneuver. (-0.8, not -0.6: the motivating scenario-6
+                # elbow reconfiguration sits at dot -0.70 — the gate must
+                # cover it; the A-suite's 150/180 deg reversals stay cusps.)
+                _dot0 = float(np.dot(vhat, d0 / n0))
+                if _dot0 > -0.8 and nv > 0.05:
+                    arc_out = self._curved_redirect(out, vhat, nv, acc, _bridge_free)
+                    if arc_out is not None:
+                        out = arc_out
+                        return out
                 # Jerk-limited braking distance: v^2/2a for the constant-
                 # decel core PLUS ~v*a/j for the jerk ramps — the ramp term
                 # DOMINATES at low speeds (at v=0.15, a=1, j=10 it is as
@@ -3019,11 +3136,17 @@ class RRTToGoalPlanner:
         self,
         path: np.ndarray,
         recent_joint_velocity: np.ndarray | None,
+        start_vel: np.ndarray | None = None,
     ) -> float:
         """Dispatch to the active path-selection strategy. Lower = better.
 
         `recent_joint_velocity` is consulted only when the strategy is
         JOINT_VELOCITY_MATCH; for other strategies it is ignored.
+
+        `start_vel` (rad/s, the moving-handoff velocity) activates the
+        start-alignment term: candidates whose opening joint direction
+        continues the handed velocity score better, in proportion to how
+        fast the robot is actually moving. See `start_align_weight`.
 
         When a soft-cost field is loaded (vegetation scenes) and
         soft_cost_mode == "score", ``weight * path-integral(cost)`` is ADDED
@@ -3060,6 +3183,30 @@ class RRTToGoalPlanner:
                 self._path_score_joint_arc_weight,
             )
             base = base + self._path_score_joint_arc_weight * joint_arc
+        if self._start_align_weight > 0.0 and start_vel is not None:
+            sv = np.asarray(start_vel, dtype=np.float64).reshape(-1)[: path.shape[1]]
+            nv = float(np.linalg.norm(sv))
+            if nv > 1e-6:
+                # Opening direction over the first ~0.1 rad of joint arc —
+                # single-segment directions on raw RRT output are noise.
+                p = np.asarray(path, dtype=np.float64)
+                arc = 0.0
+                k = 1
+                while k < p.shape[0] - 1 and arc < 0.1:
+                    arc += float(np.linalg.norm(p[k] - p[k - 1]))
+                    k += 1
+                d0 = p[k] - p[0]
+                n0 = float(np.linalg.norm(d0))
+                if n0 > 1e-9:
+                    misalign = 1.0 - float(np.dot(sv / nv, d0 / n0))
+                    _vmax = float(np.max(np.atleast_1d(self._max_joint_vel)))
+                    speed_frac = min(nv / max(_vmax, 1e-6), 1.0)
+                    pen = self._start_align_weight * misalign * speed_frac
+                    logger.debug(
+                        "_score_candidate: base=%.4f + start_align=%.4f "
+                        "(misalign %.2f, speed frac %.2f)", base, pen, misalign, speed_frac,
+                    )
+                    base = base + pen
         if not self._soft_cost_active():
             return base
         soft = self._path_soft_cost(path)

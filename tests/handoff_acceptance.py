@@ -160,20 +160,55 @@ def section_b_planner():
     path = np.array([q0, q0 + [0.4, -0.1, 0.2], q0 + [0.9, -0.3, 0.5]])
     d0u = (path[1] - path[0]) / np.linalg.norm(path[1] - path[0])
 
-    # B1: lead-in placed even at mild misalignment (dot ~0.87 = 30 deg)
+    # B1: mid-band misalignment (dot ~0.87 = 30 deg) gets the CURVED
+    # REDIRECT: start tangent along the handed velocity, NO cusp anywhere
+    # (adjacent-segment dot > -0.5 throughout) — the no-stop replacement for
+    # the straight lead-in + brake-out (which manufactured a full stop out
+    # of what is task-space-continuous motion; planar scenario 6,
+    # 2026-08-17).
     perp = np.array([-d0u[1], d0u[0], 0.0])
     perp -= d0u * np.dot(perp, d0u)
     perp /= np.linalg.norm(perp)
     vh = np.cos(np.radians(30)) * d0u + np.sin(np.radians(30)) * perp
     out = pl._straighten_terminal(path.copy(), free, start_vel=vh * 0.4)
     first = (out[1] - out[0]) / max(np.linalg.norm(out[1] - out[0]), 1e-12)
-    check("B1 mild-misalign lead-in placed", len(out) > len(path) and float(np.dot(first, vh)) > 0.99,
-          f"vertices {len(path)}->{len(out)}")
 
-    # B2: straighten_only fallback preserves the lead-in
+    def _no_cusp(p):
+        d = np.diff(p, axis=0)
+        n = np.linalg.norm(d, axis=1)
+        keep = n > 1e-9
+        d = d[keep] / n[keep][:, None]
+        return bool(np.all(np.sum(d[:-1] * d[1:], axis=1) > -0.5)) if len(d) > 1 else True
+
+    check("B1 mid-band curved redirect (no cusp)",
+          len(out) > len(path) and float(np.dot(first, vh)) > 0.97 and _no_cusp(out),
+          f"vertices {len(path)}->{len(out)} cusp-free={_no_cusp(out)}")
+
+    # B2: straighten_only fallback preserves the redirect
     out2 = pl._postprocess_path(path.copy(), start_vel=vh * 0.4, straighten_only=True)
     first2 = (out2[1] - out2[0]) / max(np.linalg.norm(out2[1] - out2[0]), 1e-12)
-    check("B2 straighten_only keeps lead-in", len(out2) > len(path) and float(np.dot(first2, vh)) > 0.99)
+    check("B2 straighten_only keeps redirect", len(out2) > len(path) and float(np.dot(first2, vh)) > 0.97)
+
+    # B4: end-to-end no-stop — the redirect's parametrized profile must
+    # CARRY speed through the turn (dip allowed at the curvature ceiling,
+    # never a stop), at 30 and 90 deg of joint-space misalignment.
+    # Speed floor scales with turn depth (mirrors _curved_redirect's
+    # depth-scaled carry floor): mild turns barely dent cruise; a hairpin
+    # legitimately slows hard through the apex — but NEVER stops.
+    for ang, floor in ((30, 0.12), (90, 0.12), (135, 0.07)):
+        vh_a = np.cos(np.radians(ang)) * d0u + np.sin(np.radians(ang)) * perp
+        out_a = pl._straighten_terminal(path.copy(), free, start_vel=vh_a * 0.4)
+        tr = parametrize_path(
+            out_a, np.full(3, 0.5), np.full(3, 1.0), np.full(3, 10.0),
+            control_hz=30, backend="retimed", start_vel=vh_a * 0.4,
+            segment_at_sharp_corners=False, uniform_path_speed=True,
+        )
+        sp = np.linalg.norm(np.diff(np.asarray(tr), axis=0), axis=1) * 30.0
+        mid = sp[: int(0.6 * len(sp))]  # transition region (excludes goal taper)
+        launch, vmin = float(sp[0]), float(mid.min())
+        check(f"B4 {ang}deg redirect carries speed (no stop)",
+              _no_cusp(out_a) and launch > 0.3 and vmin > floor,
+              f"launch {launch:.2f} min-through-turn {vmin:.2f} (floor {floor})")
 
     def _ee_at(q):
         for j, qi in zip([1, 2, 3], q):
