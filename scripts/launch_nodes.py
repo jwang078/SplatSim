@@ -96,6 +96,11 @@ class Args:
     # headless) with the exact same config. Loaded field-by-field and tolerant of
     # schema drift (see splatsim/utils/config_io.py); only affects envs that have
     # a trajectory generator.
+    #
+    # Conventional location is configs/traj_configs/<env>.json, one per
+    # environment (see splatsim/utils/paths.py:traj_config_path) — that is also
+    # where the GUI's Export/Import defaults to for the env being run, so the
+    # usual flow is: tune in the GUI, Export, then pass that path here.
     traj_config_file: Optional[str] = None
 
     # When True, skip the per-step gsplat camera render: get_observations
@@ -785,14 +790,65 @@ def launch_robot_server(args: Args):
         except Exception as exc:                        # noqa: BLE001
             print(f"[scenario] could not save: {exc}")
 
+    # Graceful shutdown on SIGTERM/SIGINT. Without this, launch_trajgen_pool's
+    # terminate() SIGTERM kills the process instantly — mid-episode or even
+    # mid-parquet-write — and the LeRobot shard is left without parquet
+    # footers, unreadable by the merge ("Parquet magic bytes not found").
+    #
+    # The handler aborts the current episode by raising KeyboardInterrupt in
+    # the main thread, which exits serve() through its finally-finalize (the
+    # partial episode is discarded, everything saved so far gets valid
+    # footers). While the server is inside a dataset critical section
+    # (save_episode / finalize) the interrupt is DEFERRED: only the shutdown
+    # flag is set, and the serve loop exits at its next safe poll. A second
+    # signal interrupts regardless; the pool's SIGKILL is the final backstop.
+    if hasattr(server, "request_shutdown"):
+        import signal
+
+        _signal_count = [0]
+
+        def _graceful_shutdown(signum, frame):
+            _signal_count[0] += 1
+            name = signal.Signals(signum).name
+            server.request_shutdown()
+            if _signal_count[0] > 1 or getattr(server, "safe_to_interrupt", True):
+                print(f"[launch] {name} — aborting current episode, finalizing dataset")
+                raise KeyboardInterrupt
+            print(f"[launch] {name} during dataset save — finishing the save "
+                  f"first, then shutting down (signal again to force)")
+
+        signal.signal(signal.SIGTERM, _graceful_shutdown)
+        signal.signal(signal.SIGINT, _graceful_shutdown)
+
     try:
         server.serve()
     except KeyboardInterrupt:
+        pass
+    finally:
         if hasattr(server, "shutdown") and type(getattr(server, "shutdown")) == types.MethodType:
             server.shutdown()
 
 
 def main(args):
+    # Server processes never configured Python logging, so every logger.info
+    # in the planner stack (including the RRTToGoalPlanner init line that
+    # records which time-parametrization backend and smoothing settings are
+    # active) was silently dropped — the planar_3joint_9 generation ran with
+    # NO record of its backend. INFO to stdout matches the print-based noise
+    # these logs already carry and makes runs auditable after the fact.
+    import logging as _logging
+
+    # force=True: some module-level import (torch et al.) installs a root
+    # handler before main() runs, and without force basicConfig silently
+    # no-ops — observed as worker logs with ZERO INFO lines even after this
+    # call was added.
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+
     launch_robot_server(args)
 
 

@@ -14,6 +14,7 @@ import glob
 import io
 import json
 import os
+import re
 from collections import OrderedDict
 
 import cv2
@@ -29,14 +30,22 @@ from lerobot_parquet_utils import parse_episodes
 _LABEL_H = 24
 
 
-def load_parquet_dataset(parquet_folder: str, episodes: list[int] | None = None) -> pd.DataFrame:
+def load_parquet_dataset(
+    parquet_folder: str, episodes: list[int] | None = None, allow_missing: bool = False
+) -> pd.DataFrame:
     """Load parquet files from a folder, optionally filtering to specific episodes.
 
     Uses parquet predicate pushdown so only matching row groups are read into memory.
+
+    With allow_missing=True an empty DataFrame is returned instead of raising when
+    nothing could be read (so the caller can fall back to loose mp4 files).
     """
     print(f"Loading parquet files from {parquet_folder}...")
     parquet_files = sorted(glob.glob(os.path.join(parquet_folder, "*.parquet")))
     if not parquet_files:
+        if allow_missing:
+            print(f"No parquet files found in {parquet_folder}")
+            return pd.DataFrame()
         raise FileNotFoundError(f"No parquet files found in {parquet_folder}")
     print(f"Found {len(parquet_files)} parquet files")
 
@@ -62,6 +71,8 @@ def load_parquet_dataset(parquet_folder: str, episodes: list[int] | None = None)
         for name, err in skipped:
             print(f"  {name}: {err}")
     if not dfs:
+        if allow_missing:
+            return pd.DataFrame()
         raise ValueError(f"No frames found for episodes {episodes}")
     df = pd.concat(dfs, ignore_index=True)
     print(f"Loaded {len(df)} frames")
@@ -103,6 +114,274 @@ def find_dataset_root(parquet_folder: str) -> str | None:
         if os.path.isfile(os.path.join(path, "meta", "info.json")):
             return path
     return None
+
+
+# Directory layouts that hold one mp4 per episode, written by eval / intervention
+# rollouts *before* (or independently of) the LeRobot dataset being finalized:
+#   <run_dir>/videos/<env_name>/eval_episode_<N>.mp4
+_LOOSE_EPISODE_RE = re.compile(r"episode[_-](\d+)\.mp4$", re.IGNORECASE)
+# Where to look for such rollout videos when the parquet can't be read.
+_DEFAULT_FALLBACK_ROOTS = (
+    os.path.expanduser("~/code/lerobot/outputs"),
+)
+
+
+def _name_tokens(name: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", name.lower()) if t}
+
+
+def _scan_loose_episode_dir(directory: str) -> dict[int, str]:
+    """Map episode index -> mp4 path for a dir of per-episode rollout videos."""
+    out: dict[int, str] = {}
+    for path in sorted(glob.glob(os.path.join(directory, "*.mp4"))):
+        m = _LOOSE_EPISODE_RE.search(os.path.basename(path))
+        if m:
+            out[int(m.group(1))] = path
+    return out
+
+
+def _dagger_sidecar_dirs(dataset_name: str, roots: tuple[str, ...]) -> list[str]:
+    """Video dirs of DAgger intervention runs whose sidecar names this dataset.
+
+    `<train_dir>/dagger/config.json` records naming.base_dataset_short + round, and
+    the intervention dataset is named `<base_dataset_short>_<a|r>_dag<round>`; that
+    is an exact link from the requested dataset back to the run that recorded it.
+    """
+    hits: list[str] = []
+    for root in roots:
+        for cfg_path in glob.glob(os.path.join(root, "**", "dagger", "config.json"), recursive=True):
+            try:
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+            except Exception:
+                continue
+            short = (cfg.get("naming") or {}).get("base_dataset_short")
+            rnd = cfg.get("round")
+            if not short or rnd is None:
+                continue
+            if dataset_name.startswith(short) and dataset_name.endswith(f"dag{rnd}"):
+                vid_root = os.path.join(os.path.dirname(cfg_path), "interventions", "videos")
+                hits += sorted(d for d in glob.glob(os.path.join(vid_root, "*")) if os.path.isdir(d))
+    return hits
+
+
+def _fuzzy_video_dirs(dataset_name: str, roots: tuple[str, ...], min_overlap: int = 3) -> list[str]:
+    """Any `*/videos/<env>/` dir whose run name shares enough tokens with the dataset."""
+    want = _name_tokens(dataset_name)
+    scored: list[tuple[int, float, str]] = []
+    for root in roots:
+        for d in glob.glob(os.path.join(root, "**", "videos", "*"), recursive=True):
+            if not os.path.isdir(d):
+                continue
+            run_name = os.path.basename(os.path.dirname(os.path.dirname(d)))
+            overlap = len(want & _name_tokens(run_name))
+            if overlap >= min_overlap:
+                scored.append((overlap, os.path.getmtime(d), d))
+    scored.sort(key=lambda t: (-t[0], -t[1]))
+    return [d for _, _, d in scored]
+
+
+def find_fallback_episode_videos(
+    parquet_folder: str,
+    episodes: list[int] | None,
+    explicit_dir: str | None = None,
+    search_roots: tuple[str, ...] = _DEFAULT_FALLBACK_ROOTS,
+) -> dict[int, list[tuple[str, str]]]:
+    """Locate loose per-episode mp4s for a dataset whose parquet isn't readable yet.
+
+    Returns {episode_index: [(label, mp4_path), ...]}. Candidate dirs are tried in
+    order (explicit > DAgger sidecar match > fuzzy name match) and the FIRST one
+    that covers the requested episodes wins; if several env subdirs of the same run
+    cover them (e.g. multiple cameras) they are all used, one tile each.
+    """
+    dataset_name = os.path.abspath(parquet_folder).rstrip("/").split("/")[-3]
+
+    candidates: list[str] = []
+    if explicit_dir:
+        # Accept either the dir of mp4s itself or a run dir containing videos/<env>/.
+        if _scan_loose_episode_dir(explicit_dir):
+            candidates.append(explicit_dir)
+        else:
+            candidates += sorted(
+                d for d in glob.glob(os.path.join(explicit_dir, "**", "videos", "*"), recursive=True)
+                if os.path.isdir(d)
+            )
+    else:
+        candidates += _dagger_sidecar_dirs(dataset_name, search_roots)
+        candidates += _fuzzy_video_dirs(dataset_name, search_roots)
+
+    seen_runs: set[str] = set()
+    for d in candidates:
+        run = os.path.dirname(d)
+        if run in seen_runs:
+            continue
+        seen_runs.add(run)
+        # Gather every sibling env dir of this run (multiple cameras -> multiple tiles).
+        sibling_dirs = sorted(x for x in glob.glob(os.path.join(run, "*")) if os.path.isdir(x)) or [d]
+        per_dir = {sd: _scan_loose_episode_dir(sd) for sd in sibling_dirs}
+        per_dir = {sd: m for sd, m in per_dir.items() if m}
+        if not per_dir:
+            continue
+        available = set().union(*per_dir.values())
+        wanted = set(episodes) if episodes is not None else available
+        if not wanted & available:
+            continue
+        result: dict[int, list[tuple[str, str]]] = {}
+        for ep in sorted(wanted & available):
+            for sd, m in per_dir.items():
+                if ep in m:
+                    label = f"observation.images.base_rgb_{os.path.basename(sd)}"
+                    result.setdefault(ep, []).append((label, m[ep]))
+        missing = sorted(wanted - available)
+        print(f"Falling back to loose episode videos in {run}")
+        if missing:
+            print(f"  (no mp4 found for episodes {missing})")
+        return result
+
+    return {}
+
+
+class LooseEpisodeVideoSource:
+    """Frame source over standalone per-episode mp4 files (one file per episode).
+
+    Duck-types `VideoFrameSource` (`.keys` + `get_frame`) so the collage/playback
+    path is shared. Used when a dataset is still being recorded and its parquet has
+    no footer yet, but the rollout mp4s are already on disk.
+    """
+
+    def __init__(self, ep_videos: dict[int, list[tuple[str, str]]], max_cached_episodes: int = 4):
+        self.ep_videos = ep_videos
+        self.keys = sorted({label for entries in ep_videos.values() for label, _ in entries})
+        self._cache: OrderedDict[tuple[str, int], list[np.ndarray]] = OrderedDict()
+        self._max_cached = max_cached_episodes
+
+    def _path(self, key: str, ep: int) -> str | None:
+        for label, path in self.ep_videos.get(ep, []):
+            if label == key:
+                return path
+        return None
+
+    def _decode(self, key: str, ep: int) -> list[np.ndarray]:
+        path = self._path(key, ep)
+        if path is None:
+            raise KeyError(f"No video for {key} episode {ep}")
+        reader = imageio.get_reader(path)
+        try:
+            frames = [np.asarray(f) for f in reader]
+        finally:
+            reader.close()
+        if not frames:
+            raise RuntimeError(f"Decoded 0 frames from {path}")
+        return frames
+
+    def episode_lengths(self) -> dict[int, int]:
+        """Frame count per episode (max across cameras; get_frame clamps shorter ones)."""
+        lengths: dict[int, int] = {}
+        for ep, entries in self.ep_videos.items():
+            n = 0
+            for _, path in entries:
+                reader = imageio.get_reader(path)
+                try:
+                    try:
+                        n = max(n, reader.count_frames())
+                    except Exception:
+                        n = max(n, sum(1 for _ in reader))
+                finally:
+                    reader.close()
+            lengths[ep] = n
+        return lengths
+
+    def get_frame(self, key: str, ep: int, frame_in_ep: int) -> np.ndarray:
+        cache_key = (key, ep)
+        frames = self._cache.get(cache_key)
+        if frames is None:
+            frames = self._decode(key, ep)
+            self._cache[cache_key] = frames
+            while len(self._cache) > self._max_cached:
+                self._cache.popitem(last=False)
+        else:
+            self._cache.move_to_end(cache_key)
+        return frames[min(frame_in_ep, len(frames) - 1)]
+
+
+class SlicedEpisodeVideoSource(LooseEpisodeVideoSource):
+    """Loose-video source whose episodes are FRAME SLICES of eval rollout mp4s.
+
+    An intervention dataset stores one episode PER RRT CYCLE (expert frames
+    only), while the loose fallback mp4s are whole eval rollouts (policy
+    phases included). Playing a rollout mp4 as "episode N" silently shows a
+    different artifact than the dataset — the exact confusion this class
+    removes: `slice_fallback_by_intervention_csv` maps dataset episodes to
+    (eval episode, frame range) via the run's intervention_per_scenario.csv,
+    and this source serves only those ranges.
+    """
+
+    def __init__(self, ep_videos, slices: dict[int, tuple[int, int, int]], **kw):
+        super().__init__(ep_videos, **kw)
+        self._slices = slices  # ds_ep -> (src_eval_ep, start_frame, n_frames)
+
+    def episode_lengths(self) -> dict[int, int]:
+        return {ep: n for ep, (_src, _st, n) in self._slices.items()}
+
+    def get_frame(self, key: str, ep: int, frame_in_ep: int) -> np.ndarray:
+        src, start, n = self._slices[ep]
+        return super().get_frame(key, src, start + min(frame_in_ep, n - 1))
+
+
+def slice_fallback_by_intervention_csv(
+    ep_videos: dict[int, list[tuple[str, str]]],
+    min_frames: int = 60,
+) -> tuple[dict[int, tuple[int, int, int]], str] | None:
+    """Build dataset-episode slices from an interventions run's CSV.
+
+    Looks for intervention_per_scenario.csv above the mp4 directory. Returns
+    ({dataset_ep: (eval_ep, start_frame, n_frames)}, csv_path) or None when
+    no CSV is found (plain eval recordings — 1:1 fallback stays correct).
+
+    Mapping: CSV row i = eval episode i; each cycle with rrt_steps_executed
+    >= min_frames becomes the next dataset episode, spanning eval-video
+    frames [trigger_step + 1, trigger_step + rrt_steps] (the recorder keeps
+    only the RRT segment; shorter cycles are dropped by its min-episode
+    filter — mirror with --fallback_min_episode_frames if numbering looks
+    shifted).
+    """
+    sample = next((path for entries in ep_videos.values() for _l, path in entries), None)
+    if sample is None:
+        return None
+    d = os.path.dirname(os.path.abspath(sample))
+    csv_path = None
+    for _ in range(4):
+        cand = os.path.join(d, "intervention_per_scenario.csv")
+        if os.path.isfile(cand):
+            csv_path = cand
+            break
+        d = os.path.dirname(d)
+    if csv_path is None:
+        return None
+    import csv as _csv
+
+    slices: dict[int, tuple[int, int, int]] = {}
+    ds_ep = 0
+    with open(csv_path) as f:
+        for eval_ep, row in enumerate(_csv.DictReader(f)):
+            steps = [int(x) for x in row.get("trigger_steps", "").split(",") if x.strip()]
+            lens = [int(x) for x in row.get("rrt_steps_executed", "").split(",") if x.strip()]
+            for ts, n in zip(steps, lens):
+                if n >= min_frames:
+                    if eval_ep in ep_videos:
+                        slices[ds_ep] = (eval_ep, ts + 1, n)
+                    ds_ep += 1
+    return (slices, csv_path) if slices else None
+
+
+def synthetic_frame_index(lengths: dict[int, int]) -> pd.DataFrame:
+    """Stand-in for the parquet: (episode_index, frame_index) rows only."""
+    rows = [
+        {"episode_index": ep, "frame_index": i}
+        for ep in sorted(lengths)
+        for i in range(lengths[ep])
+    ]
+    return pd.DataFrame(rows)
 
 
 class VideoFrameSource:
@@ -906,6 +1185,30 @@ def main():
         "e.g. --keys stretch (default: all base_rgb*/wrist_rgb* keys)",
     )
     parser.add_argument(
+        "--fallback_video_dir",
+        type=str,
+        default=None,
+        help="Directory of per-episode rollout mp4s (eval_episode_<N>.mp4), or a run "
+        "dir containing videos/<env>/. Used when the dataset parquet isn't readable "
+        "yet (still recording). Auto-discovered from DAgger sidecars / run names if omitted.",
+    )
+    parser.add_argument(
+        "--fallback_min_episode_frames",
+        type=int,
+        default=60,
+        help=(
+            "Loose-video fallback for INTERVENTION datasets: cycles shorter than "
+            "this many RRT frames are assumed dropped by the recorder's "
+            "min-episode filter when deriving dataset-episode numbering from "
+            "intervention_per_scenario.csv."
+        ),
+    )
+    parser.add_argument(
+        "--no_video_fallback",
+        action="store_true",
+        help="Disable the loose-mp4 fallback and fail on an unreadable/incomplete parquet.",
+    )
+    parser.add_argument(
         "--list-episodes",
         action="store_true",
         help="List available episodes and exit",
@@ -967,17 +1270,65 @@ def main():
         episode_lengths(args.parquet_folder, subset=episodes)
         return
 
-    df = load_parquet_dataset(args.parquet_folder, episodes)
+    df = load_parquet_dataset(args.parquet_folder, episodes, allow_missing=not args.no_video_fallback)
 
-    # Video-backed datasets keep no images in the parquet; look for the dataset
-    # root so frames can be decoded from <root>/videos/*.mp4 instead.
     video_source = None
-    base_cols, wrist_cols = find_image_columns(df)
-    if not base_cols and not wrist_cols:
-        root = find_dataset_root(args.parquet_folder)
-        if root is not None:
-            video_source = VideoFrameSource(root)
-            print(f"No image columns in parquet — decoding video features from {root}/videos")
+    if df.empty:
+        # Dataset still recording (or partially written): its parquet has no footer
+        # and meta/episodes is unusable, so there's no frame index and no episode
+        # boundaries. The rollout mp4s are already on disk though — play those.
+        # NOTE: with an intervention CSV present, dataset episode N may live
+        # inside a DIFFERENT eval mp4 than eval_episode_N — locate ALL loose
+        # videos first, slice, then filter to the requested episodes.
+        ep_videos = find_fallback_episode_videos(
+            args.parquet_folder, None, explicit_dir=args.fallback_video_dir
+        )
+        if not ep_videos:
+            raise ValueError(
+                f"No frames found for episodes {episodes} and no fallback episode "
+                f"videos located (try --fallback_video_dir=<dir with eval_episode_*.mp4>)"
+            )
+        sliced = slice_fallback_by_intervention_csv(
+            ep_videos, min_frames=args.fallback_min_episode_frames
+        )
+        if sliced is not None:
+            slices, csv_path = sliced
+            if episodes is not None:
+                slices = {ep: v for ep, v in slices.items() if ep in episodes}
+                if not slices:
+                    _avail = sorted(sliced[0].keys())
+                    raise ValueError(
+                        f"Requested episodes {episodes} not present in the CSV-derived "
+                        f"slice map ({csv_path}). Dataset episodes available so far "
+                        f"(recording may still be in flight): {_avail}"
+                    )
+            print(
+                f"Intervention CSV found ({csv_path}) — slicing eval rollout mp4s into "
+                f"dataset-equivalent RRT segments (policy phases excluded):"
+            )
+            for ep, (src, st, n) in sorted(slices.items()):
+                print(f"  dataset ep {ep} <- eval_episode_{src}.mp4 frames [{st}, {st + n - 1}] ({n} frames)")
+            print(
+                "  (numbering assumes the recorder drops cycles under "
+                f"{args.fallback_min_episode_frames} frames — adjust "
+                "--fallback_min_episode_frames if it looks shifted vs the final parquet)"
+            )
+            video_source = SlicedEpisodeVideoSource(ep_videos, slices)
+        else:
+            if episodes is not None:
+                ep_videos = {ep: v for ep, v in ep_videos.items() if ep in episodes}
+            video_source = LooseEpisodeVideoSource(ep_videos)
+        df = synthetic_frame_index(video_source.episode_lengths())
+        print(f"Using {len(video_source.keys)} fallback video key(s): {video_source.keys}")
+    else:
+        # Video-backed datasets keep no images in the parquet; look for the dataset
+        # root so frames can be decoded from <root>/videos/*.mp4 instead.
+        base_cols, wrist_cols = find_image_columns(df)
+        if not base_cols and not wrist_cols:
+            root = find_dataset_root(args.parquet_folder)
+            if root is not None:
+                video_source = VideoFrameSource(root)
+                print(f"No image columns in parquet — decoding video features from {root}/videos")
 
     key_filter = [k.strip() for k in args.keys.split(",")] if args.keys else None
 
