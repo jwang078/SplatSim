@@ -324,6 +324,28 @@ def section_e_env_config_inherit():
     check("E5 no legacy divergent names in config", not (set(cfg) & legacy),
           f"legacy keys present: {sorted(set(cfg) & legacy)}" if set(cfg) & legacy else "")
 
+    # E6: taper drift guard. The traj-config JSONs restate the final-approach
+    # taper verbatim (GUI exports write every field), and because the JSON is
+    # an OVERRIDE layer, a retune of planner_defaults silently fails to
+    # propagate to any env whose JSON still carries the old numbers — that is
+    # exactly how the 2026-08-17 taper retune would have missed interventions.
+    # Every JSON must match PLANNER_DEFAULTS on these keys unless the env is
+    # declared here as an intentional override.
+    import glob as _glob
+    from splatsim.utils.paths import TRAJ_CONFIG_DIR
+    from splatsim.utils.planner_defaults import PLANNER_DEFAULTS as _PD
+    TAPER_KEYS = ("final_approach_dist", "final_approach_vel_scale", "final_approach_acc_scale")
+    INTENTIONAL_TAPER_OVERRIDES: dict[str, dict] = {}  # env-file basename -> {key: value}
+    drift = []
+    for jf in sorted(_glob.glob(str(TRAJ_CONFIG_DIR / "*.json"))):
+        c = _json.load(open(jf))
+        allowed = INTENTIONAL_TAPER_OVERRIDES.get(os.path.basename(jf), {})
+        for k in TAPER_KEYS:
+            if k in c and c[k] != allowed.get(k, getattr(_PD, k)):
+                drift.append(f"{os.path.basename(jf)}:{k}={c[k]} (default {getattr(_PD, k)})")
+    check("E6 taper values match planner defaults in every env JSON", not drift,
+          "; ".join(drift) if drift else "")
+
 
 def main():
     section_a_parametrizer()
