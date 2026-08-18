@@ -2773,6 +2773,45 @@ class RRTToGoalPlanner:
         qq = np.asarray(q, dtype=np.float64).reshape(-1)[: self._num_dofs]
         if nv < 1e-6:
             return True  # at rest — a from-rest plan is exactly right here
+        # Braking spur checked at the EMERGENCY clearance (1 cm — the same
+        # standard the shield's replans use), not the full planning
+        # clearance: judging brake feasibility at 2 cm made the micro-rewind
+        # rewind further than physically necessary (user-observed: braking
+        # started well before the shield's own collision threshold).
+        emerg = min(0.01, float(self._collision_kwargs.get("obstacle_clearance") or 0.01))
+        return self._velocity_spur_free(qq, v, obstacle_clearance=emerg)
+
+    def is_handoff_runway_free(self, q: np.ndarray, v_vec: np.ndarray) -> bool:
+        """Stronger sibling of `is_brake_feasible`: does the state have a
+        collision-free braking spur along its velocity at the FULL planning
+        clearance?
+
+        This spur is exactly the geometry the braking lead-in (and, with
+        lateral room, the curved redirect) needs — so a state passing this
+        check hands off with real runway: the plan launches carrying the
+        policy's velocity instead of declaring "handoff will brake in
+        place" and dumping it on the PD (planar scenario 14, 2026-08-17:
+        pocket handoff at 0.45 rad/s carried only the 0.054 tangential).
+        Passing this implies `is_brake_feasible` (same spur, larger
+        clearance). Used by the shield micro-rewind's deeper search."""
+        v = np.asarray(v_vec, dtype=np.float64).reshape(-1)[: self._num_dofs]
+        qq = np.asarray(q, dtype=np.float64).reshape(-1)[: self._num_dofs]
+        if float(np.linalg.norm(v)) < 1e-6:
+            return True
+        return self._velocity_spur_free(
+            qq, v,
+            obstacle_clearance=float(self._collision_kwargs.get("obstacle_clearance") or 0.02),
+        )
+
+    def _velocity_spur_free(
+        self, qq: np.ndarray, v: np.ndarray, obstacle_clearance: float
+    ) -> bool:
+        """Shared sweep for the two checks above: the jerk-aware braking
+        spur q -> q + v_hat * (v^2/1.4a + v*a/j) (the same length formula
+        the lead-in uses), joint limits + collisions at 0.02 rad steps."""
+        from splatsim.utils.rrt_path_utils import check_links_in_collision
+
+        nv = float(np.linalg.norm(v))
         vhat = v / nv
         acc = float(np.max(np.atleast_1d(self._max_joint_acc)))
         jerk = float(np.min(np.atleast_1d(self._max_joint_jerk)))
@@ -2784,13 +2823,8 @@ class RRTToGoalPlanner:
             and np.all(tgt <= self._upper_limits[: len(tgt)])
         ):
             return False
-        # Braking spur checked at the EMERGENCY clearance (1 cm — the same
-        # standard the shield's replans use), not the full planning
-        # clearance: judging brake feasibility at 2 cm made the micro-rewind
-        # rewind further than physically necessary (user-observed: braking
-        # started well before the shield's own collision threshold).
         kw = dict(self._collision_kwargs)
-        kw["obstacle_clearance"] = min(0.01, float(kw.get("obstacle_clearance") or 0.01))
+        kw["obstacle_clearance"] = obstacle_clearance
         n = max(1, int(np.ceil(d_full / 0.02)))
         for k in range(0, n + 1):
             qi = qq + vhat * (d_full * k / n)

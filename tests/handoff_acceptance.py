@@ -256,6 +256,40 @@ def section_b_planner():
           pl.is_brake_feasible(q0, np.zeros(3)))
     check("C2 toward obstacle infeasible", not pl.is_brake_feasible(q0, v_toward))
 
+    # C3: `is_handoff_runway_free` is the planning-clearance sibling of
+    # `is_brake_feasible` (same spur, 0.02 vs 0.01 clearance) — the shield
+    # micro-rewind prefers runway-free states so handoffs launch with real
+    # runway instead of braking in place. The distinction is real: scanning
+    # a lateral obstacle toward the braking sweep must produce a band where
+    # an emergency brake still fits but planning-clearance runway does not.
+    pl._loaded_obstacle_ids.remove(obs2)
+    del pl._obstacle_names[obs2]
+    client.removeBody(obs2)
+    v_back = -v_toward
+    mid_b, _ = _sweep_midpoint(v_back / np.linalg.norm(v_back), 0.4)
+    w = np.array([0.0, 1.0, 0.0])  # out-of-plane for the planar arm
+    band = None
+    states = []
+    for off in np.arange(0.02, 0.12, 0.002):
+        sp3 = client.createMultiBody(
+            0, client.createCollisionShape(pb.GEOM_SPHERE, radius=0.02),
+            basePosition=(mid_b + w * off).tolist(),
+        )
+        pl._loaded_obstacle_ids.append(sp3)
+        pl._obstacle_names[sp3] = "c3_sphere"
+        brake = pl.is_brake_feasible(q0, v_back)
+        runway = pl.is_handoff_runway_free(q0, v_back)
+        pl._loaded_obstacle_ids.remove(sp3)
+        del pl._obstacle_names[sp3]
+        client.removeBody(sp3)
+        states.append((round(float(off), 3), brake, runway))
+        if brake and not runway and band is None:
+            band = float(off)
+    far_ok = states[-1][1] and states[-1][2]  # far obstacle: both pass
+    check("C3 runway check stricter than brake check (clearance band exists)",
+          band is not None and far_ok,
+          f"band at offset {band}, far state {states[-1]}")
+
 
 def section_d_ctor_drift():
     """Guard: features added to RRTToGoalPlanner must be threaded into BOTH
