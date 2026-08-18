@@ -988,7 +988,27 @@ def get_rrt_plan(robot_id, joint_indices, obstacle_ids, q_start, q_goal,
                                          **_ccheck_kwargs)
 
     if config_cost_fn is None:
-        path = birrt(q_start, q_goal, distance_fn, sample_fn, extend_fn, collision_fn)
+        # Adaptive search budget: pybullet_planning's default is a tiny 20
+        # RRT-connect iterations per restart — plenty for the typical
+        # sub-2-rad hop, hopeless for a joint-limit wrap-around trek (a
+        # 5.4-rad single-corridor problem measured 39/40 attempt failures,
+        # escalating to plan-level 5x-fail backoffs; 2026-08-18 scenario
+        # 11). Scale iterations with the joint-space distance to cover:
+        # ~100 per rad, floored at the old effective budget and capped so a
+        # genuinely blocked goal still fails fast. Failed attempts cost
+        # collision checks, but the caller's 15-attempts-per-IK loop pays
+        # far more for 15 hopeless 20-iteration tries than for a few
+        # properly-sized ones.
+        # Validated on the real scenario-11 field (two cuboids + goal block,
+        # 5.4-rad j1 trek): default budget 4/36 plans found, adaptive 36/36
+        # at ~0.6 s per solve. max_time bounds the cost of a genuinely
+        # blocked corridor (the caller retries up to 15x per IK — better to
+        # spend the budget on a few properly-sized attempts that fail fast
+        # on wall clock than on many hopeless 20-iteration ones).
+        _q_dist = float(np.linalg.norm(np.asarray(q_goal) - np.asarray(q_start)))
+        _rrt_iters = int(np.clip(100.0 * _q_dist, 60, 600))
+        path = birrt(q_start, q_goal, distance_fn, sample_fn, extend_fn, collision_fn,
+                     max_iterations=_rrt_iters, max_time=5.0)
     else:
         tp = dict(trrt_params or {})
         restarts = int(tp.pop("restarts", 1))
