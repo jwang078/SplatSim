@@ -171,23 +171,28 @@ def create_lerobot_dataset(
     state_dim: Optional[int] = None,
     env_state_dim: int = 0,
     image_dtype: str = "video",
+    extra_features: Optional[dict] = None,
 ) -> "LeRobotDataset":
     """Create a fresh LeRobot dataset with standard SplatSim settings.
 
     `state_dim` defaults to num_dofs + 1 (proprioception). Oracle-info envs pass
     `env_state_dim` > 0 to add a separate observation.environment_state feature
-    holding object coords."""
+    holding object coords. `extra_features` merges additional per-frame feature
+    specs (e.g. a scalar annotation column) into the standard schema."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    features = build_lerobot_features(
+        image_keys, num_dofs, state_dim=state_dim, env_state_dim=env_state_dim,
+        image_dtype=image_dtype,
+    )
+    if extra_features:
+        features = {**features, **extra_features}
     return LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
         robot_type=robot_type,
         use_videos=True,
-        features=build_lerobot_features(
-            image_keys, num_dofs, state_dim=state_dim, env_state_dim=env_state_dim,
-            image_dtype=image_dtype,
-        ),
+        features=features,
     )
 
 
