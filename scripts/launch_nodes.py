@@ -210,6 +210,11 @@ def _resolve_default_robot_name(robot_variant: str) -> str:
             VineGrapeReachPybulletRobotServer,
         )
         return VineGrapeReachPybulletRobotServer.DEFAULT_ROBOT_NAME
+    if robot_variant == "sim_pybullet_floating_gripper":
+        from splatsim.robots.sim_robot_pybullet_floating_gripper import (
+            FloatingGripperPybulletRobotServer,
+        )
+        return FloatingGripperPybulletRobotServer.DEFAULT_ROBOT_NAME
     # Fallback: base class default.
     from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
     return PybulletRobotServerBase.DEFAULT_ROBOT_NAME
@@ -479,6 +484,40 @@ def launch_robot_server(args: Args):
            # camera; `camera_names` is computed above from objects.yaml)
            camera_names=camera_names, robot_name=args.robot_name, use_gripper=use_gripper,
            wrist_cam_ver=args.wrist_cam_ver,
+           render_mode=resolved_render_mode,
+           splat_shadows=args.splat_shadows,
+           debug_fast_control=args.debug_fast_control,
+           debug_mode=args.debug_mode,
+           eval_benchmark_repo_id=args.eval_benchmark_repo_id,
+           eval_benchmark_subset=args.eval_benchmark_subset,
+           headless=args.headless,
+           show_control_gui=args.control_gui,
+           in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
+           in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
+           sync_physics_to_client=args.sync_physics_to_client,
+           physics_substeps_per_command=args.physics_substeps_per_command,
+           strict_goal_tolerances=args.strict_goal_tolerances,
+           phantom_obstacles=args.phantom_obstacles,
+        )
+
+    elif args.robot == "sim_pybullet_floating_gripper":
+        # Floating gripper for EEF-trajectory visualization (e.g. UMI demos
+        # converted to LeRobot). The 6 "arm joints" are the EE pose
+        # [x, y, z, rx, ry, rz]; pair with --eval_benchmark_repo_id and use the
+        # GUI's Eval Benchmark tab -> Replay Episode. RENDER_SPLATS=False, so
+        # rendering goes through the PyBullet camera.
+        from splatsim.robots.sim_robot_pybullet_floating_gripper import (
+            FloatingGripperPybulletRobotServer,
+        )
+
+        serve_mode = (
+            FloatingGripperPybulletRobotServer.SERVE_MODES.EVAL_BENCHMARK
+            if args.eval_benchmark_repo_id is not None
+            else FloatingGripperPybulletRobotServer.SERVE_MODES.INTERACTIVE
+        )
+        server = FloatingGripperPybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=serve_mode,
+           camera_names=["base_rgb"], robot_name=args.robot_name, use_gripper=use_gripper,
            render_mode=resolved_render_mode,
            splat_shadows=args.splat_shadows,
            debug_fast_control=args.debug_fast_control,

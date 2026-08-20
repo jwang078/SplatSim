@@ -634,3 +634,35 @@ vine_scene:
   - 0.0
   - 0.0
   use_fixed_base: true
+
+floating_gripper:
+  # 6-DoF "virtual arm" (3 prismatic + 3 revolute joints = the EE pose) with the
+  # shared Robotiq 2F-85. For visualizing recorded EEF trajectories (UMI demos)
+  # via eval-benchmark replay. state/action = [x, y, z, rx, ry, rz, gripper].
+  urdf_path: ./splatsim/robot_definitions/urdf/floating_gripper.urdf
+  base_position:
+  - 0.0
+  - 0.0
+  - 0.0
+  use_gripper: true
+  is_articulated: true
+  use_fixed_base: true
+  wrist_camera_link_name: wrist_camera_link
+  articulation_config:
+    # [x, y, z, rx, ry, rz, gripper]; gripper: 0 = open, 1 = closed.
+    initial_joint_positions:
+    - 0.0
+    - 0.0
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    joint_signs:
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1

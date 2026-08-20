@@ -356,8 +356,12 @@ def _populate_registry():
         Planar3JointOraclePybulletRobotServer,
         Planar3JointOracleSimplePybulletRobotServer,
     )
+    from splatsim.robots.sim_robot_pybullet_floating_gripper import (
+        FloatingGripperPybulletRobotServer,
+    )
 
     register_env("small_engine", SmallEnginePybulletRobotServer)
+    register_env("floating_gripper", FloatingGripperPybulletRobotServer)
     register_env("planar_3joint", Planar3JointPybulletRobotServer)
     register_env("planar_3joint_oracle", Planar3JointOraclePybulletRobotServer)
     register_env("planar_3joint_oracle_simple", Planar3JointOracleSimplePybulletRobotServer)
