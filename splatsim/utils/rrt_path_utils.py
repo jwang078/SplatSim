@@ -3556,12 +3556,21 @@ def retimed_parametrize_path(
         return _erode_box_same(c_kn, W) if len(c_kn) > 2 * W else c_kn
 
     try:
+        # Handoff plans (start_vel provided) get the strict jerk-limited
+        # onset at ANY handoff speed, including ~0: a stalled takeover
+        # (stuck-triggered, the common case) otherwise launches at cruise
+        # within one tick — the accel row alone permits it because
+        # acc_bound is calibrated on already-retimed demos — producing
+        # labels the policy cannot follow from the takeover state
+        # (onset imitation gap ~1.8x the ramped-onset data, 2026-09-05).
+        # Demo generation passes no start_vel and keeps the fast launch.
         node_v = _jerk_limited_minorant(
             c_kn, wgt, acc_bound, 0.85 * jerk_cap, dt, factor=lp_factor,
-            v_start=v_legal, strict_onset=(v_legal > 0.0 or _strict_onset),
+            v_start=v_legal,
+            strict_onset=(sv is not None or v_legal > 0.0 or _strict_onset),
         )
     except Exception:
-        if v_legal > 0.0:
+        if v_legal > 0.0 or sv is not None:
             # Infeasibility can also come from the handoff interacting with
             # tight interior constraints — retry as a from-rest LEGAL
             # profile before falling back to morphology. The executed

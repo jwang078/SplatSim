@@ -14,8 +14,9 @@
 <!-- |  The Robotiq 2F-85 block is verbatim from planar_3joint.urdf (same names, so     | -->
 <!-- |  setup_gripper()/GRIPPER_SELF_COLLISION_SKIP_PAIR_NAMES resolve identically).    | -->
 <!-- |  The gripper base is mounted 0.15 m BEHIND the virtual TCP frame along the       | -->
-<!-- |  approach axis (+Z), so the fingertips land ON the recorded TCP point (UMI       | -->
-<!-- |  tcp_pose convention: z = approach, position = fingertip midpoint).              | -->
+<!-- |  approach axis (-Y), so the fingertips land ON the recorded TCP point (UMI       | -->
+<!-- |  tcp_pose convention: -y = approach/fingers, x = finger-opening,                 | -->
+<!-- |  position = fingertip midpoint).                                                 | -->
 <!-- =================================================================================== -->
 <robot name="floating_gripper">
 
@@ -129,12 +130,18 @@
     <dynamics damping="0.0" friction="0.0"/>
   </joint>
 
-  <!-- Gripper base sits 0.15 m behind the virtual TCP along +Z (approach axis),
-       so the Robotiq fingertips coincide with the TCP frame origin. -->
+  <!-- Gripper base sits 0.15 m behind the virtual TCP along the approach axis,
+       so the Robotiq fingertips coincide with the TCP frame origin. The UMI
+       tcp_pose frame has -Y = approach (fingers; VERIFIED against the
+       2026-08-20 ground video, where the demos reach UP at overhead clusters
+       and -y is the axis whose world direction points up), +X =
+       finger-opening (lateral), while the Robotiq base frame has +Z =
+       approach and +Y = opening; this rpy maps gripper (x, y, z) onto TCP
+       (-z, x, -y) so the fingers point along TCP -Y and open along TCP +X. -->
   <joint name="arm_gripper_joint" type="fixed">
     <parent link="tcp_link"/>
     <child link="robotiq_arg2f_base_link"/>
-    <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 -0.15"/>
+    <origin rpy="1.5707963267948966 1.5707963267948966 0.0" xyz="0.0 0.15 0.0"/>
   </joint>
 
   <link name="robotiq_arg2f_base_link">

@@ -138,6 +138,54 @@ def section_a_parametrizer():
                   cusp_lead=d_lead(1.00))
 
 
+def section_a2_stalled_onset():
+    """Stalled handoff (start_vel ~ 0): the plan must RAMP, not launch at
+    cruise. Interventions overwhelmingly trigger on the stuck heuristic, so
+    the handed velocity is ~zero; before 2026-09-05 the strict onset row was
+    gated to moving handoffs and a stalled takeover launched at ~1.1x cruise
+    in one tick (start-speed audit of 04dagpl vs 03dag intervention data),
+    producing onset labels the policy cannot follow. Demo generation (no
+    start_vel) intentionally keeps the fast launch."""
+    print("--- A2: stalled-handoff onset ramp ---")
+    wp, kw = _load_corpus_case()
+    dof = wp.shape[1]
+    lims = (np.full(dof, 0.5), np.full(dof, 1.0), np.full(dof, 10.0))
+
+    def launch_profile(with_sv, v0=0.0):
+        kw2 = dict(kw)
+        if with_sv:
+            d0 = wp[1] - wp[0]
+            kw2["start_vel"] = (d0 / np.linalg.norm(d0)) * v0
+        else:
+            kw2.pop("start_vel", None)
+        tr = parametrize_path(wp, *lims, backend="retimed", **kw2)
+        return np.linalg.norm(np.diff(tr, axis=0), axis=1) * FPS
+
+    sp = launch_profile(True, 0.0)
+    cruise = float(np.percentile(sp, 90))
+    ramp_ok = sp[0] <= 0.25 * cruise
+    mono_ok = bool(np.all(np.diff(sp[:5]) >= -1e-6))
+    a = np.diff(sp) * FPS
+    reach = int(np.argmax(sp >= 0.8 * cruise)) if np.any(sp >= 0.8 * cruise) else len(sp)
+    check(
+        "A2 stalled handoff ramps (start_vel=0)",
+        ramp_ok and mono_ok and reach <= 2 * FPS and np.abs(a).max() <= 1.6,
+        f"sp0 {sp[0]:.3f} cruise {cruise:.2f} reach80% @{reach} amax {np.abs(a).max():.2f}",
+    )
+    sp2 = launch_profile(True, 0.005)
+    check(
+        "A2 near-zero handoff ramps too (start_vel=0.005)",
+        sp2[0] <= 0.25 * cruise,
+        f"sp0 {sp2[0]:.3f}",
+    )
+    spd = launch_profile(False)
+    check(
+        "A2 demo-generation launch unchanged (no start_vel; fast start kept)",
+        spd[0] >= 2.0 * sp[0] or spd[0] >= 0.5 * cruise,
+        f"demo sp0 {spd[0]:.3f} vs handoff sp0 {sp[0]:.3f}",
+    )
+
+
 def section_b_planner():
     print("--- B: planner start treatment ---")
     import pybullet as pb
@@ -506,6 +554,7 @@ def section_e_env_config_inherit():
 
 def main():
     section_a_parametrizer()
+    section_a2_stalled_onset()
     section_b_planner()
     section_d_ctor_drift()
     section_e_env_config_inherit()

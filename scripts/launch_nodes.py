@@ -122,7 +122,15 @@ class Args:
     # `physics_substeps_per_command` (default 8) `stepSimulation` calls,
     # matching the async default rate of 240 Hz when the client is running
     # at 30 Hz. Only affects INTERACTIVE / EVAL_BENCHMARK* modes.
-    sync_physics_to_client: bool = False
+    # DEFAULT ON (2026-08-27): every recording/eval/blend workflow wants
+    # deterministic client-gated stepping (wallclock physics makes rollout
+    # dynamics depend on GPU load). Trajectory-generation modes drive their
+    # own stepping and ignore this. Caveat of ON: with no client connected,
+    # INTERACTIVE/EVAL_BENCHMARK physics is frozen (objects don't settle,
+    # GUI scene is static) until a client commands — pass
+    # --no-sync_physics_to_client for a live free-running sim (e.g.
+    # human gello teleop pacing against wallclock).
+    sync_physics_to_client: bool = True
     physics_substeps_per_command: int = 8
 
     # Tighten the per-env is_success tolerances (STRICT_POS_TOLERANCE_M /
@@ -215,11 +223,12 @@ def _resolve_default_robot_name(robot_variant: str) -> str:
             VineGrapeReachPybulletRobotServer,
         )
         return VineGrapeReachPybulletRobotServer.DEFAULT_ROBOT_NAME
-    if robot_variant == "sim_pybullet_floating_gripper":
+    if robot_variant in ("sim_pybullet_floating_gripper",
+                         "sim_pybullet_floating_gripper_vine"):
         from splatsim.robots.sim_robot_pybullet_floating_gripper import (
             FloatingGripperPybulletRobotServer,
         )
-        return FloatingGripperPybulletRobotServer.DEFAULT_ROBOT_NAME
+        return FloatingGripperPybulletRobotServer.DEFAULT_ROBOT_NAME  # both share the URDF
     # Fallback: base class default.
     from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
     return PybulletRobotServerBase.DEFAULT_ROBOT_NAME
@@ -531,8 +540,44 @@ def launch_robot_server(args: Args):
            eval_benchmark_subset=args.eval_benchmark_subset,
            headless=args.headless,
            show_control_gui=args.control_gui,
-           in_collision_obstacle_clearance=args.in_collision_obstacle_clearance,
-           in_collision_self_collision_clearance=args.in_collision_self_collision_clearance,
+           # NOTE: no --in_collision_*_clearance here. Those kwargs live on
+           # SmallEnginePybulletRobotServer.__init__, and this env derives
+           # straight from PybulletRobotServerBase (no obstacles, no
+           # in_collision metric), so forwarding them is a TypeError.
+           sync_physics_to_client=args.sync_physics_to_client,
+           physics_substeps_per_command=args.physics_substeps_per_command,
+           strict_goal_tolerances=args.strict_goal_tolerances,
+           phantom_obstacles=args.phantom_obstacles,
+        )
+
+    elif args.robot == "sim_pybullet_floating_gripper_vine":
+        # Same floating-gripper replay, but rendered INSIDE the scanned grape
+        # vine splat: `vine_scene` as the photoreal background, the vine's
+        # collision mesh at the origin, and the (unscanned) gripper composited
+        # in from PyBullet. See VineFloatingGripperPybulletRobotServer's frame
+        # warning — the UMI tag frame is NOT the sim frame, so set its
+        # UMI_TO_SIM_* / ALIGN_TO_BUNCH_INDEX before reading anything into
+        # where the gripper lands relative to the fruit.
+        from splatsim.robots.sim_robot_pybullet_floating_gripper import (
+            VineFloatingGripperPybulletRobotServer,
+        )
+
+        serve_mode = (
+            VineFloatingGripperPybulletRobotServer.SERVE_MODES.EVAL_BENCHMARK
+            if args.eval_benchmark_repo_id is not None
+            else VineFloatingGripperPybulletRobotServer.SERVE_MODES.INTERACTIVE
+        )
+        server = VineFloatingGripperPybulletRobotServer(
+           port=port, host=args.hostname, serve_mode=serve_mode,
+           camera_names=camera_names, robot_name=args.robot_name, use_gripper=use_gripper,
+           render_mode=resolved_render_mode,
+           splat_shadows=args.splat_shadows,
+           debug_fast_control=args.debug_fast_control,
+           debug_mode=args.debug_mode,
+           eval_benchmark_repo_id=args.eval_benchmark_repo_id,
+           eval_benchmark_subset=args.eval_benchmark_subset,
+           headless=args.headless,
+           show_control_gui=args.control_gui,
            sync_physics_to_client=args.sync_physics_to_client,
            physics_substeps_per_command=args.physics_substeps_per_command,
            strict_goal_tolerances=args.strict_goal_tolerances,

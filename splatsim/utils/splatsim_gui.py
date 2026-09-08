@@ -135,6 +135,10 @@ class ThreadedTkinterGui(ABC):
         self._running = False
         self._shutdown_requested = False
         self._main_thread = threading.main_thread()
+        # Set once _build_ui has finished on the Tk thread. Before that, every
+        # setter (set_status, set_value, dropdown repopulation) is a silent
+        # no-op — callers that want their writes to land can wait_until_ready.
+        self._ui_ready = threading.Event()
 
     def start(self):
         """Start the GUI in a separate thread."""
@@ -144,6 +148,16 @@ class ThreadedTkinterGui(ABC):
         self._shutdown_requested = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def wait_until_ready(self, timeout: float = 10.0) -> bool:
+        """Block until the Tk widgets exist (or timeout). Returns readiness.
+
+        Immediately returns False when the GUI thread was never started
+        (fully-headless runs) so callers don't burn the timeout.
+        """
+        if not self._running:
+            return False
+        return self._ui_ready.wait(timeout)
 
     def stop(self):
         """Stop the GUI and close the window (thread-safe).
@@ -223,6 +237,7 @@ class ThreadedTkinterGui(ABC):
 
         self._configure_styles()
         self._build_ui()
+        self._ui_ready.set()
         self._check_shutdown()
 
         try:
@@ -1225,6 +1240,7 @@ class SplatSimGui(ThreadedTkinterGui):
         initial_splat_shadows: bool = False,
         traj_config_default_path: Optional[str] = None,
         traj_env_reassert_fn=None,
+        initial_eval_repo_id: str = "",
     ):
         """Initialize the GUI.
 
@@ -1262,6 +1278,10 @@ class SplatSimGui(ThreadedTkinterGui):
         )
         self._config = config
         self._eval_config = EvalBenchmarkModeConfig()
+        # Seed the Eval Benchmark panel's repo-id field (e.g. from the server's
+        # --eval_benchmark_repo_id) so the GUI shows what the server will load.
+        if initial_eval_repo_id:
+            self._eval_config.lerobot_repo_id = initial_eval_repo_id
         self._initial_mode = initial_mode
         self._mode_var: Optional[tk.StringVar] = None
         self._debug_mode_enum = debug_mode_enum

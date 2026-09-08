@@ -4,15 +4,25 @@ import torch
 from gsplat.rendering import rasterization
 
 
-def render_gsplat(splatsim_camera, pc):
+def render_gsplat(splatsim_camera, pc, with_depth: bool = False):
     """Render gaussians using gsplat with fisheye or pinhole camera model.
 
     Args:
         splatsim_camera: SplatSimCamera with camera_model, intrinsic_matrix, radial_coeffs
         pc: GaussianModel instance (same as used by the original renderer)
+        with_depth: also rasterize expected depth. Off by default because it
+            costs an extra output channel on every render and almost every
+            caller only wants colour; turn it on to depth-composite non-splat
+            geometry into the frame (see PybulletRobotServerBase's
+            COMPOSITE_PYBULLET_ROBOT).
 
     Returns:
-        dict with "render" key containing [3, H, W] clamped image tensor on CUDA
+        dict with "render" ([3, H, W] clamped image) and "depth" ([1, H, W]),
+        both CUDA tensors. "depth" is EXPECTED depth along each ray in metres
+        (alpha-weighted mean of the contributing gaussians' view-space z) when
+        `with_depth`, else a zero placeholder. Expected depth goes to 0 where
+        nothing was hit, so test coverage with `render_alphas` semantics —
+        i.e. treat depth <= 0 as "no surface", not "surface at the camera".
     """
     camera = splatsim_camera.camera
     W = camera.image_width
@@ -40,6 +50,7 @@ def render_gsplat(splatsim_camera, pc):
 
     backgrounds = splatsim_camera.background.unsqueeze(0)  # [1, 3]
 
+    render_mode = "RGB+ED" if with_depth else "RGB"
     render_colors, render_alphas, meta = rasterization(
         means=pc.get_xyz,
         quats=pc.get_rotation,
@@ -58,9 +69,16 @@ def render_gsplat(splatsim_camera, pc):
         packed=False,
         rasterize_mode="antialiased",
         radius_clip=3.0,  # clip gaussians with projected 2D radius > this many tiles
+        render_mode=render_mode,
     )
 
-    # gsplat output: [1, H, W, 3] → [3, H, W]
+    # gsplat output: [1, H, W, 3] (or [1, H, W, 4] with the depth channel
+    # appended under RGB+ED) → [3, H, W] + [1, H, W]
+    if with_depth:
+        rendered_depth = render_colors[0, ..., 3:].permute(2, 0, 1)
+        render_colors = render_colors[..., :3]
+    else:
+        rendered_depth = torch.zeros(1, H, W, device="cuda")
     rendered_image = render_colors[0].permute(2, 0, 1).clamp(0, 1)
 
     # For fisheye cameras, gsplat rasterizes over the full W x H rectangle but
@@ -79,8 +97,9 @@ def render_gsplat(splatsim_camera, pc):
         )
         inside = ((xs - cx) ** 2 + (ys - cy) ** 2) <= mask_radius ** 2
         rendered_image = rendered_image * inside.unsqueeze(0)
+        rendered_depth = rendered_depth * inside.unsqueeze(0)
 
     return {
         "render": rendered_image,
-        "depth": torch.zeros(1, H, W, device="cuda"),  # placeholder
+        "depth": rendered_depth,
     }

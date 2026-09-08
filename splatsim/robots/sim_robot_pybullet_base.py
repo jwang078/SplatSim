@@ -823,6 +823,26 @@ class PybulletRobotServerBase:
     # splats; RENDER_SPLATS=False avoids loading them in the first place.
     RENDER_SPLATS: ClassVar[bool] = True
 
+    # Whether the ROBOT itself has a Gaussian splat, separately from the scene.
+    # None (default) = follow RENDER_SPLATS, which is what every env that scanned
+    # its own robot wants. Set False to render a splat SCENE around a robot that
+    # was never scanned — e.g. the floating UMI gripper dropped into the vine
+    # scan: the scene is photoreal, the robot has no gaussians to articulate, and
+    # `COMPOSITE_PYBULLET_ROBOT` below draws it in from PyBullet instead. The
+    # robot's URDF, physics and articulation are unaffected either way.
+    RENDER_ROBOT_SPLAT: ClassVar[Optional[bool]] = None
+
+    # Draw the robot's PyBullet geometry into the splat frame, depth-composited
+    # against the splat's own expected depth so the scene occludes the robot
+    # where it should. Only meaningful with RENDER_ROBOT_SPLAT=False — otherwise
+    # the robot is already in the frame as gaussians and this would double it.
+    COMPOSITE_PYBULLET_ROBOT: ClassVar[bool] = False
+    # Depth slack (metres) when testing PyBullet geometry against splat depth.
+    # Splat expected-depth is an alpha-weighted mean, so it reads a few cm SHORT
+    # on the fuzzy edges of foliage; without slack the robot gets eaten by a halo
+    # around every leaf it passes behind.
+    COMPOSITE_DEPTH_SLACK_M: ClassVar[float] = 0.03
+
     # This is the default splat name. Overwrite it in a child class of PybulletRobotServerBase
     background_splat_name = None
 
@@ -1176,8 +1196,10 @@ class PybulletRobotServerBase:
             for m in image_resize_modes
         ]
 
-        # load labels.npy (only needed for splat rendering — see RENDER_SPLATS)
-        if self.RENDER_SPLATS:
+        # load labels.npy — the per-link segmentation of the ROBOT's own splat,
+        # so it is needed exactly when that splat is loaded (see
+        # RENDER_ROBOT_SPLAT), not merely when the scene renders as splats.
+        if self._render_robot_splat():
             self.robot_labels = np.load(
                 str(SPLATSIM_ROOT / "data" / "labels_path" / f"{self.robot_name}_labels.npy")
             )
@@ -1348,9 +1370,10 @@ class PybulletRobotServerBase:
                 # planar oracle env) construct. Existing table envs already
                 # resolved TABLE_LIMITS[2] to (0, 0), so behavior is unchanged.
                 position_range_z=(0, 0),
-                # When RENDER_SPLATS is False the robot loads its URDF (physics
+                # When splat rendering is off — or the robot simply has no scan
+                # (RENDER_ROBOT_SPLAT=False) — the robot loads its URDF (physics
                 # + articulation) but no Gaussian splat / segmentation.
-                load_splat=self.RENDER_SPLATS,
+                load_splat=self._render_robot_splat(),
             )
         )
 
@@ -2910,11 +2933,16 @@ class PybulletRobotServerBase:
                 # Raw opacity → sigmoid; a large negative value renders as ~0 alpha.
                 self.scene_gaussian._opacity[occluder_idx] = -1e4
 
+        # Splat depth is only rasterized when something downstream needs it —
+        # today, depth-compositing the PyBullet robot into the frame.
+        want_depth = self.COMPOSITE_PYBULLET_ROBOT and not self._render_robot_splat()
+        splat_depth = None
         try:
             if camera.camera_model == "fisheye" or self.use_gsplat:
-                rendering = render_gsplat(
-                    camera, self.scene_gaussian
-                )["render"].cpu().numpy()
+                out = render_gsplat(camera, self.scene_gaussian, with_depth=want_depth)
+                rendering = out["render"].cpu().numpy()
+                if want_depth:
+                    splat_depth = out["depth"][0].cpu().numpy()
             else:
                 rendering = render(
                     camera.camera, self.scene_gaussian, camera.pipeline, camera.background
@@ -2923,6 +2951,15 @@ class PybulletRobotServerBase:
             if saved_opacity is not None:
                 self.scene_gaussian._opacity[occluder_idx] = saved_opacity
         # If you index "depth" instead of "render", you get the depth image
+
+        # Robot has no gaussians of its own: draw it in from PyBullet. Before
+        # fisheye rectification, so the composite happens in the same geometry
+        # the splat was rasterized in.
+        if want_depth:
+            rendering = self._composite_pybullet_robot(
+                rendering, splat_depth, camera_name,
+                cached_link_states=cached_link_states,
+            )
 
         # Preprocess fisheye renders to an equivalent pinhole view so datasets
         # (lerobot, zarr) and policy inputs are always rectified.
@@ -3320,6 +3357,88 @@ class PybulletRobotServerBase:
         )
 
         return splatsim_camera
+
+    def _render_robot_splat(self) -> bool:
+        """Whether the robot's own Gaussian splat should be loaded/rendered."""
+        if self.RENDER_ROBOT_SPLAT is None:
+            return bool(self.RENDER_SPLATS)
+        return bool(self.RENDER_ROBOT_SPLAT and self.RENDER_SPLATS)
+
+    def _composite_pybullet_robot(
+        self,
+        rendering: np.ndarray,
+        splat_depth: Optional[np.ndarray],
+        camera_name: str,
+        cached_link_states=None,
+    ) -> np.ndarray:
+        """Draw the robot's PyBullet geometry into a splat frame.
+
+        For envs whose robot has no scan (RENDER_ROBOT_SPLAT=False) this is what
+        puts the robot in the picture at all. PyBullet renders RGB + depth +
+        segmentation from the SAME view/projection the splat used
+        (`_resolve_pybullet_view_proj` mirrors the splat camera), so the two
+        images are pixel-aligned by construction, and robot pixels replace splat
+        pixels wherever the robot is nearer than the splat surface.
+
+        Falls back to an unconditional over-composite when splat depth is
+        unavailable — the robot then always draws in front, which is wrong when
+        it passes behind scene geometry but is still far more useful than an
+        empty scene. Any failure returns the frame untouched rather than killing
+        the observation, matching `_composite_splat_shadows`.
+        """
+        robot_id = getattr(getattr(self, "splatsim_robot", None), "sim_id", None)
+        if robot_id is None:
+            return rendering
+        try:
+            view, proj, W, H = self._resolve_pybullet_view_proj(
+                camera_name, cached_link_states=cached_link_states
+            )
+            _, _, rgba, depth_buf, seg = self.pybullet_client.getCameraImage(
+                W, H, view, proj, renderer=self._pybullet_camera_renderer(),
+            )
+            rgb = np.reshape(np.asarray(rgba, dtype=np.uint8), (H, W, 4))[:, :, :3]
+            depth_buf = np.reshape(np.asarray(depth_buf, dtype=np.float32), (H, W))
+            seg = np.reshape(np.asarray(seg, dtype=np.int32), (H, W))
+        except Exception as e:
+            print(f"[render] pybullet robot composite failed ({e}); frame left splat-only.")
+            return rendering
+
+        # getCameraImage returns a NON-LINEAR OpenGL depth buffer; the near/far
+        # planes needed to linearize it are encoded in the projection matrix
+        # (column-major: proj[10] = -(f+n)/(f-n), proj[14] = -2fn/(f-n)).
+        proj = np.asarray(proj, dtype=np.float64).reshape(4, 4, order="F")
+        far = proj[2, 3] / (proj[2, 2] + 1.0)
+        near = proj[2, 3] / (proj[2, 2] - 1.0)
+        pb_depth = far * near / (far - (far - near) * depth_buf)
+
+        mask = seg == robot_id
+        if splat_depth is not None:
+            splat_depth = np.asarray(splat_depth, dtype=np.float32)
+            if splat_depth.shape != mask.shape:
+                splat_depth = cv2.resize(
+                    splat_depth, (mask.shape[1], mask.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            # depth <= 0 means the splat hit nothing along that ray (see
+            # render_gsplat) — empty space never occludes the robot.
+            hit = splat_depth > 0.0
+            mask &= ~hit | (pb_depth <= splat_depth + float(self.COMPOSITE_DEPTH_SLACK_M))
+        if not mask.any():
+            return rendering
+
+        robot_chw = np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))
+        _, out_h, out_w = rendering.shape
+        if (out_h, out_w) != (H, W):
+            robot_chw = np.stack([
+                cv2.resize(c, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                for c in robot_chw
+            ])
+            mask = cv2.resize(
+                mask.astype(np.uint8), (out_w, out_h), interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+        out = rendering.copy()
+        out[:, mask] = robot_chw[:, mask]
+        return out.astype(np.float32, copy=False)
 
     def _get_ee_link_index(self) -> int:
         """Return the link index used as the end-effector for trajectory planning."""
@@ -5370,7 +5489,9 @@ class PybulletRobotServerBase:
             self._eval_benchmark_episode_index = -1
             self._splatsim_gui.set_status(f"Loading repo_id {repo_id}")
             try:
-                self._init_lerobot_dataset(repo_id)
+                # Replay only reads observation.state — any schema (state-only
+                # or with images) is fine regardless of the render mode.
+                self._init_lerobot_dataset(repo_id, read_only=True)
             except Exception as e:
                 print(f"[EvalBenchmark] Dataset init failed: {e}")
                 if self._splatsim_gui is not None:
@@ -5810,23 +5931,37 @@ class PybulletRobotServerBase:
             state_dim=self.state_dim(), env_state_dim=self.env_state_dim(),
         )
 
-    def _init_lerobot_dataset(self, repo_id: str):
-        """Initialize or load a LeRobot dataset by repo_id."""
+    def _init_lerobot_dataset(self, repo_id: str, read_only: bool = False):
+        """Initialize or load a LeRobot dataset by repo_id.
+
+        `read_only` marks uses that only ever READ the dataset (eval-benchmark
+        replay): the feature schema then doesn't have to agree with the
+        server's rendering mode — replay reads observation.state regardless of
+        what the server renders — so the append-schema checks are skipped, and
+        a missing dataset is an error rather than something to create.
+        """
         if not repo_id:
             print("[LeRobot] No lerobot_repo_id configured, skipping LeRobot dataset creation.")
             self._lerobot_saver = None
             return
 
+        self._lerobot_read_only = read_only
         self._lerobot_saver = load_lerobot_dataset(repo_id)
 
         if self._lerobot_saver is None:
+            if read_only:
+                raise ValueError(f"[LeRobot] Dataset '{repo_id}' not found.")
             print(f"[LeRobot] Creating fresh dataset for {repo_id}")
             self._lerobot_saver = self._create_lerobot_dataset(repo_id)
             return
 
-        # Resuming an existing dataset: its feature schema must agree with the
-        # current rendering mode, or every add_frame will fail deep inside
-        # LeRobot's validate_frame. Fail fast here with a clear remedy instead.
+        if read_only:
+            return
+
+        # Resuming an existing dataset for APPENDING: its feature schema must
+        # agree with the current rendering mode, or every add_frame will fail
+        # deep inside LeRobot's validate_frame. Fail fast here with a clear
+        # remedy instead.
         # Design choice: image-free runs declare NO observation.images.* keys
         # (rather than zero-filled frames) so state-only consumers work
         # unchanged while image consumers error loudly — a no-render dataset
@@ -5869,6 +6004,11 @@ class PybulletRobotServerBase:
         signal handler defers its KeyboardInterrupt while this runs.
         """
         if self._lerobot_saver is None:
+            return
+        if getattr(self, "_lerobot_read_only", False):
+            # Replay-only dataset (eval benchmark): nothing was appended, and
+            # finalize() must not rewrite a dataset we only read.
+            self._lerobot_saver = None
             return
         print("[LeRobot] Finalizing dataset...")
         self._in_dataset_critical_section = True
@@ -6247,6 +6387,12 @@ class PybulletRobotServerBase:
         # subset[0] straight to subset[1]. Letting _enter_mode complete first
         # guarantees the first external reset hits a fully-initialized
         # benchmark state.
+        #
+        # Wait for the Tk widgets first (no-op when fully headless): every GUI
+        # setter silently drops writes until _build_ui finishes, so entering
+        # EVAL_BENCHMARK before that loses the "Loaded N episodes" status and
+        # the episode dropdown — the dataset loads but the GUI looks idle.
+        self._splatsim_gui.wait_until_ready()
         self._enter_mode(self.serve_mode)
 
         # Capture the main serve-loop thread BEFORE ZMQ starts. Used by
@@ -7182,8 +7328,6 @@ class PybulletRobotServerBase:
         # Initialize the Tkinter GUI (runs in separate thread)
         config = self.trajectory_generator.config
 
-        # TODO add some env configs to the gui on startup like self._eval_benchmark_repo_id
-
         initial_mode = self.serve_mode.value  # Use the enum's string value
         self._splatsim_gui: SplatSimGui = SplatSimGui(
             config,
@@ -7207,6 +7351,9 @@ class PybulletRobotServerBase:
             # path (configs/traj_configs/<env>.json) so Export/Import default
             # per-env instead of every env clobbering one shared scratch file.
             traj_config_default_path=self._default_traj_config_path(),
+            # Seed the Eval Benchmark panel's repo-id field from
+            # --eval_benchmark_repo_id so the GUI shows what will be loaded.
+            initial_eval_repo_id=self._eval_benchmark_repo_id,
         )
         if self._headless and not self._show_control_gui:
             # Fully headless (batch / display-less): skip the Tkinter mainloop
