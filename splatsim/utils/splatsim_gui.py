@@ -764,6 +764,57 @@ class InteractiveModePanel(ModePanel):
     default_mode = "interactive"
 
 
+class RobotPlacementPanel(ModePanel):
+    """Place the robot in the scene by hand: sliders for the base pose and
+    every arm joint, and a Save button that writes the pose into the
+    robot's yaml (base_position / base_orientation_rpy / robot:
+    initial_joint_positions) so it comes back that way next launch.
+
+    The server drives the robot from these values while this mode is active
+    (see PybulletRobotServerBase._placement_tick); widget ranges come from
+    `gui._robot_placement_info`, built off the RobotSpec."""
+
+    name = "Robot Placement"
+    mode_values = {"placement"}
+    button_key = "placement_mode"
+    default_mode = "placement"
+
+    BTN_SAVE = "placement_save"
+    BTN_RESET = "placement_reset"
+    NS = "placement"
+
+    @classmethod
+    def base_keys(cls):
+        return [f"{cls.NS}.base_x", f"{cls.NS}.base_y", f"{cls.NS}.base_z", f"{cls.NS}.base_yaw"]
+
+    @classmethod
+    def joint_key(cls, i: int) -> str:
+        return f"{cls.NS}.joint_{i}"
+
+    def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
+              style: GuiStyle, config: SplatSimModeConfig) -> None:
+        info = getattr(gui, "_robot_placement_info", None) or {}
+        base = list(info.get("base", [0.0, 0.0, 0.0, 0.0]))
+        joints = list(info.get("joints", []))
+        builder = GuiBuilder(parent, gui, style)
+        builder.add_header("Base pose (m, rad)")
+        for key, label, lo, hi, v in zip(
+            self.base_keys(), ("x", "y", "z", "yaw"),
+            (-3.0, -3.0, -2.0, -3.1416), (3.0, 3.0, 2.0, 3.1416), base,
+        ):
+            builder.add_float_param(FloatParam(key, label, lo, hi, float(v)), float(v))
+        if joints:
+            builder.add_header("Arm joints (rad)")
+            for i, (label, lo, hi, q0) in enumerate(joints):
+                lo_f = float(lo) if np.isfinite(lo) and lo < hi else -3.1416
+                hi_f = float(hi) if np.isfinite(hi) and lo < hi else 3.1416
+                builder.add_float_param(FloatParam(self.joint_key(i), label, lo_f, hi_f, float(q0)), float(q0))
+        builder.add_button_row([
+            ButtonConfig("Save placement", self.BTN_SAVE),
+            ButtonConfig("Reset to saved", self.BTN_RESET),
+        ])
+
+
 class TrajectoryGenModePanel(ModePanel):
     """Trajectory generation mode with all its parameter controls."""
 
@@ -1241,6 +1292,7 @@ class SplatSimGui(ThreadedTkinterGui):
         traj_config_default_path: Optional[str] = None,
         traj_env_reassert_fn=None,
         initial_eval_repo_id: str = "",
+        robot_placement_info: Optional[dict] = None,
     ):
         """Initialize the GUI.
 
@@ -1286,11 +1338,14 @@ class SplatSimGui(ThreadedTkinterGui):
         self._mode_var: Optional[tk.StringVar] = None
         self._debug_mode_enum = debug_mode_enum
         self._initial_debug_mode = initial_debug_mode
+        # Slider ranges / initial values for the Robot Placement panel
+        # ({"base": [x, y, z, yaw], "joints": [(label, lo, hi, q0), ...]}).
+        self._robot_placement_info = robot_placement_info
         self._panels = panels if panels is not None else [
             InteractiveModePanel(),
             TrajectoryGenModePanel(),
             EvalBenchmarkModePanel(),
-        ]
+        ] + ([RobotPlacementPanel()] if robot_placement_info is not None else [])
 
         # Mode state (thread-safe — written by GUI thread, read by main thread)
         self._current_mode = initial_mode

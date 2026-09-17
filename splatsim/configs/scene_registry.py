@@ -85,9 +85,12 @@ def _robot_defaults(cfg: Dict[str, Any]) -> None:
     derived from the URDF by RobotSpec once the body is loaded."""
     cfg.setdefault("is_articulated", True)
     cfg.setdefault("articulation_config", {"initial_joint_positions": [], "joint_signs": None})
-    cfg.setdefault("use_fixed_base", True)
-    cfg.setdefault("base_position", [0.0, 0.0, 0.0])
     cfg.setdefault("robot", {})
+    # A wheeled base is a free body on the ground plane the server adds for
+    # it; everything else is bolted down.
+    wheeled = str((cfg["robot"] or {}).get("base", "fixed")).lower() == "wheeled"
+    cfg.setdefault("use_fixed_base", not wheeled)
+    cfg.setdefault("base_position", [0.0, 0.0, 0.0])
 
 
 def _merge(parent: Dict[str, Any], child: Dict[str, Any]) -> Dict[str, Any]:
@@ -183,9 +186,19 @@ def source_file(name: str) -> Path:
 
 
 def write_back(name: str, updates: Dict[str, Any]) -> Path:
-    """Persist `updates` into whichever file `name` came from (used by the
-    calibration pipeline to store a fitted aabb). Only touches the given keys."""
+    """Persist `updates` into whichever file `name` came from. Only touches
+    the given keys. For a per-folder yaml the edit is done line by line so
+    the file's comments survive (a robot.yaml is also the user's template);
+    objects.yaml entries and anything the line editor can't place fall back
+    to a full re-dump."""
     path = source_file(name)
+    if path != LEGACY_OBJECTS_YAML:
+        text = path.read_text()
+        edited = _edit_yaml_lines(text, updates)
+        if edited is not None:
+            path.write_text(edited)
+            invalidate()
+            return path
     doc = yaml.safe_load(path.read_text()) or {}
     target = doc if path != LEGACY_OBJECTS_YAML else doc.setdefault(name, {})
     for k, v in updates.items():
@@ -196,6 +209,83 @@ def write_back(name: str, updates: Dict[str, Any]) -> Path:
     path.write_text(yaml.safe_dump(doc, sort_keys=False, default_flow_style=None))
     invalidate()
     return path
+
+
+def _flow(v: Any) -> str:
+    """One-line YAML for a scalar or a (nested) list of scalars."""
+    return yaml.safe_dump(v, default_flow_style=True, width=10**6).strip()
+
+
+def _edit_yaml_lines(text: str, updates: Dict[str, Any]) -> Optional[str]:
+    """Replace/insert `key: <flow value>` lines in place, keeping every other
+    line (comments included). Handles top-level keys and one level of
+    nesting (`{"robot": {"initial_joint_positions": [...]}}`). Returns None
+    when a value is not representable on one line (nested mappings beyond
+    one level, multi-line data) so the caller can fall back."""
+    import re as _re
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    def key_line(indent: str, key: str, value: Any) -> str:
+        return f"{indent}{key}: {_flow(value)}\n"
+
+    def find_top(key: str):
+        for i, ln in enumerate(lines):
+            if _re.match(rf"^{_re.escape(key)}\s*:", ln):
+                return i
+        return None
+
+    def block_end(start: int) -> int:
+        """Index one past the last line belonging to the top-level block at `start`."""
+        i = start + 1
+        while i < len(lines) and (lines[i].startswith(" ") or lines[i].strip() == "" or lines[i].lstrip().startswith("#")):
+            # a top-level comment followed by a top-level key ends the block
+            if lines[i].lstrip().startswith("#") and not lines[i].startswith(" "):
+                j = i
+                while j < len(lines) and lines[j].lstrip().startswith("#") and not lines[j].startswith(" "):
+                    j += 1
+                if j >= len(lines) or not lines[j].startswith(" "):
+                    break
+            i += 1
+        # trailing blank lines belong to the file's layout, not the block
+        while i > start + 1 and lines[i - 1].strip() == "":
+            i -= 1
+        return i
+
+    for key, value in updates.items():
+        if isinstance(value, dict):
+            top = find_top(key)
+            if top is None:
+                lines.append(f"{key}:\n"); top = len(lines) - 1
+            end = block_end(top)
+            for sub, subval in value.items():
+                if isinstance(subval, dict):
+                    return None
+                placed = False
+                for i in range(top + 1, end):
+                    if _re.match(rf"^\s+{_re.escape(sub)}\s*:", lines[i]):
+                        indent = _re.match(r"^(\s+)", lines[i]).group(1)
+                        lines[i] = key_line(indent, sub, subval); placed = True
+                        break
+                if not placed:
+                    indent = "  "
+                    for i in range(top + 1, end):
+                        m = _re.match(r"^(\s+)\S", lines[i])
+                        if m and not lines[i].lstrip().startswith("#"):
+                            indent = m.group(1); break
+                    lines.insert(top + 1, key_line(indent, sub, subval)); end += 1
+        else:
+            top = find_top(key)
+            if top is not None:
+                # a block-style value spanning following indented lines is replaced whole
+                end = block_end(top)
+                lines[top:end] = [key_line("", key, value)]
+            else:
+                anchor = find_top("urdf_path")
+                at = (anchor + 1) if anchor is not None else 0
+                lines.insert(at, key_line("", key, value))
+    return "".join(lines)
 
 
 def invalidate() -> None:

@@ -888,6 +888,9 @@ class PybulletRobotServerBase:
 
         EVAL_BENCHMARK = "eval_benchmark"
         EVAL_BENCHMARK_IDLE = "eval_benchmark_idle"
+        # Robot Placement panel: base pose + joint sliders drive the robot,
+        # Save writes them into the robot's yaml. See _placement_tick.
+        PLACEMENT = "placement"
 
     # Serve modes eligible for `_sync_physics_to_client` gating. Only the
     # user-driven modes (INTERACTIVE / EVAL_BENCHMARK*) qualify: their main-
@@ -2101,6 +2104,8 @@ class PybulletRobotServerBase:
                 # the spec finds.
                 self.robot_spec = self._build_robot_spec(splatsim_obj)
                 self.use_gripper = self.robot_spec.gripper.kind != "none"
+                if self.robot_spec.base == "wheeled":
+                    self._setup_wheeled_base()
                 if self.use_gripper:
                     self.setup_gripper()
                 self.open_gripper()
@@ -6734,6 +6739,11 @@ class PybulletRobotServerBase:
                     # execute on this thread.
                     self._consume_sync_render_request()
                     time.sleep(1 / 240)
+                elif current_mode == self.SERVE_MODES.PLACEMENT:
+                    self._placement_tick()
+                    self.pybullet_client.stepSimulation()
+                    self._consume_sync_render_request()
+                    time.sleep(1 / 240)
                 elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
                     # Idle mode - just step simulation while user configures settings
                     self.pybullet_client.stepSimulation()
@@ -7639,6 +7649,7 @@ class PybulletRobotServerBase:
             # Seed the Eval Benchmark panel's repo-id field from
             # --eval_benchmark_repo_id so the GUI shows what will be loaded.
             initial_eval_repo_id=self._eval_benchmark_repo_id,
+            robot_placement_info=self._robot_placement_info(),
         )
         if self._headless and not self._show_control_gui:
             # Fully headless (batch / display-less): skip the Tkinter mainloop
@@ -7650,6 +7661,108 @@ class PybulletRobotServerBase:
         # headless — including the headless + show_control_gui combo, where
         # pybullet has no 3D window but the panel still drives modes/config.
         self._splatsim_gui.start()
+
+    # ------------------------------------------------------------ mobile bases
+    def _setup_wheeled_base(self) -> None:
+        """`robot.base: wheeled`: the robot is a free body, so give it a
+        ground plane at its base height to stand on and put the wheel joints
+        under velocity control (0 until drive_wheels is called)."""
+        import pybullet_data
+        rid = self.splatsim_robot.sim_id
+        # Ground at the bottom of the robot's collision geometry (wheels), not
+        # at its base-link origin, so it rests where it was placed.
+        z = float(self._body_world_aabb(rid)[0][2])
+        self.pybullet_client.setAdditionalSearchPath(pybullet_data.getDataPath())
+        self._ground_plane_id = self.pybullet_client.loadURDF("plane.urdf", [0, 0, z], useFixedBase=True)
+        for j in self.robot_spec.wheel_joint_indices:
+            self.pybullet_client.setJointMotorControl2(rid, j, p.VELOCITY_CONTROL, targetVelocity=0.0, force=50.0)
+        print(f"[robot] wheeled base: ground plane at z={z:.3f}, {len(self.robot_spec.wheel_joint_indices)} wheel joint(s) under velocity control")
+
+    def drive_wheels(self, velocities, force: float = 50.0) -> None:
+        """Set wheel joint velocities (rad/s), one per `wheel_joints` entry in
+        the robot's yaml, in that order. A scalar applies to every wheel."""
+        wheels = self.robot_spec.wheel_joint_indices
+        v = np.broadcast_to(np.asarray(velocities, dtype=np.float64), (len(wheels),))
+        for j, w in zip(wheels, v):
+            self.pybullet_client.setJointMotorControl2(
+                self.splatsim_robot.sim_id, j, p.VELOCITY_CONTROL, targetVelocity=float(w), force=force)
+
+    # ------------------------------------------------------------ placement
+    def _robot_placement_info(self) -> Optional[dict]:
+        """Slider ranges + initial values for the GUI's Robot Placement panel."""
+        spec = getattr(self, "robot_spec", None)
+        if spec is None or self.splatsim_robot.sim_id is None:
+            return None
+        pos, quat = self.pybullet_client.getBasePositionAndOrientation(self.splatsim_robot.sim_id)
+        yaw = self.pybullet_client.getEulerFromQuaternion(quat)[2]
+        q_now = self.get_joint_state()
+        joints = []
+        for k, j in enumerate(spec.arm_joint_indices):
+            info = spec.joints[j]
+            q0 = float(q_now[k]) if k < len(q_now) else 0.0
+            joints.append((info.name, info.lower, info.upper, q0))
+        return {"base": [float(pos[0]), float(pos[1]), float(pos[2]), float(yaw)], "joints": joints}
+
+    def _placement_tick(self) -> None:
+        """One serve-loop tick of Robot Placement mode: apply the panel's
+        base pose + joint sliders when they change, handle Save / Reset."""
+        from splatsim.utils.splatsim_gui import RobotPlacementPanel as P
+        gui = self._splatsim_gui
+        spec = self.robot_spec
+        rid = self.splatsim_robot.sim_id
+        vals = [gui.get_value(k) for k in P.base_keys()]
+        qs = [gui.get_value(P.joint_key(i)) for i in range(spec.num_dofs)]
+        if any(v is None for v in vals) or any(q is None for q in qs):
+            return  # panel not built yet
+        state = (tuple(float(v) for v in vals), tuple(float(q) for q in qs))
+        if state != getattr(self, "_placement_last", None):
+            self._placement_last = state
+            x, y, z, yaw = state[0]
+            self.pybullet_client.resetBasePositionAndOrientation(
+                rid, [x, y, z], self.pybullet_client.getQuaternionFromEuler([0.0, 0.0, yaw]))
+            for q, j in zip(state[1], spec.arm_joint_indices):
+                self.pybullet_client.resetJointState(rid, j, q)
+                self.pybullet_client.setJointMotorControl2(
+                    rid, j, p.POSITION_CONTROL, targetPosition=q,
+                    force=self._control_force(), maxVelocity=self._control_max_velocity())
+            self._bump_state_version()
+        if gui.check_button(P.BTN_SAVE):
+            self._placement_save(state)
+        if gui.check_button(P.BTN_RESET):
+            info = self._robot_placement_info_saved()
+            for k, v in zip(P.base_keys(), info["base"]):
+                gui.set_value(k, v)
+            for i, (_n, _lo, _hi, q0) in enumerate(info["joints"]):
+                gui.set_value(P.joint_key(i), q0)
+            gui.set_status("Placement reset to the saved pose")
+
+    def _robot_placement_info_saved(self) -> dict:
+        """The pose as saved in the robot's yaml (not the live one)."""
+        from splatsim.configs import scene_registry
+        cfg = scene_registry.get(self.robot_name) or {}
+        spec = self.robot_spec
+        pos = list(cfg.get("base_position") or [0.0, 0.0, 0.0])
+        rpy = list(cfg.get("base_orientation_rpy") or [0.0, 0.0, 0.0])
+        q0 = list(((cfg.get("robot") or {}).get("initial_joint_positions") or spec.initial_joint_positions[: spec.num_dofs]))
+        joints = [(spec.joints[j].name, spec.joints[j].lower, spec.joints[j].upper,
+                   float(q0[k]) if k < len(q0) else 0.0) for k, j in enumerate(spec.arm_joint_indices)]
+        return {"base": [float(pos[0]), float(pos[1]), float(pos[2]), float(rpy[2])], "joints": joints}
+
+    def _placement_save(self, state) -> None:
+        """Write the current placement into the robot's own yaml."""
+        from splatsim.configs import scene_registry
+        (x, y, z, yaw), qs = state
+        try:
+            path = scene_registry.write_back(self.robot_name, {
+                "base_position": [round(x, 4), round(y, 4), round(z, 4)],
+                "base_orientation_rpy": [0.0, 0.0, round(yaw, 4)],
+                "robot": {"initial_joint_positions": [round(float(q), 4) for q in qs]},
+            })
+            msg = f"Placement saved -> {path}"
+        except Exception as e:  # objects.yaml entries have no folder of their own
+            msg = f"Placement NOT saved: {e}"
+        print(f"[placement] {msg}")
+        self._splatsim_gui.set_status(msg)
 
     def _check_debug_mode(self):
         """Check if debug mode has changed in the GUI and update self.debug_mode."""

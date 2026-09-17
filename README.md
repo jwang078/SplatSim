@@ -189,12 +189,19 @@ You need a URDF. Nothing else — the simulator works out the rest from it.
    robot fits. Without a splat scan of its own the robot is drawn from its
    meshes, composited by depth into the scene. Drop `--viewer` when you want
    the environment's task to run against it.
+4. Move it where you want it: press **Robot Placement** in the control window.
+   Sliders move the base (x, y, z, yaw) and every arm joint live in the scene;
+   **Save placement** writes the pose into your `robot.yaml` so it starts
+   there next time (the file's comments are kept).
 
 What the yaml can describe, all optional: which joints are the arm and which
 the gripper, how the gripper is commanded (one value for a parallel gripper,
 one per finger, or synergies for a coupled hand), any number of cameras and
-which link each sits on, the end-effector link, and a fixed, planar or wheeled
-base. Details and defaults are in `splatsim/robots/robot_spec.py`.
+which link each sits on, the end-effector link, and the base — `fixed`,
+`planar` (placed by the sliders, no physics), or `wheeled` (a free body on a
+ground plane; its wheel joints are velocity-controlled through
+`drive_wheels`). Planning covers the arm; driving a base around is teleop
+territory. Details and defaults are in `splatsim/robots/robot_spec.py`.
 
 To render your robot photoreal — as gaussians rather than meshes — it needs a
 scan and a calibration; that's the next section.
