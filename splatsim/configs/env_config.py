@@ -98,8 +98,9 @@ class ObjectConfig(ABC):
     initial_scale: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
 
 
-    _YAML_CACHE: Optional[Dict[str, Any]] = None
-    _OBJECT_CONFIG_PATH: Path = _SPLATSIM_ROOT / "configs/object_configs/objects.yaml"
+    # Object configs come from the scene registry: per-scene
+    # data/scenes/**/scene.yaml files, plus the deprecated
+    # configs/object_configs/objects.yaml. See splatsim.configs.scene_registry.
 
     def __post_init__(self):
         """Resolves Priority: Instance > YAML > Global Fallback"""
@@ -144,16 +145,9 @@ class ObjectConfig(ABC):
 
     @classmethod
     def _get_yaml_data(cls) -> Dict[str, Dict[str, Any]]:
-        """Loads the YAML file once and stores it in memory"""
-        if cls._YAML_CACHE is None:
-            if cls._OBJECT_CONFIG_PATH.exists():
-                with open(cls._OBJECT_CONFIG_PATH, "r") as f:
-                    cls._YAML_CACHE = yaml.safe_load(f) or {}
-            else:
-                cls._YAML_CACHE = {}
-        if len(cls._YAML_CACHE) == 0:
-            print(f"WARNING: Could not load object config file at {cls._OBJECT_CONFIG_PATH}")
-        return cls._YAML_CACHE
+        """All known object configs, name -> dict (cached by the registry)."""
+        from splatsim.configs import scene_registry
+        return scene_registry.load_all()
 
     def _load_yaml_config(self) -> Dict[str, Any]:
         splat_name = getattr(self, "splat_name", None)
@@ -197,6 +191,15 @@ class SplatObjectConfig(ObjectConfig):
     ply_path: Optional[str] = Default(None)
     model_path: Optional[str] = Default(None)
     source_path: Optional[str] = Default(None)
+    # Which frame the URDF's collision geometry is authored in.
+    #   "sim"   — already in simulator frame; loads at base_position (default,
+    #             and what every hand-made / pre-baked URDF is).
+    #   "splat" — in the scan's frame, the SAME frame as ply_path/model_path.
+    #             load_urdf applies `transformation` (uniform scale via
+    #             globalScaling, rotation+translation as the base pose), so
+    #             splat and collision share one transform in one place.
+    # Segmentation builds should be "splat"; see scripts/build_vine_collision.py.
+    collision_frame: str = Default("sim")
 
     def to_dict(self) -> dict:
         return asdict(self)

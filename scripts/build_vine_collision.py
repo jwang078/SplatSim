@@ -9,17 +9,29 @@ Backends:
   splat-transform PlayCanvas CLI (npm i -g @playcanvas/splat-transform);
                   runs `--collision-mesh smooth` and imports the .collision.glb.
 
-Outputs (under --outdir):
-  <name>_collision.obj        collision mesh, in SIM frame if --transform given
+Outputs (under --outdir, which should be the build's folder,
+data/scenes/<scan>/segmentations/<build>/):
+  <name>_collision.obj        collision mesh, in the scan's frame — or in SIM
+                              frame if --transform is given (baking; the old
+                              behaviour, kept for reproducing existing builds)
   <name>.urdf                 fixed-base URDF wrapping the mesh (concave)
+  scene.yaml                  registers the build: urdf_path + collision_frame
+                              (splat, or sim when baked). The scan's
+                              splat->sim matrix is applied at load from the
+                              parent scene.yaml, so prefer NOT baking.
   viz/10_mesh_overlay.png     mesh cross-sections overlaid on trunk points —
                               THE alignment check (mesh must hug red points)
   viz/11_mesh_render.png      shaded open3d render of the mesh (if EGL works)
 
 Usage:
-  python scripts/build_vine_collision.py data/vine_seg/synthetic/vine_trunk_hard.ply \
-      --outdir data/vine_seg/synthetic [--backend voxel|splat-transform]
-      [--voxel-size 0.012] [--transform path/to/4x4.json] [--dilate 1]
+  python scripts/build_vine_collision.py \
+      data/scenes/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_trunk_hard.ply \
+      --outdir data/scenes/vine_scene/segmentations/vine_and_trellis
+      [--backend voxel|splat-transform] [--voxel-size 0.012] [--dilate 1]
+      [--transform path/to/4x4.json]   # bake into sim frame (not recommended)
+
+NOTE: --voxel-size is in the input's units. Unbaked, that is the SCAN frame,
+which for the highbay scan is ~4x sim scale (transformation has scale ~0.25).
 """
 
 from __future__ import annotations
@@ -383,9 +395,37 @@ def main():
     )
     print(f"wrote {urdf_path}")
 
+    write_scene_yaml(outdir, name, urdf_path.name, baked=bool(args.transform))
+
     plot_mesh_overlay(verts, tris, trunk_pts,
                       vizdir / "10_mesh_overlay.png", note)
     try_render_mesh(verts, tris, vizdir / "11_mesh_render.png")
+
+
+def write_scene_yaml(outdir: Path, name: str, urdf_rel: str, baked: bool) -> None:
+    """Register the build with the scene registry (data/scenes/<scan>/
+    segmentations/<build>/scene.yaml). One frame declaration covers every
+    artifact of the build — this URDF, the cost field and the grape targets:
+
+      collision_frame: sim    --transform was given; everything is baked into
+                              sim frame and loads at identity.
+      collision_frame: splat  no --transform; everything is in the scan's
+                              frame and the scan's `transformation` (inherited
+                              from ../../scene.yaml) is applied at load.
+
+    Only sets the keys this script owns; an existing file keeps its other
+    fields (aabb, ply_path, ...)."""
+    import yaml
+    path = outdir / "scene.yaml"
+    doc = yaml.safe_load(path.read_text()) if path.exists() else {}
+    doc = doc or {}
+    doc.setdefault("name", name)
+    doc["urdf_path"] = urdf_rel
+    doc["collision_frame"] = "sim" if baked else "splat"
+    doc.setdefault("base_position", [0.0, 0.0, 0.0])
+    doc.setdefault("use_fixed_base", True)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False, default_flow_style=None))
+    print(f"wrote {path}  (collision_frame: {doc['collision_frame']})")
 
 
 if __name__ == "__main__":

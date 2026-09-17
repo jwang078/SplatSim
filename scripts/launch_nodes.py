@@ -279,8 +279,13 @@ def launch_robot_server(args: Args):
             "on client commands."
         )
 
-    with open("configs/object_configs/objects.yaml", "r") as f:
-        object_config = yaml.safe_load(f)
+    from splatsim.configs import scene_registry
+    object_config = scene_registry.load_all()
+    if args.robot_name not in object_config:
+        raise KeyError(
+            f"--robot_name {args.robot_name!r} has no config. Add "
+            f"data/scenes/{args.robot_name}/scene.yaml (see README, Data layout)."
+        )
 
     has_wrist_camera = object_config[args.robot_name].get("wrist_camera_link_name", None) is not None
     if has_wrist_camera:

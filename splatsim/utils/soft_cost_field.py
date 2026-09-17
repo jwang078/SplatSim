@@ -7,7 +7,7 @@ lookups (0 outside the grid), cheap enough to run inside RRT path scoring.
 The planner consumes this via an ``env_config["soft_cost"]`` payload:
 
     {
-      "npz_path": "data/vine_seg/<scene>/<name>_soft_cost.npz",
+      "npz_path": "data/scenes/<scan>/segmentations/<build>/<name>_soft_cost.npz",
       "grid_resolution": 0.01,        # optional, m
       "influence_radius": 0.03,       # optional, m
       "transform": [[...4x4...]],     # optional splat->sim frame matrix

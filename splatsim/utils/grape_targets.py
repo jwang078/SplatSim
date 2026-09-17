@@ -1,7 +1,7 @@
 """Grape-bunch reach targets: load clustered bunches and build approach poses.
 
 Bunch clusters come from ``splat_segmentation.cluster_labeled_points`` (class
-GRAPE) and are cached as JSON (e.g. data/vine_seg/<scene>/grape_targets.json,
+GRAPE) and are cached as JSON (e.g. data/scenes/<scan>/segmentations/<build>/grape_targets.json,
 written by scripts/segment_vine_splat.py users or ad hoc). This module is the
 single place that turns a bunch center into an end-effector goal pose, so the
 env task config and standalone planner tests stay consistent.
@@ -50,9 +50,27 @@ def is_manual(targets) -> bool:
     return any(b.get("manual") for b in targets)
 
 
-def load_targets(json_path: str | Path) -> list:
-    """List of bunch dicts ({center, n_points, extent}), largest first."""
-    return json.loads(Path(json_path).read_text())
+def load_targets(json_path: str | Path, transform=None) -> list:
+    """List of bunch dicts ({center, peduncle?, n_points, extent}), largest
+    first. ``transform`` (4x4, may carry uniform scale) moves the targets from
+    the frame they were written in into sim frame — pass the scan's
+    splat->sim matrix for a build whose scene.yaml says collision_frame:
+    splat; leave None for a baked (collision_frame: sim) build."""
+    bunches = json.loads(Path(json_path).read_text())
+    if transform is None:
+        return bunches
+    T = np.asarray(transform, dtype=np.float64)
+    scale = float(np.cbrt(abs(np.linalg.det(T[:3, :3]))))
+    out = []
+    for b in bunches:
+        b = dict(b)
+        for key in ("center", "peduncle"):
+            if key in b:
+                b[key] = (T[:3, :3] @ np.asarray(b[key], dtype=np.float64) + T[:3, 3]).tolist()
+        if "extent" in b:
+            b["extent"] = (np.asarray(b["extent"], dtype=np.float64) * scale).tolist()
+        out.append(b)
+    return out
 
 
 def compute_targets(

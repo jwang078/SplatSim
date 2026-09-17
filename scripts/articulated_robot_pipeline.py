@@ -51,8 +51,8 @@ def create_window(app, title, geometry_list, x, y):
 def main(args):
 
     #load the transformation matrix (yaml file)
-    with open("./configs/object_configs/objects.yaml", "r") as file:
-        object_configs = yaml.safe_load(file)
+    from splatsim.configs import scene_registry
+    object_configs = scene_registry.load_all()
 
     if not os.path.exists("data/labels_path"):
         os.makedirs("data/labels_path", exist_ok=True)
@@ -219,17 +219,12 @@ def main(args):
     #make the aabb_list upto 4 decimal places
     aabb_list = [[round(val, 4) for val in point] for point in aabb_list]
 
-    # Update the object_configs
-    object_configs[args.robot_name]["aabb"]['bounding_box'] = aabb_list
-    #properly save the object_configs
-    with open("./configs/object_configs/objects.yaml", "w") as file:
-        yaml.dump(
-            object_configs,
-            file,
-            Dumper=FlowStyleMatrixDumper,
-            sort_keys=False,
-            default_flow_style=False
-        )
+    # Persist the fitted aabb into whichever file this entry came from
+    # (data/scenes/<name>/scene.yaml, or the deprecated objects.yaml).
+    written = scene_registry.write_back(
+        args.robot_name, {"aabb": {"bounding_box": aabb_list}}
+    )
+    print(f"aabb.bounding_box written to {written}")
 
     print('aabb of the robot', aabb_list)
 

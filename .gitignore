@@ -31,13 +31,18 @@ MUJOCO_LOG.TXT
 
 # build
 **/build/*
+# LeRobot fork cloned by install.sh (not a submodule: co-developed, no pin)
+external/
 data/datasets/*
 output/*
 scripts/recordings/
 
 # generated at runtime / by helper scripts
-data/output/
+# Scene assets (splats, SfM, segmentation builds) are downloaded, not
+# committed — but each scene's scene.yaml IS tracked, so a fresh clone knows
+# every scene's config and only the bytes are missing. See README, Data layout.
+data/scenes/**
+!data/scenes/**/
+!data/scenes/**/scene.yaml
 data/scenarios/
-data/test_data/
-data/vine_seg/
 scripts/outputs/
