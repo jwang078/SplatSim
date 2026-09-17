@@ -275,9 +275,12 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
             self._home_arm_q = np.asarray(
                 art.initial_joint_positions[: self.num_dofs()], dtype=np.float64
             )
-        deltas = np.asarray(self.START_JOINT_DELTA[: self.num_dofs()])
+        # Per-joint sampling width; a robot with more joints than the tuple
+        # has entries gets the last value for the rest.
+        d = list(self.START_JOINT_DELTA)
+        deltas = np.asarray((d + [d[-1]] * self.num_dofs())[: self.num_dofs()])
         limits = []
-        for j in range(1, self.num_dofs() + 1):
+        for j in self.robot_spec.arm_joint_indices:
             info = self.pybullet_client.getJointInfo(rid, j)
             limits.append((info[8], info[9]))
 
@@ -310,6 +313,8 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
         # to the robot-derived grasp-aligned goal now that FK is available,
         # so GUI/batch trajectory generation aims at the same pose as
         # get_env_config and _resolve_goal_ee_target.
+        if getattr(self, "viewer_mode", False):
+            return   # viewer: no goal solving, no soft-cost overlay setup
         try:
             pos, quat, q_seed = self._grape_goal()
             cfg = self.trajectory_generator.config
@@ -429,7 +434,7 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
         from splatsim.utils.rrt_path_utils import check_links_in_collision
 
         rid = self.splatsim_robot.sim_id
-        arm = list(range(1, self.num_dofs() + 1))
+        arm = list(self.robot_spec.arm_joint_indices)
         obstacle_ids = [o.sim_id for o in self.splatsim_objects
                         if o.sim_id is not None and o is not self.splatsim_robot]
         return bool(check_links_in_collision(
@@ -503,7 +508,7 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
                 "bunch centre. Run scripts/regen_grape_targets.py.",
                 self.GRAPE_TARGETS_JSON,
             )
-        arm = list(range(1, self.num_dofs() + 1))
+        arm = list(self.robot_spec.arm_joint_indices)
         art = self.splatsim_robot.config.articulation_config
         goal = solve_goal_pose(
             self.pybullet_client,
@@ -538,6 +543,8 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
         config so every consumer — reset solvability check, batch
         generation, published env config — aims at the same bunch. Bunches
         whose goal search fails are dropped from the draw for the session."""
+        if getattr(self, "viewer_mode", False):
+            return self.active_bunch_index
         n = len(self.load_grape_targets())
         if self.TARGET_BUNCH_INDEX is not None:
             order = [int(self.TARGET_BUNCH_INDEX)]
@@ -618,7 +625,7 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
         scan_T = np.asarray(cfg["transformation"]["matrix"], dtype=np.float64)
         self._scene_clouds_cache = load_scene_clouds(
             client, rid, self._get_ee_link_index(),
-            gripper_links=range(7, client.getNumJoints(rid)),
+            gripper_links=list(self.robot_spec.gripper.link_indices),
             grapes_ply=grapes_ply, grapes_transform=scan_T,
             veg_npz=self.SOFT_COST_NPZ, veg_transform=self.ASSETS_TRANSFORM,
             hard_urdf=resolve_splatsim_path(cfg["urdf_path"]),

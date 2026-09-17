@@ -130,8 +130,10 @@ for that.
 
 ## Data layout
 
-Everything the simulator loads lives under `data/scenes/`, one folder per
-capture, described by a `scene.yaml` next to the files:
+Everything the simulator loads lives under `data/`, one folder per thing,
+described by a yaml next to the files: scenes in `data/scenes/<scene>/scene.yaml`,
+robots in `data/robots/<robot>/robot.yaml` (a scanned robot can also live
+under `data/scenes/`). A scene folder looks like this:
 
 ```
 data/scenes/<scene>/
@@ -155,12 +157,49 @@ data/scenes/<scene>/
 
 To add a scene: make `data/scenes/<scene>/` with `splat/` and `sfm/`, copy
 `data/scenes/vine_scene/scene.yaml` beside them and fill in the transform
-(see *Adding a new robot*), run the segmentation scripts with
+(see *Scanning your robot for photoreal rendering*), run the segmentation scripts with
 `--outdir data/scenes/<scene>/segmentations/<build>`, and tar the folder for
 whoever needs it. `configs/object_configs/objects.yaml` is the older
 single-file form; it still loads, but a `scene.yaml` with the same name wins.
 
-## Adding a new robot
+## Adding your robot
+
+You need a URDF. Nothing else — the simulator works out the rest from it.
+
+1. Make a folder under `data/robots/` and put the URDF (and its meshes)
+   inside. Add a `robot.yaml` next to it that says where the URDF is:
+   ```yaml
+   urdf_path: my_robot.urdf
+   ```
+   `data/robots/example_panda/` is a complete, working example — copy it.
+2. Check what the simulator sees:
+   ```bash
+   python scripts/check_robot.py my_robot
+   ```
+   It prints the arm joints, gripper, cameras and end-effector link it
+   derived, and warns about anything it had to guess. If a guess is wrong,
+   add the matching key under `robot:` in `robot.yaml` — every key is
+   optional and documented in the example.
+3. Put it in a scene:
+   ```bash
+   python scripts/launch_nodes.py --robot sim_pybullet_vine_interactive --robot_name my_robot --viewer
+   ```
+   `--viewer` works with any environment: it loads the scene and the robot and
+   nothing else — no task, no planning, no datasets — so you can look at how the
+   robot fits. Without a splat scan of its own the robot is drawn from its
+   meshes, composited by depth into the scene. Drop `--viewer` when you want
+   the environment's task to run against it.
+
+What the yaml can describe, all optional: which joints are the arm and which
+the gripper, how the gripper is commanded (one value for a parallel gripper,
+one per finger, or synergies for a coupled hand), any number of cameras and
+which link each sits on, the end-effector link, and a fixed, planar or wheeled
+base. Details and defaults are in `splatsim/robots/robot_spec.py`.
+
+To render your robot photoreal — as gaussians rather than meshes — it needs a
+scan and a calibration; that's the next section.
+
+## Scanning your robot for photoreal rendering
 
 What if you want to simulate a different robot than the one downloaded above? Or with a new background?
 

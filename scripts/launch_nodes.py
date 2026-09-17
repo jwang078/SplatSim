@@ -66,6 +66,11 @@ class Args:
     # the sim server would render with ver=1 intrinsics while lerobot
     # thought it was ver=2.
     wrist_cam_ver: int = 2
+    # Viewer mode, for ANY --robot variant and ANY --robot_name: load the
+    # scene and the robot, teleport home, serve. No scene randomisation,
+    # solvability planning, goal search or datasets — the fastest way to see
+    # how a robot fits a scene (e.g. a URDF dropped into data/robots/).
+    viewer: bool = False
 
     # When True, connect pybullet in DIRECT (no GUI) mode. Skips OpenGL
     # context creation entirely → no display required, ~3-5x faster for
@@ -280,6 +285,9 @@ def launch_robot_server(args: Args):
         )
 
     from splatsim.configs import scene_registry
+    if args.viewer:
+        from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
+        PybulletRobotServerBase.VIEWER_MODE_DEFAULT = True
     object_config = scene_registry.load_all()
     if args.robot_name not in object_config:
         raise KeyError(
@@ -287,12 +295,19 @@ def launch_robot_server(args: Args):
             f"data/scenes/{args.robot_name}/scene.yaml (see README, Data layout)."
         )
 
-    has_wrist_camera = object_config[args.robot_name].get("wrist_camera_link_name", None) is not None
-    if has_wrist_camera:
+    # Observation cameras: base_rgb (the scene camera) plus one per camera
+    # the robot declares (`robot: cameras:`), or the legacy wrist camera.
+    # The server re-derives the robot from its URDF; `use_gripper` here is
+    # only the legacy hint and is superseded by what the URDF has.
+    rcfg = object_config[args.robot_name]
+    declared = (rcfg.get("robot") or {}).get("cameras")
+    if declared is not None:
+        camera_names = ["base_rgb"] + [f"{c['name']}_rgb" for c in declared]
+    elif rcfg.get("wrist_camera_link_name") is not None:
         camera_names = ["base_rgb", "wrist_rgb"]
     else:
         camera_names = ["base_rgb"]
-    use_gripper = object_config[args.robot_name].get("use_gripper", True)
+    use_gripper = rcfg.get("use_gripper", True)
     
     port = args.robot_port
     if args.robot == "sim_ur":

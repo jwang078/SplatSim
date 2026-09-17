@@ -1,0 +1,30 @@
+# Example robot folder: a Franka Panda from pybullet_data, dropped in as-is.
+# Copy this folder, replace the URDF, and edit the few lines below.
+#
+# Only `urdf_path` is required. Everything under `robot:` is optional —
+# omit a key (or write `auto`) and it is derived from the URDF. Run
+#   python scripts/check_robot.py example_panda
+# to see what the simulator derived.
+urdf_path: panda.urdf
+
+# Where the robot's base sits in the scene (metres, radians).
+base_position: [0.0, 0.0, 0.0]
+base_orientation_rpy: [0.0, 0.0, 0.0]
+
+robot:
+  base: fixed                     # fixed | planar (x/y/yaw, no physics) | wheeled
+  arm_joints: auto                # the 7 panda_joint* joints
+  ee_link: panda_hand             # goal / tool frame; auto would pick this too
+  initial_joint_positions: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+  gripper:
+    kind: synergies               # one command drives both fingers
+    joints: [panda_finger_joint1] # finger_joint2 mimics it in the URDF
+    open:   [0.04]                # joint value at command 0
+    closed: [0.0]                 #                ... at command 1
+  cameras:                        # any number; [] for none
+    - name: wrist
+      link: panda_hand
+      offset_xyz: [0.05, 0.0, 0.0]
+      offset_rpy: [0.0, 0.0, 0.0]
+      model: pinhole
+      fov_deg: 70

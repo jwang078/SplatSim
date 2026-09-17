@@ -5,6 +5,7 @@ Layout (Hydra-style — the folder tree IS the config structure):
 
     data/scenes/<scene>/scene.yaml
     data/scenes/<scene>/segmentations/<build>/scene.yaml     (nested: inherits)
+    data/robots/<robot>/robot.yaml                           (a robot: urdf + optional scan)
 
 Each `scene.yaml` holds exactly what one `objects.yaml` entry used to hold
 (`ply_path`, `model_path`, `source_path`, `urdf_path`, `transformation`,
@@ -42,7 +43,13 @@ from splatsim.utils.paths import SPLATSIM_ROOT
 logger = logging.getLogger(__name__)
 
 SCENES_ROOT = SPLATSIM_ROOT / "data" / "scenes"
+# Robots are the same kind of entry (urdf_path, splat, transformation, ...)
+# but a robot without a scan is not a "scene", so they get their own folder
+# and file name. Both roots are walked; both file names are accepted in both.
+ROBOTS_ROOT = SPLATSIM_ROOT / "data" / "robots"
 SCENE_FILE = "scene.yaml"
+ROBOT_FILE = "robot.yaml"
+ENTRY_FILES = (SCENE_FILE, ROBOT_FILE)
 LEGACY_OBJECTS_YAML = SPLATSIM_ROOT / "configs" / "object_configs" / "objects.yaml"
 
 # Fields whose string values are filesystem paths and get rebased from
@@ -72,6 +79,17 @@ def _rebase_paths(entry: Dict[str, Any], base: Path) -> Dict[str, Any]:
     return out
 
 
+def _robot_defaults(cfg: Dict[str, Any]) -> None:
+    """A robot folder only has to say `urdf_path`. Fill in what the object
+    loader expects of an articulated body; the real joint vectors are
+    derived from the URDF by RobotSpec once the body is loaded."""
+    cfg.setdefault("is_articulated", True)
+    cfg.setdefault("articulation_config", {"initial_joint_positions": [], "joint_signs": None})
+    cfg.setdefault("use_fixed_base", True)
+    cfg.setdefault("base_position", [0.0, 0.0, 0.0])
+    cfg.setdefault("robot", {})
+
+
 def _merge(parent: Dict[str, Any], child: Dict[str, Any]) -> Dict[str, Any]:
     """Child overrides parent, one level deep for mapping values (so a child can
     override `aabb.bounding_box` without restating `aabb.urdf_bbox_adjustment`)."""
@@ -89,7 +107,7 @@ def _load_scene_tree(root: Path) -> Dict[str, Dict[str, Any]]:
     entries: Dict[str, Dict[str, Any]] = {}
     if not root.is_dir():
         return entries
-    files = sorted(root.rglob(SCENE_FILE), key=lambda p: len(p.parts))
+    files = sorted((f for pat in ENTRY_FILES for f in root.rglob(pat)), key=lambda p: (len(p.parts), str(p)))
     resolved_by_dir: Dict[Path, Dict[str, Any]] = {}
     for f in files:
         folder = f.parent
@@ -106,6 +124,8 @@ def _load_scene_tree(root: Path) -> Dict[str, Dict[str, Any]]:
         cfg = _merge({k: v for k, v in parent_cfg.items() if k != "name"}, raw)
         name = cfg.get("name") or folder.name
         cfg["name"] = name
+        if f.name == ROBOT_FILE or "robot" in cfg:
+            _robot_defaults(cfg)
         if name in entries:
             logger.warning("scene registry: duplicate scene name %r (%s and %s); keeping the latter",
                            name, _SOURCE[name], f)
@@ -127,7 +147,10 @@ def load_all() -> Dict[str, Dict[str, Any]]:
         for name, cfg in legacy.items():
             entries[name] = dict(cfg or {})
             _SOURCE[name] = LEGACY_OBJECTS_YAML
-    for name, cfg in _load_scene_tree(SCENES_ROOT).items():
+    tree = {}
+    for root in (SCENES_ROOT, ROBOTS_ROOT):
+        tree.update(_load_scene_tree(root))
+    for name, cfg in tree.items():
         if name in entries and _SOURCE.get(name) == LEGACY_OBJECTS_YAML:
             logger.warning("scene registry: %r is defined in both objects.yaml and %s; "
                            "the scene.yaml wins — delete the objects.yaml entry",

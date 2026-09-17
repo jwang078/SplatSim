@@ -359,6 +359,9 @@ WRIST_CAM_FISHEYE_CALIBRATIONS: Dict[int, Dict[str, Any]] = {
 
 class PybulletRobotServerBase:
     MAX_TRAJECTORY_COUNT = 500
+    # See the `viewer` ctor kwarg; launch_nodes --viewer flips this before
+    # constructing whichever env variant was asked for.
+    VIEWER_MODE_DEFAULT: ClassVar[bool] = False
 
     # ── Graceful shutdown (SIGTERM from launch_trajgen_pool) ─────────────────
     # LeRobot's DatasetWriter streams episodes through open ParquetWriters
@@ -524,15 +527,19 @@ class PybulletRobotServerBase:
         that reads `self.SELF_COLLISION_SKIP_PAIRS` (is_robot_in_collision,
         `_get_default_trajectory_gen_config`, `get_env_config`) sees the full,
         robot-specific list."""
-        arm_pairs = list(type(self).SELF_COLLISION_SKIP_PAIRS)
+        spec = self.robot_spec
+        # Class-declared ARM pairs describe the shipped UR5; a robot with a
+        # `robot:` block brings its own (derived or declared) pairs instead.
+        arm_pairs = list(type(self).SELF_COLLISION_SKIP_PAIRS) if spec.legacy else []
         gripper_pairs = (
             self._resolve_link_name_pairs(self.GRIPPER_SELF_COLLISION_SKIP_PAIR_NAMES)
-            if self.use_gripper else []
+            if spec.gripper.kind == "robotiq_2f85" else []
         )
+        spec_pairs = list(spec.self_collision_skip_pairs)
         # Dedup while preserving order; treat (a,b) == (b,a).
         seen = set()
         merged = []
-        for a, b in arm_pairs + gripper_pairs:
+        for a, b in arm_pairs + gripper_pairs + spec_pairs:
             key = frozenset((int(a), int(b)))
             if key not in seen:
                 seen.add(key)
@@ -551,7 +558,7 @@ class PybulletRobotServerBase:
         every env — not just the planar one — gets it by setting the class attr."""
         if not self.JOINT_DAMPING:
             return
-        for j in range(1, self.num_dofs() + 1):
+        for j in self.robot_spec.arm_joint_indices:
             self.pybullet_client.changeDynamics(
                 self.splatsim_robot.sim_id, j, jointDamping=self.JOINT_DAMPING
             )
@@ -1039,6 +1046,12 @@ class PybulletRobotServerBase:
         # trajectories — the robot passes through obstacles, but the policy
         # still SEES them and metrics still report the would-be collisions.
         phantom_obstacles: bool = False,
+        # Viewer: load the scene and robot, teleport home, and stop — no
+        # scene randomisation, no solvability planning, no goal search, no
+        # datasets. For looking at how a robot fits a scene (any env, any
+        # robot). None = the class default, which launch_nodes --viewer sets
+        # so every env variant honours it without a constructor change.
+        viewer: Optional[bool] = None,
     ):
         self._splatsim_gui = None
         # Latest rendered camera frames, served by `get_last_frames` so a
@@ -1060,6 +1073,9 @@ class PybulletRobotServerBase:
         # requests, so bump/stamp ordering is well-defined cross-process.
         self._state_version: int = 0
         self._phantom_obstacles = bool(phantom_obstacles)
+        self.viewer_mode = bool(type(self).VIEWER_MODE_DEFAULT if viewer is None else viewer)
+        if self.viewer_mode:
+            print("[viewer] viewer mode: scene + robot only (no randomisation, planning, goals or datasets)")
         self._serve_mode = serve_mode
         self._eval_benchmark_repo_id = eval_benchmark_repo_id or ""
         self._eval_benchmark_subset: Optional[List[int]] = eval_benchmark_subset
@@ -1394,11 +1410,11 @@ class PybulletRobotServerBase:
             pybullet_client=self.pybullet_client,
             pb_client_id=self._pb_client_id,
             robot_id=self.splatsim_robot.sim_id,
-            joint_indices=list(range(1, self.num_dofs() + 1)), # excludes gripper
+            joint_indices=list(self.robot_spec.arm_joint_indices),  # planner / IK joints; excludes gripper + wheels
             env_config_name=self.ENV_CONFIG.name,
             get_ee_link_fn=lambda: self._get_ee_link_index(),
             splatsim_objects=self.splatsim_objects,
-            wrist_camera_link_name=self.splatsim_robot.config.wrist_camera_link_name,
+            wrist_camera_link_name=self.robot_spec.ee_link_name,
             trajectory_gen_config=self._get_default_trajectory_gen_config(),
             # Envs with a soft-cost field (EnvConfig.soft_cost) get cost-aware
             # trajectory generation; None for binary-obstacle envs (no-op).
@@ -1499,34 +1515,52 @@ class PybulletRobotServerBase:
                     background=None,
                 )
 
-        # Add the index of the wrist_camera_link to the wrist camera if it's available
-        if self.splatsim_robot.config.wrist_camera_link_name is not None:
-            wrist_camera_link_name = self.splatsim_robot.config.wrist_camera_link_name
-            num_joints = p.getNumJoints(self.splatsim_robot.sim_id)
-            for i in range(num_joints):
-                info = p.getJointInfo(self.splatsim_robot.sim_id, i)
-                if info[12].decode("utf-8") == wrist_camera_link_name:
-                    self.wrist_camera.tracked_link_index = i
-                    break
-            if self.wrist_camera.tracked_link_index is None:
-                raise ValueError(
-                    f"Cannot find wrist camera link name {wrist_camera_link_name}"
-                )
-        else:
+        # The rendered "wrist" camera is the robot's camera named `wrist`
+        # (else its first camera). Robots with no cameras have none — the EE
+        # link still comes from the spec, so planning works without one.
+        cam = self.robot_spec.camera("wrist") or (self.robot_spec.cameras[0] if self.robot_spec.cameras else None)
+        if cam is not None:
+            self.wrist_camera.tracked_link_index = cam.link_index
+        elif "wrist_rgb" in self.camera_names:
             raise ValueError(
-                f"wrist_camera_link_name attribute not defined in object config of robot {self.robot_name}, yet wrist camera was requested"
+                f"camera_names requests wrist_rgb but robot {self.robot_name!r} declares no cameras "
+                f"(add `robot: cameras:` to its yaml, or a legacy wrist_camera_link_name)"
             )
 
         # current gripper state
         self.current_gripper_action = GripperState.OPEN
-        self.teleport_joint_state(self.splatsim_robot, self.splatsim_robot.config.articulation_config.initial_joint_positions)
+        self.teleport_joint_state(self.splatsim_robot, list(self.robot_spec.initial_joint_positions))
 
         # Gym-related state
         self._step_count = 0
         self._episode_started = False
 
+    def _build_robot_spec(self, splatsim_obj: SplatSimObject):
+        from splatsim.configs import scene_registry
+        from splatsim.robots.robot_spec import RobotSpec
+        cfg = scene_registry.get(self.robot_name) or {}
+        urdf = resolve_splatsim_path(str(splatsim_obj.config.urdf_path))
+        spec = RobotSpec.derive(
+            self.pybullet_client, splatsim_obj.sim_id, cfg, name=self.robot_name,
+            wrist_cam_ver=getattr(self, "wrist_cam_ver", None), urdf_path=urdf,
+        )
+        print("[robot]\n" + "\n".join("  " + l for l in spec.summary().splitlines()))
+        # A robot folder carries no articulation_config; fill it from the spec
+        # so everything that reads initial_joint_positions / joint_signs off
+        # the object config (home pose, trajgen defaults, episode metadata)
+        # sees the derived values.
+        art = splatsim_obj.config.articulation_config
+        if art is not None and not len(art.initial_joint_positions or []):
+            art.initial_joint_positions = [float(v) for v in spec.initial_joint_positions]
+            art.joint_signs = [int(v) for v in spec.joint_signs]
+        if not spec.has_splat and self._render_robot_splat():
+            print(f"WARNING: robot {self.robot_name!r} has no splat scan — it is drawn from its "
+                  f"URDF meshes (composited by depth into the splat render). Scan it for photoreal rendering.")
+        return spec
+
     def num_dofs(self) -> int:
-        return 6
+        spec = getattr(self, "robot_spec", None)
+        return spec.num_dofs if spec is not None else 6
 
     def state_dim(self) -> int:
         """Width of observation.state = [joints, gripper] (proprioception only).
@@ -1535,7 +1569,8 @@ class PybulletRobotServerBase:
         (see env_state_dim / oracle_environment_state), because policies like the
         diffusion policy require an image OR a distinct environment_state input
         and normalize the two feature types independently."""
-        return self.num_dofs() + 1
+        spec = getattr(self, "robot_spec", None)
+        return self.num_dofs() + (spec.gripper.command_dim if spec is not None else 1)
 
     def _apply_strict_goal_tolerances(self) -> None:
         """Tighten the success-tolerance thresholds to the STRICT_* class-vars.
@@ -1801,13 +1836,9 @@ class PybulletRobotServerBase:
 
     def get_joint_state(self) -> np.ndarray:
         # return self._joint_state
-        joint_states = []
-        num_joints = self.pybullet_client.getNumJoints(self.splatsim_robot.sim_id)
-        for i in range(1, num_joints):
-            joint_states.append(
-                self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[0]
-            )
-        return np.array(joint_states)
+        rid = self.splatsim_robot.sim_id
+        return np.array([self.pybullet_client.getJointState(rid, i)[0]
+                         for i in self.robot_spec.state_joint_indices])
 
     def load_urdf(self, splatsim_obj: SplatSimObject, physics_scale: float = 1.0):
         # This must be called after the gaussians are finalized
@@ -2061,6 +2092,14 @@ class PybulletRobotServerBase:
 
             if splatsim_obj.config.name == "robot":
                 self.splatsim_robot = splatsim_obj
+                # Everything robot-specific (arm joints, gripper, cameras, EE
+                # link, action size) comes from the URDF + the robot's yaml —
+                # see splatsim.robots.robot_spec. Built here, the moment the
+                # body exists, so setup_gripper and every consumer below can
+                # read it. The `use_gripper` ctor arg is superseded by what
+                # the spec finds.
+                self.robot_spec = self._build_robot_spec(splatsim_obj)
+                self.use_gripper = self.robot_spec.gripper.kind != "none"
                 if self.use_gripper:
                     self.setup_gripper()
                 self.open_gripper()
@@ -2251,13 +2290,17 @@ class PybulletRobotServerBase:
                 "Cannot set joint states of object not represented in pybullet (ex: has urdf)"
             )
 
-        num_joints = self.pybullet_client.getNumJoints(splatsim_obj.sim_id)
-        if len(joint_state) > num_joints - 1:
+        # joint_state[i] refers to robot_spec.state_joint_indices[i]: for a
+        # robot scan without a `robot:` block that is every URDF joint 1..N
+        # (historical convention, gripper mimics included); for a declared
+        # robot it is arm + commanded gripper + wheel joints.
+        state_idx = self.robot_spec.state_joint_indices
+        if len(joint_state) > len(state_idx):
             raise ValueError(
-                f"Expected at most {num_joints - 1} joint states, got {len(joint_state)}."
+                f"Expected at most {len(state_idx)} joint states, got {len(joint_state)}."
             )
 
-        signs = splatsim_obj.config.articulation_config.joint_signs
+        signs = self.robot_spec.joint_signs
 
         # Snap EVERY provided joint to its target with resetJointState — this
         # includes the gripper's mimic joints, so the gripper starts in the
@@ -2267,13 +2310,13 @@ class PybulletRobotServerBase:
         # lookback-rewind teleport puts the robot back into the MOVING state
         # it was recorded in — without it, resetJointState zeroes velocity
         # and every rewound intervention physically cold-starts from rest.
-        for i in range(0, min(len(joint_state), num_joints - 1)):
+        for i in range(0, min(len(joint_state), len(state_idx))):
             vel_i = 0.0
             if joint_velocities is not None and i < len(joint_velocities):
                 vel_i = float(joint_velocities[i]) * signs[i]
             self.pybullet_client.resetJointState(
                 splatsim_obj.sim_id,
-                i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
+                state_idx[i],
                 joint_state[i] * signs[i],
                 targetVelocity=vel_i,
             )
@@ -2287,7 +2330,7 @@ class PybulletRobotServerBase:
         for i in range(0, min(len(joint_state), self.num_dofs())):
             self.pybullet_client.setJointMotorControl2(
                 splatsim_obj.sim_id,
-                i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
+                self.robot_spec.arm_joint_indices[i],
                 p.POSITION_CONTROL,
                 targetPosition=joint_state[i] * signs[i],
                 force=self._control_force(),
@@ -2330,12 +2373,12 @@ class PybulletRobotServerBase:
             # through objects between commands) — debug only, never for data.
             for i in range(0, min(len(joint_state), self.num_dofs())):
                 self.pybullet_client.resetJointState(
-                    splatsim_obj.sim_id, i + 1, joint_state[i]
+                    splatsim_obj.sim_id, self.robot_spec.arm_joint_indices[i], joint_state[i]
                 )
         for i in range(0, min(len(joint_state), self.num_dofs())):
             self.pybullet_client.setJointMotorControl2(
                 splatsim_obj.sim_id,
-                i + 1, # Assuming the first joint index is 1 (0 is often a fixed joint), adjust if necessary
+                self.robot_spec.arm_joint_indices[i],
                 p.POSITION_CONTROL,
                 targetPosition=joint_state[i],
                 # Set a more realistic force for the robot
@@ -2354,9 +2397,14 @@ class PybulletRobotServerBase:
             # `IndexError: index N is out of bounds for axis 0 with size N`
             # from an arm-only teleport call; the gripper's current motor
             # target stays in effect from the last full-length command.
-            if len(joint_state) > self.num_dofs():
-                self.move_gripper((1 - joint_state[self.num_dofs()]) * 0.085)
-                self.current_gripper_action = joint_state[self.num_dofs()]
+            g = self.robot_spec.gripper
+            cmd = np.asarray(joint_state[self.num_dofs(): self.num_dofs() + g.command_dim], dtype=np.float64)
+            if len(cmd) == g.command_dim and g.command_dim > 0:
+                if g.kind == "robotiq_2f85":
+                    self.move_gripper((1 - float(cmd[0])) * 0.085)
+                else:
+                    self._command_generic_gripper(cmd)
+                self.current_gripper_action = float(cmd[0]) if g.command_dim == 1 else cmd.copy()
 
         # Client-driven physics: step N times per commanded action. See
         # `_sync_physics_to_client` docstring on __init__. Only fires when:
@@ -2502,6 +2550,12 @@ class PybulletRobotServerBase:
         # rather than conforming to the base camera's aspect.
         fisheye_cal = WRIST_CAM_FISHEYE_CALIBRATIONS.get(self.wrist_cam_ver)
 
+        if self.base_camera is None or getattr(self.base_camera, "camera", None) is None:
+            # No splat base camera (RENDER_SPLATS=False envs): there is no
+            # pipeline to derive the wrist view from. Callers treat None as
+            # "no wrist render" — the pybullet-camera path falls back to a
+            # plain link-frame view.
+            return None
         H = self.base_camera.camera.image_height
         if fisheye_cal is not None:
             # Preserve the fisheye's native aspect (CAL_W : CAL_H).
@@ -2979,7 +3033,7 @@ class PybulletRobotServerBase:
 
         # Splat depth is only rasterized when something downstream needs it —
         # today, depth-compositing the PyBullet robot into the frame.
-        want_depth = self.COMPOSITE_PYBULLET_ROBOT and not self._render_robot_splat()
+        want_depth = self._composite_robot_enabled()
         splat_depth = None
         try:
             if camera.camera_model == "fisheye" or self.use_gsplat:
@@ -3402,11 +3456,31 @@ class PybulletRobotServerBase:
 
         return splatsim_camera
 
+    def _robot_has_splat(self) -> bool:
+        """Does the robot's registry entry point at a splat (model_path /
+        ply_path)? A robot folder with just a URDF has none — it is drawn
+        from its meshes instead (see _composite_robot_enabled)."""
+        from splatsim.configs import scene_registry
+        cfg = scene_registry.get(self.robot_name) or {}
+        return bool(cfg.get("model_path") or cfg.get("ply_path"))
+
     def _render_robot_splat(self) -> bool:
-        """Whether the robot's own Gaussian splat should be loaded/rendered."""
+        """Whether the robot's own Gaussian splat should be loaded/rendered.
+        False when the robot has no splat asset, whatever the class flags say."""
+        if not self._robot_has_splat():
+            return False
         if self.RENDER_ROBOT_SPLAT is None:
             return bool(self.RENDER_SPLATS)
         return bool(self.RENDER_ROBOT_SPLAT and self.RENDER_SPLATS)
+
+    def _composite_robot_enabled(self) -> bool:
+        """Draw the robot's PyBullet geometry into the splat frame (depth-
+        composited). On when the env asks for it (COMPOSITE_PYBULLET_ROBOT)
+        or automatically when the scene renders as splats but the robot has
+        no splat of its own — the drop-in URDF case."""
+        if not self.RENDER_SPLATS or self._render_robot_splat():
+            return False
+        return bool(self.COMPOSITE_PYBULLET_ROBOT or not self._robot_has_splat())
 
     def _composite_pybullet_robot(
         self,
@@ -4572,7 +4646,7 @@ class PybulletRobotServerBase:
         joint_velocities = np.array(
             [
                 self.pybullet_client.getJointState(self.splatsim_robot.sim_id, i)[1]
-                for i in range(self.num_dofs() + 1)
+                for i in self.robot_spec.state_joint_indices[: self.state_dim()]
             ]
         )
 
@@ -4581,7 +4655,9 @@ class PybulletRobotServerBase:
         dummy_ee_euler = self.pybullet_client.getEulerFromQuaternion(dummy_ee_quat)
 
         # print the euler angles and the reconstructed quaternion
-        if self.use_gripper:
+        if self.use_gripper and self.robot_spec.gripper.kind != "robotiq_2f85":
+            self.current_gripper_state = self.get_current_gripper_state()   # already normalised 0..1
+        elif self.use_gripper:
             self.current_gripper_state = self.get_current_gripper_state() / 0.8
             # Snap the gripper state to 0 or 1 if they're reasonably close.
             # The wider thresholds (0.2 / 0.8 instead of 0.05 / 0.95) account
@@ -4942,6 +5018,10 @@ class PybulletRobotServerBase:
         return True
 
     def randomize_objects(self, max_attempts: int = 100):
+        if getattr(self, "viewer_mode", False):
+            # Viewer: nothing to randomise or solve — the scene stays as
+            # authored and the robot where the last teleport left it.
+            return
         collision = True
         able_to_solve = False
         attempt = 0
@@ -5296,7 +5376,7 @@ class PybulletRobotServerBase:
         Returns:
             bool, or (bool, str | None) when return_kind=True.
         """
-        joint_indices = list(range(1, self.num_dofs() + 1))
+        joint_indices = list(self.robot_spec.arm_joint_indices)
         obstacles = [
             obj for obj in self.splatsim_objects
             if obj.sim_id is not None and obj != self.splatsim_robot
@@ -5434,14 +5514,58 @@ class PybulletRobotServerBase:
         return True
 
     def open_gripper(self):
-        """Open the gripper."""
-        self.move_gripper(0.084)
+        """Open the gripper (command 0 on every gripper command channel)."""
+        if self.robot_spec.gripper.kind == "robotiq_2f85":
+            self.move_gripper(0.084)
+        elif self.use_gripper:
+            self._command_generic_gripper(np.zeros(self.robot_spec.gripper.command_dim))
         self.current_gripper_action = GripperState.OPEN  # 1
 
     def close_gripper(self):
-        """Close the gripper."""
-        self.move_gripper(0.0)
+        """Close the gripper (command 1 on every gripper command channel)."""
+        if self.robot_spec.gripper.kind == "robotiq_2f85":
+            self.move_gripper(0.0)
+        elif self.use_gripper:
+            self._command_generic_gripper(np.ones(self.robot_spec.gripper.command_dim))
         self.current_gripper_action = GripperState.CLOSE  # 0
+
+    # ------------------------------------------------------------ generic grippers
+    # Any gripper that is not the calibrated Robotiq 2F-85: driven through
+    # GripperSpec.joint_targets (per_joint or synergies), mimic children
+    # coupled by JOINT_GEAR constraints from the URDF's <mimic> tags, and
+    # self-collision among the gripper's own links disabled (linkages overlap
+    # by design and would otherwise jam).
+    def _setup_generic_gripper(self):
+        g = self.robot_spec.gripper
+        rid = self.splatsim_robot.sim_id
+        self._generic_gripper_gears = []
+        for child, (parent, mult, _offset) in g.mimic.items():
+            c = self.pybullet_client.createConstraint(
+                rid, parent, rid, child, jointType=self.pybullet_client.JOINT_GEAR,
+                jointAxis=[0, 1, 0], parentFramePosition=[0, 0, 0], childFramePosition=[0, 0, 0],
+            )
+            self.pybullet_client.changeConstraint(c, gearRatio=-mult, maxForce=10, erp=1)
+            self._generic_gripper_gears.append(c)
+        links = list(g.link_indices)
+        for a in range(len(links)):
+            for b in range(a + 1, len(links)):
+                self.pybullet_client.setCollisionFilterPair(rid, rid, links[a], links[b], enableCollision=0)
+        for link_a, link_b in getattr(self, "SELF_COLLISION_SKIP_PAIRS", ()):
+            self.pybullet_client.setCollisionFilterPair(rid, rid, link_a, link_b, enableCollision=0)
+
+    def _command_generic_gripper(self, command) -> None:
+        g = self.robot_spec.gripper
+        targets = g.joint_targets(command)
+        rid = self.splatsim_robot.sim_id
+        for j, q in zip(g.joint_indices, targets):
+            info = self.robot_spec.joints[j]
+            force = info.max_force if info.max_force > 0 else 20.0
+            if self.debug_fast_control:
+                self.pybullet_client.resetJointState(rid, j, float(q))
+            self.pybullet_client.setJointMotorControl2(
+                rid, j, p.POSITION_CONTROL, targetPosition=float(q), force=force,
+                maxVelocity=(info.max_velocity if info.max_velocity > 0 else 1.0),
+            )
 
     def plan_execute_record_trajectory(self, initial_joint_positions, joint_signs):
         # Returns whether it was a success
@@ -6162,6 +6286,11 @@ class PybulletRobotServerBase:
     def _generate_and_render_one_episode(self):
         """Generate trajectories, render each step, and save to LeRobot + Zarr."""
         from splatsim.utils.rrt_to_goal import RRTPlanningAborted
+        if getattr(self, "viewer_mode", False):
+            self._trajgen_status("viewer mode — trajectory generation is disabled (launch without --viewer)")
+            print("[viewer] trajectory generation is disabled in viewer mode")
+            self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
+            return
         self._trajgen_active = True
         try:
             self._trajgen_status("resetting scene")
@@ -6363,9 +6492,9 @@ class PybulletRobotServerBase:
 
             q = joint_trajectory[step_idx]
 
-            # Build a 7-DOF command (6 joints + gripper open = 0)
-            action_7 = np.zeros(self.num_dofs() + 1, dtype=np.float32)
-            action_7[:len(q)] = q
+            # Build the full action (arm joints + gripper command(s), open = 0)
+            action_7 = np.zeros(self.state_dim(), dtype=np.float32)
+            action_7[:min(len(q), len(action_7))] = q[:len(action_7)]
 
             # Command the robot and step the physics simulation
             self.command_joint_state(self.splatsim_robot, action_7)
@@ -6838,6 +6967,8 @@ class PybulletRobotServerBase:
 
     def setup_gripper(self):
         self.__parse_joint_info__()
+        if self.robot_spec.gripper.kind != "robotiq_2f85":
+            return self._setup_generic_gripper()
         self.gripper_range = [0, 0.085]
 
         mimic_parent_name = "finger_joint"
@@ -7002,6 +7133,16 @@ class PybulletRobotServerBase:
                 )
 
     def get_current_gripper_state(self):
+        g = self.robot_spec.gripper
+        if g.kind != "robotiq_2f85":
+            # Normalised command read back from the first commanded joint:
+            # 0 = open, 1 = closed (per_joint / synergies convention).
+            if not g.joint_indices:
+                return 0.0
+            j = g.joint_indices[0]
+            q = self.pybullet_client.getJointState(self.splatsim_robot.sim_id, j)[0]
+            lo, hi = float(g.open[0]), float(g.closed[0])
+            return float(np.clip((q - lo) / (hi - lo), 0.0, 1.0)) if hi != lo else 0.0
         # Snap the gripper state to 0 or 1 if they're very close
         gripper_state = self.pybullet_client.getJointState(
             self.splatsim_robot.sim_id, self.mimic_parent_id

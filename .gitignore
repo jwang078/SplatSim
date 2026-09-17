@@ -44,5 +44,9 @@ scripts/recordings/
 data/scenes/**
 !data/scenes/**/
 !data/scenes/**/scene.yaml
+data/robots/**
+!data/robots/**/
+!data/robots/**/robot.yaml
+!data/robots/example_*/**
 data/scenarios/
 scripts/outputs/
