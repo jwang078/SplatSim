@@ -36,6 +36,8 @@ output/*
 scripts/recordings/
 
 # generated at runtime / by helper scripts
+data/output/
 data/scenarios/
+data/test_data/
 data/vine_seg/
 scripts/outputs/

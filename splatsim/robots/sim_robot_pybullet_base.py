@@ -2,7 +2,7 @@ import logging
 import pickle
 import threading
 import time
-from typing import Any, ClassVar, Dict, Optional, List, Tuple
+from typing import Any, ClassVar, Dict, Optional, List, Tuple, TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 import gymnasium
@@ -80,8 +80,11 @@ from splatsim.utils import rrt_path_utils
 from splatsim.utils.rrt_path_utils import _COLLISION_CLEARANCE, RuckigCloudUnavailableError
 from collections import defaultdict
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.transforms.transforms import ImageTransformConfig, ImageTransformsConfig
+# LeRobot is a lazy, feature-scoped dependency here (dataset recording / eval
+# replay), not a startup one — keep it out of module import so the sim server
+# runs without `lerobot[dataset]` installed.
+if TYPE_CHECKING:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from pathlib import Path
 
@@ -5908,7 +5911,7 @@ class PybulletRobotServerBase:
         repo_id: str,
         fps: Optional[int] = None,
         image_keys: Optional[List[str]] = None,
-    ) -> LeRobotDataset:
+    ) -> "LeRobotDataset":
         """Create a fresh LeRobot dataset, defaulting fps/image_keys from instance config."""
         if fps is None:
             fps = self.trajectory_generator.config.robot_update_rate

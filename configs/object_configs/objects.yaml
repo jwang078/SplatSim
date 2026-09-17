@@ -229,8 +229,8 @@ robot_iphone_w_engine_curtain:
     - 1
     - 1
     - 1
-  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/2026-07-06-small_engine_on_table_images_500_500match_540height_SIMPLE_RADIALcam/sfm_disk_disk+lightglue/undistorted
-  model_path: /home/jennyw2/code/gaussian-splatting/output/2026-07-06-small_engine_on_table_images_500_500match_540height_SIMPLE_RADIALcam
+  source_path: ./data/test_data/vine_scene
+  model_path: ./data/output/robot_iphone_w_engine_curtain
   use_gripper: true
   is_articulated: true
   use_fixed_base: true
@@ -593,7 +593,7 @@ vine_and_trellis:
     - [0.0, 0.0]
     - [0.0, 0.0]
     - [0.0, 0.0]
-  ply_path: /home/jennyw2/code/gaussian-splatting/output/grape_prop_in_highbay2_images_500_500match_800height_SIMPLE_RADIALcam/point_cloud/iteration_30000/vine_and_trellis.ply
+  ply_path: ./data/output/vine_scene/point_cloud/iteration_30000/vine_and_trellis.ply
   urdf_path: ./data/vine_seg/vine_and_trellis/vine_and_trellis.urdf
   base_position:
   - 0.0
@@ -627,8 +627,8 @@ vine_scene:
     - [0.0, 0.0]
     - [0.0, 0.0]
     - [0.0, 0.0]
-  model_path: /home/jennyw2/code/gaussian-splatting/output/grape_prop_in_highbay2_images_500_500match_800height_SIMPLE_RADIALcam
-  source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/grape_prop_in_highbay2_images_500_500match_800height_SIMPLE_RADIALcam/sfm_disk_disk+lightglue/undistorted
+  model_path: ./data/output/vine_scene
+  source_path: ./data/test_data/vine_scene
   base_position:
   - 0.0
   - 0.0

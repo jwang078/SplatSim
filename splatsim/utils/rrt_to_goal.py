@@ -28,7 +28,7 @@ from enum import Enum
 import numpy as np
 import pybullet as p
 
-from lerobot.policies.guidance.base import GuidanceMode
+from splatsim.configs.guidance import GuidanceMode
 
 from splatsim.utils.planner_defaults import PLANNER_DEFAULTS as _PD
 

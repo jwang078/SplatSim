@@ -206,9 +206,7 @@ def main():
                     help="robot variant named in the launch hint printed when "
                          "no simulator is found")
     ap.add_argument("--grapes-ply", default=(
-        "/home/jennyw2/code/gaussian-splatting/output/"
-        "grape_prop_in_highbay2_images_500_500match_800height_"
-        "SIMPLE_RADIALcam/point_cloud/iteration_30000/grapes_only.ply"),
+        "data/output/vine_scene/point_cloud/iteration_30000/grapes_only.ply"),
         help="segmented grape gaussians, used by search mode for visibility")
     ap.add_argument("--mode", default="search", choices=["ik", "search"],
                     help="initial solver. 'search' = task-space sample/score/"

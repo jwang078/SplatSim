@@ -36,10 +36,19 @@ dependencies = [
     # NOTE: community ruckig delegates INTERMEDIATE-waypoint trajectories to a
     # rate-limited cloud API and fails closed when unreachable; only
     # target-state trajectories solve locally.
-    "ruckig==0.15.3",
+    #
+    # 0.19.4, not the older 0.15.3: 0.15.3 ships no cp312 wheel and its sdist
+    # no longer builds (its backend uses `cmake.targets`, which
+    # scikit-build-core >= 0.10 rejects). 0.19.4 has wheels and is
+    # API-compatible with _ruckig_run_segment (per-section limits included).
+    "ruckig==0.19.4",
     "numpy-quaternion==2024.0.13",
     "pyquaternion==0.9.9",
-    "ghalton==0.6.2",
+    # ghalton (a pybullet-planning dependency) is NOT listed here: the PyPI
+    # sdist hard-codes the clang-only flag `-stdlib=libc++`, so it cannot
+    # build against the conda gcc toolchain. install.sh installs the patched
+    # `submodules/ghalton` fork before this metadata is resolved, which
+    # satisfies pybullet-planning's requirement.
     "mujoco==3.3.7",
     "dm_control==1.0.34",
     "gymnasium==1.3.0",

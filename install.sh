@@ -38,13 +38,44 @@ say "2/4  torch stack (CUDA 12.8 index)"
 pip install --index-url "$TORCH_INDEX" \
     "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128"
 
-say "3/4  SplatSim + pip dependencies"
+# Two dependencies cannot come from the `pip install -e .` resolve below and
+# have to be placed FIRST, the same way torch is:
+#
+#   ghalton  (via pybullet-planning) — the PyPI sdist hard-codes the
+#            clang-only flag `-stdlib=libc++`, so conda's gcc rejects it.
+#            `submodules/ghalton` is a fork with that line removed.
+#   evdev    (via pynput) — it generates its C source from the HOST kernel
+#            headers in /usr/include, then compiles against conda's older
+#            sysroot, so newly added key codes come out undeclared
+#            ("error: 'KEY_LINK_PHONE' undeclared"). Building it with the
+#            system gcc keeps the headers and the compiler consistent.
+say "3a/4  dependencies that need a non-default toolchain (ghalton, evdev)"
+pip install --no-build-isolation submodules/ghalton
+CC=/usr/bin/gcc pip install "evdev==1.9.2"
+
+say "3b/4  SplatSim + pip dependencies"
 pip install -e .                      # add '.[hardware]' for a physical xArm
 
 say "4/4  source-built submodules (--no-build-isolation: they import torch at build time)"
+
+# diff-gaussian-rasterization is pinned to upstream graphdeco-inria, which
+# SplatSim needs two changes to. Applied here rather than committed because
+# the submodule points at a repo we do not control; both are idempotent.
+#
+#   cstdint      — upstream omits it, so the uint32_t/uintptr_t uses in
+#                  rasterizer_impl.h do not compile under gcc 13.
+#   near plane   — upstream culls every gaussian closer than 0.2 m to the
+#                  camera. The wrist camera works well inside that, so
+#                  close-up geometry (grapes, the gripper's own fingers)
+#                  would disappear from the render. 0.01 m keeps it.
+DGR=submodules/gaussian-splatting-wrapper/gaussian_splatting/submodules/diff-gaussian-rasterization
+grep -q '#include <cstdint>' "$DGR/cuda_rasterizer/rasterizer_impl.h" || \
+    sed -i 's|#include <cuda_runtime_api.h>|#include <cstdint>\n#include <cuda_runtime_api.h>|' \
+        "$DGR/cuda_rasterizer/rasterizer_impl.h"
+sed -i 's/if (p_view.z <= 0.2f)/if (p_view.z <= 0.01f)/' "$DGR/cuda_rasterizer/auxiliary.h"
+
 pip install -e submodules/gaussian-splatting-wrapper
-pip install --no-build-isolation \
-    submodules/gaussian-splatting-wrapper/gaussian_splatting/submodules/diff-gaussian-rasterization
+pip install --no-build-isolation "$DGR"
 pip install --no-build-isolation submodules/simple-knn
 pip install -e submodules/pybullet-playground-wrapper
 pip install -e submodules/gello_software
@@ -57,14 +88,17 @@ pip install -e submodules/gello_software/third_party/DynamixelSDK/python
 if [[ "$SKIP_LEROBOT" != "true" ]]; then
     if [[ -d "$LEROBOT_DIR" ]]; then
         say "LeRobot (editable, from $LEROBOT_DIR)"
-        pip install -e "$LEROBOT_DIR"
+        # [dataset] is what the recording / eval-replay paths import
+        # (LeRobotDataset needs `datasets` + torchcodec).
+        pip install -e "$LEROBOT_DIR[dataset]"
     else
         cat >&2 <<MSG
 
 NOTE: LeRobot not found at $LEROBOT_DIR — skipping.
-      The LeRobot dataset/eval integration will not import without it:
+      The sim server runs without it; dataset recording, eval-benchmark
+      replay and policy agents will not import until you install it:
           git clone git@github.com:jwang078/lerobot.git "$LEROBOT_DIR"
-          pip install -e "$LEROBOT_DIR"
+          pip install -e "$LEROBOT_DIR[dataset]"
       Or re-run with LEROBOT_DIR=/path/to/lerobot ./install.sh
       Set SKIP_LEROBOT=true to silence this.
 MSG

@@ -34,9 +34,7 @@ from splatsim.utils import grape_targets as G
 from splatsim.utils.rrt_path_utils import check_links_in_collision
 from splatsim.utils.splat_ply_io import read_gaussian_ply
 
-GRAPES_PLY = ("/home/jennyw2/code/gaussian-splatting/output/"
-              "grape_prop_in_highbay2_images_500_500match_800height_"
-              "SIMPLE_RADIALcam/point_cloud/iteration_30000/grapes_only.ply")
+GRAPES_PLY = "data/output/vine_scene/point_cloud/iteration_30000/grapes_only.ply"
 SCENE_DIR = Path("data/vine_seg/vine_and_trellis")
 
 

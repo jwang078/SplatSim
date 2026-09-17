@@ -9,7 +9,7 @@ This repository contains the code for the paper "SplatSim".
 
 ## Installation
 
-Requires conda and an NVIDIA GPU. Tested on Python 3.12 / CUDA 12.8.
+You'll need conda and an NVIDIA GPU. We've tested on Python 3.12 / CUDA 12.8.
 
 ```bash
 git clone --recursive git@github.com:jwang078/SplatSim.git ~/code/SplatSim
@@ -19,37 +19,65 @@ conda activate splatsim
 ./install.sh
 ```
 
-`install.sh` installs everything (including compiling the CUDA extensions, which
-takes a few minutes) and import-checks the result when it finishes.
+`install.sh` installs the PyTorch CUDA build, the
+Python dependencies, and the source-built submodules (compiling the CUDA
+extensions takes a few minutes). It also patches a couple of dependencies that don't build out of the box — see
+[Things `install.sh` already handles](#things-installsh-already-handles) below
+if you're curious. When it finishes, it import-checks everything and tells you
+if anything is off.
 
-To drive a physical xArm, add the hardware extras afterwards:
-`pip install -e '.[hardware]'`
+If you'd like to drive a physical xArm, add the hardware extras afterwards:
+```bash
+pip install -e '.[hardware]'
+```
 
 ### LeRobot
 
-Training and dataset tooling live in a companion repo, cloned next to this one:
+The simulation server runs on its own, but you'll want our fork of LeRobot for
+anything involving datasets or policies — recording demos, replaying an
+eval-benchmark episode, or driving the sim with a trained policy. Clone it next
+to SplatSim:
 
 ```bash
 git clone git@github.com:jwang078/lerobot.git ~/code/lerobot
-pip install -e ~/code/lerobot
+pip install -e '~/code/lerobot[dataset]'
 ```
 
-`install.sh` does this for you if it finds `../lerobot`. Use
-`LEROBOT_DIR=/path/to/lerobot ./install.sh` for a different location, or
-`SKIP_LEROBOT=true ./install.sh` to skip it.
+The `[dataset]` extra is what the recording and replay code needs, so please
+keep it.
 
-### Troubleshooting
+`install.sh` does this step for you if it finds `../lerobot`. If your checkout
+lives somewhere else, point it there with `LEROBOT_DIR=/path/to/lerobot
+./install.sh`, or `SKIP_LEROBOT=true ./install.sh` to leave it out for now.
 
-- **`ModuleNotFoundError: simple_knn`** (or an empty `submodules/` folder) — the
-  clone missed its submodules. Run `git submodule update --init --recursive`,
-  then `./install.sh` again.
-- **Don't upgrade torch.** The version is pinned to 2.11.0+cu128 on purpose:
-  the CUDA extensions are compiled against it, and video dataloading gets
-  several times slower on other builds. Same for the CUDA 12.8 toolchain.
-- **`nvcc: command not found`** — the conda env isn't active
-  (`conda activate splatsim`).
-- **Noisy `git status` after installing** — the submodule builds leave
-  artifacts behind:
+### Things `install.sh` already handles
+
+You don't need to do anything about these — they're listed so the output
+doesn't surprise you.
+
+- **`ghalton` and `evdev`** both fail to compile with the conda toolchain, so
+  `install.sh` builds ghalton from the patched `submodules/ghalton` fork and
+  evdev with the system gcc. This is step 3a in its output.
+- **`diff_gaussian_rasterization`** needs two small edits to the upstream
+  source (a missing `#include <cstdint>` and a closer near-plane cull so the
+  wrist camera can see up close). `install.sh` applies them right before
+  compiling, so if `git status` shows those two files modified inside the
+  submodule, that's expected.
+
+### If something goes wrong
+
+- **`ModuleNotFoundError: simple_knn`** (or an empty `submodules/` folder) —
+  the clone missed its submodules. Run
+  `git submodule update --init --recursive`, then `./install.sh` again. If a
+  submodule folder has nothing but a `.git` inside even after that, check it
+  out directly with `git -C submodules/<name> checkout -f HEAD`.
+- **`nvcc: command not found`** — the conda env isn't active. A quick
+  `conda activate splatsim` fixes it.
+- **Please don't upgrade torch.** It's pinned to 2.11.0+cu128 on purpose: the
+  CUDA extensions are compiled against it, and video dataloading gets several
+  times slower on other builds. The same goes for the CUDA 12.8 toolchain.
+- **Noisy `git status` after installing** — the submodule builds leave a few
+  artifacts behind. Harmless, but if you'd like them hidden:
   ```bash
   echo '*.egg-info' >> .git/modules/submodules/ghalton/info/exclude
   echo '*.egg-info' >> .git/modules/submodules/gello_software/modules/third_party/DynamixelSDK/info/exclude
@@ -239,6 +267,94 @@ python scripts/run_env_sim.py --agent replay_trajectory_and_save
 ```
 
 You can use `splatsim/robots/sim_robot_pybullet_object_on_plate.py` as a template for configuring custom environments.
+
+## Grape vine environment
+
+A UR5 reaching toward a grape bunch on a scanned vine, rendered inside the vine
+splat. Launch it with:
+
+```bash
+python scripts/launch_nodes.py --robot sim_pybullet_vine_interactive \
+    --robot_port 6003 --wrist_cam_ver=2 --control_gui
+```
+
+You do not pass `--robot_name`: this variant already knows it renders against
+`robot_iphone_w_engine_curtain`. `--wrist_cam_ver=2` picks a fisheye
+calibration that ships in the code, so it needs nothing on disk.
+
+### 1. Download the vine assets
+
+- [vine assets (vine_assets.tar.gz)](TODO-DRIVE-LINK) — about 900 MB
+
+Unpack it into the repo. It contains a `data/` folder that merges into the
+existing one, and the configs already point at those paths, so there's nothing
+to edit:
+
+```bash
+tar xzf vine_assets.tar.gz -C ~/code/SplatSim
+```
+
+That gives you:
+
+```
+data/output/robot_iphone_w_engine_curtain/   gaussian splat of the robot
+data/output/vine_scene/                      gaussian splat of the vine highbay scene
+data/test_data/vine_scene/                   structure-from-motion output for the vine scene
+data/vine_seg/vine_and_trellis/              vine collision mesh, grape targets, soft-cost field
+```
+
+### 2. Launch
+
+Run the command at the top of this section. You should see the PyBullet
+window, the control GUI, and a splat render with the arm in front of the vine.
+
+<details>
+<summary>What each downloaded piece is for</summary>
+
+- `data/output/*/point_cloud/iteration_30000/point_cloud.ply` — the trained
+  splats. The robot's is articulated as the arm moves; the vine scene's is the
+  rendered background. `grapes_only.ply` alongside it is the segmented fruit,
+  used by `scripts/tune_goal_pose.py`.
+- `data/test_data/vine_scene/sparse/0/` — camera poses from an
+  [hloc](https://github.com/cvg/Hierarchical-Localization) run with
+  disk+lightglue. The base camera view is picked from these. This isn't the
+  COLMAP `convert.py` route described under *Adding a new robot*, so don't
+  expect to regenerate it that way.
+- `data/test_data/vine_scene/images/` — the source frames; the server loads
+  the one the base camera corresponds to.
+- `data/vine_seg/vine_and_trellis/vine_and_trellis.urdf` + `_collision.obj` —
+  the hard trunk and trellis, loaded as a PyBullet obstacle. Pre-baked in sim
+  frame, so there's no splat-to-sim transform to calibrate.
+- `data/vine_seg/vine_and_trellis/grape_targets_manual.json` — the bunch
+  centers the task aims at. Hand-annotated, because colour segmentation can't
+  see green fruit.
+- `data/vine_seg/vine_and_trellis/vine_and_trellis_cost_field_sim.npz` — the
+  soft-cost field the RRT planner trades off against, so foliage is a cost
+  rather than a wall.
+
+These come from `scripts/segment_vine_splat.py`, `scripts/build_vine_collision.py`
+and `scripts/mark_grape_targets.py` if you ever need to rebuild them. If you keep
+your splats somewhere else, the three entries to repoint in
+`configs/object_configs/objects.yaml` are `robot_iphone_w_engine_curtain`,
+`vine_scene` and `vine_and_trellis`.
+</details>
+
+### Retargeting the task
+
+The knobs are class attributes on `VineGrapeReachPybulletRobotServer` in
+`splatsim/robots/sim_robot_pybullet_vine.py` — `TARGET_BUNCH_INDEX` (which
+bunch, largest first), `GRAPE_STANDOFF_M` (how close), and the
+`GRIPPER_CAMERA_UP_WORLD` / `CAMERA_FORWARD_AXIS` pair that decides how the
+wrist camera frames the fruit. Tune the goal pose live with
+`scripts/tune_goal_pose.py` rather than by guessing; the roll in particular is
+specified as an absolute world direction because a relative offset is measured
+from an arbitrary IK branch.
+
+If the log fills with `vine env: robot-derived grape goal failed — falling back
+to the static task target`, the goal solver could not find a collision-free IK
+that satisfies `GRIPPER_CAMERA_UP_WORLD` within its tolerance. The sim still
+runs, on the static pose from the config. Widen the tolerances or retune with
+the script above.
 
 ## GELLO integration
 
