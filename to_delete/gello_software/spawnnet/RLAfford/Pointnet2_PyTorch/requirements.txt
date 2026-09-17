@@ -1,5 +1,0 @@
-numpy
-msgpack-numpy
-lmdb
-h5py
-./pointnet2_ops_lib/.
