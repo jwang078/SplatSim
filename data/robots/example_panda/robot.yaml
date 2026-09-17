@@ -21,10 +21,16 @@ robot:
     joints: [panda_finger_joint1] # finger_joint2 mimics it in the URDF
     open:   [0.04]                # joint value at command 0
     closed: [0.0]                 #                ... at command 1
-  cameras:                        # any number; [] for none
-    - name: wrist
+  cameras:                        # any number; [] for none. Each becomes an
+    - name: wrist                 #   observation "<name>_rgb"
       link: panda_hand
-      offset_xyz: [0.05, 0.0, 0.0]
-      offset_rpy: [0.0, 0.0, 0.0]
+      offset_xyz: [0.0, 0.0, 0.03]  # metres, in the link frame
+      offset_rpy: [0.0, 0.0, 0.0]   # the camera looks down its own +Z; image-up is -Y
+      model: pinhole              # pinhole | fisheye_v1 | fisheye_v2 (shipped GoPro calibrations)
+      fov_deg: 70                 # pinhole only; omit to match the scene camera
+    - name: elbow
+      link: panda_link4
+      offset_xyz: [0.0, 0.0, 0.1]
+      offset_rpy: [1.5708, 0.0, 0.0]
       model: pinhole
-      fov_deg: 70
+      fov_deg: 90

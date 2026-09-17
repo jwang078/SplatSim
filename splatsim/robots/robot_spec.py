@@ -119,7 +119,7 @@ class CameraSpec:
     offset_xyz: tuple = (0.0, 0.0, 0.0)
     offset_rpy: tuple = (0.0, 0.0, 0.0)
     model: str = "pinhole"          # pinhole | fisheye_v1 | fisheye_v2
-    fov_deg: float = 60.0
+    fov_deg: Optional[float] = None # pinhole horizontal FoV; None = same as the scene's base camera
 
     @property
     def obs_key(self) -> str:
@@ -348,7 +348,8 @@ class RobotSpec:
                 cams.append(CameraSpec(
                     name=str(c["name"]), link=str(c["link"]), link_index=_link_index(link_names, c["link"]),
                     offset_xyz=tuple(c.get("offset_xyz", (0, 0, 0))), offset_rpy=tuple(c.get("offset_rpy", (0, 0, 0))),
-                    model=str(c.get("model", "pinhole")), fov_deg=float(c.get("fov_deg", 60.0))))
+                    model=str(c.get("model", "pinhole")),
+                    fov_deg=(float(c["fov_deg"]) if c.get("fov_deg") is not None else None)))
         elif cfg.get("wrist_camera_link_name"):
             ver = wrist_cam_ver if wrist_cam_ver else 0
             cams.append(CameraSpec(name="wrist", link=cfg["wrist_camera_link_name"],

@@ -61,6 +61,8 @@ class ObjectConfig(ABC):
     name: str
 
     base_position: List[float] = Default(lambda: [0, 0, 0])
+    # Base orientation as roll/pitch/yaw (radians); None = identity.
+    base_orientation_rpy: Optional[List[float]] = Default(None)
     base_quat: Tuple[float, float, float, float] = Default((0.0, 0.0, 0.0, 1.0))
     
     source_path: Optional[str] = Default(None)

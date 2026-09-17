@@ -1867,7 +1867,8 @@ class PybulletRobotServerBase:
             else:
                 raise ValueError(f"urdf_path not found for object {splatsim_obj.config.name}")
 
-            quat = self.pybullet_client.getQuaternionFromEuler([0, 0, 0])
+            rpy = getattr(splatsim_obj.config, "base_orientation_rpy", None) or [0.0, 0.0, 0.0]
+            quat = self.pybullet_client.getQuaternionFromEuler([float(v) for v in rpy])
             collision_scale = 1.0
             if getattr(splatsim_obj.config, "collision_frame", "sim") == "splat":
                 # Collision geometry is in the scan frame: place it with the
@@ -2537,43 +2538,76 @@ class PybulletRobotServerBase:
 
         return T_cw, R_cw
 
-    def get_wrist_camera(self, cached_link_states=None):
-        transform_pair = self.get_wrist_camera_transform(cached_link_states=cached_link_states)
-        if transform_pair is None:
+    def _robot_camera_for(self, camera_name):
+        """CameraSpec for an observation key ("wrist_rgb", "chest_rgb", ...)
+        or None if the name is not one of the robot's cameras."""
+        spec = getattr(self, "robot_spec", None)
+        if spec is None or camera_name is None:
             return None
-        T_cw, R_cw = transform_pair
+        return spec.camera(camera_name)
 
+    def _robot_camera_pose(self, cam, cached_link_states=None):
+        """(T_cw, R_cw): world position + rotation of a robot camera = its
+        link's frame composed with the camera's mounting offset."""
+        link_idx = int(cam.link_index)
+        if link_idx < 0:
+            # camera on the robot's base link
+            pos, quat = p.getBasePositionAndOrientation(self.splatsim_robot.sim_id)
+            pos = np.array(pos, dtype=np.float64)
+        elif cached_link_states is not None and link_idx < len(cached_link_states):
+            cached_state = cached_link_states[link_idx]
+            pos = np.array(cached_state["link_frame_pos"], dtype=np.float64)
+            quat = cached_state["link_frame_q"]
+        else:
+            link_state = p.getLinkState(self.splatsim_robot.sim_id, link_idx, computeForwardKinematics=True)
+            pos = np.array(link_state[4], dtype=np.float64)
+            quat = link_state[5]
+        R_link = np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3)
+        off_xyz = np.asarray(cam.offset_xyz, dtype=np.float64)
+        off_rpy = [float(v) for v in cam.offset_rpy]
+        if np.any(off_xyz) or np.any(off_rpy):
+            R_off = np.array(p.getMatrixFromQuaternion(p.getQuaternionFromEuler(off_rpy))).reshape(3, 3)
+            pos = pos + R_link @ off_xyz
+            R_link = R_link @ R_off
+        return pos.astype(np.float32), R_link.astype(np.float32)
+
+    def get_robot_camera(self, cam, cached_link_states=None):
+        """SplatSimCamera for one of the robot's cameras (any link, any
+        offset, fisheye or pinhole), rendering through the scene's base
+        camera pipeline. None when there is no splat base camera to render
+        with (RENDER_SPLATS=False envs)."""
+        if cam is None:
+            return None
+        T_cw, R_cw = self._robot_camera_pose(cam, cached_link_states=cached_link_states)
         T_wc = -R_cw.T @ T_cw
 
-        # Fisheye calibration (from scripts/calibrate_camera_intrinsics.py);
-        # preserve the wrist camera's native aspect ratio (CAL_W : CAL_H)
-        # rather than conforming to the base camera's aspect.
-        fisheye_cal = WRIST_CAM_FISHEYE_CALIBRATIONS.get(self.wrist_cam_ver)
+        fisheye_cal = WRIST_CAM_FISHEYE_CALIBRATIONS.get(cam.fisheye_version) if cam.fisheye_version else None
 
         if self.base_camera is None or getattr(self.base_camera, "camera", None) is None:
-            # No splat base camera (RENDER_SPLATS=False envs): there is no
-            # pipeline to derive the wrist view from. Callers treat None as
-            # "no wrist render" — the pybullet-camera path falls back to a
-            # plain link-frame view.
+            # No splat base camera (RENDER_SPLATS=False envs): nothing to
+            # derive the view from. Callers treat None as "no robot-camera
+            # render" — the pybullet-camera path uses a plain link-frame view.
             return None
         H = self.base_camera.camera.image_height
         if fisheye_cal is not None:
-            # Preserve the fisheye's native aspect (CAL_W : CAL_H).
             W = int(round(H * fisheye_cal["CAL_W"] / fisheye_cal["CAL_H"]))
         else:
-            # Pinhole: match base camera resolution exactly so both cameras
-            # produce identical-shape frames downstream.
             W = self.base_camera.camera.image_width
         resolution = (W, H)
 
-        fovx = self.base_camera.camera.FoVx
-        fovy = 2 * np.atan(np.tan(self.base_camera.camera.FoVy / 2))
+        if cam.fov_deg is not None:
+            # Declared pinhole FoV (horizontal); vertical follows the aspect.
+            fovx = float(np.radians(cam.fov_deg))
+            fovy = 2 * np.arctan(np.tan(fovx / 2) * H / W)
+        else:
+            fovx = self.base_camera.camera.FoVx
+            fovy = 2 * np.atan(np.tan(self.base_camera.camera.FoVy / 2))
 
         colmap_id = self.wrist_colmap_camera_id
         uid = 0
         depth_params = None
         invdepthmap = None
-        image_name = "wrist_camera"
+        image_name = f"{cam.name}_camera"
         image = torch.zeros((3, resolution[0], resolution[1]), dtype=torch.float32)
 
         camera = Camera(
@@ -2592,38 +2626,35 @@ class PybulletRobotServerBase:
         )
 
         if fisheye_cal is not None:
-            # Aspect ratio is preserved, so sx == sy; scale K uniformly.
             scale = H / fisheye_cal["CAL_H"]
             fisheye_K = torch.tensor([
                 [fisheye_cal["CAL_FX"] * scale, 0.0,                            fisheye_cal["CAL_CX"] * scale],
                 [0.0,                            fisheye_cal["CAL_FY"] * scale, fisheye_cal["CAL_CY"] * scale],
                 [0.0,                            0.0,                            1.0],
             ], dtype=torch.float32, device="cuda")
-            # Distortion coefficients are resolution-independent.
-            fisheye_D = torch.tensor(
-                fisheye_cal["D"],
-                dtype=torch.float32, device="cuda",
+            fisheye_D = torch.tensor(fisheye_cal["D"], dtype=torch.float32, device="cuda")
+            return SplatSimCamera(
+                camera=camera, pipeline=self.base_camera.pipeline, background=self.base_camera.background,
+                camera_model="fisheye", intrinsic_matrix=fisheye_K, radial_coeffs=fisheye_D,
             )
+        return SplatSimCamera(
+            camera=camera, pipeline=self.base_camera.pipeline, background=self.base_camera.background,
+            camera_model="pinhole",
+        )
 
-            splatsim_camera = SplatSimCamera(
-                camera=camera,
-                pipeline=self.base_camera.pipeline,
-                background=self.base_camera.background,
-                camera_model="fisheye",
-                intrinsic_matrix=fisheye_K,
-                radial_coeffs=fisheye_D,
-            )
-        else:
-            # Pinhole render using base camera's intrinsics (FoV inherited via the
-            # Camera object's fovx/fovy above). Matches the pre-a161cad6 default.
-            splatsim_camera = SplatSimCamera(
-                camera=camera,
-                pipeline=self.base_camera.pipeline,
-                background=self.base_camera.background,
-                camera_model="pinhole",
-            )
-
-        return splatsim_camera
+    def get_wrist_camera(self, cached_link_states=None, camera_name=None):
+        """The robot camera for `camera_name` (default: the one named
+        `wrist`, else the robot's first camera) as a SplatSimCamera, or None."""
+        cam = None
+        if camera_name is not None:
+            cam = self._robot_camera_for(camera_name)
+        elif getattr(self, "robot_spec", None) is not None:
+            cam = self.robot_spec.camera("wrist") or (self.robot_spec.cameras[0] if self.robot_spec.cameras else None)
+        if cam is None:
+            if getattr(self, "wrist_camera", None) is None or self.wrist_camera.tracked_link_index is None:
+                print("WARNING: No wrist camera index found")
+            return None
+        return self.get_robot_camera(cam, cached_link_states=cached_link_states)
 
     def _init_scene_gaussian_buffers(self):
         """Initialize pre-allocated buffers for scene_gaussian to avoid fragmentation.
@@ -3011,12 +3042,15 @@ class PybulletRobotServerBase:
                 camera = self.get_pybullet_debug_camera_as_splat_camera()
             if camera is None:
                 camera = self.base_camera
-        elif camera_name == "wrist_rgb":
-            camera = self.get_wrist_camera(cached_link_states=cached_link_states)
+        elif self._robot_camera_for(camera_name) is not None:
+            camera = self.get_wrist_camera(cached_link_states=cached_link_states, camera_name=camera_name)
             if camera is None:
                 return None
         else:
-            raise ValueError(f"Unknown camera name {camera_name}")
+            raise ValueError(
+                f"Unknown camera name {camera_name!r}: not base_rgb and not one of the robot's cameras "
+                f"({[c.obs_key for c in self.robot_spec.cameras]})"
+            )
 
         # For the wrist view, temporarily hide the gaussians of the physical
         # camera body (which the aligned virtual camera sits inside). Save and
@@ -3707,8 +3741,8 @@ class PybulletRobotServerBase:
         wrist camera link is actually available to render it from)."""
         return (
             camera_name is not None
-            and "wrist" in camera_name.lower()
-            and self.wrist_camera is not None
+            and (self._robot_camera_for(camera_name) is not None
+                 or ("wrist" in camera_name.lower() and self.wrist_camera is not None))
             and self.wrist_camera.tracked_link_index is not None
         )
 
@@ -4049,7 +4083,7 @@ class PybulletRobotServerBase:
         if self._is_wrist_camera(camera_name):
             # Wrist view from the wrist-camera pose + FoV (a fisheye lens
             # renders as its RECTIFIED pinhole equivalent, matching the splat).
-            wrist_cam = self.get_wrist_camera(cached_link_states=cached_link_states)
+            wrist_cam = self.get_wrist_camera(cached_link_states=cached_link_states, camera_name=camera_name)
             if wrist_cam is not None:
                 view_proj = self._splatsim_camera_to_pybullet_view(wrist_cam)
         elif self.base_camera is not None:
