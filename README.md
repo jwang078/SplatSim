@@ -14,14 +14,16 @@ You'll need conda and an NVIDIA GPU. We've tested on Python 3.12 / CUDA 12.8.
 ```bash
 git clone --recursive git@github.com:jwang078/SplatSim.git ~/code/SplatSim
 cd ~/code/SplatSim
-conda env create -f environment.yml
-conda activate splatsim
 ./install.sh
+conda activate splatsim
 ```
 
-`install.sh` installs the PyTorch CUDA build, the
-Python dependencies, and the source-built submodules (compiling the CUDA
-extensions takes a few minutes). It also patches a couple of dependencies that don't build out of the box — see
+`install.sh` creates the `splatsim` conda env from `environment.yml`, then
+installs the PyTorch CUDA build, the Python dependencies, and the source-built
+submodules into it (compiling the CUDA extensions takes a few minutes). If a
+`splatsim` env already exists it checks it first and asks whether to install
+into it or recreate it from scratch — nothing is touched before you answer.
+It also patches a couple of dependencies that don't build out of the box — see
 [Things `install.sh` already handles](#things-installsh-already-handles) below
 if you're curious. When it finishes, it import-checks everything and tells you
 if anything is off.
@@ -33,22 +35,13 @@ pip install -e '.[hardware]'
 
 ### LeRobot
 
-The simulation server runs on its own, but you'll want our fork of LeRobot for
-anything involving datasets or policies — recording demos, replaying an
-eval-benchmark episode, or driving the sim with a trained policy. Clone it next
-to SplatSim:
-
-```bash
-git clone git@github.com:jwang078/lerobot.git ~/code/lerobot
-pip install -e '~/code/lerobot[dataset]'
-```
-
-The `[dataset]` extra is what the recording and replay code needs, so please
-keep it.
-
-`install.sh` does this step for you if it finds `../lerobot`. If your checkout
-lives somewhere else, point it there with `LEROBOT_DIR=/path/to/lerobot
-./install.sh`, or `SKIP_LEROBOT=true ./install.sh` to leave it out for now.
+`install.sh` also clones and installs
+[our fork of LeRobot](https://github.com/jwang078/lerobot) into
+`external/lerobot` (editable, ignored by git). SplatSim reads and writes its
+datasets through it, and it's where the training and DAgger code lives, so
+the two are meant to be worked on together. If you already have a checkout,
+the installer uses a sibling `../lerobot` automatically, or point it anywhere
+with `LEROBOT_DIR=/path/to/lerobot ./install.sh`.
 
 ### Things `install.sh` already handles
 
@@ -71,8 +64,8 @@ doesn't surprise you.
   `git submodule update --init --recursive`, then `./install.sh` again. If a
   submodule folder has nothing but a `.git` inside even after that, check it
   out directly with `git -C submodules/<name> checkout -f HEAD`.
-- **`nvcc: command not found`** — the conda env isn't active. A quick
-  `conda activate splatsim` fixes it.
+- **`nvcc: command not found`** when running things later — the conda env
+  isn't active. A quick `conda activate splatsim` fixes it.
 - **Please don't upgrade torch.** It's pinned to 2.11.0+cu128 on purpose: the
   CUDA extensions are compiled against it, and video dataloading gets several
   times slower on other builds. The same goes for the CUDA 12.8 toolchain.
@@ -83,54 +76,89 @@ doesn't surprise you.
   echo '*.egg-info' >> .git/modules/submodules/gello_software/modules/third_party/DynamixelSDK/info/exclude
   ```
 
-## Running the rendering code 
-### 1. Download the colmap and gaussian-splatting models from the below links:
-- [colmap (test_data)](https://drive.google.com/file/d/14D3fFtaPX4GBe9dSJLKAIvUYlgK7fUxS/view?usp=sharing)
-- [gaussian-splats (output)](https://drive.google.com/file/d/1rAUkf7l2ZZqG1Bm3ih6cAO5HCd9dSTO-/view?usp=sharing)
-- [trajectories (bc_data/gello)](https://drive.google.com/file/d/1NhSBNYMi51hETAspk6vN7F-Ih1134_lt/view?usp=sharing)
+## Running a simulation
 
-`test_data` is the folder name of the output of colmap. `output` is the folder name of the output of gaussian splat generation. `bc_data/gello` is the folder name of the demo trajectories recorded by one of the scripts in this repo.
+A simulation is a robot scan plus a scene scan, each a folder under
+`data/scenes/` (see *Data layout* below). Two are available to download and
+make a working example: the grape vine, and the UR5 scanned in the engine
+scene that it uses as its robot.
 
-Assume below that these files are stored under:
+### 1. Download the example scenes
 
-- test_data: /home/yourusername/data/test_data
-- output: /home/yourusername/data/output
-- bc_data/gello: /home/yourusername/data/bc_data/gello
+One tarball per scene, named after the folder it unpacks to:
 
-### 2. Configure the configs to match your folder directory structure
+- [vine_scene.tar.gz](https://drive.google.com/file/d/1fzErjuOOu85abCVYgvtSJQXf6HzEpZmO/view?usp=drive_link) — the grape vine, scanned in the highbay, ~700 MB
+- [robot_iphone_w_engine_curtain.tar.gz](https://drive.google.com/file/d/15OvhOXCvdgjNVPUZB1W28DLXjG9HLpJX/view?usp=drive_link) — the UR5 with its wrist camera, scanned in the engine scene, ~200 MB
 
-#### Open `configs/object_configs/objects.yaml`. The data you downloaded in step 1 is for the robot `robot_iphone`.
+Unpack both into the repo's `data/scenes/` folder. Each carries its own
+`scene.yaml`, so there's nothing to edit:
 
-Modify `robot_iphone` as below:
-- source_path: /home/yourusername/data/test_data/robot_iphone # Path to a folder you downloaded
-- model_path: /home/yourusername/data/output/robot_iphone # Path to a folder you downloaded
-
-Modify all `ply_path` attributes to point to `/home/yourusername/data/output/...`, for example for `plastic_apple`
-
-#### Open `configs/folder_configs.yaml`
-
-Modify as follows:
-- traj_folder: /home/yourusername/data/bc_data/gello
-
-### 3. Run the rendering script:
-
-Launch the robot server which includes an apple and a plate:
 ```bash
-python scripts/launch_nodes.py --robot sim_ur_pybullet_apple_interactive --robot_name robot_iphone
+tar xzf vine_scene.tar.gz -C /path/to/SplatSim/data/scenes
+tar xzf robot_iphone_w_engine_curtain.tar.gz -C /path/to/SplatSim/data/scenes
 ```
 
-In another terminal tab, launch a node that will send the recorded trajectories in `/home/yourusername/data/bc_data/gello` to the server so that it will be rendered:
-```bash
-python scripts/run_env_sim.py --agent replay_trajectory_and_save
+That gives you:
+
+```
+data/scenes/vine_scene/splat/                                  gaussian splat of the vine highbay scene
+data/scenes/vine_scene/sfm/                                    structure-from-motion output for it
+data/scenes/vine_scene/segmentations/vine_and_trellis/         collision mesh, grape targets, soft-cost field
+data/scenes/robot_iphone_w_engine_curtain/splat/               gaussian splat of the robot
 ```
 
-A window should pop up that is a rendering of the robot in the pybullet simulation. If you drag the end effector of the robot around in pybullet, it should be reflected in the render.
+### 2. Launch
 
-The rendered images for trajectory 0 are saved in `{traj_folder}/0/images_1`, for example `/home/yourusername/data/bc_data/gello/0/images_1`.
+Each environment is a `--robot` variant of `launch_nodes.py`; the vine one is:
 
-Congrats! Your static splat is now being simulated! 🚀
+```bash
+python scripts/launch_nodes.py --robot sim_pybullet_vine_interactive \
+    --robot_port 6003 --wrist_cam_ver=2 --control_gui
+```
+
+You should see the PyBullet window, the control GUI, and a splat render with
+the arm in front of the vine. `--wrist_cam_ver=2` picks a fisheye calibration
+that ships in the code; `--robot_name` isn't needed, the variant knows its
+robot.
+
+The apple-on-plate demo from the paper (the `test_data` / `output` /
+`bc_data/gello` downloads) is not maintained here — use the
+[original SplatSim repository](https://github.com/qureshinomaan/SplatSim)
+for that.
 
 # Optional
+
+## Data layout
+
+Everything the simulator loads lives under `data/scenes/`, one folder per
+capture, described by a `scene.yaml` next to the files:
+
+```
+data/scenes/<scene>/
+    scene.yaml                       transformation, aabb, model_path, source_path, ...
+    splat/                           gaussian-splatting output
+    sfm/                             COLMAP / hloc output
+    segmentations/<build>/
+        scene.yaml                   ply_path, urdf_path, collision_frame
+        <build>.urdf, <build>_collision.obj, cost field, grape targets, ...
+```
+
+- The folder tree is the config: every `scene.yaml` is one object, named
+  after its folder, referenced by that flat name in code
+  (`splat_name="vine_and_trellis"`). Paths inside it are relative to the
+  file; a nested `scene.yaml` inherits from the one above it.
+- `collision_frame: splat` means the build's collision mesh, cost field and
+  grape targets are in the scan's frame and get the scan's `transformation`
+  at load; `sim` means they were baked already. `scripts/build_vine_collision.py`
+  sets it.
+- `scene.yaml` files are tracked in git; the data next to them is not.
+
+To add a scene: make `data/scenes/<scene>/` with `splat/` and `sfm/`, copy
+`data/scenes/vine_scene/scene.yaml` beside them and fill in the transform
+(see *Adding a new robot*), run the segmentation scripts with
+`--outdir data/scenes/<scene>/segmentations/<build>`, and tar the folder for
+whoever needs it. `configs/object_configs/objects.yaml` is the older
+single-file form; it still loads, but a `scene.yaml` with the same name wins.
 
 ## Adding a new robot
 
@@ -244,117 +272,77 @@ python scripts/run_env_sim.py --agent replay_trajectory_and_save
 
 ## Generating new trajectories
 
-The trajectories are stored at the folder specified in `configs/trajectory_configs.yaml` (`trajectory_folder`). New trajectories are added as larger folder id numbers, and then the replay_trajectory agent starts playing trajectories from folder 0 and up.
+Demos are planned by the simulator itself (RRT to the task goal, retimed to
+joint limits) and saved as a LeRobot dataset under
+`~/.cache/huggingface/lerobot/<repo_id>`.
 
-For new trajectories, clear out the trajectory folder. Either change `trajectory_folder` or move the previously generated trajectories to another location.
+### From the control GUI
 
-The provided demos are for placing an apple on a plate. If instead you wanted to generate demos for placing a banana on a plate, run
-
-```bash
-python scripts/launch_nodes.py --robot sim_ur_pybullet_banana --robot_name your_robot_name
-```
-
-This populates the `trajectory_folder`. Then, to replay these new trajectories, do the same visualization setup but with this banana on plate environment:
-
-Launch the simulation server
-```bash
-python scripts/launch_nodes.py --robot sim_ur_pybullet_banana_interactive --robot_name your_robot_name
-```
-
-Set the robot to follow the recorded trajectories.
-```bash
-python scripts/run_env_sim.py --agent replay_trajectory_and_save
-```
-
-You can use `splatsim/robots/sim_robot_pybullet_object_on_plate.py` as a template for configuring custom environments.
-
-## Grape vine environment
-
-A UR5 reaching toward a grape bunch on a scanned vine, rendered inside the vine
-splat. Launch it with:
+Launch any environment with `--control_gui` — the vine one, for example:
 
 ```bash
 python scripts/launch_nodes.py --robot sim_pybullet_vine_interactive \
     --robot_port 6003 --wrist_cam_ver=2 --control_gui
 ```
 
-You do not pass `--robot_name`: this variant already knows it renders against
-`robot_iphone_w_engine_curtain`. `--wrist_cam_ver=2` picks a fisheye
-calibration that ships in the code, so it needs nothing on disk.
+In the control window, press **Trajectory Gen Mode**. The panel that opens has
+every planner knob, but the two you need are:
 
-### 1. Download the vine assets
+- **Num Trajectories** — how many episodes to record
+- **LeRobot Repo ID (user/name)** — where to save them, e.g. `you/vine_reach`
 
-- [vine assets (vine_assets.tar.gz)](TODO-DRIVE-LINK) — about 900 MB
+Press **Start Traj Gen**. Each episode randomises the scene, plans a path,
+executes it while rendering, and appends to the dataset. The status line
+under the mode buttons says what's happening at each moment — which RRT
+attempt, which frame is being recorded, when the episode and dataset are
+being saved — so a long plan isn't mistaken for a hang. **Stop** ends the
+run early and still finalises what was recorded — it also interrupts a plan
+that's still running (within about one RRT attempt), so you don't have to
+wait for a slow episode to finish.
 
-Unpack it into the repo. It contains a `data/` folder that merges into the
-existing one, and the configs already point at those paths, so there's nothing
-to edit:
+In the vine environment each episode also draws a new target bunch at
+random; the episode's `task_description` records which one
+(`reach grape bunch N`). Pin a bunch with `TARGET_BUNCH_INDEX` on the env
+class if you want every episode on the same one. If you tune the other knobs,
+**Export Config** saves them to `configs/traj_configs/<env>.json` so the run is
+reproducible — see [configs/traj_configs/README.md](configs/traj_configs/README.md).
+
+To watch what you recorded, press **Eval Benchmark**, enter the same repo id,
+**Load Dataset**, and step through with **Prev / Next Episode** and
+**Replay Episode**.
+
+### In parallel, from one command
+
+One simulator generates one episode at a time. For a bigger dataset,
+`launch_trajgen_pool.py` brings up several headless workers and a coordinator
+panel, then merges their shards into a single dataset when the target is
+reached:
 
 ```bash
-tar xzf vine_assets.tar.gz -C ~/code/SplatSim
+python scripts/launch_trajgen_pool.py --robot sim_pybullet_vine_interactive \
+    --workers 4 --base-repo-id you/vine_reach
 ```
 
-That gives you:
+Set the episode target in the panel and press Start; it runs unattended and
+tears the workers down on exit (Ctrl-C included). VRAM is what limits
+`--workers`, not CPU cores. To reuse settings you tuned in the GUI, pass the
+exported file with `--traj-config-file`; anything else you'd pass to
+`launch_nodes.py` goes through `--extra-worker-arg`, and `--dry-run` prints
+the commands without launching. The script's docstring lists the rest.
 
-```
-data/output/robot_iphone_w_engine_curtain/   gaussian splat of the robot
-data/output/vine_scene/                      gaussian splat of the vine highbay scene
-data/test_data/vine_scene/                   structure-from-motion output for the vine scene
-data/vine_seg/vine_and_trellis/              vine collision mesh, grape targets, soft-cost field
-```
+## Tuning the vine task
 
-### 2. Launch
-
-Run the command at the top of this section. You should see the PyBullet
-window, the control GUI, and a splat render with the arm in front of the vine.
-
-<details>
-<summary>What each downloaded piece is for</summary>
-
-- `data/output/*/point_cloud/iteration_30000/point_cloud.ply` — the trained
-  splats. The robot's is articulated as the arm moves; the vine scene's is the
-  rendered background. `grapes_only.ply` alongside it is the segmented fruit,
-  used by `scripts/tune_goal_pose.py`.
-- `data/test_data/vine_scene/sparse/0/` — camera poses from an
-  [hloc](https://github.com/cvg/Hierarchical-Localization) run with
-  disk+lightglue. The base camera view is picked from these. This isn't the
-  COLMAP `convert.py` route described under *Adding a new robot*, so don't
-  expect to regenerate it that way.
-- `data/test_data/vine_scene/images/` — the source frames; the server loads
-  the one the base camera corresponds to.
-- `data/vine_seg/vine_and_trellis/vine_and_trellis.urdf` + `_collision.obj` —
-  the hard trunk and trellis, loaded as a PyBullet obstacle. Pre-baked in sim
-  frame, so there's no splat-to-sim transform to calibrate.
-- `data/vine_seg/vine_and_trellis/grape_targets_manual.json` — the bunch
-  centers the task aims at. Hand-annotated, because colour segmentation can't
-  see green fruit.
-- `data/vine_seg/vine_and_trellis/vine_and_trellis_cost_field_sim.npz` — the
-  soft-cost field the RRT planner trades off against, so foliage is a cost
-  rather than a wall.
-
-These come from `scripts/segment_vine_splat.py`, `scripts/build_vine_collision.py`
-and `scripts/mark_grape_targets.py` if you ever need to rebuild them. If you keep
-your splats somewhere else, the three entries to repoint in
-`configs/object_configs/objects.yaml` are `robot_iphone_w_engine_curtain`,
-`vine_scene` and `vine_and_trellis`.
-</details>
-
-### Retargeting the task
-
-The knobs are class attributes on `VineGrapeReachPybulletRobotServer` in
-`splatsim/robots/sim_robot_pybullet_vine.py` — `TARGET_BUNCH_INDEX` (which
-bunch, largest first), `GRAPE_STANDOFF_M` (how close), and the
-`GRIPPER_CAMERA_UP_WORLD` / `CAMERA_FORWARD_AXIS` pair that decides how the
-wrist camera frames the fruit. Tune the goal pose live with
-`scripts/tune_goal_pose.py` rather than by guessing; the roll in particular is
-specified as an absolute world direction because a relative offset is measured
-from an arbitrary IK branch.
-
-If the log fills with `vine env: robot-derived grape goal failed — falling back
-to the static task target`, the goal solver could not find a collision-free IK
-that satisfies `GRIPPER_CAMERA_UP_WORLD` within its tolerance. The sim still
-runs, on the static pose from the config. Widen the tolerances or retune with
-the script above.
+- `scripts/tune_goal_pose.py --once --target 0 --out goal.png` — with the sim
+  running, renders the wrist camera at the goal pose and the base view with
+  every bunch marked. The quickest way to see whether the arm is aiming at
+  fruit.
+- `scripts/mark_grape_targets.py --load` — click on bunches in the splat
+  render to add or move targets; saves to
+  `data/scenes/vine_scene/segmentations/vine_and_trellis/grape_targets_manual.json`.
+- Task knobs are class attributes on `VineGrapeReachPybulletRobotServer` in
+  `splatsim/robots/sim_robot_pybullet_vine.py`: `TARGET_BUNCH_INDEX` (`None`
+  = random bunch each reset), `GRAPE_STANDOFF_M`, and the camera-framing
+  settings, each documented inline.
 
 ## GELLO integration
 

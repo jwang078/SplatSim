@@ -1,33 +1,118 @@
 #!/usr/bin/env bash
-# SplatSim pip-layer installer. Run AFTER creating + activating the conda env:
+# SplatSim installer. One command from a fresh clone:
 #
-#     conda env create -f environment.yml
-#     conda activate splatsim
 #     ./install.sh
 #
-# Order is the whole point of this script and cannot be expressed in
-# pyproject.toml:
+# It creates (or, with your say-so, reuses / recreates) the `splatsim` conda
+# env from environment.yml, then installs everything into it in the one
+# order that works — which is the whole point of this script and cannot be
+# expressed in pyproject.toml:
 #   1. git submodules            — not a pip concept
 #   2. torch from the CUDA 12.8 index — the +cu128 builds are not on PyPI
 #   3. the rest of the pip deps  — pyproject.toml
 #   4. source-built CUDA extensions — their setup.py IMPORTS torch, so torch
 #      must already be present; hence --no-build-isolation
+#
+# Knobs (environment variables):
+#   ENV_NAME=splatsim        conda env to create/use
+#   ENV_ACTION=use|recreate  what to do if ENV_NAME already exists (else: ask)
+#   ENV_ONLY=true            stop after the conda env is ready
+#   LEROBOT_DIR, SKIP_LEROBOT, TORCH_INDEX — see below
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
-LEROBOT_DIR="${LEROBOT_DIR:-$(cd .. 2>/dev/null && pwd)/lerobot}"
-SKIP_LEROBOT="${SKIP_LEROBOT:-false}"
-
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
-if [[ -z "${CONDA_PREFIX:-}" ]]; then
-    echo "ERROR: no conda env active. Run: conda env create -f environment.yml && conda activate splatsim" >&2
-    exit 1
+# ── 0. conda env — decided BEFORE any other work ───────────────────────────
+ENV_NAME="${ENV_NAME:-splatsim}"
+ENV_ACTION="${ENV_ACTION:-}"
+REQUIRED_PY="$(sed -n 's/^\s*-\s*python=\([0-9]*\.[0-9]*\).*/\1/p' environment.yml)"
+
+command -v conda >/dev/null || {
+    echo "ERROR: conda not found on PATH. Install miniforge/miniconda first." >&2; exit 1; }
+CONDA_BASE="$(conda info --base)"
+# shellcheck disable=SC1091
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+
+env_exists() { conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; }
+
+ask() {  # ask "<prompt>" "<valid letters>" -> echoes the chosen letter
+    local prompt="$1" valid="$2" ans
+    if [[ ! -t 0 ]]; then
+        echo "ERROR: '$ENV_NAME' already exists and stdin is not a terminal." >&2
+        echo "       Re-run with ENV_ACTION=use (install into it) or ENV_ACTION=recreate (delete + rebuild)." >&2
+        exit 1
+    fi
+    while true; do
+        read -r -p "$prompt " ans
+        ans="${ans,,}"
+        [[ -n "$ans" && "$valid" == *"$ans"* ]] && { echo "$ans"; return; }
+    done
+}
+
+if env_exists; then
+    # Inspect what's there so the choice is informed: the python minor
+    # version must match environment.yml (extensions are built against it)
+    # and nvcc must be present (comes from environment.yml's cuda-nvcc).
+    env_py="$(conda run -n "$ENV_NAME" python -c 'import sys;print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || echo "unknown")"
+    if conda run -n "$ENV_NAME" bash -c 'command -v nvcc' >/dev/null 2>&1; then env_nvcc="yes"; else env_nvcc="MISSING"; fi
+    compatible=true
+    [[ "$env_py" == "$REQUIRED_PY" && "$env_nvcc" == "yes" ]] || compatible=false
+
+    say "conda env '$ENV_NAME' already exists (python $env_py, nvcc: $env_nvcc)"
+    if [[ -z "$ENV_ACTION" ]]; then
+        if $compatible; then
+            echo "It looks compatible with environment.yml (python $REQUIRED_PY + nvcc)."
+            choice="$(ask "[u]se it and install into it / [r]ecreate it from scratch / [q]uit?" "urq")"
+        else
+            echo "It does NOT match environment.yml (needs python $REQUIRED_PY and nvcc) — installing into it is unlikely to work."
+            choice="$(ask "[r]ecreate it from scratch (deletes the env) / [u]se it anyway / [q]uit?" "ruq")"
+        fi
+        case "$choice" in u) ENV_ACTION=use ;; r) ENV_ACTION=recreate ;; q) echo "Aborted; nothing was changed."; exit 0 ;; esac
+    fi
+    case "$ENV_ACTION" in
+        use)      say "installing into the existing '$ENV_NAME'" ;;
+        recreate) say "removing '$ENV_NAME' and recreating it from environment.yml"
+                  set +u; conda deactivate 2>/dev/null || true; set -u
+                  conda env remove -n "$ENV_NAME" -y
+                  conda env create -f environment.yml -n "$ENV_NAME" -y ;;
+        *) echo "ERROR: ENV_ACTION must be 'use' or 'recreate' (got '$ENV_ACTION')" >&2; exit 1 ;;
+    esac
+else
+    say "creating conda env '$ENV_NAME' from environment.yml"
+    conda env create -f environment.yml -n "$ENV_NAME" -y
 fi
+
+# conda's own activate/deactivate hooks reference unset variables, which
+# `set -u` would turn into a hard error — relax it just around them.
+set +u
+conda activate "$ENV_NAME"
+set -u
 command -v nvcc >/dev/null || {
-    echo "ERROR: nvcc not found. It comes from environment.yml (cuda-nvcc); is the env active?" >&2; exit 1; }
+    echo "ERROR: nvcc not found in '$ENV_NAME'. It comes from environment.yml (cuda-nvcc); recreate the env (ENV_ACTION=recreate)." >&2; exit 1; }
 say "env: $CONDA_PREFIX | python $(python -V 2>&1 | cut -d' ' -f2) | nvcc $(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')"
+if [[ "${ENV_ONLY:-false}" == "true" ]]; then
+    echo "ENV_ONLY=true — conda env is ready; stopping here. Activate with: conda activate $ENV_NAME"; exit 0
+fi
+
+# ── knobs for the pip layer ────────────────────────────────────────────────
+TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
+# Where LeRobot lives. Default is INSIDE this repo (external/, gitignored) so
+# the installer never creates anything outside the directory you ran it in.
+# An existing sibling checkout at ../lerobot is used if present (reading it
+# is fine; we just won't create one there). LEROBOT_DIR overrides both.
+if [[ -z "${LEROBOT_DIR:-}" ]]; then
+    if [[ -d "external/lerobot" ]]; then
+        LEROBOT_DIR="$PWD/external/lerobot"
+    elif [[ -d "../lerobot" ]]; then
+        LEROBOT_DIR="$(cd ../lerobot && pwd)"
+        echo "NOTE: using the existing LeRobot checkout at $LEROBOT_DIR (set LEROBOT_DIR to override)"
+    else
+        LEROBOT_DIR="$PWD/external/lerobot"
+    fi
+fi
+SKIP_LEROBOT="${SKIP_LEROBOT:-false}"
+export SKIP_LEROBOT   # read by the verify step below
 
 say "1/4  git submodules"
 git submodule update --init --recursive
@@ -82,34 +167,33 @@ pip install -e submodules/gello_software
 pip install -r submodules/gello_software/requirements.txt
 pip install -e submodules/gello_software/third_party/DynamixelSDK/python
 
-# LeRobot is a co-developed SIBLING checkout, not a pinned dependency — it is
-# imported by the dataset/eval integration (splatsim/utils/lerobot_*.py,
-# rrt_to_goal.py). Installed editable so both repos can be worked on together.
+# LeRobot: our fork (github.com/jwang078/lerobot) is co-developed with this
+# repo — it holds the training / DAgger side, and SplatSim's dataset
+# recording + eval-benchmark replay read and write LeRobot datasets through
+# it. Cloned into external/lerobot (see LEROBOT_DIR above) if not already
+# available, installed editable so both can be worked on together.
+# SKIP_LEROBOT=true skips the step entirely (the bare simulator still runs).
+LEROBOT_URL="${LEROBOT_URL:-https://github.com/jwang078/lerobot.git}"
 if [[ "$SKIP_LEROBOT" != "true" ]]; then
-    if [[ -d "$LEROBOT_DIR" ]]; then
-        say "LeRobot (editable, from $LEROBOT_DIR)"
-        # [dataset] is what the recording / eval-replay paths import
-        # (LeRobotDataset needs `datasets` + torchcodec).
-        pip install -e "$LEROBOT_DIR[dataset]"
-    else
-        cat >&2 <<MSG
-
-NOTE: LeRobot not found at $LEROBOT_DIR — skipping.
-      The sim server runs without it; dataset recording, eval-benchmark
-      replay and policy agents will not import until you install it:
-          git clone git@github.com:jwang078/lerobot.git "$LEROBOT_DIR"
-          pip install -e "$LEROBOT_DIR[dataset]"
-      Or re-run with LEROBOT_DIR=/path/to/lerobot ./install.sh
-      Set SKIP_LEROBOT=true to silence this.
-MSG
+    if [[ ! -d "$LEROBOT_DIR" ]]; then
+        say "LeRobot: cloning $LEROBOT_URL -> $LEROBOT_DIR"
+        git clone "$LEROBOT_URL" "$LEROBOT_DIR"
     fi
+    say "LeRobot (editable, from $LEROBOT_DIR)"
+    # [dataset] is what the recording / eval-replay paths import
+    # (LeRobotDataset needs `datasets` + torchcodec).
+    pip install -e "$LEROBOT_DIR[dataset]"
 fi
 
 say "verifying"
 python - <<'PY'
 import importlib
 ok=True
-for m in ("torch","torchvision","gsplat","pybullet","diff_gaussian_rasterization","simple_knn","splatsim"):
+mods=["torch","torchvision","gsplat","pybullet","diff_gaussian_rasterization","simple_knn","splatsim"]
+import os
+if os.environ.get("SKIP_LEROBOT","false")!="true":
+    mods += ["lerobot","lerobot.datasets.lerobot_dataset"]
+for m in mods:
     try:
         importlib.import_module(m); print(f"  {m}: OK")
     except Exception as e:
@@ -118,4 +202,4 @@ import torch
 print(f"  torch {torch.__version__} | cuda available: {torch.cuda.is_available()}")
 raise SystemExit(0 if ok else 1)
 PY
-say "done"
+say "done — activate with: conda activate $ENV_NAME"
