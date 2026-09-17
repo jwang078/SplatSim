@@ -11,7 +11,7 @@ from splatsim.configs import TrajectoryGenModeConfig
 from splatsim.configs.mode_config import PathSelectionStrategy
 from splatsim.utils import rrt_path_utils
 from splatsim.utils.lerobot_utils import MIN_EPISODE_FRAMES
-from splatsim.utils.rrt_to_goal import RRTToGoalPlanner, RRTPlanningError
+from splatsim.utils.rrt_to_goal import RRTToGoalPlanner, RRTPlanningError, RRTPlanningAborted
 from splatsim.configs.env_config import SplatSimObject
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,8 @@ class TrajectoryGenerator:
         trajectory_gen_config: Optional[TrajectoryGenModeConfig] = None,
         pb_client_id: int = 0,
         soft_cost_payload: Optional[dict] = None,
+        cancel_check=None,
+        progress_fn=None,
     ):
         """
         Initialize trajectory generator.
@@ -103,6 +105,10 @@ class TrajectoryGenerator:
         # `self.wrist_camera` — and the parent robot server sets that up AFTER
         # constructing this generator, so calling it now would AttributeError.
         self._planner = None
+        # () -> bool polled by the planner between RRT attempts; lets the
+        # server's Stop button / shutdown interrupt an in-flight plan.
+        self._cancel_check = cancel_check
+        self._progress_fn = progress_fn
 
         # Optional pre-validated base trajectory (T, num_dofs), set by the env's
         # reset via `_check_scenario_solvable` after it already planned a path to
@@ -292,7 +298,13 @@ class TrajectoryGenerator:
                 q_goal_bias=(None if q_goal_bias is None else np.asarray(q_goal_bias, dtype=np.float64)),
             )
             return traj
-        except RRTPlanningError:
+        except RRTPlanningAborted:
+            raise
+        except RRTPlanningError as e:
+            # Say WHY, once per attempt: randomize_objects re-rolls on None
+            # up to 100 times, and without this the only symptom of a
+            # systematically unsolvable goal is a slow, silent reset.
+            logger.info("try_plan_to_goal: %s", str(e).splitlines()[0][:300])
             return None
 
     def _get_start_and_goal_qs(self) -> Tuple[Optional[np.ndarray], List[np.ndarray]]:
@@ -361,6 +373,8 @@ class TrajectoryGenerator:
         historically applied."""
         if self._planner is None:
             self._planner = RRTToGoalPlanner(
+                cancel_check=self._cancel_check,
+                progress_fn=self._progress_fn,
                 pb_client=self._pb_client_id,
                 robot_id=self.robot_id,
                 joint_indices=list(self.joint_indices),

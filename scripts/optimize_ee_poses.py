@@ -34,42 +34,23 @@ from splatsim.utils import grape_targets as G
 from splatsim.utils.rrt_path_utils import check_links_in_collision
 from splatsim.utils.splat_ply_io import read_gaussian_ply
 
-GRAPES_PLY = "data/output/vine_scene/point_cloud/iteration_30000/grapes_only.ply"
-SCENE_DIR = Path("data/vine_seg/vine_and_trellis")
+GRAPES_PLY = "data/scenes/vine_scene/splat/point_cloud/iteration_30000/grapes_only.ply"
 
 
 def load_hard_points(env_cls, step: int = 1):
-    """Point-sample the HARD collision mesh (trellis + thick branches).
-
-    Vertices plus per-face centroids: vertices alone leave gaps across large
-    triangles, and a gap in this cloud is a gripper that passes through a
-    trellis wire unnoticed. The URDF loads the mesh at identity (it was baked
-    into sim frame), so these coordinates need no transform.
-    """
-    obj = None
+    """Point-sample the HARD collision mesh of the env's vine object, in sim
+    frame. Delegates to goal_pose.sample_collision_mesh (the env's own
+    sampler) and honours the build's collision_frame via ASSETS_TRANSFORM."""
+    from splatsim.utils.goal_pose import sample_collision_mesh
+    from splatsim.utils.paths import resolve_splatsim_path
     for o in getattr(env_cls.ENV_CONFIG, "objects", []):
-        urdf = Path(str(o.urdf_path))
-        if urdf.exists():
-            for ln in urdf.read_text().splitlines():
-                if "<mesh filename=" in ln and "collision" in ln:
-                    obj = urdf.parent / ln.split('filename="')[1].split('"')[0]
-                    break
-        if obj is not None:
-            break
-    if obj is None or not obj.exists():
-        return None
-    verts, faces = [], []
-    for ln in obj.read_text().splitlines():
-        if ln.startswith("v "):
-            verts.append([float(x) for x in ln.split()[1:4]])
-        elif ln.startswith("f "):
-            faces.append([int(t.split("/")[0]) - 1 for t in ln.split()[1:4]])
-    v = np.asarray(verts, dtype=np.float64)
-    pts = [v]
-    if faces:
-        f = np.asarray(faces, dtype=int)
-        pts.append(v[f].mean(axis=1))
-    return np.concatenate(pts)[::step]
+        if getattr(o, "urdf_path", None):
+            pts = sample_collision_mesh(resolve_splatsim_path(str(o.urdf_path)),
+                                        transform=getattr(env_cls, "ASSETS_TRANSFORM", None),
+                                        step=step)
+            if pts is not None:
+                return pts
+    return None
 
 
 def load_scene(client, env_cls):
@@ -107,7 +88,7 @@ def main():
                          "and the setting a grasp task would use")
     ap.add_argument("--cam-up", default="inverted",
                     choices=["inverted", "upright", "off"])
-    ap.add_argument("--out", default="data/vine_seg/vine_and_trellis/viz")
+    ap.add_argument("--out", default="data/scenes/vine_scene/segmentations/vine_and_trellis/viz")
     args = ap.parse_args()
 
     import matplotlib
@@ -120,14 +101,14 @@ def main():
     out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------------------------------------------------- 1. load the scene
-    T = np.asarray(json.loads((SCENE_DIR / "splat_to_sim.json").read_text()),
+    T = np.asarray(json.loads((V._SEG_DIR / "splat_to_sim.json").read_text()),
                    dtype=np.float64)
     grapes = read_gaussian_ply(args.grapes_ply).xyz @ T[:3, :3].T + T[:3, 3]
     field = np.load(V.SOFT_COST_NPZ, allow_pickle=False)
     veg = np.asarray(field["points"], dtype=np.float64)
     print(f"grapes {len(grapes):,} pts | vegetation {len(veg):,} pts")
 
-    bunches = G.load_targets(V.GRAPE_TARGETS_JSON)
+    bunches = V.load_grape_targets()
     bunch = bunches[args.target % len(bunches)]
     centre = np.asarray(bunch["center"], dtype=np.float64)
     # Only the fruit belonging to THIS bunch is the visibility target.

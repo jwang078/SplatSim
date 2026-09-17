@@ -214,6 +214,13 @@ class RRTRuntimeState:
     no_lookback: bool = False
 
 
+class RRTPlanningAborted(RuntimeError):
+    """Planning was cancelled by the caller's ``cancel_check`` (GUI Stop,
+    shutdown, mode change). Deliberately NOT an RRTPlanningError subclass:
+    every retry/fallback loop catches RRTPlanningError to try the next
+    candidate, and an abort must escape all of them."""
+
+
 class RRTPlanningError(RuntimeError):
     """Raised when RRT planning fails with a recognizable cause (start/goal
     in collision, no path found within iteration budget, etc.)."""
@@ -334,6 +341,14 @@ class RRTToGoalPlanner:
         ik_goal_selection: IkGoalSelectionStrategy | str | None = None,
         num_path_candidates_per_ik: int = 1,
         max_path_attempts_per_ik: int = 5,
+        # () -> bool, polled between RRT attempts / IK candidates so a long
+        # plan can be stopped within ~one RRT call (raises RRTPlanningAborted).
+        cancel_check=None,
+        # (str) -> None, called at planning stage boundaries with a short
+        # human-readable phase ("IK candidate 1/2 — RRT attempt 3/5"); the
+        # server mirrors it into the GUI status line so a long plan doesn't
+        # look like a freeze. Exceptions from it are swallowed.
+        progress_fn=None,
         path_perturbation_scale: float = 0.001,
         # Acceptance gate on the ik_goal_selection early exit. When set (and
         # ik_goal_selection orders the candidates), the first IK's winning
@@ -568,6 +583,8 @@ class RRTToGoalPlanner:
         # ruckig fallback backend, doesn't hit its cloud API that often).
         self._parametrize_per_candidate = bool(parametrize_per_candidate)
         self._path_selection = path_selection
+        self._cancel_check = cancel_check
+        self._progress_fn = progress_fn
         # Joint-arc regularizer added to EVERY path-selection strategy's base
         # score (units: base-score-units per rad — m/rad for the arc-length
         # strategies). 0 (default) = off. Motivation: EE_ARC_LENGTH is blind
@@ -1511,6 +1528,23 @@ class RRTToGoalPlanner:
     #  Planning                                                          #
     # ------------------------------------------------------------------ #
 
+    def set_cancel_check(self, fn) -> None:
+        """Install / replace the ``() -> bool`` cancel poll (see __init__)."""
+        self._cancel_check = fn
+
+    def _progress(self, text: str) -> None:
+        fn = getattr(self, "_progress_fn", None)
+        if fn is not None:
+            try:
+                fn(text)
+            except Exception:
+                pass
+
+    def _check_cancel(self) -> None:
+        fn = getattr(self, "_cancel_check", None)
+        if fn is not None and fn():
+            raise RRTPlanningAborted("planning cancelled")
+
     def plan(self, q_start, target_ee_pos, target_ee_quat, *args, **kwargs):
         """Thin RNG-scoping wrapper around `_plan_inner` (the real planner —
         see its docstring). With `plan_rng_seed` set, the global numpy RNG is
@@ -1672,6 +1706,7 @@ class RRTToGoalPlanner:
                 logger.info(
                     "Start config in collision; attempting escape chain (contact-normal → self-collision gradient)..."
                 )
+                self._progress("start pose in collision — escaping")
                 escape_path = self._try_escape_chain(q_start)
                 if escape_path is None:
                     raise RRTPlanningError(
@@ -1713,6 +1748,7 @@ class RRTToGoalPlanner:
                         f"the collision-history filter — no untried branch remains"
                     )
             logger.info("Resolved EE goal to %d collision-free IK candidate(s)", len(candidates))
+            self._progress(f"{len(candidates)} IK candidate(s) for the goal")
 
             # Planning loop. The two scoring axes work TOGETHER (not
             # mutually exclusive):
@@ -1817,6 +1853,8 @@ class RRTToGoalPlanner:
                 # With num_path_candidates_per_ik=1 (default) this is a
                 # single get_path call; with >1, the helper perturbs
                 # endpoints to force RRT to find distinct paths.
+                self._check_cancel()
+                self._progress_ik = (tried, len(_loop_ordered))
                 candidate_paths = self._generate_paths_for_ik(q_start, q_goal)
                 if not candidate_paths:
                     continue
@@ -3102,6 +3140,7 @@ class RRTToGoalPlanner:
             )
 
         if self._elastic_smooth_passes and out.shape[0] >= 3:
+            self._progress("smoothing + retiming the chosen path")
             out = np.asarray(
                 elastic_smooth_path(
                     out,
@@ -3716,6 +3755,11 @@ class RRTToGoalPlanner:
         # up on this goal and let the caller try the next IK candidate.
         early_abort_after = 10**6
         while len(paths) < num_target and attempts < max_attempts:
+            self._check_cancel()
+            _ik = getattr(self, "_progress_ik", None)
+            self._progress(
+                (f"IK candidate {_ik[0]}/{_ik[1]} — " if _ik else "")
+                + f"RRT path {len(paths) + 1}/{num_target}, attempt {attempts + 1}/{max_attempts}")
             if not paths and attempts >= early_abort_after:
                 logger.info(
                     "IK goal looks unplannable (%d/%d attempts, 0 paths) — "

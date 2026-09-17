@@ -3,17 +3,17 @@
 Extends the small-engine env the same way the planar env does: same UR5
 (`robot_iphone_w_engine_curtain` — sisbot.urdf at its usual base position),
 but the scene is the real scanned grape vine at the origin. The vine's
-splat->sim transform is baked into its collision URDF (see objects.yaml
-`vine_and_trellis:` entry), so the object loads at identity.
+splat->sim transform is baked into its collision URDF (collision_frame: sim
+in its scene.yaml), so the object loads at identity.
 
 Task: reach an end-effector pose `GRAPE_STANDOFF_M` short of a grape bunch
-(bunch clusters from data/vine_seg/<scene>/grape_targets.json, produced by
+(bunch clusters from the build's grape_targets.json under data/scenes/, produced by
 the segmentation pipeline). The env also publishes a `soft_cost` payload in
 its oracle env config so the RRT planner runs cost-aware over the foliage
 (hard trunk mesh stays a binary obstacle).
 
 Class attrs are the knobs; subclass or edit to retarget:
-  TARGET_BUNCH_INDEX   which bunch (largest-first) the task aims at
+  TARGET_BUNCH_INDEX   which bunch the task aims at; None = random per reset
   GRAPE_STANDOFF_M     how close the gripper should get
   GRAPE_TARGETS_JSON / SOFT_COST_NPZ / VINE_SPLAT_NAME  asset locations
 """
@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from splatsim.configs import scene_registry
 from splatsim.configs.env_config import EnvConfig, SplatObjectConfig, TaskConfig
 from splatsim.robots.sim_robot_pybullet_small_engine import (
     SmallEnginePybulletRobotServer,
@@ -33,10 +34,27 @@ from splatsim.utils import grape_targets
 
 logger = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Same UR5 mount as the small-engine env (objects.yaml base_position).
 _ROBOT_BASE_POS = np.array([0.0, 0.0, -0.088])
+
+
+def _build_frame(vine_splat_name: str):
+    """(collision_frame, splat->sim 4x4 or None) for a registered segmentation
+    build. Everything the build produced — collision URDF, cost field, grape
+    targets — shares ONE frame declaration, `collision_frame` in its
+    scene.yaml, and one matrix, the scan's `transformation`:
+      sim   -> artifacts were baked into sim frame; transform is None.
+      splat -> artifacts are in the scan frame; transform is applied at load
+               (load_urdf for the URDF, here for targets + cost field)."""
+    cfg = scene_registry.get(vine_splat_name) or {}
+    frame = cfg.get("collision_frame", "sim")
+    if frame == "sim":
+        return frame, None
+    T = (cfg.get("transformation") or {}).get("matrix")
+    if T is None:
+        raise ValueError(f"{vine_splat_name}: collision_frame='splat' but no transformation")
+    return frame, np.asarray(T, dtype=np.float64)
 
 
 def _vine_env_config(
@@ -46,12 +64,15 @@ def _vine_env_config(
     grape_targets_json: Path,
     soft_cost_npz: Path,
     vine_splat_name: str = "vine_and_trellis",
+    assets_transform=None,
 ) -> EnvConfig:
     """Build the vine reach EnvConfig. Pure function so tests/subclasses can
-    build variants (different bunch, standoff, assets) without subclassing."""
+    build variants (different bunch, standoff, assets) without subclassing.
+    ``assets_transform`` is the scan's splat->sim matrix when the build's
+    artifacts are in scan frame (collision_frame: splat), else None."""
     task = None
     try:
-        bunches = grape_targets.load_targets(grape_targets_json)
+        bunches = grape_targets.load_targets(grape_targets_json, transform=assets_transform)
         bunch = bunches[bunch_index]
         # Horizontal approach: aim from the robot column at bunch height so
         # the gripper closes in level with the bunch rather than from above.
@@ -76,6 +97,10 @@ def _vine_env_config(
     soft_cost = None
     if soft_cost_npz.exists():
         soft_cost = {"npz_path": str(soft_cost_npz)}
+        if assets_transform is not None:
+            # Raw (xyz + weight) npz: SoftCostField re-rasterises the grid in
+            # sim frame after applying this. A prebuilt grid cannot be re-posed.
+            soft_cost["transform"] = assets_transform.tolist()
     else:
         logger.warning(
             "vine env: soft-cost npz missing (%s) — planner will run "
@@ -98,8 +123,8 @@ def _vine_env_config(
                 # Explicit z-range: a missing range falls back to
                 # TABLE_LIMITS, which raises in this tableless env.
                 position_range_z=(0, 0),
-                # Collision URDF is pre-baked in sim frame -> loads at origin.
-                # Splat visual (when enabled) is placed by transformation.matrix.
+                # Collision URDF placement follows the build's collision_frame
+                # (load_urdf); splat visual (when enabled) by transformation.matrix.
                 load_splat=False,
             ),
         ],
@@ -136,18 +161,42 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
     PYBULLET_CAMERA_TARGET = (-0.4, 0.55, 0.5)
     PYBULLET_CAMERA_FOV = 65.0
 
-    # All assets from the trellis-inclusive build (data/vine_seg/vine_and_trellis):
-    # trellis gaussians are forced into the hard collision mesh via
+    # The vine is a segmentation BUILD registered under data/scenes/ — its
+    # scene.yaml carries urdf/ply paths and the scan's splat->sim transform,
+    # and the folder holds the grape targets + cost field. Retarget to another
+    # vine (or another build of the same scan) by changing this one name; see
+    # README "Data layout". This build is the trellis-inclusive one: trellis
+    # gaussians are forced into the hard collision mesh via
     # `segment_vine_splat.py --force-hard-diff vine_only.ply`.
     VINE_SPLAT_NAME = "vine_and_trellis"
+    _SEG_DIR = scene_registry.scene_dir(VINE_SPLAT_NAME)
     # Prefers grape_targets_manual.json when present (see
     # grape_targets.resolve_targets_json): hand annotation outranks detector
     # output, because colour segmentation cannot see green fruit and this
     # prop has red, purple AND green bunches.
-    GRAPE_TARGETS_JSON = grape_targets.resolve_targets_json(
-        _REPO_ROOT / "data/vine_seg/vine_and_trellis")
-    SOFT_COST_NPZ = _REPO_ROOT / "data/vine_seg/vine_and_trellis/vine_and_trellis_cost_field_sim.npz"
-    TARGET_BUNCH_INDEX = 0
+    GRAPE_TARGETS_JSON = grape_targets.resolve_targets_json(_SEG_DIR)
+    # One frame declaration for every artifact of the build (see _build_frame).
+    # Baked builds ship the prebuilt sim-frame grid; unbaked ones ship the raw
+    # soft-cost points, rasterised at load after the transform.
+    ASSETS_FRAME, ASSETS_TRANSFORM = _build_frame(VINE_SPLAT_NAME)
+    SOFT_COST_NPZ = (
+        _SEG_DIR / f"{VINE_SPLAT_NAME}_cost_field_sim.npz" if ASSETS_FRAME == "sim"
+        else _SEG_DIR / f"{VINE_SPLAT_NAME}_soft_cost.npz"
+    )
+
+    @classmethod
+    def load_grape_targets(cls) -> list:
+        """Bunch targets in SIM frame regardless of how the build was written.
+        Use this rather than grape_targets.load_targets(cls.GRAPE_TARGETS_JSON)."""
+        return grape_targets.load_targets(cls.GRAPE_TARGETS_JSON, transform=cls.ASSETS_TRANSFORM)
+    # Which bunch the task aims at. None (default) = a NEW random bunch at
+    # every reset, drawn from the bunches the goal search can reach (a bunch
+    # whose search fails is dropped from the draw for the session and
+    # logged). Set an int to pin one bunch, e.g. for an eval benchmark.
+    TARGET_BUNCH_INDEX = None
+    # Bunch used for the STATIC floor task pose built at class-definition
+    # time (no robot yet); the live target comes from _pick_target_bunch.
+    STATIC_TASK_BUNCH_INDEX = 0
     GRAPE_STANDOFF_M = 0.10
     # Gripper (cutter) approach direction in the wrist_camera_link frame,
     # measured by FK as the direction of wrist -> finger-pad midpoint; see
@@ -190,11 +239,16 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
 
     ENV_CONFIG = _vine_env_config(
         name="vine_grape_reach",
-        bunch_index=TARGET_BUNCH_INDEX,
-        standoff_m=GRAPE_STANDOFF_M,
+        bunch_index=STATIC_TASK_BUNCH_INDEX,
+        # The static target is expressed at the EE link, so add the tip
+        # offset: GRAPE_STANDOFF_M is fingertip-to-bunch. Without this the
+        # static pose put the fingers 10 cm INSIDE the bunch and no IK could
+        # reach it.
+        standoff_m=GRAPE_STANDOFF_M + GRIPPER_TIP_OFFSET_M,
         grape_targets_json=GRAPE_TARGETS_JSON,
         soft_cost_npz=SOFT_COST_NPZ,
         vine_splat_name=VINE_SPLAT_NAME,
+        assets_transform=ASSETS_TRANSFORM,
     )
 
     # Start-pose randomization: per-joint deltas (rad) around the home
@@ -265,7 +319,10 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
         except Exception:
             logger.exception(
                 "vine env: could not refine trajectory-gen goal — GUI batch "
-                "generation will use the static task pose"
+                "generation will use the STATIC task pose (bunch centre, "
+                "horizontal approach, no fingertip offset). Episodes will "
+                "still aim at the bunch but from the wrong distance; fix the "
+                "goal search before recording."
             )
         # GUI-only overlay of the SOFT vegetation (leaves/twigs/grapes the
         # pipeline kept OUT of the hard collision mesh), viridis by cost
@@ -301,8 +358,29 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
         # Anti-wobble settings (elastic_smooth_passes=30,
         # uniform_path_speed=True) are TrajectoryGenModeConfig defaults now —
         # no per-env override needed; tune them live in the GUI Traj Gen panel.
+        # The env-OWNED goal. Once __init__ has refined it, this is the
+        # search-derived imaging pose (cached in _grape_goal_cache) — so
+        # reassert_env_traj_config_fields re-applies THAT after a config push
+        # or import, never the static floor. Before refinement (or if it
+        # failed) it is the static task pose: bunch centre, horizontal
+        # approach, fingertip offset applied. Some EE goal must always be
+        # set — with none, TrajectoryGenerator._get_start_and_goal_qs plans
+        # every episode after the first to a RANDOM collision-free config.
+        refined = getattr(self, "_grape_goal_cache", None)
+        task = self.ENV_CONFIG.task
+        if refined is not None:
+            pos, quat, q_seed = refined
+            goal = dict(ee_pos_goal=[float(v) for v in pos],
+                        ee_quat_goal=[float(v) for v in quat],
+                        q_goal_bias=[float(v) for v in q_seed])
+        elif task is not None:
+            goal = dict(ee_pos_goal=list(task.target_ee_pos),
+                        ee_quat_goal=list(task.target_ee_quat))
+        else:
+            goal = {}
         return dataclasses.replace(
             super()._get_default_trajectory_gen_config(),
+            **goal,
             # Grasp goals put the fingers within mm of the vine by design —
             # enable the planner's finger<->obstacle IK filter.
             ik_skip_gripper_obstacle_pairs=True,
@@ -407,33 +485,146 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
         (published to the external RRT planner over ZMQ) AND
         _resolve_goal_ee_target (reset-time solvability check + in-env
         trajectory generation), so all consumers aim at the same pose.
-        Cached after the first computation (goal is static per scene).
-        Returns (pos, quat, q_seed) or raises."""
-        cached = getattr(self, "_grape_goal_cache", None)
+        Cached per bunch; `_grape_goal_cache` is the goal for the ACTIVE
+        bunch (`active_bunch_index`). Returns (pos, quat, q_seed) or raises."""
+        idx = self.active_bunch_index
+        by_bunch = self.__dict__.setdefault("_grape_goal_by_bunch", {})
+        cached = by_bunch.get(idx)
         if cached is not None:
+            self._grape_goal_cache = cached
             return cached
         from splatsim.utils.goal_pose import GoalPoseSpec, solve_goal_pose
 
-        bunches = grape_targets.load_targets(self.GRAPE_TARGETS_JSON)
-        bunch = bunches[self.TARGET_BUNCH_INDEX]
+        bunches = self.load_grape_targets()
+        bunch = bunches[idx]
         if bunch.get("peduncle") is None and self.AIM_AT_PEDUNCLE:
             logger.warning(
                 "vine env: %s has no 'peduncle' field — positioning off the "
                 "bunch centre. Run scripts/regen_grape_targets.py.",
                 self.GRAPE_TARGETS_JSON,
             )
+        arm = list(range(1, self.num_dofs() + 1))
+        art = self.splatsim_robot.config.articulation_config
         goal = solve_goal_pose(
             self.pybullet_client,
             self.splatsim_robot.sim_id,
             self._get_ee_link_index(),
-            list(range(1, self.num_dofs() + 1)),
+            arm,
             bunch,
             GoalPoseSpec.from_env_class(type(self)),
             collision_fn=self._arm_config_collides,
             score_fn=self._soft_cost_score_fn(),
+            clouds=self._scene_clouds(),
+            q_home=np.asarray(art.initial_joint_positions[: self.num_dofs()], dtype=np.float64),
+            ik_fn=self._planner_ik_fn(),
         )
+        by_bunch[idx] = goal
         self._grape_goal_cache = goal
         return goal
+
+    # ------------------------------------------------------------ bunch choice
+    @property
+    def active_bunch_index(self) -> int:
+        """The bunch this episode aims at: the pinned TARGET_BUNCH_INDEX, or
+        whatever _pick_target_bunch drew at the last reset (bunch 0 until
+        the first reset)."""
+        if self.TARGET_BUNCH_INDEX is not None:
+            return int(self.TARGET_BUNCH_INDEX)
+        return int(getattr(self, "_active_bunch_index", 0))
+
+    def _pick_target_bunch(self) -> int:
+        """Choose the episode's bunch (random when TARGET_BUNCH_INDEX is
+        None), solve its goal, and push that goal into the trajectory-gen
+        config so every consumer — reset solvability check, batch
+        generation, published env config — aims at the same bunch. Bunches
+        whose goal search fails are dropped from the draw for the session."""
+        n = len(self.load_grape_targets())
+        if self.TARGET_BUNCH_INDEX is not None:
+            order = [int(self.TARGET_BUNCH_INDEX)]
+        else:
+            bad = self.__dict__.setdefault("_unreachable_bunches", set())
+            pool = [i for i in range(n) if i not in bad]
+            if not pool:
+                logger.error("vine env: every bunch failed the goal search — keeping bunch %d",
+                             self.active_bunch_index)
+                pool = [self.active_bunch_index]
+            first = int(np.random.choice(pool))
+            order = [first] + [i for i in pool if i != first]
+        for idx in order:
+            self._active_bunch_index = idx
+            self._grape_goal_cache = None
+            if idx not in self.__dict__.get("_grape_goal_by_bunch", {}):
+                self._trajgen_status(f"solving goal pose for grape bunch {idx}")
+            try:
+                pos, quat, q_seed = self._grape_goal()
+            except Exception:
+                logger.exception("vine env: bunch %d has no reachable goal — dropping it", idx)
+                self.__dict__.setdefault("_unreachable_bunches", set()).add(idx)
+                continue
+            gen = getattr(self, "trajectory_generator", None)
+            if gen is not None:
+                gen.config.ee_pos_goal = [float(v) for v in pos]
+                gen.config.ee_quat_goal = [float(v) for v in quat]
+                gen.config.q_goal_bias = [float(v) for v in q_seed]
+            logger.info("vine env: target bunch %d (%s)", idx,
+                        "pinned" if self.TARGET_BUNCH_INDEX is not None else "random")
+            return idx
+        return self.active_bunch_index
+
+    def reset(self, seed=None, options=None):
+        # Re-draw the target BEFORE randomize_objects runs its solvability
+        # check, so the cached reset path and the batch goal agree.
+        self._pick_target_bunch()
+        return super().reset(seed=seed, options=options)
+
+    def _planner_ik_fn(self):
+        """The planner's goal-IK acceptance (5 mm / 5 deg / obstacle
+        clearance), for filtering search candidates — so the goal the env
+        publishes is one the reset-time plan can actually reach. None when
+        the planner isn't available yet; the search then uses its own,
+        looser filter."""
+        try:
+            gen = getattr(self, "trajectory_generator", None)
+            if gen is None:
+                return None
+            planner = gen._ensure_planner()
+            gen._sync_planner_obstacles()
+            return planner._solve_ik
+        except Exception:
+            logger.exception("vine env: planner IK unavailable for goal search")
+            return None
+
+    def _scene_clouds(self):
+        """Point clouds for the task-space goal search (GoalPoseSpec.solver
+        == "search"), built once from this build's registry entry: the
+        scan's grapes_only.ply (scan frame -> scan transformation), and the
+        cost-field points + hard collision mesh (which follow the build's
+        collision_frame — ASSETS_TRANSFORM is None when baked). Returns None,
+        and the solver falls back to ik, if the grapes PLY is missing."""
+        cached = getattr(self, "_scene_clouds_cache", None)
+        if cached is not None:
+            return cached
+        from splatsim.utils.goal_pose import load_scene_clouds
+        from splatsim.utils.paths import resolve_splatsim_path
+        cfg = scene_registry.get(self.VINE_SPLAT_NAME) or {}
+        grapes_ply = Path(resolve_splatsim_path(cfg["model_path"])) / \
+            "point_cloud" / "iteration_30000" / "grapes_only.ply"
+        if not grapes_ply.exists():
+            logger.warning("vine env: %s missing — goal search unavailable, "
+                           "using the ik solver", grapes_ply)
+            self._scene_clouds_cache = None
+            return None
+        client, rid = self.pybullet_client, self.splatsim_robot.sim_id
+        scan_T = np.asarray(cfg["transformation"]["matrix"], dtype=np.float64)
+        self._scene_clouds_cache = load_scene_clouds(
+            client, rid, self._get_ee_link_index(),
+            gripper_links=range(7, client.getNumJoints(rid)),
+            grapes_ply=grapes_ply, grapes_transform=scan_T,
+            veg_npz=self.SOFT_COST_NPZ, veg_transform=self.ASSETS_TRANSFORM,
+            hard_urdf=resolve_splatsim_path(cfg["urdf_path"]),
+            hard_transform=self.ASSETS_TRANSFORM,
+        )
+        return self._scene_clouds_cache
 
     def _resolve_goal_ee_target(self):
         """Override small_engine's static-task version: that would feed the
@@ -461,6 +652,8 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
             cfg_dict["task"]["target_ee_pos"] = [float(v) for v in pos]
             cfg_dict["task"]["target_ee_quat"] = [float(v) for v in quat]
             cfg_dict["task"]["q_goal_bias"] = [float(v) for v in q_seed]
+            cfg_dict["task"]["task_description"] = f"reach grape bunch {self.active_bunch_index}"
+            cfg_dict["task"]["bunch_index"] = int(self.active_bunch_index)
         except Exception:
             logger.exception(
                 "vine env: runtime grape-task refinement failed — publishing "

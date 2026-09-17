@@ -254,18 +254,25 @@ class TrajectoryGenModeConfig(SplatSimModeConfig):
     obstacle_clearance: float = 0.02
     self_collision_clearance: float = 0.01
     # Which scoring strategy picks the winning path among the RRT candidates
-    # generated per IK goal. Default `MIN_PAIR_CLEARANCE` — picks the path whose
-    # tightest non-adjacent link-pair gap is LARGEST, avoiding pretzeled / near-
-    # self-collision poses that wedge during execution (matches the DAgger/SA
-    # intervention side). `CAMERA_SCORING` picks the path whose wrist-camera view
-    # best satisfies `camera_k_exp`/`camera_k_sig`/`camera_threshold` against the target EE pose;
-    # `EE_ARC_LENGTH` / `JOINT_ARC_LENGTH` minimize cartesian / joint path
-    # length. See `PathSelectionStrategy` for full descriptions. Stored as the
-    # enum value string; parsed back to enum at use.
+    # generated per IK goal. Default `EE_ARC_LENGTH` (2026-09-17, all envs) —
+    # the shortest cartesian EE path, the same default the planner itself
+    # uses and what the checked-in per-env traj configs already pin.
+    # `MIN_PAIR_CLEARANCE` (the previous default) picks the path whose
+    # tightest non-adjacent link-pair gap is LARGEST — avoids pretzeled /
+    # near-self-collision poses, at the cost of wide EE swings that hurt
+    # demo quality. Every candidate is still hard-gated by
+    # `self_collision_clearance` / `obstacle_clearance` above, so switching
+    # the ranking does not admit colliding paths — it only stops clearance
+    # from choosing among the clean ones.
+    # `CAMERA_SCORING` picks the path whose wrist-camera view best satisfies
+    # `camera_k_exp`/`camera_k_sig`/`camera_threshold` against the target EE
+    # pose; `JOINT_ARC_LENGTH` minimizes joint path length. See
+    # `PathSelectionStrategy` for full descriptions. Stored as the enum value
+    # string; parsed back to enum at use.
     #
     # `disable_camera_scoring_for_rrt` below is DEPRECATED — only consulted when
     # `path_selection == CAMERA_SCORING`, forcing it to `EE_ARC_LENGTH`.
-    path_selection: str = PathSelectionStrategy.MIN_PAIR_CLEARANCE.value
+    path_selection: str = PathSelectionStrategy.EE_ARC_LENGTH.value
     # Joint-arc regularizer ADDED to the base score of whichever
     # `path_selection` strategy is active (skipped when the strategy is
     # already `joint_arc_length`). Units: base-score-units per rad — m/rad

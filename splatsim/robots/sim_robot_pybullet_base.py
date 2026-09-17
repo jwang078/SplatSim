@@ -26,6 +26,7 @@ import json
 
 import torch
 import numpy as np
+from scipy.spatial.transform import Rotation
 import mujoco
 import mujoco.viewer
 import zmq
@@ -1402,6 +1403,8 @@ class PybulletRobotServerBase:
             # Envs with a soft-cost field (EnvConfig.soft_cost) get cost-aware
             # trajectory generation; None for binary-obstacle envs (no-op).
             soft_cost_payload=getattr(self.ENV_CONFIG, "soft_cost", None),
+            cancel_check=self._planning_cancel_requested,
+            progress_fn=lambda m: self._trajgen_status(f"planning: {m}"),
         )
 
         self._setup_interactive_gui()
@@ -1833,13 +1836,35 @@ class PybulletRobotServerBase:
             else:
                 raise ValueError(f"urdf_path not found for object {splatsim_obj.config.name}")
 
-            # TODO possibly do custom quat
             quat = self.pybullet_client.getQuaternionFromEuler([0, 0, 0])
+            collision_scale = 1.0
+            if getattr(splatsim_obj.config, "collision_frame", "sim") == "splat":
+                # Collision geometry is in the scan frame: place it with the
+                # same splat->sim transform the gaussians got. A 4x4 with
+                # uniform scale s becomes globalScaling=s plus a rigid base
+                # pose — pybullet scales about the base origin, and s*R == R*s,
+                # so world = R (s x) + t == s R x + t. Same SVD decomposition
+                # as transform_object / setup_camera_from_dataset.
+                assert splatsim_obj.config.transformation is not None, (
+                    f"{splatsim_obj.config.name}: collision_frame='splat' needs a transformation"
+                )
+                if np.any(np.asarray(base_position) != 0.0):
+                    print(f"WARNING: {splatsim_obj.config.name}: base_position is ignored "
+                          f"when collision_frame='splat' (the transformation places it)")
+                T = np.asarray(splatsim_obj.config.transformation.matrix, dtype=np.float64)
+                U, S_vec, Vh = np.linalg.svd(T[:3, :3])
+                R_mat = U @ Vh
+                if np.linalg.det(R_mat) < 0:
+                    U[:, -1] *= -1
+                    R_mat = U @ Vh
+                collision_scale = float(np.cbrt(np.prod(S_vec)))
+                base_position = T[:3, 3].tolist()
+                quat = Rotation.from_matrix(R_mat).as_quat().tolist()  # xyzw, pybullet order
             object_loaded = self.pybullet_client.loadURDF(
                 urdf_path,
                 base_position,
                 quat,
-                globalScaling=physics_scale,  # Visual scaling (scaling_range_x/y/z) is applied to the gaussian splat at reset time via randomize_object_scale(), not at URDF load time.
+                globalScaling=physics_scale * collision_scale,  # Visual scaling (scaling_range_x/y/z) is applied to the gaussian splat at reset time via randomize_object_scale(), not at URDF load time.
                 useFixedBase=use_fixed_base,
                 flags=flags,
             )
@@ -2355,6 +2380,22 @@ class PybulletRobotServerBase:
         # on the ZMQ handler thread here; post the request to the main
         # thread's serve loop and block until it signals completion.
         if (
+            step_physics
+            and self._sync_physics_to_client
+            and self.serve_mode in self._SYNC_ELIGIBLE_MODES
+            and self._zmq_server_thread.is_alive()
+            and threading.current_thread() is threading.main_thread()
+        ):
+            # Already ON the main thread — e.g. the eval-benchmark episode
+            # replay, which drives command_joint_state from the serve loop
+            # itself. The handshake below would post a request to the very
+            # loop we are blocking and wait 5 s per substep for a reply that
+            # cannot come (observed as "main-thread step timeout" spam and a
+            # replay that crawls). The OpenGL-context constraint the
+            # handshake exists for is satisfied here, so just step inline.
+            for _ in range(int(self._physics_substeps_per_command)):
+                self.pybullet_client.stepSimulation()
+        elif (
             step_physics
             and self._sync_physics_to_client
             and self.serve_mode in self._SYNC_ELIGIBLE_MODES
@@ -4906,6 +4947,11 @@ class PybulletRobotServerBase:
         attempt = 0
         while collision or not able_to_solve:
             attempt += 1
+            if self._planning_cancel_requested():
+                print("[randomize_objects] stop requested — accepting the current arrangement.")
+                break
+            if self._trajgen_active and attempt > 1:
+                self._trajgen_status(f"resetting scene — solvability attempt {attempt}/{max_attempts}")
             if attempt > max_attempts:
                 # Bounded so a scene that's never solvable (e.g. obstacles that
                 # always wall off the target) can't spin forever. Accept the last
@@ -5469,8 +5515,9 @@ class PybulletRobotServerBase:
             except Exception as e:
                 print(f"[LeRobot] Cannot start trajectory generation — dataset init failed: {e}")
                 if self._splatsim_gui is not None:
+                    reason = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
                     self._splatsim_gui.set_status(
-                        f"ERROR: dataset '{traj_config.lerobot_repo_id}' cannot be loaded — see console"
+                        f"ERROR loading '{traj_config.lerobot_repo_id}': {reason[:160]}"
                     )
                 self.serve_mode = self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE
                 return
@@ -5498,7 +5545,11 @@ class PybulletRobotServerBase:
             except Exception as e:
                 print(f"[EvalBenchmark] Dataset init failed: {e}")
                 if self._splatsim_gui is not None:
-                    self._splatsim_gui.set_status(f"ERROR: dataset '{repo_id}' cannot be loaded — see console")
+                    # Put the actual reason in the status line (first line,
+                    # trimmed) — "see console" is useless when the console
+                    # isn't in view.
+                    reason = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+                    self._splatsim_gui.set_status(f"ERROR loading '{repo_id}': {reason[:160]}")
                 self.serve_mode = self.SERVE_MODES.EVAL_BENCHMARK_IDLE
                 return
             # Parse episode subset from GUI config string (e.g. "3,8,23" or "[3,8,23]")
@@ -6014,14 +6065,17 @@ class PybulletRobotServerBase:
             self._lerobot_saver = None
             return
         print("[LeRobot] Finalizing dataset...")
+        self._trajgen_status("saving dataset (finalizing parquet + videos)")
         self._in_dataset_critical_section = True
         try:
             finalize_lerobot_dataset(self._lerobot_saver)
             if push_to_hub:
+                self._trajgen_status("saving dataset — pushing to the Hub")
                 push_lerobot_to_hub(self._lerobot_saver)
             self._lerobot_saver = None
         finally:
             self._in_dataset_critical_section = False
+        self._trajgen_status("dataset saved")
 
     # =========================================================================
     # Scene State Save / Restore
@@ -6067,18 +6121,67 @@ class PybulletRobotServerBase:
 
     def _is_stop_requested(self) -> bool:
         """Check if the user has pressed Stop in the GUI (non-consuming peek)."""
-        return self._splatsim_gui.peek_button("stop_traj")
+        gui = getattr(self, "_splatsim_gui", None)
+        return bool(gui is not None and gui.peek_button("stop_traj"))
+
+    # True while _generate_and_render_one_episode is running — the only time
+    # a Stop press / mode change should interrupt a plan (an interactive
+    # reset must not be aborted by a stale button flag).
+    _trajgen_active = False
+
+    def _trajgen_status(self, phase: str) -> None:
+        """GUI status line during trajectory generation:
+        ``Trajectory: <done> / <total> — <phase>``. The phase is what the
+        server is doing RIGHT NOW (resetting, solving the goal, which RRT
+        attempt, recording frame i/N, saving) so a long plan is visibly
+        alive without watching the terminal. No-op without a GUI."""
+        gui = getattr(self, "_splatsim_gui", None)
+        if gui is None:
+            return
+        tgen = getattr(self, "trajectory_generator", None)
+        try:
+            done = tgen.trajectory_count if tgen is not None else 0
+            total = tgen.config.num_base_trajectories if tgen is not None else "?"
+            gui.set_status(f"Trajectory: {done} / {total} — {phase}")
+        except Exception:
+            pass
+
+    def _planning_cancel_requested(self) -> bool:
+        """Planner cancel poll (RRTToGoalPlanner.cancel_check). Cheap: a few
+        attribute reads and a non-consuming GUI peek. True when trajectory
+        generation is active and the user pressed Stop, the coordinator /
+        GUI switched the mode away, or a shutdown was requested."""
+        if self._shutdown_requested:
+            return True
+        if not self._trajgen_active:
+            return False
+        if self.serve_mode != self.SERVE_MODES.GENERATE_TRAJECTORIES:
+            return True
+        return self._is_stop_requested()
 
     def _generate_and_render_one_episode(self):
         """Generate trajectories, render each step, and save to LeRobot + Zarr."""
-        self.reset()
-        # Snapshot scene state AFTER reset, BEFORE trajectory generation
-        scene_state = self._save_scene_state()
+        from splatsim.utils.rrt_to_goal import RRTPlanningAborted
+        self._trajgen_active = True
+        try:
+            self._trajgen_status("resetting scene")
+            self.reset()
+            # Snapshot scene state AFTER reset, BEFORE trajectory generation
+            scene_state = self._save_scene_state()
 
-        # Start from the current state
-        self.trajectory_generator.config.q_start = self.get_joint_state()[:self.num_dofs()].tolist()
+            # Start from the current state
+            self.trajectory_generator.config.q_start = self.get_joint_state()[:self.num_dofs()].tolist()
 
-        episodes = self.trajectory_generator.generate_trajectory_batch()
+            self._trajgen_status("planning")
+            episodes = self.trajectory_generator.generate_trajectory_batch()
+        except RRTPlanningAborted:
+            # Stop / shutdown / mode change landed mid-plan. Nothing was
+            # recorded for this episode; the serve loop processes the button
+            # (or the shutdown) on its next iteration.
+            print("[TrajectoryGen] planning interrupted by stop request — episode discarded.")
+            return
+        finally:
+            self._trajgen_active = False
         if episodes is None:
             return  # Planning failed, will retry next iteration
 
@@ -6251,6 +6354,8 @@ class PybulletRobotServerBase:
 
         stopped_early = False
         for step_idx in range(len(joint_trajectory)):
+            if step_idx % 10 == 0:
+                self._trajgen_status(f"recording frame {step_idx + 1}/{len(joint_trajectory)}")
             if self._is_stop_requested():
                 print(f"[TrajectoryGen] Stop requested at step {step_idx}/{len(joint_trajectory)}, saving partial episode.")
                 stopped_early = True
@@ -6305,11 +6410,13 @@ class PybulletRobotServerBase:
         # encode, data-parquet write, and episode-metadata write would orphan
         # frames — the signal handler defers its interrupt while this is True.
         if not stopped_early and self._lerobot_saver is not None:
+            self._trajgen_status("saving episode to dataset (encoding video)")
             self._in_dataset_critical_section = True
             try:
                 self._lerobot_saver.save_episode(episode_metadata=self._get_splatsim_episode_metadata())
             finally:
                 self._in_dataset_critical_section = False
+            self._trajgen_status("episode saved")
 
         # Save images to Zarr (save even if partial — zarr is more forgiving)
         if zarr_group is not None:

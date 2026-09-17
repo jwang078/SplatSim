@@ -206,7 +206,7 @@ def main():
                     help="robot variant named in the launch hint printed when "
                          "no simulator is found")
     ap.add_argument("--grapes-ply", default=(
-        "data/output/vine_scene/point_cloud/iteration_30000/grapes_only.ply"),
+        "data/scenes/vine_scene/splat/point_cloud/iteration_30000/grapes_only.ply"),
         help="segmented grape gaussians, used by search mode for visibility")
     ap.add_argument("--mode", default="search", choices=["ik", "search"],
                     help="initial solver. 'search' = task-space sample/score/"
@@ -214,10 +214,10 @@ def main():
                          "the older config-space solver the env still runs, "
                          "which manages 2/7 under the same constraints. "
                          "Switchable live with the 'mode 0ik/1search' slider.")
-    ap.add_argument("--search-directions", type=int, default=200,
+    ap.add_argument("--search-directions", type=int, default=GoalPoseSpec.search_directions,
                     help="approach directions sampled per search (higher = "
                          "better coverage, slower)")
-    ap.add_argument("--search-top-k", type=int, default=25,
+    ap.add_argument("--search-top-k", type=int, default=GoalPoseSpec.search_top_k,
                     help="diverse candidates kept for the IK filter")
     ap.add_argument("--cam-fov", type=float, default=60.0,
                     help="wrist preview vertical FoV (deg)")
@@ -264,7 +264,7 @@ def main():
     # single static task target in ENV_CONFIG.
     targets_json = getattr(env_cls, "GRAPE_TARGETS_JSON", None)
     if targets_json is not None:
-        bunches = grape_targets.load_targets(targets_json)
+        bunches = env_cls.load_grape_targets()
     else:
         task = getattr(env_cls.ENV_CONFIG, "task", None)
         if task is None or task.target_ee_pos is None:
@@ -383,112 +383,53 @@ def main():
     vals_mode = [1.0 if args.mode == "search" else 0.0, 0.0, 0.0]
 
     def _ensure_clouds():
+        """Scene clouds for the shared task-space search — built exactly the
+        way the env builds them (goal_pose.load_scene_clouds off the scene
+        registry), so the tuner scores against the same geometry."""
         if search["clouds"] is not None:
             return search["clouds"]
-        import json as _json
-        from scipy.spatial import cKDTree as _KD
-        from splatsim.utils import ee_pose_search as _eps
-        from splatsim.utils.splat_ply_io import read_gaussian_ply as _rply
-        sd = Path(env_cls.GRAPE_TARGETS_JSON).parent
-        T = np.asarray(_json.loads((sd / "splat_to_sim.json").read_text()))
-        grapes = _rply(args.grapes_ply).xyz @ T[:3, :3].T + T[:3, 3]
-        veg = np.asarray(np.load(env_cls.SOFT_COST_NPZ)["points"])
-        gl = list(range(7, client.getNumJoints(robot_id)))
-        gc, gr = _eps.gripper_spheres(client, robot_id, ee_link, gl)
-        from optimize_ee_poses import load_hard_points as _lhp
-        search["clouds"] = {"grapes": grapes, "veg": veg, "gc": gc, "gr": gr,
-                            "hard": _lhp(env_cls), "gtree": _KD(grapes)}
-        print(f"  [search] grapes {len(grapes):,}  veg {len(veg):,}  "
-              f"hard {0 if search['clouds']['hard'] is None else len(search['clouds']['hard']):,}")
-        return search["clouds"]
+        from splatsim.configs import scene_registry as _reg
+        from splatsim.utils import goal_pose as _gp
+        from splatsim.utils.paths import resolve_splatsim_path as _rp
+        cfg = _reg.get(env_cls.VINE_SPLAT_NAME) or {}
+        scan_T = np.asarray(cfg["transformation"]["matrix"], dtype=np.float64)
+        search["clouds"] = _gp.load_scene_clouds(
+            client, robot_id, ee_link, range(7, client.getNumJoints(robot_id)),
+            grapes_ply=args.grapes_ply, grapes_transform=scan_T,
+            veg_npz=env_cls.SOFT_COST_NPZ, veg_transform=env_cls.ASSETS_TRANSFORM,
+            hard_urdf=_rp(cfg["urdf_path"]), hard_transform=env_cls.ASSETS_TRANSFORM)
+        c = search["clouds"]
+        print(f"  [search] grapes {len(c.grapes):,}  veg {len(c.veg):,}  "
+              f"hard {0 if c.hard is None else len(c.hard):,}")
+        return c
 
     def run_search(ti, standoff_cm, cam_up, use_coll, from_below):
-        """Full task-space pipeline for one bunch. Returns ranked feasible
-        candidates: [(score, pos, quat, q, terms), ...]."""
-        from scipy.spatial import cKDTree as _KD
-        from scipy.spatial.transform import Rotation as _R
-        from splatsim.utils import ee_pose_search as _eps
+        """The env's search solver (goal_pose.search_goal_poses) on one bunch.
+        Returns ranked feasible candidates [(score, pos, quat, q, terms), ...].
 
-        cl = _ensure_clouds()
-        b = bunches[ti]
-        ctr = np.asarray(b["center"], dtype=np.float64)
-        ext = max(b.get("extent", [0.1, 0.1, 0.1]))
-        tp = cl["grapes"][np.asarray(
-            cl["gtree"].query_ball_point(ctr, 0.5 * ext + 0.04))]
-        if len(tp) == 0:
-            return [], "no grape points near this target"
-        d, _ = _KD(tp).query(cl["veg"])
-        clouds = _eps.build_clouds(cl["grapes"], cl["veg"], cl["gc"], cl["gr"],
-                                   occluder_pts=cl["veg"][d > 0.03],
-                                   hard_pts=cl["hard"])
-        spec = _eps.SearchSpec(
-            n_directions=args.search_directions, top_k=args.search_top_k,
-            standoff_range=(max(standoff_cm / 100.0 - 0.04, 0.03),
-                            standoff_cm / 100.0 + 0.06),
-            camera_up_world=_UP_MODES.get(int(round(cam_up)),
-                                          CameraUpMode.OFF).world_up(),
+        One difference from the live env: there is no planner here, so the
+        IK filter is the built-in one (10 mm / 15 deg / 1 cm clearance via
+        `collides`) rather than the planner's goal gate. A candidate the
+        tuner accepts can still be refused by the env — expect the env to
+        pick a lower-ranked one."""
+        import dataclasses as _dc
+        from splatsim.utils import goal_pose as _gp
+        spec = _dc.replace(
+            base_spec,
+            standoff_m=standoff_cm / 100.0,
+            camera_up=_UP_MODES.get(int(round(cam_up)), CameraUpMode.OFF),
             tip_offset_m=float(tip_m),
-            base_xyz=tuple(np.asarray(
-                client.getBasePositionAndOrientation(robot_id)[0])),
+            search_directions=args.search_directions,
+            search_top_k=args.search_top_k,
         )
-        if from_below:
-            spec.direction_hint = (0.0, 0.0, -1.0)
-            spec.direction_max_angle_deg = 60.0
-        pos_s, rot_s, ap_s = _eps.sample_poses(ctr, spec)
-        # Distant bunches (this scene has several past 1.2 m) leave only a
-        # sliver of the sampling shell inside the arm's reach, so say so —
-        # "0 feasible" from 5 samples is a sampling problem, not a geometry
-        # one, and the two want different fixes.
-        n_raw = len(_eps.fibonacci_directions(spec.n_directions)) * spec.n_standoffs
-        if len(pos_s) < 0.05 * n_raw:
-            print(f"  [search] WARNING only {len(pos_s)}/{n_raw} poses survived "
-                  f"the reach prefilter — bunch is "
-                  f"{np.linalg.norm(ctr - np.asarray(spec.base_xyz)):.2f} m "
-                  f"from the base; widen SearchSpec.reach_range if the arm "
-                  f"really can get there")
-        if not len(pos_s):
-            return [], "no candidate poses (reach prefilter)"
-        sc = np.full(len(pos_s), -1.0); terms = [None] * len(pos_s)
-        n_hard = 0
-        for i in range(len(pos_s)):
-            if _eps.gripper_hits_hard(pos_s[i], rot_s[i], clouds):
-                n_hard += 1
-                continue
-            sc[i], terms[i] = _eps.score_pose(pos_s[i], rot_s[i], ap_s[i],
-                                              clouds, spec, tp)
-        ok = np.flatnonzero(sc >= 0)
-        if not len(ok):
-            return [], "every pose hits the trellis"
-        keep = ok[_eps.select_diverse(pos_s[ok], rot_s[ok], sc[ok], spec)]
-        out = []
-        for i in keep:
-            quat = _R.from_matrix(rot_s[i]).as_quat()
-            for att in range(4):
-                seed = (q_home if att == 0 else
-                        np.random.uniform(joint_limits[:, 0], joint_limits[:, 1]))
-                for j, qq in zip(joint_indices, seed):
-                    client.resetJointState(robot_id, j, float(qq))
-                sol = client.calculateInverseKinematics(
-                    robot_id, ee_link, pos_s[i].tolist(), list(quat),
-                    maxNumIterations=300, residualThreshold=1e-9)
-                q = np.asarray(sol[:6])
-                for j, qq in zip(joint_indices, q):
-                    client.resetJointState(robot_id, j, float(qq))
-                st = client.getLinkState(robot_id, ee_link,
-                                         computeForwardKinematics=True)
-                if np.linalg.norm(np.asarray(st[4]) - pos_s[i]) > 0.01:
-                    continue
-                if _R.from_matrix(rot_s[i].T @ _R.from_quat(
-                        st[5]).as_matrix()).magnitude() > np.radians(15):
-                    continue
-                if use_coll and collides(q):
-                    continue
-                out.append((float(sc[i]), pos_s[i], np.asarray(st[5]), q,
-                            terms[i]))
-                break
-        out.sort(key=lambda t: -t[0])
-        return out, (f"{len(out)}/{len(keep)} IK-feasible of {len(pos_s)} "
-                     f"sampled ({n_hard} hit trellis)")
+        return _gp.search_goal_poses(
+            client, robot_id, ee_link, joint_indices, bunches[ti], spec,
+            _ensure_clouds(), joint_limits, q_home,
+            collision_fn=collides if use_coll else None,
+            direction_hint=(0.0, 0.0, -1.0) if from_below else None,
+            direction_max_angle_deg=60.0,
+            ik_attempts=spec.search_ik_attempts,
+        )
 
     def solve(target_i, standoff_cm, roll_deg, aim_err_deg, use_coll,
               cam_up, ik_seed):
