@@ -180,7 +180,7 @@ data/stages/<stage>/
   from the one above it.
 - `collision_frame: splat` means the build's collision mesh, cost field and
   grape targets are in the scan's frame and get the scan's `transformation`
-  at load; `sim` means they were baked already. `scripts/build_vine_collision.py`
+  at load; `sim` means they were baked already. `scripts/splat_to_collision.py`
   sets it.
 - The yaml files are tracked in git; the data next to them is not.
 - A stage with a URDF but no splat (`ply_path`/`model_path`) still works in
@@ -404,6 +404,54 @@ pasting a stage transform you write where the URDF cloud ended up as that
 body's `base_position` / `base_orientation_rpy`. Each body is then its own
 entry, `<stage>/<name>`, that an environment can load and move. Bear in mind
 that cutting a body out of the scan leaves a gap in the surface it stood on.
+
+## Making a collision body from a scan (no URDF)
+
+The section above starts from a URDF and cuts its splat out of the scan.
+Things that have no URDF — the grape vine, its trellis, a tree — go the
+other way: cut the body's gaussians out of the scan, turn them into a mesh,
+and wrap that in a generated URDF. The result is a *segmentation build*,
+`data/stages/<scan>/segmentations/<build>/`, which is a registry entry like
+any other (the vine env's `vine_and_trellis` is one). The examples run on the
+shipped `vine_scene`.
+
+1. **Crop the body's gaussians** into a gaussian PLY (it must keep the 3DGS
+   fields — SuperSplat's editor exports them; CloudCompare's PLY export does
+   not). Put it in the build folder:
+   `data/stages/vine_scene/segmentations/<build>/<build>.ply`. For vegetation,
+   `scripts/segment_vine_splat.py <ply> --outdir <build dir>` splits it into
+   the hard trunk (`<build>_trunk_hard.ply`, what gets a mesh) and the soft
+   twigs/leaves/grapes (`<build>_soft_cost.npz`, what the planner steers
+   around), with a picture of every stage under `viz/`.
+
+2. **Mesh it and register it:**
+   ```bash
+   python scripts/splat_to_collision.py \
+       data/stages/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_trunk_hard.ply \
+       --outdir data/stages/vine_scene/segmentations/my_build
+   ```
+   writes `<name>_collision.obj`, `<name>.urdf` (fixed base, concave) and
+   the build's `stage.yaml` with `collision_frame: splat`, meaning the mesh is
+   in the scan's frame and the scan's `transformation` (inherited from the
+   stage.yaml above) is applied at load — the same transform you found for
+   the robot places the vine. The build is named after its folder
+   (`my_build` here). The default backend is PlayCanvas's mesher
+   (`npm i -g @playcanvas/splat-transform`); `--backend voxel` is an
+   in-repo blockier mesher that needs no extra tools. `--voxel-size` sets
+   the resolution in the scan's units.
+
+3. **Check it:** `viz/10_mesh_overlay.png` must hug the trunk points, and
+   ```bash
+   python scripts/visualize_collision.py --urdf data/stages/vine_scene/segmentations/my_build/my_build.urdf \
+       --soft-npz data/stages/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_soft_cost.npz --gui
+   ```
+   loads it in PyBullet with the soft points and a probe sphere. Grape
+   targets for the task come from `scripts/regen_grape_targets.py` (or
+   `mark_grape_targets.py` by hand); see *Tuning the vine task*.
+
+An environment then refers to the build by its folder name
+(`splat_name="vine_and_trellis"`); nothing else needs to know it was
+a splat first.
 
 ## Generating new trajectories
 

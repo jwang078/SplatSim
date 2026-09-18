@@ -218,7 +218,7 @@ class SplatObjectConfig(ObjectConfig):
     #             load_urdf applies `transformation` (uniform scale via
     #             globalScaling, rotation+translation as the base pose), so
     #             splat and collision share one transform in one place.
-    # Segmentation builds should be "splat"; see scripts/build_vine_collision.py.
+    # Segmentation builds should be "splat"; see scripts/splat_to_collision.py.
     collision_frame: str = Default("sim")
 
     def to_dict(self) -> dict:

@@ -12,7 +12,7 @@ GUI mode (--gui) — interactive inspection:
     soft-cost at the probe are re-printed whenever it moves
 
 Usage:
-  python scripts/visualize_vine_collision.py \
+  python scripts/visualize_collision.py \
       --urdf data/stages/synthetic_vine/segmentations/default/vine.urdf \
       --soft-npz data/stages/synthetic_vine/segmentations/default/vine_soft_cost.npz [--gui]
 """

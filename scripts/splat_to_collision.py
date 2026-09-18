@@ -1,13 +1,17 @@
-"""Build a static collision mesh + URDF from a trunk-hard gaussian PLY,
-with alignment visualizations at every step.
+"""Make a collision body from a piece of a scan: a gaussian PLY (the body's
+gaussians, cropped out of the stage's splat) -> watertight mesh + fixed-base
+URDF + the stage.yaml that registers it, with alignment visualizations at
+every step. This is the splat-first path — no URDF to start from — used for
+the grape vine and its trellis; the URDF-first path is
+scripts/segment_stage_asset.py.
 
 Backends:
-  voxel           (default) in-repo voxel-face mesher: occupancy grid from the
-                  gaussian centers, emit faces between occupied/empty voxel
-                  neighbors -> watertight blocky mesh. No external tools.
-                  (Same idea as splat-transform's `--collision-mesh faces`.)
-  splat-transform PlayCanvas CLI (npm i -g @playcanvas/splat-transform);
+  splat-transform (default) PlayCanvas CLI (npm i -g @playcanvas/splat-transform);
                   runs `--collision-mesh smooth` and imports the .collision.glb.
+  voxel           in-repo voxel-face mesher: occupancy grid from the gaussian
+                  centers, emit faces between occupied/empty voxel neighbors ->
+                  watertight blocky mesh. No external tools.
+                  (Same idea as splat-transform's `--collision-mesh faces`.)
 
 Outputs (under --outdir, which should be the build's folder,
 data/stages/<scan>/segmentations/<build>/):
@@ -24,7 +28,7 @@ data/stages/<scan>/segmentations/<build>/):
   viz/11_mesh_render.png      shaded open3d render of the mesh (if EGL works)
 
 Usage:
-  python scripts/build_vine_collision.py \
+  python scripts/splat_to_collision.py \
       data/stages/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_trunk_hard.ply \
       --outdir data/stages/vine_scene/segmentations/vine_and_trellis
       [--backend voxel|splat-transform] [--voxel-size 0.012] [--dilate 1]
@@ -37,6 +41,7 @@ which for the highbay scan is ~4x sim scale (transformation has scale ~0.25).
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import shutil
 import subprocess
@@ -278,7 +283,7 @@ def build_capsules(args, cloud, outdir, vizdir, name):
 
     urdf_path = outdir / f"{name}_capsules.urdf"
     urdf_path.write_text(capsule_urdf(skel.capsules, f"{name}_trunk_capsules"))
-    print(f"wrote {urdf_path}")
+    wrote("URDF (capsules)", urdf_path)
 
     # viz: capsule segments over trunk points (line width ~ radius)
     from matplotlib.collections import LineCollection
@@ -315,7 +320,8 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("trunk_ply", help="trunk-hard gaussian PLY from segmentation")
+    ap.add_argument("trunk_ply", help="gaussian PLY of the body (a crop of the stage's splat; for vegetation the "
+                    "*_trunk_hard.ply from segment_vine_splat.py)")
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--backend", choices=["voxel", "splat-transform", "capsules"],
                     default="splat-transform",
@@ -348,7 +354,12 @@ def main():
     outdir = Path(args.outdir)
     vizdir = outdir / "viz"
     vizdir.mkdir(parents=True, exist_ok=True)
-    name = Path(args.trunk_ply).stem.replace("_trunk_hard", "")
+    global _INPUT_PLY
+    _INPUT_PLY = os.path.abspath(args.trunk_ply)
+    # The build is named after its folder — that is its registry name (a
+    # nested stage.yaml is the entry `<folder>`), so two builds of the same
+    # input in different folders never collide.
+    name = outdir.name
 
     cloud = read_gaussian_ply(args.trunk_ply)
     print(f"{len(cloud)} trunk gaussians from {args.trunk_ply}")
@@ -387,19 +398,27 @@ def main():
 
     obj_path = outdir / f"{name}_collision.obj"
     write_obj(obj_path, verts, tris)
-    print(f"wrote {obj_path}")
+    wrote("collision mesh (OBJ)", obj_path)
 
     urdf_path = outdir / f"{name}.urdf"
     urdf_path.write_text(
         URDF_TEMPLATE.format(name=f"{name}_trunk", obj_rel=obj_path.name)
     )
-    print(f"wrote {urdf_path}")
+    wrote("URDF (fixed base, concave mesh)", urdf_path)
 
     write_scene_yaml(outdir, name, urdf_path.name, baked=bool(args.transform))
 
     plot_mesh_overlay(verts, tris, trunk_pts,
                       vizdir / "10_mesh_overlay.png", note)
     try_render_mesh(verts, tris, vizdir / "11_mesh_render.png")
+
+
+def wrote(what: str, path) -> None:
+    """One output per line, absolute path last (copy/pastable, clickable)."""
+    print(f"  {what:<40s} {Path(path).resolve()}")
+
+
+_INPUT_PLY = ""
 
 
 def write_scene_yaml(outdir: Path, name: str, urdf_rel: str, baked: bool) -> None:
@@ -416,16 +435,29 @@ def write_scene_yaml(outdir: Path, name: str, urdf_rel: str, baked: bool) -> Non
     Only sets the keys this script owns; an existing file keeps its other
     fields (aabb, ply_path, ...)."""
     import yaml
+    from splatsim.configs.registry import _edit_yaml_lines
     path = outdir / "stage.yaml"
-    doc = yaml.safe_load(path.read_text()) if path.exists() else {}
-    doc = doc or {}
-    doc.setdefault("name", name)
-    doc["urdf_path"] = urdf_rel
-    doc["collision_frame"] = "sim" if baked else "splat"
-    doc.setdefault("base_position", [0.0, 0.0, 0.0])
-    doc.setdefault("use_fixed_base", True)
-    path.write_text(yaml.safe_dump(doc, sort_keys=False, default_flow_style=None))
-    print(f"wrote {path}  (collision_frame: {doc['collision_frame']})")
+    frame = "sim" if baked else "splat"
+    if path.exists():
+        # keep the file's comments and other fields; only set what this build owns
+        text = _edit_yaml_lines(path.read_text(), {"urdf_path": urdf_rel, "collision_frame": frame})
+        doc = yaml.safe_load(text) or {}
+        for k, v in (("name", name), ("base_position", [0.0, 0.0, 0.0]), ("use_fixed_base", True)):
+            if k not in doc:
+                text = _edit_yaml_lines(text, {k: v})
+        path.write_text(text)
+    else:
+        path.write_text(
+            f"# Collision body built from {Path(_INPUT_PLY).name} by scripts/splat_to_collision.py.\n"
+            f"# Inherits the scan's transformation from the stage.yaml above; collision_frame\n"
+            f"# says which frame the mesh is in ({frame}).\n"
+            f"name: {name}\n"
+            f"ply_path: {os.path.relpath(_INPUT_PLY, outdir)}\n"
+            f"urdf_path: {urdf_rel}\n"
+            f"collision_frame: {frame}\n"
+            f"base_position: [0.0, 0.0, 0.0]\n"
+            f"use_fixed_base: true\n")
+    wrote(f"stage yaml (collision_frame: {frame})", path)
 
 
 if __name__ == "__main__":
