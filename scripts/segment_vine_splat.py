@@ -1,14 +1,15 @@
 """Segment a vegetation splat into hard trunk / soft twigs / soft foliage,
 with a visualization artifact for EVERY stage so each step can be inspected.
 
-Outputs (under --outdir):
-  <name>_trunk_hard.ply     gaussian PLY subset -> input to collision meshing
+Outputs (under --outdir; the simulator loads only the first one):
   <name>_soft_cost.npz      xyz + per-point weight + class for the cost field
-  <name>_seg_labels.npy     full-length class array (aligned to input PLY)
-  <name>_seg_params.json    every threshold used (reproducibility)
-  <name>_class_preview.ply  class-colored point cloud (SuperSplat/CloudCompare)
-  <name>_weight_preview.ply weight-colormapped point cloud
-  viz/01_input_rgb.png            input cloud in its own colors
+  intermediate/
+    <name>_trunk_hard.ply     gaussian PLY subset -> input to splat_to_collision.py
+    <name>_seg_labels.npy     full-length class array (aligned to input PLY)
+    <name>_seg_params.json    every threshold used (reproducibility)
+    <name>_class_preview.ply  class-colored point cloud (SuperSplat/CloudCompare)
+    <name>_weight_preview.ply weight-colormapped point cloud
+    viz/01_input_rgb.png          input cloud in its own colors
   viz/02_opacity_prefilter.png    kept vs dropped points
   viz/03_color_classes.png        after HSV stage only
   viz/04_hue_histogram.png        hue distribution + threshold windows
@@ -177,7 +178,12 @@ def main():
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
-    vizdir = outdir / "viz"
+    # What the simulator loads stays at the top of the build folder
+    # (<name>_soft_cost.npz); everything else this script leaves behind —
+    # the trunk subset that feeds the mesher, per-point labels, thresholds,
+    # previews, plots — goes under intermediate/ so the folder stays legible.
+    inter = outdir / "intermediate"
+    vizdir = inter / "viz"
     vizdir.mkdir(parents=True, exist_ok=True)
     name = Path(args.input_ply).stem
 
@@ -266,7 +272,7 @@ def main():
 
     # ---- artifacts ----
     n_hard = write_gaussian_ply_subset(
-        cloud, result.hard_mask, outdir / f"{name}_trunk_hard.ply"
+        cloud, result.hard_mask, inter / f"{name}_trunk_hard.ply"
     )
     soft = result.soft_mask
     np.savez_compressed(
@@ -276,12 +282,12 @@ def main():
         class_id=result.labels[soft],
         params_json=json.dumps(asdict(params)),
     )
-    np.save(outdir / f"{name}_seg_labels.npy", result.labels)
-    params.to_json(outdir / f"{name}_seg_params.json")
+    np.save(inter / f"{name}_seg_labels.npy", result.labels)
+    params.to_json(inter / f"{name}_seg_params.json")
     write_rgb_preview_ply(cloud.xyz, class_colors(result.labels),
-                          outdir / f"{name}_class_preview.ply")
+                          inter / f"{name}_class_preview.ply")
     write_rgb_preview_ply(cloud.xyz, weight_rgb,
-                          outdir / f"{name}_weight_preview.ply")
+                          inter / f"{name}_weight_preview.ply")
 
     counts = {seg.CLASS_NAMES[c]: int((result.labels == c).sum())
               for c in np.unique(result.labels)}

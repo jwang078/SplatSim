@@ -23,13 +23,14 @@ data/stages/<scan>/segmentations/<build>/):
                               (splat, or sim when baked). The scan's
                               splat->sim matrix is applied at load from the
                               parent stage.yaml, so prefer NOT baking.
-  viz/10_mesh_overlay.png     mesh cross-sections overlaid on trunk points —
-                              THE alignment check (mesh must hug red points)
-  viz/11_mesh_render.png      shaded open3d render of the mesh (if EGL works)
+  intermediate/viz/10_mesh_overlay.png   mesh cross-sections overlaid on trunk
+                              points — THE alignment check (mesh must hug red points)
+  intermediate/viz/11_mesh_render.png    shaded open3d render of the mesh (if EGL works)
+  intermediate/st_output.*    the mesher's own outputs
 
 Usage:
   python scripts/splat_to_collision.py \
-      data/stages/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_trunk_hard.ply \
+      data/stages/vine_scene/segmentations/vine_and_trellis/intermediate/vine_and_trellis_trunk_hard.ply \
       --outdir data/stages/vine_scene/segmentations/vine_and_trellis
       [--backend voxel|splat-transform] [--voxel-size 0.012] [--dilate 1]
       [--transform path/to/4x4.json]   # bake into sim frame (not recommended)
@@ -163,7 +164,7 @@ def run_splat_transform(input_ply: Path, outdir: Path, voxel: float):
             "splat-transform not on PATH (npm i -g @playcanvas/splat-transform); "
             "use --backend voxel instead"
         )
-    out_voxel = outdir / "st_output.voxel.json"
+    out_voxel = outdir / "intermediate" / "st_output.voxel.json"
     cmd = [exe, str(input_ply), "--voxel-params", f"{voxel},0.1",
            "--collision-mesh", "smooth", str(out_voxel)]
     print("running:", " ".join(cmd))
@@ -171,9 +172,15 @@ def run_splat_transform(input_ply: Path, outdir: Path, voxel: float):
     if result.returncode != 0:
         print("GPU voxelization failed; retrying with -g cpu ...")
         subprocess.run(cmd + ["-g", "cpu"], check=True)
-    candidates = list(outdir.glob("*.collision.glb"))
+    # splat-transform writes its st_output.* beside the input or in outdir
+    # depending on version; gather them under intermediate/ either way.
+    inter = outdir / "intermediate"
+    for f in list(outdir.glob("st_output.*")) + list(input_ply.parent.glob("st_output.*")):
+        if f.parent != inter:
+            shutil.move(str(f), str(inter / f.name))
+    candidates = list(inter.glob("*.collision.glb"))
     if not candidates:
-        raise RuntimeError(f"expected a .collision.glb next to {out_voxel}")
+        raise RuntimeError(f"expected a .collision.glb under {inter}")
     glb = candidates[0]
 
     import open3d as o3d
@@ -352,7 +359,10 @@ def main():
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
-    vizdir = outdir / "viz"
+    # The mesh, URDF and stage.yaml sit at the top of the build folder; the
+    # mesher's own files and the check pictures go under intermediate/.
+    inter = outdir / "intermediate"
+    vizdir = inter / "viz"
     vizdir.mkdir(parents=True, exist_ok=True)
     global _INPUT_PLY
     _INPUT_PLY = os.path.abspath(args.trunk_ply)
