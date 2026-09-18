@@ -77,6 +77,11 @@ doesn't surprise you.
   out directly with `git -C submodules/<name> checkout -f HEAD`.
 - **`nvcc: command not found`** when running things later — the conda env
   isn't active. A quick `conda activate splatsim` fixes it.
+- **`[splat assets] not found` at launch** — a scene you haven't downloaded.
+  The sim doesn't abort: it lists the missing files, turns splat rendering
+  off and renders image observations with the PyBullet camera instead, so
+  physics, control, planning, metrics and oracle state all still work. Unpack
+  the scene's tarball into `data/scenes/` and relaunch for photoreal frames.
 - **`CUDA error: no kernel image is available for execution on the device`**
   — torch is a CUDA build (`cuda available: True`) but has no kernels for
   your GPU. Compare `torch.cuda.get_device_capability()` with

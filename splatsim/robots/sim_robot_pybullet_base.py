@@ -2,7 +2,7 @@ import logging
 import pickle
 import threading
 import time
-from typing import Any, ClassVar, Dict, Optional, List, Tuple, TYPE_CHECKING
+from typing import Any, ClassVar, Dict, Optional, List, Sequence, Tuple, TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 import gymnasium
@@ -826,6 +826,14 @@ class PybulletRobotServerBase:
     # `render_from_splat` flag, which only gates rendering of already-loaded
     # splats; RENDER_SPLATS=False avoids loading them in the first place.
     RENDER_SPLATS: ClassVar[bool] = True
+    # Set by the __init__ preflight when a scan this env renders is not on
+    # disk: the env then runs with RENDER_SPLATS off (an instance-level
+    # shadow of the ClassVar above) and the PyBullet camera as its image
+    # source. Class-level defaults so every instance has them even if a
+    # subclass reaches create_object by an unusual path. NOT ClassVar —
+    # __init__ assigns them per instance. See `_preflight_splat_assets`.
+    missing_splat_assets: Sequence[str] = ()
+    _splat_assets_unavailable: bool = False
 
     # Whether the ROBOT itself has a Gaussian splat, separately from the scene.
     # None (default) = follow RENDER_SPLATS, which is what every env that scanned
@@ -1200,6 +1208,32 @@ class PybulletRobotServerBase:
             for m in image_resize_modes
         ]
 
+        # Splat scans are downloaded per scene, outside the repo, so check
+        # they are on disk BEFORE anything tries to load one — a missing scan
+        # should not take the whole server down several seconds into
+        # construction. See `_preflight_splat_assets`.
+        self.missing_splat_assets = (
+            self._preflight_splat_assets() if self.RENDER_SPLATS else []
+        )
+        self._splat_assets_unavailable = bool(self.missing_splat_assets)
+        if self.missing_splat_assets:
+            print(
+                "[splat assets] not found — rendering from the PyBullet camera "
+                "instead. Physics, control, planning, metrics and oracle state "
+                "are unaffected; images just aren't photoreal."
+            )
+            for item in self.missing_splat_assets:
+                print(f"    missing: {item}")
+            print(
+                "    Unpack the scene tarball(s) into data/scenes/ and relaunch "
+                "for splat rendering (see the README's Download the example scenes)."
+            )
+            # Instance-level shadow of the ClassVar. Everything reads
+            # self.RENDER_SPLATS, so this one assignment turns off the robot
+            # splat, the background object, the base camera, the segmentation
+            # load and the SPLAT entry in the GUI's render-mode dropdown.
+            self.RENDER_SPLATS = False
+
         # load labels.npy — the per-link segmentation of the ROBOT's own splat,
         # so it is needed exactly when that splat is loaded (see
         # RENDER_ROBOT_SPLAT), not merely when the scene renders as splats.
@@ -1243,6 +1277,16 @@ class PybulletRobotServerBase:
             else:
                 render_mode = RenderMode.NONE
         render_mode = RenderMode(render_mode)  # accept enum or str
+        if render_mode == RenderMode.SPLAT and self.missing_splat_assets:
+            # Splats were asked for explicitly (--render_mode splat, or the
+            # env's own default) but there are none to render. The PyBullet
+            # camera covers the same camera keys, so downgrade rather than
+            # hand back a server whose every observation would be blank.
+            print(
+                "[splat assets] render_mode=splat was requested but the scans "
+                "are missing — falling back to render_mode=pybullet."
+            )
+            render_mode = RenderMode.PYBULLET
         self._apply_render_mode(render_mode)
         # Launch-time preference, kept separate from the runtime gates above:
         # paths that re-enable rendering after a temporary disable (e.g.
@@ -2103,6 +2147,13 @@ class PybulletRobotServerBase:
             initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
             articulation_config.initial_link_poses = initial_link_poses
 
+        if splatsim_obj.config.load_splat and self._splat_assets_unavailable:
+            # Degraded mode (see `_preflight_splat_assets`): the scans are not
+            # on disk. Clear the flag on the config rather than skipping the
+            # call locally — the articulation block below reads `load_splat`
+            # to decide whether per-point segmentation exists, and the two
+            # must agree.
+            splatsim_obj.config.load_splat = False
         if splatsim_obj.config.load_splat:
             self.load_gaussian_splat(splatsim_obj)
         else:
@@ -2502,18 +2553,36 @@ class PybulletRobotServerBase:
         # rather than conforming to the base camera's aspect.
         fisheye_cal = WRIST_CAM_FISHEYE_CALIBRATIONS.get(self.wrist_cam_ver)
 
-        H = self.base_camera.camera.image_height
+        # Size and FoV normally come from the splat base camera, so the wrist
+        # view lands on pixels comparable to the base view. With no splat
+        # assets there IS no base camera (RENDER_SPLATS off, or scans missing
+        # — see `_preflight_splat_assets`) and this camera exists only to aim
+        # the PyBullet render, so fall back to the PyBullet camera's own size
+        # and FoV. The wrist POSE, which is what the view is actually about,
+        # comes from the link either way.
+        if self.base_camera is not None:
+            H = self.base_camera.camera.image_height
+            base_W = self.base_camera.camera.image_width
+            fovx = self.base_camera.camera.FoVx
+            fovy = 2 * np.atan(np.tan(self.base_camera.camera.FoVy / 2))
+        else:
+            H = int(self.PYBULLET_CAMERA_HEIGHT)
+            base_W = int(self.PYBULLET_CAMERA_WIDTH)
+            fovy = np.deg2rad(float(self.PYBULLET_CAMERA_FOV))
+            fovx = 2 * np.arctan(np.tan(fovy / 2) * base_W / H)
         if fisheye_cal is not None:
             # Preserve the fisheye's native aspect (CAL_W : CAL_H).
             W = int(round(H * fisheye_cal["CAL_W"] / fisheye_cal["CAL_H"]))
         else:
             # Pinhole: match base camera resolution exactly so both cameras
             # produce identical-shape frames downstream.
-            W = self.base_camera.camera.image_width
+            W = base_W
         resolution = (W, H)
 
-        fovx = self.base_camera.camera.FoVx
-        fovy = 2 * np.atan(np.tan(self.base_camera.camera.FoVy / 2))
+        # Splat render params, carried through from the base camera. None
+        # without one — the PyBullet render path never reads them.
+        base_pipeline = getattr(self.base_camera, "pipeline", None)
+        base_background = getattr(self.base_camera, "background", None)
 
         colmap_id = self.wrist_colmap_camera_id
         uid = 0
@@ -2553,8 +2622,8 @@ class PybulletRobotServerBase:
 
             splatsim_camera = SplatSimCamera(
                 camera=camera,
-                pipeline=self.base_camera.pipeline,
-                background=self.base_camera.background,
+                pipeline=base_pipeline,
+                background=base_background,
                 camera_model="fisheye",
                 intrinsic_matrix=fisheye_K,
                 radial_coeffs=fisheye_D,
@@ -2564,8 +2633,8 @@ class PybulletRobotServerBase:
             # Camera object's fovx/fovy above). Matches the pre-a161cad6 default.
             splatsim_camera = SplatSimCamera(
                 camera=camera,
-                pipeline=self.base_camera.pipeline,
-                background=self.base_camera.background,
+                pipeline=base_pipeline,
+                background=base_background,
                 camera_model="pinhole",
             )
 
@@ -3407,6 +3476,71 @@ class PybulletRobotServerBase:
         if self.RENDER_ROBOT_SPLAT is None:
             return bool(self.RENDER_SPLATS)
         return bool(self.RENDER_ROBOT_SPLAT and self.RENDER_SPLATS)
+
+    def _missing_splat_files(
+        self, splat_name: Optional[str], fields: Sequence[str]
+    ) -> List[str]:
+        """Which of `splat_name`'s path `fields` point at something absent."""
+        if not splat_name:
+            return []
+        from splatsim.configs import scene_registry
+
+        entry = scene_registry.get(splat_name)
+        if entry is None:
+            return [f"{splat_name} (no scene.yaml under data/scenes/)"]
+        missing = []
+        for field in fields:
+            path = entry.get(field)
+            if path is None:
+                continue
+            resolved = resolve_splatsim_path(path)
+            if not os.path.exists(resolved):
+                missing.append(f"{splat_name}.{field} -> {resolved}")
+        return missing
+
+    def _preflight_splat_assets(self) -> List[str]:
+        """Splat assets this env needs to render but that aren't on disk.
+
+        The scans live outside the repo — one downloadable tarball per scene —
+        so a complete checkout with a working CUDA stack can still have
+        nothing to render, and a fresh machine usually has some scenes but not
+        all of them. Loading used to discover that one asset at a time and
+        raise FileNotFoundError mid-construction, which killed a server that
+        was otherwise perfectly able to run: physics, control, planning,
+        metrics and oracle state need no gaussians at all, and the PyBullet
+        camera renders the same camera keys. So we look first, and the caller
+        degrades to that camera instead of aborting.
+
+        Checked: the robot's own splat and its per-link labels (only when the
+        robot is rendered as gaussians), the background scan, the base
+        camera's scan (its COLMAP output too — `setup_camera_from_dataset`
+        reads `source_path`, not just the splat), and every scene object that
+        loads a splat.
+        """
+        missing: List[str] = []
+        if self._render_robot_splat():
+            missing += self._missing_splat_files(
+                self.robot_name, ("model_path", "ply_path")
+            )
+            labels = (
+                SPLATSIM_ROOT / "data" / "labels_path" / f"{self.robot_name}_labels.npy"
+            )
+            if not labels.exists():
+                missing.append(f"{self.robot_name} per-link labels -> {labels}")
+        missing += self._missing_splat_files(
+            self.background_splat_name, ("model_path", "ply_path")
+        )
+        missing += self._missing_splat_files(
+            self.base_camera_splat_name or self.background_splat_name,
+            ("model_path", "source_path"),
+        )
+        for object_config in getattr(self.ENV_CONFIG, "objects", None) or []:
+            if getattr(object_config, "load_splat", False):
+                missing += self._missing_splat_files(
+                    getattr(object_config, "splat_name", None),
+                    ("model_path", "ply_path"),
+                )
+        return list(dict.fromkeys(missing))  # de-duplicated, order kept
 
     def _composite_pybullet_robot(
         self,
