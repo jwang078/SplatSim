@@ -225,12 +225,28 @@ for; the scan name renders the robot photoreal, the asset name draws it from
 its meshes.
 
 1. Make a folder under `data/assets/` and put the URDF (and its meshes)
-   inside. Add an `asset.yaml` next to it that says where the URDF is:
+   inside, with an `asset.yaml` next to it. The one line it needs says where
+   the URDF is; `data/assets/ur5/asset.yaml` is:
    ```yaml
-   urdf_path: my_robot.urdf
+   urdf_path: ur5.urdf
+   base_position: [0.0, 0.0, 0.0]
+   base_orientation_rpy: [0.0, 0.0, 0.0]
+
+   robot:
+     base: fixed
+     arm_joints: auto                # the six UR joints
+     ee_link: wrist_camera_link      # goal frame = the wrist camera (imaging tasks)
+     initial_joint_positions: [1.570796, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]
+     gripper:
+       kind: robotiq_2f85            # recognised by its joint names; calibrated open/close path
+     cameras:
+       - name: wrist
+         link: wrist_camera_link
+         model: fisheye_v2           # the GoPro calibration used for the datasets
    ```
-   `data/assets/ur5/`, `ur5e/` and `panda/` are complete, working robot
-   folders — copy one.
+   Everything under `robot:` is optional (`auto` or omitted = derived from
+   the URDF). `data/assets/ur5/`, `ur5e/` and `panda/` are complete, working
+   robot folders — copy one.
 2. Check what the simulator sees:
    ```bash
    python scripts/check_robot.py robot_iphone_w_engine_curtain
