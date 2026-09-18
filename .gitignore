@@ -53,5 +53,6 @@ data/assets/**
 !data/assets/panda/**
 !data/assets/ur5/**
 !data/assets/ur5e/**
+!data/assets/dual_panda/**
 data/scenarios/
 scripts/outputs/
