@@ -57,6 +57,19 @@ def main() -> int:
         return 1
 
     print(spec.summary())
+    if not args.robot.endswith(".urdf"):
+        lp = registry.labels_path(name)
+        if lp.exists():
+            import numpy as np
+            labels = np.load(lp); key = registry.labels_key(name)
+            used = sorted(set(np.unique(labels).astype(int).tolist()))
+            if key:
+                names = [key["links"].get(str(v), "?") for v in used]
+                print(f"  splat labels: {len(labels)} gaussians over {len(used)} links ({lp.name}; key {lp.with_suffix('.json').name})")
+                print("    " + ", ".join(f"{v}={n}" for v, n in zip(used, names)))
+            else:
+                print(f"  splat labels: {len(labels)} gaussians over link indices {used} ({lp.name}; no key file — "
+                      f"values are PyBullet link indices of the URDF, -1 = base)")
     warnings = []
     if spec.legacy and "robot" not in cfg:
         warnings.append("no `robot:` block — everything above was derived from the URDF (fine; add the block only to override)")

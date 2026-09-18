@@ -234,6 +234,38 @@ def labels_path(name: str) -> Path:
     return LEGACY_LABELS_DIR / f"{name}_labels.npy"
 
 
+def labels_key(name: str) -> Optional[Dict[str, Any]]:
+    """The legend written next to `labels_path` (`<stem>.json`): what each
+    integer in the labels array means (PyBullet link index into the entry's
+    URDF, -1 = base link) and the link names in that URDF's order. None for
+    scans labelled before the legend existed."""
+    import json
+    lp = labels_path(name)
+    key = lp.with_suffix(".json")
+    if not key.exists():
+        return None
+    return json.loads(key.read_text())
+
+
+def write_labels_key(labels_file: Path, client, body_id: int, urdf_path: str) -> Path:
+    """Write the legend for a labels array next to it. `labels_file` is the
+    .npy the array was (or will be) saved to; the key is `<stem>.json`."""
+    import json
+    links = {"-1": client.getBodyInfo(body_id)[0].decode()}
+    for j in range(client.getNumJoints(body_id)):
+        links[str(j)] = client.getJointInfo(body_id, j)[12].decode()
+    key = {
+        "labels_file": Path(labels_file).name,
+        "meaning": "one value per Gaussian of the splat (same order as its point_cloud.ply); "
+                   "the value is the PyBullet link index of the URDF that link belongs to, -1 = base link",
+        "urdf_path": str(urdf_path),
+        "links": links,
+    }
+    out = Path(labels_file).with_suffix(".json")
+    out.write_text(json.dumps(key, indent=2) + "\n")
+    return out
+
+
 def source_file(name: str) -> Path:
     load_all()
     return _SOURCE[name]

@@ -150,7 +150,8 @@ data/stages/<stage>/
     stage.yaml                       transformation, aabb, asset, model_path, source_path, ...
     splat/                           gaussian-splatting output
     sfm/                             COLMAP / hloc output
-    splat_labels.npy                 per-Gaussian link labels (robot scans; see Scanning your robot)
+    splat_labels.npy                 which URDF link each Gaussian belongs to (see Scanning your robot)
+    splat_labels.json                its key: link index -> link name
     segmentations/<build>/
         stage.yaml                   ply_path, urdf_path, collision_frame
         <build>.urdf, <build>_collision.obj, cost field, grape targets, ...
@@ -290,7 +291,7 @@ python scripts/articulated_robot_pipeline.py --robot_name your_robot_name
 
 Verify that the first point cloud visualization has the same joint poses as your robot had in the splat. If not, adjust `joint_states`. Ignore the second visualization for now.
 
-The point cloud is written next to the scan as `data/stages/your_robot_name/urdf_pcd.ply` (and the per-Gaussian link labels as `splat_labels.npy` in the same folder, recorded in the `stage.yaml` as `labels_path`).
+The point cloud is written next to the scan as `data/stages/your_robot_name/urdf_pcd.ply` (and the per-Gaussian link labels as `splat_labels.npy` in the same folder, recorded in the `stage.yaml` as `labels_path`, with `splat_labels.json` saying which link index is which link).
 
 #### Align robot coordinate frames in sim and in splat
 

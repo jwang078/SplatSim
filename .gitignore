@@ -45,6 +45,7 @@ data/stages/**
 !data/stages/**/
 !data/stages/**/stage.yaml
 !data/stages/**/splat_labels.npy
+!data/stages/**/splat_labels.json
 data/assets/**
 !data/assets/**/
 !data/assets/**/asset.yaml

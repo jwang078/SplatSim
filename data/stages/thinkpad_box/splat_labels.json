@@ -1,0 +1,9 @@
+{
+  "labels_file": "splat_labels.npy",
+  "meaning": "one value per Gaussian of the splat (same order as its point_cloud.ply); the value is the PyBullet link index of the URDF that link belongs to, -1 = base link",
+  "urdf_path": "./data/stages/thinkpad_box/thinkpad_box.urdf",
+  "links": {
+    "-1": "world",
+    "0": "base_link"
+  }
+}

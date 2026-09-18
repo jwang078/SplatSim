@@ -292,7 +292,9 @@ def main(args):
 
     #save labels
     print(f"Saving labels to numpy file {labels_fn}...")
-    np.save(labels_fn, splat_labels)
+    np.save(labels_fn, np.asarray(splat_labels, dtype=np.int32))
+    key = registry.write_labels_key(labels_fn, p, robot_id, robot_path)
+    print(f"Labels key (link index -> link name) written to {key}")
     if not labels_fn.startswith("data/labels_path/"):
         # record it in the yaml so the simulator finds it without any naming convention
         registry.write_back(args.robot_name, {"labels_path": os.path.basename(labels_fn)})
