@@ -1,0 +1,43 @@
+# Two Franka Pandas on one box base — the shipped example of a multi-arm robot
+# (one URDF, one body: the arms are chains of the same kinematic tree, which
+# is also how USD would express it, as one articulation). Meshes are shared
+# with data/assets/panda/.
+#
+# With `arms:`, each arm has its own ee_link, gripper and start pose; the
+# state/action vectors are all arm joints in this order, then every gripper
+# command in this order. The first arm is the one goals and `ee_link` refer
+# to unless `primary_arm` says otherwise.
+urdf_path: dual_panda.urdf
+base_position: [0.0, 0.0, 0.0]
+base_orientation_rpy: [0.0, 0.0, 0.0]
+
+robot:
+  base: fixed
+  arms:
+    - name: left
+      ee_link: left_panda_hand
+      initial_joint_positions: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+      gripper:
+        kind: synergies
+        joints: [left_panda_finger_joint1]
+        open: [0.04]
+        closed: [0.0]
+    - name: right
+      ee_link: right_panda_hand
+      initial_joint_positions: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+      gripper:
+        kind: synergies
+        joints: [right_panda_finger_joint1]
+        open: [0.04]
+        closed: [0.0]
+  cameras:
+    - name: left_wrist
+      link: left_panda_hand
+      offset_xyz: [0.0, 0.0, 0.03]
+      model: pinhole
+      fov_deg: 70
+    - name: right_wrist
+      link: right_panda_hand
+      offset_xyz: [0.0, 0.0, 0.03]
+      model: pinhole
+      fov_deg: 70

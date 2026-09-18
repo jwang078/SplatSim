@@ -38,6 +38,25 @@ Full form (every key optional; `auto` or omitted = derive):
         tip_link: auto | link name
         contact_links: auto | [link names]
 
+Several arms on one body (a mobile manipulator with two arms, say) replace
+`arm_joints` / `ee_link` / `gripper` / `initial_joint_positions` with a list;
+each arm gets its own, and the state/action vectors are every arm's joints
+in this order followed by every gripper's commands in this order:
+
+    robot:
+      base: wheeled
+      wheel_joints: [...]
+      primary_arm: left                         # goals / `ee_link_index` refer to it (default: first)
+      arms:
+        - name: left
+          ee_link: left_tool0
+          joints: auto                          # auto = the movable chain base -> ee_link
+          initial_joint_positions: auto | [per arm joint]
+          gripper: {kind: ..., ...}             # detected under this arm's ee link
+        - name: right
+          ee_link: right_tool0
+      cameras: [...]                            # cameras are per link, not per arm
+
 `kind: auto` recognises the Robotiq 2F-85 by its joint names (the shipped
 UR5) and keeps its calibrated mimic behaviour; any other gripper becomes
 `per_joint` over its movable joints, which always works and can be tightened
@@ -170,17 +189,31 @@ class GripperSpec:
 
 
 @dataclass
+class ArmSpec:
+    """One kinematic chain with its own tool frame and gripper."""
+    name: str
+    joint_indices: List[int]                    # planner / IK joints of this arm, in order
+    ee_link_index: int
+    gripper: GripperSpec
+
+    @property
+    def num_dofs(self) -> int:
+        return len(self.joint_indices)
+
+
+@dataclass
 class RobotSpec:
     name: str
     urdf_path: str
     base: str                                   # fixed | planar | wheeled
     joints: List[JointInfo]
     link_names: Dict[int, str]                  # link index -> name (-1 = base)
-    arm_joint_indices: List[int]
+    arms: List[ArmSpec]                         # one or more; arms[primary] is what goals refer to
+    arm_joint_indices: List[int]                # every arm's joints, arm after arm
     wheel_joint_indices: List[int]
-    gripper: GripperSpec
+    gripper: GripperSpec                        # the primary arm's gripper
     cameras: List[CameraSpec]
-    ee_link_index: int
+    ee_link_index: int                          # the primary arm's tool frame
     state_joint_indices: List[int]              # what get_joint_state / teleport vectors index
 
     @property
@@ -200,8 +233,31 @@ class RobotSpec:
         return len(self.arm_joint_indices)
 
     @property
+    def grippers(self) -> List[GripperSpec]:
+        """Every arm's gripper, in arm order (the layout of the gripper part
+        of the action vector)."""
+        return [a.gripper for a in self.arms]
+
+    @property
+    def gripper_command_dim(self) -> int:
+        return sum(g.command_dim for g in self.grippers)
+
+    @property
     def action_dim(self) -> int:
-        return self.num_dofs + self.gripper.command_dim
+        return self.num_dofs + self.gripper_command_dim
+
+    @property
+    def primary_arm(self) -> ArmSpec:
+        for a in self.arms:
+            if a.ee_link_index == self.ee_link_index and a.gripper is self.gripper:
+                return a
+        return self.arms[0]
+
+    def arm(self, name: str) -> ArmSpec:
+        for a in self.arms:
+            if a.name == name:
+                return a
+        raise KeyError(f"no arm named {name!r} (have: {[a.name for a in self.arms]})")
 
     @property
     def ee_link_name(self) -> str:
@@ -226,15 +282,18 @@ class RobotSpec:
         return None
 
     def summary(self) -> str:
-        g = self.gripper
-        lines = [
-            f"robot {self.name!r}: {self.urdf_path}",
-            f"  base: {self.base}",
-            f"  arm joints ({self.num_dofs}): {[self.joints[i].name for i in self.arm_joint_indices]}",
-            f"  ee link: {self.ee_link_name} (index {self.ee_link_index})",
-            f"  gripper: {g.kind}" + (f", command dim {g.command_dim}, joints {g.joint_names}" if g.kind != 'none' else ''),
+        lines = [f"robot {self.name!r}: {self.urdf_path}", f"  base: {self.base}"]
+        for a in self.arms:
+            g = a.gripper
+            tag = f"arm {a.name!r}" + (" (primary)" if len(self.arms) > 1 and a is self.primary_arm else "")
+            lines += [
+                f"  {tag}: {a.num_dofs} joints {[self.joints[i].name for i in a.joint_indices]}",
+                f"    ee link: {self.link_names[a.ee_link_index]} (index {a.ee_link_index})",
+                f"    gripper: {g.kind}" + (f", command dim {g.command_dim}, joints {g.joint_names}" if g.kind != 'none' else ''),
+            ]
+        lines += [
             f"  cameras ({len(self.cameras)}): " + (", ".join(f"{c.name}@{c.link} [{c.model}]" for c in self.cameras) or "none"),
-            f"  action vector: {self.num_dofs} arm + {g.command_dim} gripper = {self.action_dim}",
+            f"  action vector: {self.num_dofs} arm + {self.gripper_command_dim} gripper = {self.action_dim}",
             f"  splat scan: {'yes' if self.has_splat else 'no (rendered from URDF meshes)'}",
         ]
         if self.wheel_joint_indices:
@@ -265,87 +324,54 @@ class RobotSpec:
         if base not in ("fixed", "planar", "wheeled"):
             raise ValueError(f"{name}: robot.base must be fixed | planar | wheeled, got {base!r}")
 
-        # --- gripper -------------------------------------------------------
-        gcfg: Dict[str, Any] = dict(rb.get("gripper") or {})
-        kind = str(gcfg.get("kind") or "auto").lower()
-        use_gripper_legacy = bool(cfg.get("use_gripper", True))
-        names = {j.name for j in joints}
-        is_robotiq = ROBOTIQ_2F85_DRIVE in names and all(n in names for n in ROBOTIQ_2F85_MIMIC)
-        if kind == "auto":
-            if is_robotiq and (not legacy or use_gripper_legacy):
-                kind = "robotiq_2f85"
-            elif legacy and not use_gripper_legacy:
-                kind = "none"
-            else:
-                auto_g = [j for j in movable if _GRIPPER_NAME_RE.search(j.name) and not _WHEEL_NAME_RE.search(j.name)]
-                kind = "per_joint" if auto_g else "none"
-        if kind == "robotiq_2f85" and not is_robotiq:
-            raise ValueError(f"{name}: gripper.kind robotiq_2f85 but the URDF has no Robotiq 2F-85 joints")
-
-        if kind == "none":
-            g_roots: List[int] = []
-        elif kind == "robotiq_2f85":
-            g_roots = [j.index for j in joints if j.name in ROBOTIQ_2F85_ALL_JOINTS and j.movable]
-        elif _auto(gcfg.get("joints")):
-            g_roots = [j.index for j in movable
-                       if _GRIPPER_NAME_RE.search(j.name) and not _WHEEL_NAME_RE.search(j.name)]
+        # --- arms + grippers ------------------------------------------------
+        arms: List[ArmSpec] = []
+        if rb.get("arms"):
+            claimed: set = set(wheel_idx)
+            for i, acfg in enumerate(rb["arms"]):
+                acfg = dict(acfg or {})
+                aname = str(acfg.get("name") or f"arm{i}")
+                if _auto(acfg.get("ee_link")) and _auto(acfg.get("joints")):
+                    raise ValueError(f"{name}: arm {aname!r} needs `ee_link` (or an explicit `joints` list)")
+                ee_i = None if _auto(acfg.get("ee_link")) else _link_index(link_names, acfg["ee_link"])
+                if _auto(acfg.get("joints")):
+                    chain = _chain_to(joints, ee_i)
+                    a_idx = [j for j in chain if joints[j].movable and j not in claimed]
+                else:
+                    a_idx = [_find_joint(joints, n).index for n in acfg["joints"]]
+                if not a_idx:
+                    raise ValueError(f"{name}: arm {aname!r} has no movable joints between the base and {acfg.get('ee_link')!r}")
+                if ee_i is None:
+                    ee_i = a_idx[-1]
+                # this arm's gripper lives under its tool link (or its last joint)
+                sub = _links_under(joints, [ee_i])
+                g, g_all = _derive_gripper(dict(acfg.get("gripper") or {}), joints, movable, link_names, wheel_idx,
+                                           legacy=False, use_gripper_legacy=True, urdf_path=urdf_path or cfg.get("urdf_path"),
+                                           name=f"{name}/{aname}", candidate_links=set(sub))
+                a_idx = [j for j in a_idx if j not in g_all]
+                claimed |= set(a_idx) | set(g_all)
+                arms.append(ArmSpec(name=aname, joint_indices=a_idx, ee_link_index=ee_i, gripper=g))
+            if any(g.kind == "robotiq_2f85" for g in (a.gripper for a in arms)) and sum(a.gripper.kind == "robotiq_2f85" for a in arms) > 1:
+                raise ValueError(f"{name}: only one Robotiq 2F-85 per robot is supported (its calibrated mimic path is a singleton)")
         else:
-            g_roots = [_find_joint(joints, n).index for n in gcfg["joints"]]
-        g_roots = [i for i in g_roots if i not in wheel_idx]
-        # The gripper is a SUBTREE: every movable joint whose link hangs below
-        # the declared/detected joints belongs to it (mimic children, extra
-        # finger joints) even if it wasn't named — otherwise it would be
-        # mistaken for an arm joint.
-        g_links_all = _links_under(joints, g_roots) if g_roots else []
-        g_joint_idx = sorted(set(g_roots) | {j.index for j in movable if j.index in g_links_all and j.index not in wheel_idx})
-
-        # --- arm -----------------------------------------------------------
-        if _auto(rb.get("arm_joints")):
-            if legacy:
-                n_legacy = int(cfg.get("num_dofs") or 0)
+            g, g_joint_idx = _derive_gripper(dict(rb.get("gripper") or {}), joints, movable, link_names, wheel_idx,
+                                             legacy=legacy, use_gripper_legacy=bool(cfg.get("use_gripper", True)),
+                                             urdf_path=urdf_path or cfg.get("urdf_path"), name=name)
+            if _auto(rb.get("arm_joints")):
                 arm_idx = [j.index for j in movable if j.index not in g_joint_idx and j.index not in wheel_idx]
-                if n_legacy:
-                    arm_idx = arm_idx[:n_legacy]
+                if legacy:
+                    n_legacy = int(cfg.get("num_dofs") or 0)
+                    if n_legacy:
+                        arm_idx = arm_idx[:n_legacy]
             else:
-                arm_idx = [j.index for j in movable if j.index not in g_joint_idx and j.index not in wheel_idx]
-        else:
-            arm_idx = [_find_joint(joints, n).index for n in rb["arm_joints"]]
-        if not arm_idx:
-            raise ValueError(f"{name}: no arm joints found in the URDF (no movable non-gripper joints)")
-
-        # --- gripper details (needs arm known for link ownership) ----------
-        g_links = g_links_all
-        g_mimic = _mimic_from_urdf(urdf_path or cfg.get("urdf_path"), joints) if kind in ("synergies", "per_joint") else {}
-        # mimic children are driven by their parent, not commanded
-        commanded = [i for i in g_joint_idx if i not in g_mimic] if kind != "robotiq_2f85" else g_joint_idx
-        gopen = gclosed = gmat = None
-        if kind in ("synergies", "per_joint"):
-            n = len(commanded)
-            lo = np.array([joints[i].lower for i in commanded]); hi = np.array([joints[i].upper for i in commanded])
-            gopen = np.asarray(gcfg.get("open"), dtype=np.float64) if gcfg.get("open") is not None else np.where(np.isfinite(lo), lo, 0.0)
-            gclosed = np.asarray(gcfg.get("closed"), dtype=np.float64) if gcfg.get("closed") is not None else np.where(np.isfinite(hi), hi, 0.0)
-            if len(gopen) != n or len(gclosed) != n:
-                raise ValueError(f"{name}: gripper open/closed need {n} values (commanded joints "
-                                 f"{[joints[i].name for i in commanded]}), got {len(gopen)}/{len(gclosed)}")
-            if gcfg.get("matrix") is not None:
-                gmat = np.asarray(gcfg["matrix"], dtype=np.float64)
-                if gmat.ndim != 2 or gmat.shape[1] != n:
-                    raise ValueError(f"{name}: gripper.matrix must be K x {n}")
-                kind = "synergies"
-        tip_idx = None
-        if kind != "none":
-            if not _auto(gcfg.get("tip_link")):
-                tip_idx = _link_index(link_names, gcfg["tip_link"])
-            else:
-                leaves = _leaf_links(joints, g_links)
-                tip_idx = leaves[0] if len(leaves) == 1 else None   # >1 leaves: centroid, resolved by FK later
-        if not _auto(gcfg.get("contact_links")):
-            contact = [_link_index(link_names, n) for n in gcfg["contact_links"]]
-        else:
-            contact = _leaf_links(joints, g_links) if g_links else []
-        gripper = GripperSpec(kind=kind, joint_indices=commanded, joint_names=[joints[i].name for i in commanded],
-                              link_indices=g_links, open=gopen, closed=gclosed, matrix=gmat, mimic=g_mimic,
-                              tip_link_index=tip_idx, contact_link_indices=contact)
+                arm_idx = [_find_joint(joints, n).index for n in rb["arm_joints"]]
+            if not arm_idx:
+                raise ValueError(f"{name}: no arm joints found in the URDF (no movable non-gripper joints)")
+            arms.append(ArmSpec(name=str(rb.get("name") or "arm"), joint_indices=arm_idx, ee_link_index=-2, gripper=g))
+        arm_idx = [j for a in arms for j in a.joint_indices]
+        commanded = [j for a in arms for j in a.gripper.joint_indices]
+        gripper = arms[0].gripper if _auto(rb.get("primary_arm")) else next(a for a in arms if a.name == rb["primary_arm"]).gripper
+        primary = arms[0] if _auto(rb.get("primary_arm")) else next(a for a in arms if a.name == rb["primary_arm"])
 
         # --- cameras -------------------------------------------------------
         cams: List[CameraSpec] = []
@@ -368,17 +394,21 @@ class RobotSpec:
             seen.add(c.name)
 
         # --- EE link -------------------------------------------------------
-        if not _auto(rb.get("ee_link")):
-            ee = _link_index(link_names, rb["ee_link"])
-        elif cams and legacy:
-            ee = cams[0].link_index            # shipped convention: goal frame = wrist camera link
+        if rb.get("arms"):
+            ee = primary.ee_link_index
         else:
-            ee = arm_idx[-1]
-            # prefer a fixed "tool"/"ee" link hanging off the last arm link if the URDF has one
-            for j in joints:
-                if j.parent_link_index == arm_idx[-1] and not j.movable and re.search(r"ee|tool|tcp|flange|hand", j.child_link, re.I):
-                    ee = j.index
-                    break
+            if not _auto(rb.get("ee_link")):
+                ee = _link_index(link_names, rb["ee_link"])
+            elif cams and legacy:
+                ee = cams[0].link_index            # shipped convention: goal frame = wrist camera link
+            else:
+                ee = arm_idx[-1]
+                # prefer a fixed "tool"/"ee" link hanging off the last arm link if the URDF has one
+                for j in joints:
+                    if j.parent_link_index == arm_idx[-1] and not j.movable and re.search(r"ee|tool|tcp|flange|hand", j.child_link, re.I):
+                        ee = j.index
+                        break
+            arms[0].ee_link_index = ee
 
         # --- state vector, initial positions, signs -------------------------
         if legacy:
@@ -387,6 +417,15 @@ class RobotSpec:
             state_idx = arm_idx + commanded + wheel_idx
         art = cfg.get("articulation_config") or {}
         init_src = rb.get("initial_joint_positions")
+        if rb.get("arms"):
+            per_arm = [a.get("initial_joint_positions") for a in rb["arms"]]
+            if any(not _auto(v) for v in per_arm):
+                init_src = []
+                for a, v in zip(arms, per_arm):
+                    v = [] if _auto(v) else list(v)
+                    if len(v) != a.num_dofs:
+                        raise ValueError(f"{name}: arm {a.name!r} initial_joint_positions needs {a.num_dofs} values, got {len(v)}")
+                    init_src += v
         if _auto(init_src):
             init_src = art.get("initial_joint_positions")
         init = np.zeros(len(state_idx))
@@ -406,15 +445,17 @@ class RobotSpec:
             # adjacent links always; every gripper-internal pair (linkages overlap by design)
             for j in joints:
                 skip.append((j.parent_link_index, j.index))
-            for a in g_links:
-                for b in g_links:
-                    if a < b:
-                        skip.append((a, b))
+            for arm in arms:                      # within ONE gripper, never across grippers
+                gl = arm.gripper.link_indices
+                for a in gl:
+                    for b in gl:
+                        if a < b:
+                            skip.append((a, b))
         # legacy: the server's class-level lists apply (see PybulletRobotServerBase)
 
         return cls(
             name=name, urdf_path=str(urdf_path or cfg.get("urdf_path")), base=base, joints=joints,
-            link_names=link_names, arm_joint_indices=arm_idx, wheel_joint_indices=wheel_idx,
+            link_names=link_names, arms=arms, arm_joint_indices=arm_idx, wheel_joint_indices=wheel_idx,
             gripper=gripper, cameras=cams, ee_link_index=ee, state_joint_indices=state_idx,
             initial_joint_positions=init, joint_signs=signs, self_collision_skip_pairs=skip,
             legacy=legacy, has_splat=bool(cfg.get("model_path") or cfg.get("ply_path")),
@@ -422,6 +463,90 @@ class RobotSpec:
 
 
 # ---------------------------------------------------------------- helpers
+def _derive_gripper(gcfg: Dict[str, Any], joints: List[JointInfo], movable: List[JointInfo],
+                    link_names: Dict[int, str], wheel_idx: List[int], *, legacy: bool, use_gripper_legacy: bool,
+                    urdf_path, name: str, candidate_links: Optional[set] = None):
+    """Gripper of one arm from its `gripper:` block. `candidate_links`
+    restricts auto-detection to a subtree (a multi-arm robot's arm). Returns
+    (GripperSpec, every movable gripper joint index incl. mimic children)."""
+    def _auto(v): return v is None or (isinstance(v, str) and v.lower() == "auto")
+    def _in(j): return candidate_links is None or j.index in candidate_links
+    kind = str(gcfg.get("kind") or "auto").lower()
+    names = {j.name for j in joints if _in(j)}
+    is_robotiq = ROBOTIQ_2F85_DRIVE in names and all(n in names for n in ROBOTIQ_2F85_MIMIC)
+    if kind == "auto":
+        if is_robotiq and (not legacy or use_gripper_legacy):
+            kind = "robotiq_2f85"
+        elif legacy and not use_gripper_legacy:
+            kind = "none"
+        else:
+            auto_g = [j for j in movable if _in(j) and _GRIPPER_NAME_RE.search(j.name) and not _WHEEL_NAME_RE.search(j.name)]
+            kind = "per_joint" if auto_g else "none"
+    if kind == "robotiq_2f85" and not is_robotiq:
+        raise ValueError(f"{name}: gripper.kind robotiq_2f85 but the URDF has no Robotiq 2F-85 joints")
+
+    if kind == "none":
+        g_roots: List[int] = []
+    elif kind == "robotiq_2f85":
+        g_roots = [j.index for j in joints if j.name in ROBOTIQ_2F85_ALL_JOINTS and j.movable and _in(j)]
+    elif _auto(gcfg.get("joints")):
+        g_roots = [j.index for j in movable
+                   if _in(j) and _GRIPPER_NAME_RE.search(j.name) and not _WHEEL_NAME_RE.search(j.name)]
+    else:
+        g_roots = [_find_joint(joints, n).index for n in gcfg["joints"]]
+    g_roots = [i for i in g_roots if i not in wheel_idx]
+    # The gripper is a SUBTREE: every movable joint whose link hangs below
+    # the declared/detected joints belongs to it (mimic children, extra
+    # finger joints) even if it wasn't named — otherwise it would be
+    # mistaken for an arm joint.
+    g_links = _links_under(joints, g_roots) if g_roots else []
+    g_joint_idx = sorted(set(g_roots) | {j.index for j in movable if j.index in g_links and j.index not in wheel_idx})
+
+    g_mimic = _mimic_from_urdf(urdf_path, joints) if kind in ("synergies", "per_joint") else {}
+    g_mimic = {c: pm for c, pm in g_mimic.items() if c in g_joint_idx}
+    # mimic children are driven by their parent, not commanded
+    commanded = [i for i in g_joint_idx if i not in g_mimic] if kind != "robotiq_2f85" else g_joint_idx
+    gopen = gclosed = gmat = None
+    if kind in ("synergies", "per_joint"):
+        n = len(commanded)
+        lo = np.array([joints[i].lower for i in commanded]); hi = np.array([joints[i].upper for i in commanded])
+        gopen = np.asarray(gcfg.get("open"), dtype=np.float64) if gcfg.get("open") is not None else np.where(np.isfinite(lo), lo, 0.0)
+        gclosed = np.asarray(gcfg.get("closed"), dtype=np.float64) if gcfg.get("closed") is not None else np.where(np.isfinite(hi), hi, 0.0)
+        if len(gopen) != n or len(gclosed) != n:
+            raise ValueError(f"{name}: gripper open/closed need {n} values (commanded joints "
+                             f"{[joints[i].name for i in commanded]}), got {len(gopen)}/{len(gclosed)}")
+        if gcfg.get("matrix") is not None:
+            gmat = np.asarray(gcfg["matrix"], dtype=np.float64)
+            if gmat.ndim != 2 or gmat.shape[1] != n:
+                raise ValueError(f"{name}: gripper.matrix must be K x {n}")
+            kind = "synergies"
+    tip_idx = None
+    if kind != "none":
+        if not _auto(gcfg.get("tip_link")):
+            tip_idx = _link_index(link_names, gcfg["tip_link"])
+        else:
+            leaves = _leaf_links(joints, g_links)
+            tip_idx = leaves[0] if len(leaves) == 1 else None   # >1 leaves: centroid, resolved by FK later
+    if not _auto(gcfg.get("contact_links")):
+        contact = [_link_index(link_names, n) for n in gcfg["contact_links"]]
+    else:
+        contact = _leaf_links(joints, g_links) if g_links else []
+    return GripperSpec(kind=kind, joint_indices=commanded, joint_names=[joints[i].name for i in commanded],
+                       link_indices=g_links, open=gopen, closed=gclosed, matrix=gmat, mimic=g_mimic,
+                       tip_link_index=tip_idx, contact_link_indices=contact), g_joint_idx
+
+
+def _chain_to(joints: List[JointInfo], link_index: int) -> List[int]:
+    """Joint indices from the base down to `link_index` (a link's index is
+    the index of the joint whose child it is)."""
+    chain: List[int] = []
+    j = link_index
+    while j is not None and j >= 0:
+        chain.append(j)
+        j = joints[j].parent_link_index
+    return chain[::-1]
+
+
 def _read_joints(client, body_id: int) -> List[JointInfo]:
     out = []
     for i in range(client.getNumJoints(body_id)):

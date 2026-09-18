@@ -240,6 +240,13 @@ ground plane; its wheel joints are velocity-controlled through
 `drive_wheels`). Planning covers the arm; driving a base around is teleop
 territory. Details and defaults are in `splatsim/robots/robot_spec.py`.
 
+A robot with several arms is still one URDF and one folder: list them under
+`arms:` instead of `arm_joints` / `ee_link` / `gripper`, each with its own
+`ee_link`, gripper and start pose. The state and action vectors are then
+every arm's joints in that order followed by every gripper's commands, and
+goals refer to the first arm (or `primary_arm`). `data/assets/dual_panda/`
+is a working two-arm example.
+
 To render your robot photoreal — as gaussians rather than meshes — it needs a
 scan and a calibration; that's the next section.
 

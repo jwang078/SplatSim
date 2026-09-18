@@ -1594,7 +1594,7 @@ class PybulletRobotServerBase:
         diffusion policy require an image OR a distinct environment_state input
         and normalize the two feature types independently."""
         spec = getattr(self, "robot_spec", None)
-        return self.num_dofs() + (spec.gripper.command_dim if spec is not None else 1)
+        return self.num_dofs() + (spec.gripper_command_dim if spec is not None else 1)
 
     def _apply_strict_goal_tolerances(self) -> None:
         """Tighten the success-tolerance thresholds to the STRICT_* class-vars.
@@ -2450,14 +2450,11 @@ class PybulletRobotServerBase:
             # `IndexError: index N is out of bounds for axis 0 with size N`
             # from an arm-only teleport call; the gripper's current motor
             # target stays in effect from the last full-length command.
-            g = self.robot_spec.gripper
-            cmd = np.asarray(joint_state[self.num_dofs(): self.num_dofs() + g.command_dim], dtype=np.float64)
-            if len(cmd) == g.command_dim and g.command_dim > 0:
-                if g.kind == "robotiq_2f85":
-                    self.move_gripper((1 - float(cmd[0])) * 0.085)
-                else:
-                    self._command_generic_gripper(cmd)
-                self.current_gripper_action = float(cmd[0]) if g.command_dim == 1 else cmd.copy()
+            dim = self.robot_spec.gripper_command_dim
+            cmd = np.asarray(joint_state[self.num_dofs(): self.num_dofs() + dim], dtype=np.float64)
+            if len(cmd) == dim and dim > 0:
+                self._command_grippers(cmd)
+                self.current_gripper_action = float(cmd[0]) if dim == 1 else cmd.copy()
 
         # Client-driven physics: step N times per commanded action. See
         # `_sync_physics_to_client` docstring on __init__. Only fires when:
@@ -4821,14 +4818,15 @@ class PybulletRobotServerBase:
         state = np.concatenate(
             [dummy_ee_pos, dummy_ee_euler, [self.current_gripper_state]]
         )
+        # one entry per gripper command channel (several arms -> several)
         action = np.concatenate(
-            [dummy_ee_pos, dummy_ee_euler, [self.current_gripper_action]]
+            [dummy_ee_pos, dummy_ee_euler, np.atleast_1d(np.asarray(self.current_gripper_action, dtype=np.float64))]
         )
 
         # Target object position and orientation
 
         observations = {
-            "joint_positions": joint_positions[:self.num_dofs() + 1],
+            "joint_positions": joint_positions[:self.state_dim()],   # arm joints + every gripper command
             "all_joint_positions": joint_positions,
             "joint_velocities": joint_velocities,
             "ee_pos_quat": dummy_ee_quat,
@@ -5719,20 +5717,31 @@ class PybulletRobotServerBase:
         return True
 
     def open_gripper(self):
-        """Open the gripper (command 0 on every gripper command channel)."""
-        if self.robot_spec.gripper.kind == "robotiq_2f85":
-            self.move_gripper(0.084)
-        elif self.use_gripper:
-            self._command_generic_gripper(np.zeros(self.robot_spec.gripper.command_dim))
+        """Open every gripper (command 0 on every gripper command channel)."""
+        if self.use_gripper:
+            self._command_grippers(np.zeros(self.robot_spec.gripper_command_dim))
         self.current_gripper_action = GripperState.OPEN  # 1
 
     def close_gripper(self):
-        """Close the gripper (command 1 on every gripper command channel)."""
-        if self.robot_spec.gripper.kind == "robotiq_2f85":
-            self.move_gripper(0.0)
-        elif self.use_gripper:
-            self._command_generic_gripper(np.ones(self.robot_spec.gripper.command_dim))
+        """Close every gripper (command 1 on every gripper command channel)."""
+        if self.use_gripper:
+            self._command_grippers(np.ones(self.robot_spec.gripper_command_dim))
         self.current_gripper_action = GripperState.CLOSE  # 0
+
+    def _command_grippers(self, command) -> None:
+        """Apply the gripper part of an action: one slice per arm, in arm
+        order, each `gripper.command_dim` wide (0 = open, 1 = closed)."""
+        cmd = np.asarray(command, dtype=np.float64).reshape(-1)
+        off = 0
+        for arm in self.robot_spec.arms:
+            g = arm.gripper
+            c, off = cmd[off: off + g.command_dim], off + g.command_dim
+            if g.command_dim == 0:
+                continue
+            if g.kind == "robotiq_2f85":
+                self.move_gripper((1 - float(c[0])) * 0.085)
+            else:
+                self._command_generic_gripper(c, g)
 
     # ------------------------------------------------------------ generic grippers
     # Any gripper that is not the calibrated Robotiq 2F-85: driven through
@@ -5741,25 +5750,29 @@ class PybulletRobotServerBase:
     # self-collision among the gripper's own links disabled (linkages overlap
     # by design and would otherwise jam).
     def _setup_generic_gripper(self):
-        g = self.robot_spec.gripper
+        """Gear constraints for URDF mimic joints + no self-collision inside
+        each gripper, for every non-Robotiq gripper on the robot."""
         rid = self.splatsim_robot.sim_id
         self._generic_gripper_gears = []
-        for child, (parent, mult, _offset) in g.mimic.items():
-            c = self.pybullet_client.createConstraint(
-                rid, parent, rid, child, jointType=self.pybullet_client.JOINT_GEAR,
-                jointAxis=[0, 1, 0], parentFramePosition=[0, 0, 0], childFramePosition=[0, 0, 0],
-            )
-            self.pybullet_client.changeConstraint(c, gearRatio=-mult, maxForce=10, erp=1)
-            self._generic_gripper_gears.append(c)
-        links = list(g.link_indices)
-        for a in range(len(links)):
-            for b in range(a + 1, len(links)):
-                self.pybullet_client.setCollisionFilterPair(rid, rid, links[a], links[b], enableCollision=0)
+        for g in self.robot_spec.grippers:
+            if g.kind not in ("per_joint", "synergies"):
+                continue
+            for child, (parent, mult, _offset) in g.mimic.items():
+                c = self.pybullet_client.createConstraint(
+                    rid, parent, rid, child, jointType=self.pybullet_client.JOINT_GEAR,
+                    jointAxis=[0, 1, 0], parentFramePosition=[0, 0, 0], childFramePosition=[0, 0, 0],
+                )
+                self.pybullet_client.changeConstraint(c, gearRatio=-mult, maxForce=10, erp=1)
+                self._generic_gripper_gears.append(c)
+            links = list(g.link_indices)
+            for a in range(len(links)):
+                for b in range(a + 1, len(links)):
+                    self.pybullet_client.setCollisionFilterPair(rid, rid, links[a], links[b], enableCollision=0)
         for link_a, link_b in getattr(self, "SELF_COLLISION_SKIP_PAIRS", ()):
             self.pybullet_client.setCollisionFilterPair(rid, rid, link_a, link_b, enableCollision=0)
 
-    def _command_generic_gripper(self, command) -> None:
-        g = self.robot_spec.gripper
+    def _command_generic_gripper(self, command, g=None) -> None:
+        g = g or self.robot_spec.gripper
         targets = g.joint_targets(command)
         rid = self.splatsim_robot.sim_id
         for j, q in zip(g.joint_indices, targets):
@@ -7180,8 +7193,9 @@ class PybulletRobotServerBase:
 
     def setup_gripper(self):
         self.__parse_joint_info__()
-        if self.robot_spec.gripper.kind != "robotiq_2f85":
-            return self._setup_generic_gripper()
+        self._setup_generic_gripper()            # every per_joint / synergies gripper
+        if not any(g.kind == "robotiq_2f85" for g in self.robot_spec.grippers):
+            return
         self.gripper_range = [0, 0.085]
 
         mimic_parent_name = "finger_joint"
