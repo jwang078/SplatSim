@@ -200,7 +200,7 @@ data/stages/<stage>/
 
 To add a stage: make `data/stages/<stage>/` with `splat/` and `sfm/`, copy
 `data/stages/vine_scene/stage.yaml` beside them and fill in the transform
-(see *Scanning your robot for photoreal rendering*), run the segmentation scripts with
+(see *Scanning an asset for photoreal rendering*), run the segmentation scripts with
 `--outdir data/stages/<stage>/segmentations/<build>`, and tar the folder for
 whoever needs it.
 
@@ -211,12 +211,15 @@ The pose a robot *starts* episodes in is the asset's
 `robot.initial_joint_positions`; a stage that wants a different start writes
 its own `robot:` block, which overrides the asset's.
 
-## Adding your robot
+## Adding an asset you have a URDF for (a robot, a box, an engine)
 
-You need a URDF. Nothing else — the simulator works out the rest from it.
+Anything with a URDF is an asset: a folder under `data/assets/` that the
+simulator can load into any scene. The steps below are written for a robot,
+which is the interesting case (joints, gripper, cameras); a box is the same
+with just step 1.
 
 1. Make a folder under `data/assets/` and put the URDF (and its meshes)
-   inside. Add a `asset.yaml` next to it that says where the URDF is:
+   inside. Add an `asset.yaml` next to it that says where the URDF is:
    ```yaml
    urdf_path: my_robot.urdf
    ```
@@ -269,7 +272,7 @@ is a working two-arm example.
 To render your robot photoreal — as gaussians rather than meshes — it needs a
 scan and a calibration; that's the next section.
 
-## Scanning your robot for photoreal rendering
+## Scanning an asset for photoreal rendering
 
 What if you want to simulate a different robot than the one downloaded above? Or with a new background?
 
@@ -332,7 +335,7 @@ make `data/stages/<stage>/` with a `stage.yaml`:
   ```yaml
   assets:
     robot:
-      asset: ur5                    # its folder under data/assets/ (see Adding your robot)
+      asset: ur5                    # its folder under data/assets/ (see *Adding an asset you have a URDF for*)
       base_position: [0.0, 0.0, 0.0]
       scan_pose:                    # joint angles (rad, by joint name) it had during the scan
         shoulder_pan_joint: 1.5708  #   joints you leave out are 0
