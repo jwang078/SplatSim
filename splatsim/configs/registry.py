@@ -235,34 +235,65 @@ def labels_path(name: str) -> Path:
 
 
 def labels_key(name: str) -> Optional[Dict[str, Any]]:
-    """The legend written next to `labels_path` (`<stem>.json`): what each
-    integer in the labels array means (PyBullet link index into the entry's
-    URDF, -1 = base link) and the link names in that URDF's order. None for
-    scans labelled before the legend existed."""
+    """The legend written next to `labels_path` (`<stem>.json`): `classes`
+    maps each integer in the labels array to a name, `source` says how the
+    labels were made. Names are just strings — a robot scan's classes are its
+    URDF link names, a vine segmentation's could be "grapes" / "trunk" — and
+    `load_labels` is where names get matched to whatever the consumer needs.
+    None for arrays labelled before the legend existed."""
     import json
-    lp = labels_path(name)
-    key = lp.with_suffix(".json")
+    key = labels_path(name).with_suffix(".json")
     if not key.exists():
         return None
     return json.loads(key.read_text())
 
 
-def write_labels_key(labels_file: Path, client, body_id: int, urdf_path: str) -> Path:
-    """Write the legend for a labels array next to it. `labels_file` is the
-    .npy the array was (or will be) saved to; the key is `<stem>.json`."""
+def write_labels_key(labels_file: Path, classes: Dict[int, str], source: str) -> Path:
+    """Write the legend for a labels array next to it (`<stem>.json`).
+    `classes`: label value -> name. `source`: how the labels were produced."""
     import json
-    links = {"-1": client.getBodyInfo(body_id)[0].decode()}
-    for j in range(client.getNumJoints(body_id)):
-        links[str(j)] = client.getJointInfo(body_id, j)[12].decode()
     key = {
         "labels_file": Path(labels_file).name,
         "meaning": "one value per Gaussian of the splat (same order as its point_cloud.ply); "
-                   "the value is the PyBullet link index of the URDF that link belongs to, -1 = base link",
-        "urdf_path": str(urdf_path),
-        "links": links,
+                   "`classes` says what each value is",
+        "source": source,
+        "classes": {str(int(k)): str(v) for k, v in sorted(classes.items(), key=lambda kv: int(kv[0]))},
     }
     out = Path(labels_file).with_suffix(".json")
     out.write_text(json.dumps(key, indent=2) + "\n")
+    return out
+
+
+def load_labels(name: str, client=None, body_id: Optional[int] = None):
+    """`name`'s labels as an int array. With a PyBullet body, the values are
+    remapped to THAT body's link indices by matching class names to its link
+    names (-1 = base), so labels survive a URDF whose link order differs from
+    the one they were made against, and classes that are not links of this
+    body (a heuristic's "background", say) become -1. Without a key file the
+    array is returned as is (the pre-legend convention: values already are
+    link indices of the entry's URDF)."""
+    import numpy as np
+    labels = np.asarray(np.load(labels_path(name))).astype(np.int64)
+    key = labels_key(name)
+    if key is None or client is None or body_id is None:
+        return labels
+    link_of = {client.getBodyInfo(body_id)[0].decode(): -1}
+    for j in range(client.getNumJoints(body_id)):
+        link_of[client.getJointInfo(body_id, j)[12].decode()] = j
+    lut: Dict[int, int] = {}
+    unmapped = []
+    for v, cname in key.get("classes", {}).items():
+        if cname in link_of:
+            lut[int(v)] = link_of[cname]
+        else:
+            lut[int(v)] = -1
+            unmapped.append(cname)
+    if unmapped:
+        logger.warning("labels for %r: classes %s are not links of the loaded body; treated as base (-1)",
+                       name, unmapped)
+    out = np.full_like(labels, -1)
+    for v, li in lut.items():
+        out[labels == v] = li
     return out
 
 

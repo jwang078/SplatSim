@@ -64,8 +64,8 @@ def main() -> int:
             labels = np.load(lp); key = registry.labels_key(name)
             used = sorted(set(np.unique(labels).astype(int).tolist()))
             if key:
-                names = [key["links"].get(str(v), "?") for v in used]
-                print(f"  splat labels: {len(labels)} gaussians over {len(used)} links ({lp.name}; key {lp.with_suffix('.json').name})")
+                names = [key["classes"].get(str(v), "?") for v in used]
+                print(f"  splat labels: {len(labels)} gaussians over {len(used)} classes ({lp.name}; key {lp.with_suffix('.json').name}; source: {key.get('source', '?')})")
                 print("    " + ", ".join(f"{v}={n}" for v, n in zip(used, names)))
             else:
                 print(f"  splat labels: {len(labels)} gaussians over link indices {used} ({lp.name}; no key file — "

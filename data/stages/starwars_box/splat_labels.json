@@ -1,8 +1,8 @@
 {
   "labels_file": "splat_labels.npy",
-  "meaning": "one value per Gaussian of the splat (same order as its point_cloud.ply); the value is the PyBullet link index of the URDF that link belongs to, -1 = base link",
-  "urdf_path": "./data/stages/starwars_box/starwars_box.urdf",
-  "links": {
+  "meaning": "one value per Gaussian of the splat (same order as its point_cloud.ply); `classes` says what each value is",
+  "source": "scripts/articulated_robot_pipeline.py: KNN against the URDF sampled at the scan pose",
+  "classes": {
     "-1": "world",
     "0": "base_link"
   }

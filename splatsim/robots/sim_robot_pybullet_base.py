@@ -1224,8 +1224,7 @@ class PybulletRobotServerBase:
         # so it is needed exactly when that splat is loaded (see
         # RENDER_ROBOT_SPLAT), not merely when the scene renders as splats.
         if self._render_robot_splat():
-            self.robot_labels = np.load(str(registry.labels_path(self.robot_name)))
-            self.robot_labels = torch.from_numpy(self.robot_labels).to(device="cuda").long()
+            self.robot_labels = torch.from_numpy(registry.load_labels(self.robot_name)).to(device="cuda").long()
         else:
             self.robot_labels = None
 
@@ -2181,7 +2180,10 @@ class PybulletRobotServerBase:
             # load_splat=False (RENDER_SPLATS off) gaussians is None, so skip —
             # the articulation still works from the URDF alone (physics + FK).
             if splatsim_obj.config.load_splat:
-                segmentation_labels = np.load(str(registry.labels_path(splatsim_obj.config.splat_name)))
+                # Label values become THIS body's link indices (matched by
+                # link name through the labels' key file, when it has one).
+                segmentation_labels = registry.load_labels(
+                    splatsim_obj.config.splat_name, self.pybullet_client, splatsim_obj.sim_id)
                 segmentation_labels = (
                     torch.from_numpy(segmentation_labels)
                     .to(device=splatsim_obj.gaussians._xyz.device)
