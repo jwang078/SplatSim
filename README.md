@@ -214,7 +214,9 @@ its own `robot:` block, which overrides the asset's.
 ## Adding an asset you have a URDF for (a robot, a box, an engine)
 
 Anything with a URDF is an asset: a folder under `data/assets/` that the
-simulator can load into any scene. The steps below are written for a robot,
+simulator can load into any scene, collide with and move (a body with no
+URDF is just part of the background splat — see *Making a collision body
+from a scan* for those). The steps below are written for a robot,
 which is the interesting case (joints, gripper, cameras); a box is the same
 with just step 1.
 
@@ -410,10 +412,12 @@ that cutting a body out of the scan leaves a gap in the surface it stood on.
 
 ## Making a collision body from a scan (no URDF)
 
-The section above starts from a URDF and cuts its splat out of the scan.
-Things that have no URDF — the grape vine, its trellis, a tree — go the
-other way: cut the body's gaussians out of the scan, turn them into a mesh,
-and wrap that in a generated URDF. The result is a *segmentation build*,
+Without a URDF a thing is only paint in the background splat: the simulator
+can neither collide with it nor move it. The section above starts from a
+URDF and cuts its splat out of the scan. Things that have no URDF — the
+grape vine, its trellis, a tree — go the other way: cut the body's gaussians
+out of the scan, turn them into a mesh, and wrap that in a generated URDF,
+which is what lets the robot collide with it and lets you place it. The result is a *segmentation build*,
 `data/stages/<scan>/segmentations/<build>/`, which is a registry entry like
 any other (the vine env's `vine_and_trellis` is one). The examples run on the
 shipped `vine_scene`.
