@@ -1,6 +1,6 @@
 # Trellis-inclusive segmentation build of vine_scene (trellis gaussians forced
 # into the hard collision mesh). Inherits transformation/aabb defaults from
-# ../../scene.yaml; `aabb` here is the object's own bounds.
+# ../../stage.yaml; `aabb` here is the object's own bounds.
 # collision_frame: sim — this build's collision OBJ, cost field and grape
 # targets were baked into SIM frame by build_vine_collision.py --transform.
 # New builds should omit --transform and get collision_frame: splat.

@@ -19,8 +19,8 @@ Outputs (under --outdir):
   viz/09_forced_hard.png          (only with --force-hard-diff)
 
 Usage:
-  python scripts/segment_vine_splat.py data/scenes/<scan>/segmentations/synthetic/vine.ply \
-      --outdir data/scenes/<scan>/segmentations/synthetic [--params my_params.json] [--show]
+  python scripts/segment_vine_splat.py data/stages/<scan>/segmentations/synthetic/vine.ply \
+      --outdir data/stages/<scan>/segmentations/synthetic [--params my_params.json] [--show]
       [--force-hard-diff vegetation_only_subset.ply]
 """
 

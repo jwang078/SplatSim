@@ -1,7 +1,7 @@
 """Grape-bunch reach targets: load clustered bunches and build approach poses.
 
 Bunch clusters come from ``splat_segmentation.cluster_labeled_points`` (class
-GRAPE) and are cached as JSON (e.g. data/scenes/<scan>/segmentations/<build>/grape_targets.json,
+GRAPE) and are cached as JSON (e.g. data/stages/<scan>/segmentations/<build>/grape_targets.json,
 written by scripts/segment_vine_splat.py users or ad hoc). This module is the
 single place that turns a bunch center into an end-effector goal pose, so the
 env task config and standalone planner tests stay consistent.
@@ -54,7 +54,7 @@ def load_targets(json_path: str | Path, transform=None) -> list:
     """List of bunch dicts ({center, peduncle?, n_points, extent}), largest
     first. ``transform`` (4x4, may carry uniform scale) moves the targets from
     the frame they were written in into sim frame — pass the scan's
-    splat->sim matrix for a build whose scene.yaml says collision_frame:
+    splat->sim matrix for a build whose stage.yaml says collision_frame:
     splat; leave None for a baked (collision_frame: sim) build."""
     bunches = json.loads(Path(json_path).read_text())
     if transform is None:

@@ -13,8 +13,8 @@ GUI mode (--gui) — interactive inspection:
 
 Usage:
   python scripts/visualize_vine_collision.py \
-      --urdf data/scenes/synthetic_vine/segmentations/default/vine.urdf \
-      --soft-npz data/scenes/synthetic_vine/segmentations/default/vine_soft_cost.npz [--gui]
+      --urdf data/stages/synthetic_vine/segmentations/default/vine.urdf \
+      --soft-npz data/stages/synthetic_vine/segmentations/default/vine_soft_cost.npz [--gui]
 """
 
 from __future__ import annotations

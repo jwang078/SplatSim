@@ -14,7 +14,7 @@ sim-frame coordinates of the second.
 
 Usage:
     python scripts/regen_grape_targets.py                       # vine_and_trellis
-    python scripts/regen_grape_targets.py --scene-dir data/scenes/<scan>/segmentations/<scene>
+    python scripts/regen_grape_targets.py --scene-dir data/stages/<scan>/segmentations/<scene>
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scene-dir", type=Path,
-                    default=Path("data/scenes/<scan>/segmentations/vine_and_trellis"))
+                    default=Path("data/stages/<scan>/segmentations/vine_and_trellis"))
     ap.add_argument("--name", default=None,
                     help="asset basename (default: scene dir name)")
     ap.add_argument("--eps", type=float, default=0.025,

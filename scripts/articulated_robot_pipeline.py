@@ -51,13 +51,22 @@ def create_window(app, title, geometry_list, x, y):
 def main(args):
 
     #load the transformation matrix (yaml file)
-    from splatsim.configs import scene_registry
-    object_configs = scene_registry.load_all()
+    from splatsim.configs import registry
+    object_configs = registry.load_all()
 
-    if not os.path.exists("data/labels_path"):
+    # Outputs (URDF point cloud for alignment, per-Gaussian link labels) go
+    # next to the entry's own yaml — they are products of THIS scan. Entries
+    # that only exist in the deprecated objects.yaml have no folder, so they
+    # fall back to the old shared data/labels_path + data/pcds_path.
+    try:
+        out_dir = registry.entry_dir(args.robot_name)
+        pcd_fn = str(out_dir / "urdf_pcd.ply")
+        labels_fn = str(out_dir / "splat_labels.npy")
+    except KeyError:
         os.makedirs("data/labels_path", exist_ok=True)
-    if not os.path.exists("data/pcds_path"):
         os.makedirs("data/pcds_path", exist_ok=True)
+        pcd_fn = f"data/pcds_path/{args.robot_name}_pcd.ply"
+        labels_fn = f"data/labels_path/{args.robot_name}_labels.npy"
 
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, sentinel=True)
@@ -177,7 +186,8 @@ def main(args):
 
     pcd.colors = o3d.utility.Vector3dVector(pcd_colors)
     #save the pcd
-    o3d.io.write_point_cloud("data/pcds_path/" + args.robot_name + '_pcd.ply', pcd)
+    o3d.io.write_point_cloud(pcd_fn, pcd)
+    print(f"URDF point cloud written to {pcd_fn}")
 
     #visualize the knn predictions
     o3d.visualization.draw_geometries([pcd])
@@ -220,8 +230,8 @@ def main(args):
     aabb_list = [[round(val, 4) for val in point] for point in aabb_list]
 
     # Persist the fitted aabb into whichever file this entry came from
-    # (data/scenes/<name>/scene.yaml, or the deprecated objects.yaml).
-    written = scene_registry.write_back(
+    # (data/stages/<name>/stage.yaml, or the deprecated objects.yaml).
+    written = registry.write_back(
         args.robot_name, {"aabb": {"bounding_box": aabb_list}}
     )
     print(f"aabb.bounding_box written to {written}")
@@ -281,9 +291,11 @@ def main(args):
     gui.Application.instance.run()
 
     #save labels
-    labels_fn = f"data/labels_path/{args.robot_name}_labels.npy"
     print(f"Saving labels to numpy file {labels_fn}...")
     np.save(labels_fn, splat_labels)
+    if not labels_fn.startswith("data/labels_path/"):
+        # record it in the yaml so the simulator finds it without any naming convention
+        registry.write_back(args.robot_name, {"labels_path": os.path.basename(labels_fn)})
 
     # #run the simulation
     # print("Running simulation...")

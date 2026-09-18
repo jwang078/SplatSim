@@ -1,0 +1,23 @@
+# Star Wars Lego box: a cardboard box scanned once, so the URDF (one rigid link, box
+# collision) lives here with its scan instead of under data/assets/.
+name: starwars_box
+transformation:
+  matrix:
+  - [-0.16933627, 0.00382843, 0.02871471, -0.08730588]
+  - [-0.02674902, 0.04470196, -0.16370686, 0.08338431]
+  - [-0.01111961, -0.16583431, -0.04346569, 0.39915784]
+  - [0.0, 0.0, 0.0, 0.98039216]
+aabb:
+  bounding_box:
+  - [-0.254, -0.0762, -0.0008]
+  - [0.254, 0.0766, 0.2935]
+  urdf_bbox_adjustment:
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+urdf_path: starwars_box.urdf
+labels_path: splat_labels.npy    # per-Gaussian link labels, from articulated_robot_pipeline.py
+source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/boxes_starwarsbox_images_500_500match_540height_OPENCVcam/sfm_disk_disk+lightglue/undistorted
+model_path: /home/jennyw2/code/gaussian-splatting/output/boxes_starwarsbox_images_500_500match_540height_OPENCVcam
+base_position: [0.0, 0.0, 0.0]
+use_fixed_base: true

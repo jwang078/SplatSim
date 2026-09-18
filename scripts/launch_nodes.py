@@ -69,7 +69,7 @@ class Args:
     # Viewer mode, for ANY --robot variant and ANY --robot_name: load the
     # scene and the robot, teleport home, serve. No scene randomisation,
     # solvability planning, goal search or datasets — the fastest way to see
-    # how a robot fits a scene (e.g. a URDF dropped into data/robots/).
+    # how a robot fits a scene (e.g. a URDF dropped into data/assets/).
     viewer: bool = False
 
     # When True, connect pybullet in DIRECT (no GUI) mode. Skips OpenGL
@@ -284,15 +284,15 @@ def launch_robot_server(args: Args):
             "on client commands."
         )
 
-    from splatsim.configs import scene_registry
+    from splatsim.configs import registry
     if args.viewer:
         from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
         PybulletRobotServerBase.VIEWER_MODE_DEFAULT = True
-    object_config = scene_registry.load_all()
+    object_config = registry.load_all()
     if args.robot_name not in object_config:
         raise KeyError(
             f"--robot_name {args.robot_name!r} has no config. Add "
-            f"data/scenes/{args.robot_name}/scene.yaml (see README, Data layout)."
+            f"data/stages/{args.robot_name}/stage.yaml (see README, Data layout)."
         )
 
     # Observation cameras: base_rgb (the scene camera) plus one per camera

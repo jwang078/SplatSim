@@ -38,18 +38,19 @@ output/*
 scripts/recordings/
 
 # generated at runtime / by helper scripts
-# Scene assets (splats, SfM, segmentation builds) are downloaded, not
-# committed — but each scene's scene.yaml IS tracked, so a fresh clone knows
-# every scene's config and only the bytes are missing. See README, Data layout.
-data/scenes/**
-!data/scenes/**/
-!data/scenes/**/scene.yaml
-data/robots/**
-!data/robots/**/
-!data/robots/**/robot.yaml
-# robots that ship with the repo (URDF + meshes)
-!data/robots/panda/**
-!data/robots/ur5/**
-!data/robots/ur5e/**
+# Stage data (splats, SfM, segmentation builds) is downloaded, not
+# committed — but every stage.yaml / asset.yaml IS tracked, so a fresh clone
+# knows each entry's config and only the bytes are missing. See README.
+data/stages/**
+!data/stages/**/
+!data/stages/**/stage.yaml
+!data/stages/**/splat_labels.npy
+data/assets/**
+!data/assets/**/
+!data/assets/**/asset.yaml
+# bodies that ship with the repo (URDF + meshes)
+!data/assets/panda/**
+!data/assets/ur5/**
+!data/assets/ur5e/**
 data/scenarios/
 scripts/outputs/

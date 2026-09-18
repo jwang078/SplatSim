@@ -3,10 +3,10 @@ from its URDF plus an optional `robot:` block in its yaml, so that any robot
 (any DOF, any gripper, any number of cameras, fixed or mobile base) is a
 drop-in folder rather than a set of class attributes.
 
-    data/robots/<name>/robot.yaml      (or a robot scan under data/scenes/)
-    data/robots/<name>/my_robot.urdf   (+ meshes)
+    data/assets/<name>/asset.yaml      (or a robot scan under data/stages/)
+    data/assets/<name>/my_robot.urdf   (+ meshes)
 
-Minimal robot.yaml — everything else is derived from the URDF:
+Minimal asset.yaml — everything else is derived from the URDF:
 
     urdf_path: my_robot.urdf
 

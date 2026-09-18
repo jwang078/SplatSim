@@ -14,7 +14,7 @@ Ground-truth class per point is saved alongside (<out>.truth.npy) so the
 segmentation stages can be scored, not just eyeballed.
 
 Usage:
-  python scripts/make_synthetic_vine_splat.py --out data/scenes/synthetic_vine/segmentations/default/vine.ply
+  python scripts/make_synthetic_vine_splat.py --out data/stages/synthetic_vine/segmentations/default/vine.ply
 """
 
 from __future__ import annotations
@@ -146,7 +146,7 @@ def write_3dgs_ply(path, xyz, rgb, opacity, scale=0.004, sh_rest=45):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", default="data/scenes/synthetic_vine/segmentations/default/vine.ply")
+    ap.add_argument("--out", default="data/stages/synthetic_vine/segmentations/default/vine.ply")
     ap.add_argument("--n-scale", type=float, default=1.0,
                     help="point-count multiplier")
     ap.add_argument("--seed", type=int, default=0)

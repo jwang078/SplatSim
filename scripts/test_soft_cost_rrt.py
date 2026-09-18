@@ -28,7 +28,7 @@ import numpy as np
 import pybullet as pb
 import pybullet_data
 
-DATA = Path("data/scenes/synthetic_vine/segmentations/default")
+DATA = Path("data/stages/synthetic_vine/segmentations/default")
 ROBOT_URDF = "splatsim/robot_definitions/urdf/planar_3joint.urdf"
 JOINT_INDICES = [1, 2, 3]
 EE_LINK = 15  # wrist_camera_link (COM == link frame; planner FK gate matches)

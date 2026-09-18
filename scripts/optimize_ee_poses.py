@@ -34,7 +34,7 @@ from splatsim.utils import grape_targets as G
 from splatsim.utils.rrt_path_utils import check_links_in_collision
 from splatsim.utils.splat_ply_io import read_gaussian_ply
 
-GRAPES_PLY = "data/scenes/vine_scene/splat/point_cloud/iteration_30000/grapes_only.ply"
+GRAPES_PLY = "data/stages/vine_scene/splat/point_cloud/iteration_30000/grapes_only.ply"
 
 
 def load_hard_points(env_cls, step: int = 1):
@@ -88,7 +88,7 @@ def main():
                          "and the setting a grasp task would use")
     ap.add_argument("--cam-up", default="inverted",
                     choices=["inverted", "upright", "off"])
-    ap.add_argument("--out", default="data/scenes/vine_scene/segmentations/vine_and_trellis/viz")
+    ap.add_argument("--out", default="data/stages/vine_scene/segmentations/vine_and_trellis/viz")
     args = ap.parse_args()
 
     import matplotlib

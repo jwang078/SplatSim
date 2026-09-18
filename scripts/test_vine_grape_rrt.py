@@ -12,7 +12,7 @@ trajectories. "off" and "score" generate identical candidate sets
 generation itself cost-aware (T-RRT transition test + cost-gated
 smoothing).
 
-Outputs (data/scenes/vine_scene/segmentations/vine_and_trellis/viz/):
+Outputs (data/stages/vine_scene/segmentations/vine_and_trellis/viz/):
   14_grape_rrt_paths.png    EE traces over cost-field projections, per bunch
   15_grape_final_pose.png   robot at the winning goal config near the bunch
 
@@ -44,7 +44,7 @@ from splatsim.utils import grape_targets
 from splatsim.utils.rrt_to_goal import RRTPlanningError, RRTToGoalPlanner
 from splatsim.utils.soft_cost_field import SoftCostField
 
-VIZ = Path("data/scenes/vine_scene/segmentations/vine_and_trellis/viz")
+VIZ = Path("data/stages/vine_scene/segmentations/vine_and_trellis/viz")
 
 
 def serialize_env_config(cfg) -> dict:
@@ -162,7 +162,7 @@ def main():
     from splatsim.utils.rrt_path_utils import check_links_in_collision
 
     goal_vine = client.loadURDF(
-        "data/scenes/vine_scene/segmentations/vine_and_trellis/vine_and_trellis.urdf",
+        "data/stages/vine_scene/segmentations/vine_and_trellis/vine_and_trellis.urdf",
         useFixedBase=True)
     # Fingers are checked against the mesh too: grapes/foliage are not in
     # the hard mesh (only trunk + trellis), so a finger-clear goal here is

@@ -2,7 +2,7 @@
 simulator will use (arm joints, gripper, cameras, EE link, action size) and
 print it in one screen, with warnings for the things that usually go wrong.
 
-    python scripts/check_robot.py my_robot          # a data/robots/<name>/ or data/scenes/<name>/ entry
+    python scripts/check_robot.py my_robot          # a data/assets/<name>/ or data/stages/<name>/ entry
     python scripts/check_robot.py path/to/robot.urdf # a bare URDF, no yaml (derive everything)
 
 Exit code 0 = the simulator will accept it; 1 = something needs fixing (the
@@ -25,7 +25,7 @@ def main() -> int:
     ap.add_argument("--wrist-cam-ver", type=int, default=2, help="fisheye calibration for a legacy wrist_camera_link_name")
     args = ap.parse_args()
 
-    from splatsim.configs import scene_registry
+    from splatsim.configs import registry
     from splatsim.robots.robot_spec import RobotSpec
     from splatsim.utils.paths import resolve_splatsim_path
 
@@ -33,10 +33,10 @@ def main() -> int:
         cfg = {"urdf_path": str(Path(args.robot).resolve()), "robot": {}}
         name = Path(args.robot).stem
     else:
-        cfg = scene_registry.get(args.robot)
+        cfg = registry.get(args.robot)
         if cfg is None:
-            print(f"ERROR: no entry named {args.robot!r} under data/robots/ or data/scenes/ "
-                  f"(known: {sorted(scene_registry.load_all())})")
+            print(f"ERROR: no entry named {args.robot!r} under data/assets/ or data/stages/ "
+                  f"(known: {sorted(registry.load_all())})")
             return 1
         name = args.robot
     urdf = resolve_splatsim_path(str(cfg.get("urdf_path", "")))

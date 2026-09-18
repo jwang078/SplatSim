@@ -4,10 +4,10 @@ Extends the small-engine env the same way the planar env does: same UR5
 (`robot_iphone_w_engine_curtain` — sisbot.urdf at its usual base position),
 but the scene is the real scanned grape vine at the origin. The vine's
 splat->sim transform is baked into its collision URDF (collision_frame: sim
-in its scene.yaml), so the object loads at identity.
+in its stage.yaml), so the object loads at identity.
 
 Task: reach an end-effector pose `GRAPE_STANDOFF_M` short of a grape bunch
-(bunch clusters from the build's grape_targets.json under data/scenes/, produced by
+(bunch clusters from the build's grape_targets.json under data/stages/, produced by
 the segmentation pipeline). The env also publishes a `soft_cost` payload in
 its oracle env config so the RRT planner runs cost-aware over the foliage
 (hard trunk mesh stays a binary obstacle).
@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from splatsim.configs import scene_registry
+from splatsim.configs import registry
 from splatsim.configs.env_config import EnvConfig, SplatObjectConfig, TaskConfig
 from splatsim.robots.sim_robot_pybullet_small_engine import (
     SmallEnginePybulletRobotServer,
@@ -43,11 +43,11 @@ def _build_frame(vine_splat_name: str):
     """(collision_frame, splat->sim 4x4 or None) for a registered segmentation
     build. Everything the build produced — collision URDF, cost field, grape
     targets — shares ONE frame declaration, `collision_frame` in its
-    scene.yaml, and one matrix, the scan's `transformation`:
+    stage.yaml, and one matrix, the scan's `transformation`:
       sim   -> artifacts were baked into sim frame; transform is None.
       splat -> artifacts are in the scan frame; transform is applied at load
                (load_urdf for the URDF, here for targets + cost field)."""
-    cfg = scene_registry.get(vine_splat_name) or {}
+    cfg = registry.get(vine_splat_name) or {}
     frame = cfg.get("collision_frame", "sim")
     if frame == "sim":
         return frame, None
@@ -161,15 +161,15 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
     PYBULLET_CAMERA_TARGET = (-0.4, 0.55, 0.5)
     PYBULLET_CAMERA_FOV = 65.0
 
-    # The vine is a segmentation BUILD registered under data/scenes/ — its
-    # scene.yaml carries urdf/ply paths and the scan's splat->sim transform,
+    # The vine is a segmentation BUILD registered under data/stages/ — its
+    # stage.yaml carries urdf/ply paths and the scan's splat->sim transform,
     # and the folder holds the grape targets + cost field. Retarget to another
     # vine (or another build of the same scan) by changing this one name; see
     # README "Data layout". This build is the trellis-inclusive one: trellis
     # gaussians are forced into the hard collision mesh via
     # `segment_vine_splat.py --force-hard-diff vine_only.ply`.
     VINE_SPLAT_NAME = "vine_and_trellis"
-    _SEG_DIR = scene_registry.scene_dir(VINE_SPLAT_NAME)
+    _SEG_DIR = registry.stage_dir(VINE_SPLAT_NAME)
     # Prefers grape_targets_manual.json when present (see
     # grape_targets.resolve_targets_json): hand annotation outranks detector
     # output, because colour segmentation cannot see green fruit and this
@@ -613,7 +613,7 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
             return cached
         from splatsim.utils.goal_pose import load_scene_clouds
         from splatsim.utils.paths import resolve_splatsim_path
-        cfg = scene_registry.get(self.VINE_SPLAT_NAME) or {}
+        cfg = registry.get(self.VINE_SPLAT_NAME) or {}
         grapes_ply = Path(resolve_splatsim_path(cfg["model_path"])) / \
             "point_cloud" / "iteration_30000" / "grapes_only.ply"
         if not grapes_ply.exists():

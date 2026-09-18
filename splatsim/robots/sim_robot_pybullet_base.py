@@ -77,6 +77,7 @@ from splatsim.configs.env_config import (
     ArticulationConfig,
 )
 from splatsim.configs.mode_config import TrajectoryGenModeConfig, ImageResizeMode, RenderMode
+from splatsim.configs import registry
 from splatsim.utils import rrt_path_utils
 from splatsim.utils.rrt_path_utils import _COLLISION_CLEARANCE, RuckigCloudUnavailableError
 from collections import defaultdict
@@ -1223,9 +1224,7 @@ class PybulletRobotServerBase:
         # so it is needed exactly when that splat is loaded (see
         # RENDER_ROBOT_SPLAT), not merely when the scene renders as splats.
         if self._render_robot_splat():
-            self.robot_labels = np.load(
-                str(SPLATSIM_ROOT / "data" / "labels_path" / f"{self.robot_name}_labels.npy")
-            )
+            self.robot_labels = np.load(str(registry.labels_path(self.robot_name)))
             self.robot_labels = torch.from_numpy(self.robot_labels).to(device="cuda").long()
         else:
             self.robot_labels = None
@@ -1539,9 +1538,8 @@ class PybulletRobotServerBase:
         self._episode_started = False
 
     def _build_robot_spec(self, splatsim_obj: SplatSimObject):
-        from splatsim.configs import scene_registry
         from splatsim.robots.robot_spec import RobotSpec
-        cfg = scene_registry.get(self.robot_name) or {}
+        cfg = registry.get(self.robot_name) or {}
         urdf = resolve_splatsim_path(str(splatsim_obj.config.urdf_path))
         spec = RobotSpec.derive(
             self.pybullet_client, splatsim_obj.sim_id, cfg, name=self.robot_name,
@@ -1556,6 +1554,26 @@ class PybulletRobotServerBase:
         if art is not None and not len(art.initial_joint_positions or []):
             art.initial_joint_positions = [float(v) for v in spec.initial_joint_positions]
             art.joint_signs = [int(v) for v in spec.joint_signs]
+        elif art is not None and not spec.legacy and len(art.initial_joint_positions) != len(spec.state_joint_indices):
+            # A scan records the pose the robot was scanned in (labels were
+            # assigned and the splat is rendered relative to it) as one value
+            # per URDF joint 1..N — the pre-`robot:` state convention. When
+            # the scan references a declared robot asset, pick out the joints
+            # that robot's state vector actually carries, and let the scan
+            # pose win over the asset's nominal home pose.
+            full = [float(v) for v in art.initial_joint_positions]
+            n_all = self.pybullet_client.getNumJoints(splatsim_obj.sim_id)
+            if len(full) != n_all - 1:
+                raise ValueError(
+                    f"robot {self.robot_name!r}: articulation_config.initial_joint_positions has "
+                    f"{len(full)} values; expected {len(spec.state_joint_indices)} (arm + gripper + wheels) "
+                    f"or {n_all - 1} (one per URDF joint 1..N)."
+                )
+            signs = list(art.joint_signs or [])
+            art.initial_joint_positions = [full[j - 1] for j in spec.state_joint_indices]
+            art.joint_signs = [int(signs[j]) if j < len(signs) else 1 for j in spec.state_joint_indices]
+            spec.initial_joint_positions = np.asarray(art.initial_joint_positions, dtype=np.float64)
+            spec.joint_signs = np.asarray(art.joint_signs, dtype=np.float64)
         if not spec.has_splat and self._render_robot_splat():
             print(f"WARNING: robot {self.robot_name!r} has no splat scan — it is drawn from its "
                   f"URDF meshes (composited by depth into the splat render). Scan it for photoreal rendering.")
@@ -2163,9 +2181,7 @@ class PybulletRobotServerBase:
             # load_splat=False (RENDER_SPLATS off) gaussians is None, so skip —
             # the articulation still works from the URDF alone (physics + FK).
             if splatsim_obj.config.load_splat:
-                segmentation_labels = np.load(
-                    resolve_splatsim_path("./data/labels_path/" + splatsim_obj.config.splat_name + "_labels.npy")
-                )
+                segmentation_labels = np.load(str(registry.labels_path(splatsim_obj.config.splat_name)))
                 segmentation_labels = (
                     torch.from_numpy(segmentation_labels)
                     .to(device=splatsim_obj.gaussians._xyz.device)
@@ -3499,8 +3515,7 @@ class PybulletRobotServerBase:
         """Does the robot's registry entry point at a splat (model_path /
         ply_path)? A robot folder with just a URDF has none — it is drawn
         from its meshes instead (see _composite_robot_enabled)."""
-        from splatsim.configs import scene_registry
-        cfg = scene_registry.get(self.robot_name) or {}
+        cfg = registry.get(self.robot_name) or {}
         return bool(cfg.get("model_path") or cfg.get("ply_path"))
 
     def _render_robot_splat(self) -> bool:
@@ -7746,8 +7761,7 @@ class PybulletRobotServerBase:
 
     def _robot_placement_info_saved(self) -> dict:
         """The pose as saved in the robot's yaml (not the live one)."""
-        from splatsim.configs import scene_registry
-        cfg = scene_registry.get(self.robot_name) or {}
+        cfg = registry.get(self.robot_name) or {}
         spec = self.robot_spec
         pos = list(cfg.get("base_position") or [0.0, 0.0, 0.0])
         rpy = list(cfg.get("base_orientation_rpy") or [0.0, 0.0, 0.0])
@@ -7758,10 +7772,9 @@ class PybulletRobotServerBase:
 
     def _placement_save(self, state) -> None:
         """Write the current placement into the robot's own yaml."""
-        from splatsim.configs import scene_registry
         (x, y, z, yaw), qs = state
         try:
-            path = scene_registry.write_back(self.robot_name, {
+            path = registry.write_back(self.robot_name, {
                 "base_position": [round(x, 4), round(y, 4), round(z, 4)],
                 "base_orientation_rpy": [0.0, 0.0, round(yaw, 4)],
                 "robot": {"initial_joint_positions": [round(float(q), 4) for q in qs]},

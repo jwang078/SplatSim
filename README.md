@@ -79,7 +79,7 @@ doesn't surprise you.
 ## Running a simulation
 
 A simulation is a robot scan plus a scene scan, each a folder under
-`data/scenes/` (see *Data layout* below). Two are available to download and
+`data/stages/` (see *Data layout* below). Two are available to download and
 make a working example: the grape vine, and the UR5 scanned in the engine
 scene that it uses as its robot.
 
@@ -90,21 +90,21 @@ One tarball per scene, named after the folder it unpacks to:
 - [vine_scene.tar.gz](https://drive.google.com/file/d/1fzErjuOOu85abCVYgvtSJQXf6HzEpZmO/view?usp=drive_link) — the grape vine, scanned in the highbay, ~700 MB
 - [robot_iphone_w_engine_curtain.tar.gz](https://drive.google.com/file/d/15OvhOXCvdgjNVPUZB1W28DLXjG9HLpJX/view?usp=drive_link) — the UR5 with its wrist camera, scanned in the engine scene, ~200 MB
 
-Unpack both into the repo's `data/scenes/` folder. Each carries its own
-`scene.yaml`, so there's nothing to edit:
+Unpack both into the repo's `data/stages/` folder. Each carries its own
+`stage.yaml`, so there's nothing to edit:
 
 ```bash
-tar xzf vine_scene.tar.gz -C /path/to/SplatSim/data/scenes
-tar xzf robot_iphone_w_engine_curtain.tar.gz -C /path/to/SplatSim/data/scenes
+tar xzf vine_scene.tar.gz -C /path/to/SplatSim/data/stages
+tar xzf robot_iphone_w_engine_curtain.tar.gz -C /path/to/SplatSim/data/stages
 ```
 
 That gives you:
 
 ```
-data/scenes/vine_scene/splat/                                  gaussian splat of the vine highbay scene
-data/scenes/vine_scene/sfm/                                    structure-from-motion output for it
-data/scenes/vine_scene/segmentations/vine_and_trellis/         collision mesh, grape targets, soft-cost field
-data/scenes/robot_iphone_w_engine_curtain/splat/               gaussian splat of the robot
+data/stages/vine_scene/splat/                                  gaussian splat of the vine highbay scene
+data/stages/vine_scene/sfm/                                    structure-from-motion output for it
+data/stages/vine_scene/segmentations/vine_and_trellis/         collision mesh, grape targets, soft-cost field
+data/stages/robot_iphone_w_engine_curtain/splat/               gaussian splat of the robot
 ```
 
 ### 2. Launch
@@ -131,47 +131,60 @@ for that.
 ## Data layout
 
 Everything the simulator loads lives under `data/`, one folder per thing,
-described by a yaml next to the files: scenes in `data/scenes/<scene>/scene.yaml`,
-robots in `data/robots/<robot>/robot.yaml` (a scanned robot can also live
-under `data/scenes/`). A scene folder looks like this:
+described by a yaml next to the files. The two kinds borrow their names from
+USD:
+
+- **assets** — `data/assets/<asset>/asset.yaml`: a body you can reuse. A URDF
+  and its meshes; a `robot:` block if it is a robot. `ur5/`, `ur5e/` and
+  `panda/` ship with the repo.
+- **stages** — `data/stages/<stage>/stage.yaml`: a scan. The gaussian splat,
+  the SfM output, the transform that aligns the splat with the simulator, and
+  `asset: <name>` for the body it is a scan of (the engine-scene UR5 scan says
+  `asset: ur5`; a stage's own fields override the asset's). A thing scanned
+  once, like the cardboard boxes, keeps its URDF in the stage folder instead.
+
+A stage folder looks like this:
 
 ```
-data/scenes/<scene>/
-    scene.yaml                       transformation, aabb, model_path, source_path, ...
+data/stages/<stage>/
+    stage.yaml                       transformation, aabb, asset, model_path, source_path, ...
     splat/                           gaussian-splatting output
     sfm/                             COLMAP / hloc output
+    splat_labels.npy                 per-Gaussian link labels (robot scans; see Scanning your robot)
     segmentations/<build>/
-        scene.yaml                   ply_path, urdf_path, collision_frame
+        stage.yaml                   ply_path, urdf_path, collision_frame
         <build>.urdf, <build>_collision.obj, cost field, grape targets, ...
 ```
 
-- The folder tree is the config: every `scene.yaml` is one object, named
-  after its folder, referenced by that flat name in code
-  (`splat_name="vine_and_trellis"`). Paths inside it are relative to the
-  file; a nested `scene.yaml` inherits from the one above it.
+- The folder tree is the config: every yaml is one entry, named after its
+  folder, referenced by that flat name in code (`splat_name="vine_and_trellis"`).
+  Paths inside it are relative to the file; a nested `stage.yaml` inherits
+  from the one above it.
 - `collision_frame: splat` means the build's collision mesh, cost field and
   grape targets are in the scan's frame and get the scan's `transformation`
   at load; `sim` means they were baked already. `scripts/build_vine_collision.py`
   sets it.
-- `scene.yaml` files are tracked in git; the data next to them is not.
+- The yaml files are tracked in git; the data next to them is not.
+- Folders extracted under the older names (`data/scenes/`, `data/robots/`,
+  `scene.yaml`, `robot.yaml`) still load.
 
-To add a scene: make `data/scenes/<scene>/` with `splat/` and `sfm/`, copy
-`data/scenes/vine_scene/scene.yaml` beside them and fill in the transform
+To add a stage: make `data/stages/<stage>/` with `splat/` and `sfm/`, copy
+`data/stages/vine_scene/stage.yaml` beside them and fill in the transform
 (see *Scanning your robot for photoreal rendering*), run the segmentation scripts with
-`--outdir data/scenes/<scene>/segmentations/<build>`, and tar the folder for
+`--outdir data/stages/<stage>/segmentations/<build>`, and tar the folder for
 whoever needs it. `configs/object_configs/objects.yaml` is the older
-single-file form; it still loads, but a `scene.yaml` with the same name wins.
+single-file form; it still loads, but a folder entry with the same name wins.
 
 ## Adding your robot
 
 You need a URDF. Nothing else — the simulator works out the rest from it.
 
-1. Make a folder under `data/robots/` and put the URDF (and its meshes)
-   inside. Add a `robot.yaml` next to it that says where the URDF is:
+1. Make a folder under `data/assets/` and put the URDF (and its meshes)
+   inside. Add a `asset.yaml` next to it that says where the URDF is:
    ```yaml
    urdf_path: my_robot.urdf
    ```
-   `data/robots/panda/`, `ur5/` and `ur5e/` are complete, working robot folders
+   `data/assets/panda/`, `ur5/` and `ur5e/` are complete, working robot folders
    — copy one.
 2. Check what the simulator sees:
    ```bash
@@ -179,7 +192,7 @@ You need a URDF. Nothing else — the simulator works out the rest from it.
    ```
    It prints the arm joints, gripper, cameras and end-effector link it
    derived, and warns about anything it had to guess. If a guess is wrong,
-   add the matching key under `robot:` in `robot.yaml` — every key is
+   add the matching key under `robot:` in `asset.yaml` — every key is
    optional and documented in the example.
 3. Put it in a scene:
    ```bash
@@ -196,7 +209,7 @@ You need a URDF. Nothing else — the simulator works out the rest from it.
    side by side while you move the robot.
 5. Move it where you want it: press **Robot Placement** in the control window.
    Sliders move the base (x, y, z, yaw) and every arm joint live in the scene;
-   **Save placement** writes the pose into your `robot.yaml` so it starts
+   **Save placement** writes the pose into your `asset.yaml` so it starts
    there next time (the file's comments are kept).
 
 What the yaml can describe, all optional: which joints are the arm and which
@@ -277,13 +290,13 @@ python scripts/articulated_robot_pipeline.py --robot_name your_robot_name
 
 Verify that the first point cloud visualization has the same joint poses as your robot had in the splat. If not, adjust `joint_states`. Ignore the second visualization for now.
 
-The point cloud is outputted in `data/pcds_path/your_robot_name_pcd.ply`.
+The point cloud is written next to the scan as `data/stages/your_robot_name/urdf_pcd.ply` (and the per-Gaussian link labels as `splat_labels.npy` in the same folder, recorded in the `stage.yaml` as `labels_path`).
 
 #### Align robot coordinate frames in sim and in splat
 
 Download CloudCompare, which visualizes point clouds. 
 
-Open both the URDF point cloud `data/pcds_path/your_robot_name_pcd.ply` and the gaussian splat `output/.../point_cloud/point_cloud/iteration_30000/point_cloud.ply`. The goal is to apply transformations (rotation/translation/scale) *to your splat* such that the robot arm matches between the sim and splat, then you can copy that transformation to a config file. Don't apply transformations to the simulated robot arm.
+Open both the URDF point cloud `data/stages/your_robot_name/urdf_pcd.ply` and the gaussian splat `output/.../point_cloud/point_cloud/iteration_30000/point_cloud.ply`. The goal is to apply transformations (rotation/translation/scale) *to your splat* such that the robot arm matches between the sim and splat, then you can copy that transformation to a config file. Don't apply transformations to the simulated robot arm.
 
 <details>
 <summary> Tips and tricks with CloudCompare </summary>
@@ -389,7 +402,7 @@ the commands without launching. The script's docstring lists the rest.
   fruit.
 - `scripts/mark_grape_targets.py --load` — click on bunches in the splat
   render to add or move targets; saves to
-  `data/scenes/vine_scene/segmentations/vine_and_trellis/grape_targets_manual.json`.
+  `data/stages/vine_scene/segmentations/vine_and_trellis/grape_targets_manual.json`.
 - Task knobs are class attributes on `VineGrapeReachPybulletRobotServer` in
   `splatsim/robots/sim_robot_pybullet_vine.py`: `TARGET_BUNCH_INDEX` (`None`
   = random bunch each reset), `GRAPE_STANDOFF_M`, and the camera-framing

@@ -101,8 +101,8 @@ class ObjectConfig(ABC):
 
 
     # Object configs come from the scene registry: per-scene
-    # data/scenes/**/scene.yaml files, plus the deprecated
-    # configs/object_configs/objects.yaml. See splatsim.configs.scene_registry.
+    # data/stages/**/stage.yaml files, plus the deprecated
+    # configs/object_configs/objects.yaml. See splatsim.configs.registry.
 
     def __post_init__(self):
         """Resolves Priority: Instance > YAML > Global Fallback"""
@@ -148,8 +148,8 @@ class ObjectConfig(ABC):
     @classmethod
     def _get_yaml_data(cls) -> Dict[str, Dict[str, Any]]:
         """All known object configs, name -> dict (cached by the registry)."""
-        from splatsim.configs import scene_registry
-        return scene_registry.load_all()
+        from splatsim.configs import registry
+        return registry.load_all()
 
     def _load_yaml_config(self) -> Dict[str, Any]:
         splat_name = getattr(self, "splat_name", None)

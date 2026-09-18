@@ -1,0 +1,23 @@
+# ThinkPad shipping box: a cardboard box scanned once, so the URDF (one rigid link, box
+# collision) lives here with its scan instead of under data/assets/.
+name: thinkpad_box
+transformation:
+  matrix:
+  - [-0.163842, -0.019906, 0.040555, -0.259844]
+  - [-0.04517, 0.069524, -0.148362, 0.216919]
+  - [0.000787, -0.153803, -0.072313, 0.489712]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.2541, -0.0381, -0.0008]
+  - [0.2541, 0.0384, 0.3189]
+  urdf_bbox_adjustment:
+  - [-0.01, 0.01]
+  - [-0.01, 0.01]
+  - [-0.01, 0.01]
+urdf_path: thinkpad_box.urdf
+labels_path: splat_labels.npy    # per-Gaussian link labels, from articulated_robot_pipeline.py
+source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/boxes_thinkpadbox_images_500_500match_540height_OPENCVcam/sfm_disk_disk+lightglue/undistorted
+model_path: /home/jennyw2/code/gaussian-splatting/output/boxes_thinkpadbox_images_500_500match_540height_OPENCVcam
+base_position: [0.0, 0.0, 0.0]
+use_fixed_base: true

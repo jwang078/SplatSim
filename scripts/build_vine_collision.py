@@ -10,23 +10,23 @@ Backends:
                   runs `--collision-mesh smooth` and imports the .collision.glb.
 
 Outputs (under --outdir, which should be the build's folder,
-data/scenes/<scan>/segmentations/<build>/):
+data/stages/<scan>/segmentations/<build>/):
   <name>_collision.obj        collision mesh, in the scan's frame — or in SIM
                               frame if --transform is given (baking; the old
                               behaviour, kept for reproducing existing builds)
   <name>.urdf                 fixed-base URDF wrapping the mesh (concave)
-  scene.yaml                  registers the build: urdf_path + collision_frame
+  stage.yaml                  registers the build: urdf_path + collision_frame
                               (splat, or sim when baked). The scan's
                               splat->sim matrix is applied at load from the
-                              parent scene.yaml, so prefer NOT baking.
+                              parent stage.yaml, so prefer NOT baking.
   viz/10_mesh_overlay.png     mesh cross-sections overlaid on trunk points —
                               THE alignment check (mesh must hug red points)
   viz/11_mesh_render.png      shaded open3d render of the mesh (if EGL works)
 
 Usage:
   python scripts/build_vine_collision.py \
-      data/scenes/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_trunk_hard.ply \
-      --outdir data/scenes/vine_scene/segmentations/vine_and_trellis
+      data/stages/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_trunk_hard.ply \
+      --outdir data/stages/vine_scene/segmentations/vine_and_trellis
       [--backend voxel|splat-transform] [--voxel-size 0.012] [--dilate 1]
       [--transform path/to/4x4.json]   # bake into sim frame (not recommended)
 
@@ -403,20 +403,20 @@ def main():
 
 
 def write_scene_yaml(outdir: Path, name: str, urdf_rel: str, baked: bool) -> None:
-    """Register the build with the scene registry (data/scenes/<scan>/
-    segmentations/<build>/scene.yaml). One frame declaration covers every
+    """Register the build with the scene registry (data/stages/<scan>/
+    segmentations/<build>/stage.yaml). One frame declaration covers every
     artifact of the build — this URDF, the cost field and the grape targets:
 
       collision_frame: sim    --transform was given; everything is baked into
                               sim frame and loads at identity.
       collision_frame: splat  no --transform; everything is in the scan's
                               frame and the scan's `transformation` (inherited
-                              from ../../scene.yaml) is applied at load.
+                              from ../../stage.yaml) is applied at load.
 
     Only sets the keys this script owns; an existing file keeps its other
     fields (aabb, ply_path, ...)."""
     import yaml
-    path = outdir / "scene.yaml"
+    path = outdir / "stage.yaml"
     doc = yaml.safe_load(path.read_text()) if path.exists() else {}
     doc = doc or {}
     doc.setdefault("name", name)

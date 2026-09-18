@@ -206,7 +206,7 @@ def main():
                     help="robot variant named in the launch hint printed when "
                          "no simulator is found")
     ap.add_argument("--grapes-ply", default=(
-        "data/scenes/vine_scene/splat/point_cloud/iteration_30000/grapes_only.ply"),
+        "data/stages/vine_scene/splat/point_cloud/iteration_30000/grapes_only.ply"),
         help="segmented grape gaussians, used by search mode for visibility")
     ap.add_argument("--mode", default="search", choices=["ik", "search"],
                     help="initial solver. 'search' = task-space sample/score/"
@@ -388,7 +388,7 @@ def main():
         registry), so the tuner scores against the same geometry."""
         if search["clouds"] is not None:
             return search["clouds"]
-        from splatsim.configs import scene_registry as _reg
+        from splatsim.configs import registry as _reg
         from splatsim.utils import goal_pose as _gp
         from splatsim.utils.paths import resolve_splatsim_path as _rp
         cfg = _reg.get(env_cls.VINE_SPLAT_NAME) or {}
