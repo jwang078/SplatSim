@@ -167,6 +167,13 @@ data/stages/<stage>/
   at load; `sim` means they were baked already. `scripts/build_vine_collision.py`
   sets it.
 - The yaml files are tracked in git; the data next to them is not.
+- A stage with a URDF but no splat (`ply_path`/`model_path`) still works in
+  a splat-rendered scene: like an unscanned robot, the body is drawn from
+  its PyBullet visual geometry and composited by depth into the render.
+  Set `composite_if_no_splat: false` on an object that exists only for
+  physics or planning so it stays out of the images. (`load_splat: false`
+  is different — it means the object is already part of the background
+  scan and must not be drawn twice.)
 - Folders extracted under the older names (`data/scenes/`, `data/robots/`,
   `scene.yaml`, `robot.yaml`) still load.
 - `data/scenarios/<env>__<robot>.json` is a saved arrangement: the robot's

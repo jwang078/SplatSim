@@ -83,6 +83,14 @@ class ObjectConfig(ABC):
     grasp_configs: Optional[List[GraspConfig]] = Default(list)
     load_splat: Optional[bool] = Default(True)
     load_urdf: Optional[bool] = Default(True)
+    # When the scene renders as splats and this body asked for a splat
+    # (load_splat=True) but has none (no ply_path/model_path — a drop-in
+    # URDF/mesh object), draw it from its PyBullet visual geometry,
+    # depth-composited into the splat frame. Set False for bodies that exist
+    # only for physics/planning so they never show up in image observations.
+    # (load_splat=False bodies are never composited: that means "already in
+    # the background scan".)
+    composite_if_no_splat: Optional[bool] = Default(True)
     randomize_pose: Optional[bool] = Default(True)
     randomize_scale: Optional[bool] = Default(True)
     skip_collision_robot_links: Optional[List[int]] = Default(list)  # Robot link indices to skip when checking collisions against this object.

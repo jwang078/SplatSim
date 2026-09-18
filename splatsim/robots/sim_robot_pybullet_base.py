@@ -844,10 +844,14 @@ class PybulletRobotServerBase:
     # robot's URDF, physics and articulation are unaffected either way.
     RENDER_ROBOT_SPLAT: ClassVar[Optional[bool]] = None
 
-    # Draw the robot's PyBullet geometry into the splat frame, depth-composited
-    # against the splat's own expected depth so the scene occludes the robot
-    # where it should. Only meaningful with RENDER_ROBOT_SPLAT=False — otherwise
-    # the robot is already in the frame as gaussians and this would double it.
+    # Bodies with no gaussians of their own (an unscanned robot, an object
+    # with load_splat=False) are drawn from their PyBullet visual geometry,
+    # depth-composited against the splat's expected depth so the scene
+    # occludes them where it should — see `_composite_bodies`. Per-object
+    # opt-out: ObjectConfig.composite_if_no_splat. This flag forces the
+    # robot into that set even when it has a scan; only meaningful with
+    # RENDER_ROBOT_SPLAT=False — otherwise the robot is already in the
+    # frame as gaussians and this would double it.
     COMPOSITE_PYBULLET_ROBOT: ClassVar[bool] = False
     # Depth slack (metres) when testing PyBullet geometry against splat depth.
     # Splat expected-depth is an alpha-weighted mean, so it reads a few cm SHORT
@@ -1573,7 +1577,7 @@ class PybulletRobotServerBase:
             art.joint_signs = [int(signs[j]) if j < len(signs) else 1 for j in spec.state_joint_indices]
             spec.initial_joint_positions = np.asarray(art.initial_joint_positions, dtype=np.float64)
             spec.joint_signs = np.asarray(art.joint_signs, dtype=np.float64)
-        if not spec.has_splat and self._render_robot_splat():
+        if not spec.has_splat and self.RENDER_SPLATS:
             print(f"WARNING: robot {self.robot_name!r} has no splat scan — it is drawn from its "
                   f"URDF meshes (composited by depth into the splat render). Scan it for photoreal rendering.")
         return spec
@@ -2180,7 +2184,17 @@ class PybulletRobotServerBase:
             initial_link_poses = get_curr_link_states(splatsim_obj.sim_id)
             articulation_config.initial_link_poses = initial_link_poses
 
-        if splatsim_obj.config.load_splat:
+        if splatsim_obj.config.load_splat and not self._object_has_splat(splatsim_obj):
+            # Wanted a splat but the config points at none (a drop-in object
+            # folder with just a URDF/mesh): no gaussians; the body is drawn
+            # from its PyBullet visuals instead, depth-composited into the
+            # splat frame (see _composite_bodies). Not the same as
+            # load_splat=False, which means "already in the background scan".
+            splatsim_obj.gaussians = None
+            if self.RENDER_SPLATS and splatsim_obj is not self.splatsim_robot:
+                print(f"WARNING: object {splatsim_obj.config.name!r} has no splat (ply_path/model_path) — "
+                      f"it is drawn from its PyBullet visual geometry, composited by depth into the splat render.")
+        elif splatsim_obj.config.load_splat:
             self.load_gaussian_splat(splatsim_obj)
         else:
             splatsim_obj.gaussians = None
@@ -2194,7 +2208,7 @@ class PybulletRobotServerBase:
             # Per-point segmentation only exists when a splat was loaded. With
             # load_splat=False (RENDER_SPLATS off) gaussians is None, so skip —
             # the articulation still works from the URDF alone (physics + FK).
-            if splatsim_obj.config.load_splat:
+            if splatsim_obj.gaussians is not None:
                 # Label values become THIS body's link indices (matched by
                 # link name through the labels' key file, when it has one).
                 segmentation_labels = registry.load_labels(
@@ -3067,19 +3081,27 @@ class PybulletRobotServerBase:
         start_idx = offsets[robot.config.name][0]
         return self._wrist_cam_occluder_rel_idx + start_idx
 
+    def _base_camera_for_render(self) -> Optional[SplatSimCamera]:
+        """The SplatSimCamera the base view renders from right now: the
+        pybullet debug-visualizer camera in debug modes (rotate_base_cam /
+        no_background), else `base_camera`. ONE resolution shared by the
+        splat render and every PyBullet mirror of it (pybullet render mode,
+        the composite, shadow masks) so they can't disagree on the view.
+
+        The debug camera is None in headless (DIRECT) runs — no visualizer
+        exists, so debug modes there keep their OTHER effects (e.g.
+        no_background hiding the background splat) but render from the
+        normal base camera instead of crashing on the visualizer's zero
+        view matrix."""
+        if self.debug_mode != DebugModes.OFF and self.base_camera is not None:
+            camera = self.get_pybullet_debug_camera_as_splat_camera()
+            if camera is not None:
+                return camera
+        return self.base_camera
+
     def render_image(self, camera_name, cached_link_states=None):
         if camera_name == "base_rgb":
-            camera = None
-            if self.debug_mode != DebugModes.OFF:
-                # Mirror the pybullet debug-visualizer camera in debug modes.
-                # None in headless (DIRECT) runs — no visualizer exists, so
-                # debug modes there keep their OTHER effects (e.g.
-                # no_background hiding the background splat) but render from
-                # the normal base camera instead of crashing on the
-                # visualizer's zero view matrix.
-                camera = self.get_pybullet_debug_camera_as_splat_camera()
-            if camera is None:
-                camera = self.base_camera
+            camera = self._base_camera_for_render()
         elif self._robot_camera_for(camera_name) is not None:
             camera = self.get_wrist_camera(cached_link_states=cached_link_states, camera_name=camera_name)
             if camera is None:
@@ -3104,8 +3126,9 @@ class PybulletRobotServerBase:
                 self.scene_gaussian._opacity[occluder_idx] = -1e4
 
         # Splat depth is only rasterized when something downstream needs it —
-        # today, depth-compositing the PyBullet robot into the frame.
-        want_depth = self._composite_robot_enabled()
+        # today, depth-compositing splat-less PyBullet bodies into the frame.
+        composite_ids = self._composite_bodies()
+        want_depth = bool(composite_ids)
         splat_depth = None
         try:
             if camera.camera_model == "fisheye" or self.use_gsplat:
@@ -3122,12 +3145,12 @@ class PybulletRobotServerBase:
                 self.scene_gaussian._opacity[occluder_idx] = saved_opacity
         # If you index "depth" instead of "render", you get the depth image
 
-        # Robot has no gaussians of its own: draw it in from PyBullet. Before
-        # fisheye rectification, so the composite happens in the same geometry
-        # the splat was rasterized in.
+        # Bodies with no gaussians of their own: draw them in from PyBullet.
+        # Before fisheye rectification, so the composite happens in the same
+        # geometry the splat was rasterized in.
         if want_depth:
-            rendering = self._composite_pybullet_robot(
-                rendering, splat_depth, camera_name,
+            rendering = self._composite_pybullet_bodies(
+                rendering, splat_depth, camera_name, composite_ids,
                 cached_link_states=cached_link_states,
             )
 
@@ -3140,12 +3163,8 @@ class PybulletRobotServerBase:
         # Optional depth cue: darken the splat with PyBullet's shadow mask (see
         # SPLAT_SHADOW_* class attrs). AFTER rectification on purpose — the
         # pybullet mirror of a fisheye wrist is its rectified pinhole view, so
-        # that's the geometry the mask matches. Skipped while the base view
-        # tracks the pybullet debug-visualizer camera (debug mode): the mask is
-        # computed from the normal base-camera pose and wouldn't line up.
-        if self.splat_shadows and not (
-            camera_name == "base_rgb" and self.debug_mode != DebugModes.OFF
-        ):
+        # that's the geometry the mask matches.
+        if self.splat_shadows:
             rendering = self._composite_splat_shadows(
                 rendering, camera_name, cached_link_states=cached_link_states
             )
@@ -3166,8 +3185,6 @@ class PybulletRobotServerBase:
         if not self.splat_shadows:
             return masks
         for camera_name in self.camera_names:
-            if camera_name == "base_rgb" and self.debug_mode != DebugModes.OFF:
-                continue  # render_image skips compositing for the debug camera
             try:
                 masks[camera_name] = self._raycast_splat_shadow_mask(
                     camera_name, cached_link_states=cached_link_states
@@ -3528,10 +3545,20 @@ class PybulletRobotServerBase:
 
         return splatsim_camera
 
+    @staticmethod
+    def _object_has_splat(splatsim_obj: SplatSimObject) -> bool:
+        """Does this object's config point at gaussians? A SplatObjectConfig
+        needs a ply_path/model_path; every other kind (cuboids, ...) builds
+        synthetic gaussians and always has them."""
+        cfg = splatsim_obj.config
+        if isinstance(cfg, SplatObjectConfig):
+            return bool(cfg.ply_path or cfg.model_path)
+        return True
+
     def _robot_has_splat(self) -> bool:
         """Does the robot's registry entry point at a splat (model_path /
         ply_path)? A robot folder with just a URDF has none — it is drawn
-        from its meshes instead (see _composite_robot_enabled)."""
+        from its meshes instead (see _composite_bodies)."""
         cfg = registry.get(self.robot_name) or {}
         return bool(cfg.get("model_path") or cfg.get("ply_path"))
 
@@ -3544,39 +3571,77 @@ class PybulletRobotServerBase:
             return bool(self.RENDER_SPLATS)
         return bool(self.RENDER_ROBOT_SPLAT and self.RENDER_SPLATS)
 
-    def _composite_robot_enabled(self) -> bool:
-        """Draw the robot's PyBullet geometry into the splat frame (depth-
-        composited). On when the env asks for it (COMPOSITE_PYBULLET_ROBOT)
-        or automatically when the scene renders as splats but the robot has
-        no splat of its own — the drop-in URDF case."""
-        if not self.RENDER_SPLATS or self._render_robot_splat():
-            return False
-        return bool(self.COMPOSITE_PYBULLET_ROBOT or not self._robot_has_splat())
+    def _composite_bodies(self) -> Dict[int, str]:
+        """{pybullet body id: object name} of every body to draw from PyBullet
+        into the splat frame: the scene renders as splats, but the body has no
+        gaussians in `scene_gaussian` despite asking for them (load_splat=True
+        but no ply_path/model_path) and hasn't opted out via
+        `composite_if_no_splat`. load_splat=False bodies are skipped: that is
+        the "already in the background scan" convention. Empty when nothing needs it, so
+        envs where everything is scanned pay no extra depth rasterization.
 
-    def _composite_pybullet_robot(
+        The robot is included when it isn't rendered as a splat (the drop-in
+        URDF case) or when COMPOSITE_PYBULLET_ROBOT forces it. The background
+        is never composited — under no_background it is deliberately hidden,
+        and otherwise it is in the frame as gaussians.
+        """
+        if not self.RENDER_SPLATS:
+            return {}
+        offsets = getattr(self, "_scene_gaussian_offsets", None) or {}
+        bodies: Dict[int, str] = {}
+        for obj in self.splatsim_objects:
+            if obj.sim_id is None or obj is self.splatsim_background:
+                continue
+            is_robot = obj is self.splatsim_robot
+            if is_robot:
+                wanted = self.COMPOSITE_PYBULLET_ROBOT or not self._render_robot_splat()
+            else:
+                # load_splat=False is the "already part of the background
+                # scan" convention (table, wall, engine, vine collision mesh)
+                # — those must NOT be drawn again. Composite only bodies that
+                # asked for a splat and have none.
+                has_gaussians = obj.gaussians is not None and (
+                    not offsets or obj.config.name in offsets
+                )
+                wanted = (
+                    bool(obj.config.load_splat)
+                    and not has_gaussians
+                    and obj.config.composite_if_no_splat is not False
+                )
+            if wanted:
+                bodies[int(obj.sim_id)] = obj.config.name
+        if bodies != getattr(self, "_composite_bodies_last", None):
+            self._composite_bodies_last = dict(bodies)
+            if bodies:
+                print(f"[render] compositing from PyBullet (no splat): {sorted(bodies.values())}")
+        return bodies
+
+    def _composite_pybullet_bodies(
         self,
         rendering: np.ndarray,
         splat_depth: Optional[np.ndarray],
         camera_name: str,
+        body_ids: Dict[int, str],
         cached_link_states=None,
     ) -> np.ndarray:
-        """Draw the robot's PyBullet geometry into a splat frame.
+        """Draw the PyBullet geometry of `body_ids` (see `_composite_bodies`)
+        into a splat frame.
 
-        For envs whose robot has no scan (RENDER_ROBOT_SPLAT=False) this is what
-        puts the robot in the picture at all. PyBullet renders RGB + depth +
-        segmentation from the SAME view/projection the splat used
-        (`_resolve_pybullet_view_proj` mirrors the splat camera), so the two
-        images are pixel-aligned by construction, and robot pixels replace splat
-        pixels wherever the robot is nearer than the splat surface.
+        PyBullet renders RGB + depth + segmentation from the SAME view/
+        projection the splat used (`_resolve_pybullet_view_proj` mirrors the
+        splat camera), so the two images are pixel-aligned by construction,
+        and a body's pixels replace splat pixels wherever the body is nearer
+        than the splat surface. Bodies not in `body_ids` (scanned objects, the
+        background) are drawn by PyBullet too but masked out — they are
+        already in the frame as gaussians.
 
         Falls back to an unconditional over-composite when splat depth is
-        unavailable — the robot then always draws in front, which is wrong when
-        it passes behind scene geometry but is still far more useful than an
+        unavailable — the bodies then always draw in front, which is wrong when
+        they pass behind scene geometry but is still far more useful than an
         empty scene. Any failure returns the frame untouched rather than killing
         the observation, matching `_composite_splat_shadows`.
         """
-        robot_id = getattr(getattr(self, "splatsim_robot", None), "sim_id", None)
-        if robot_id is None:
+        if not body_ids:
             return rendering
         try:
             view, proj, W, H = self._resolve_pybullet_view_proj(
@@ -3589,7 +3654,7 @@ class PybulletRobotServerBase:
             depth_buf = np.reshape(np.asarray(depth_buf, dtype=np.float32), (H, W))
             seg = np.reshape(np.asarray(seg, dtype=np.int32), (H, W))
         except Exception as e:
-            print(f"[render] pybullet robot composite failed ({e}); frame left splat-only.")
+            print(f"[render] pybullet composite failed ({e}); frame left splat-only.")
             return rendering
 
         # getCameraImage returns a NON-LINEAR OpenGL depth buffer; the near/far
@@ -3600,7 +3665,10 @@ class PybulletRobotServerBase:
         near = proj[2, 3] / (proj[2, 2] - 1.0)
         pb_depth = far * near / (far - (far - near) * depth_buf)
 
-        mask = seg == robot_id
+        # Default segmentation encodes the body unique id per pixel (link
+        # index only packs in with ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX,
+        # which we don't request), so a body test is a plain membership test.
+        mask = np.isin(seg, np.fromiter(body_ids.keys(), dtype=np.int32))
         if splat_depth is not None:
             splat_depth = np.asarray(splat_depth, dtype=np.float32)
             if splat_depth.shape != mask.shape:
@@ -3609,24 +3677,24 @@ class PybulletRobotServerBase:
                     interpolation=cv2.INTER_NEAREST,
                 )
             # depth <= 0 means the splat hit nothing along that ray (see
-            # render_gsplat) — empty space never occludes the robot.
+            # render_gsplat) — empty space never occludes the body.
             hit = splat_depth > 0.0
             mask &= ~hit | (pb_depth <= splat_depth + float(self.COMPOSITE_DEPTH_SLACK_M))
         if not mask.any():
             return rendering
 
-        robot_chw = np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))
+        body_chw = np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))
         _, out_h, out_w = rendering.shape
         if (out_h, out_w) != (H, W):
-            robot_chw = np.stack([
+            body_chw = np.stack([
                 cv2.resize(c, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-                for c in robot_chw
+                for c in body_chw
             ])
             mask = cv2.resize(
                 mask.astype(np.uint8), (out_w, out_h), interpolation=cv2.INTER_NEAREST
             ).astype(bool)
         out = rendering.copy()
-        out[:, mask] = robot_chw[:, mask]
+        out[:, mask] = body_chw[:, mask]
         return out.astype(np.float32, copy=False)
 
     def _get_ee_link_index(self) -> int:
@@ -4131,8 +4199,10 @@ class PybulletRobotServerBase:
         elif self.base_camera is not None:
             # Base/third-person: mirror the SPLAT base camera (pose + FoV) so the
             # pybullet base matches the splat base view instead of a synthetic
-            # orbit with an unrelated FoV.
-            view_proj = self._splatsim_camera_to_pybullet_view(self.base_camera)
+            # orbit with an unrelated FoV. `_base_camera_for_render` swaps in
+            # the debug-visualizer camera in debug modes, exactly as the splat
+            # render does, so rotate_base_cam / no_background move this view too.
+            view_proj = self._splatsim_camera_to_pybullet_view(self._base_camera_for_render())
         if view_proj is None:
             # No SplatSimCamera to mirror (e.g. the planar env has no base
             # camera): fall back to the fixed PYBULLET_CAMERA_* third-person pose.
