@@ -346,7 +346,9 @@ make `data/stages/<stage>/` with a `stage.yaml`:
 python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset robot pcd
 ```
 
-writes `<stage>/robot_urdf_pcd.ply` (the URDF sampled at `scan_pose`, one
+`--asset robot` is the block's name under `assets:` in the stage.yaml — call
+the block something else and pass that instead. (`robot` is special only in
+that the stage name alone refers to it.) The command writes `<stage>/robot_urdf_pcd.ply` (the URDF sampled at `scan_pose`, one
 colour per link) and `<stage>/splat_rgb.ply` (the splat as a plain RGB
 cloud). Check the first one has the joint pose the robot really had; if
 not, fix `scan_pose` and rerun. Then open both in CloudCompare, crop the
@@ -396,37 +398,12 @@ under that body and rerun.
 
 #### More bodies in the same scan
 
-The scan is now placed, so a second body (a box, say) is aligned the other
-way: run `pcd` for it, move the *URDF cloud* onto the splat in CloudCompare,
-and write where it ended up as that body's `base_position` /
-`base_orientation_rpy` in the yaml (or hand the matrix to `transform
---as-pose`, which converts it for you) — then `labels`:
-
-```bash
-python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box pcd
-python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box transform "<16 numbers>" --as-pose   # optional
-python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box labels --show
-```
-
-(`box` being a second block under `assets:` in that stage's yaml, e.g.
-`asset: thinkpad_box` with a `base_position`.)
-
-Every body is then its own entry, `<stage>/<name>`, that an environment can
-load and move (`splat_name="<stage>/box"`); the stage name alone is the
-robot, and loading the stage as a background leaves a hole where each body
-was scanned.
-
-#### Your custom robot can now follow the same recorded joint state trajectories!
-
-Launch the simulation server
-```bash
-python scripts/launch_nodes.py --robot sim_ur_pybullet_apple_interactive --robot_name your_robot_name
-```
-
-Set the robot to follow the recorded trajectories.
-```bash
-python scripts/run_env_sim.py --agent replay_trajectory_and_save
-```
+Repeat the same steps for every other body under `assets:` (a box, an
+engine), with one difference: the scan is already placed, so instead of
+pasting a stage transform you write where the URDF cloud ended up as that
+body's `base_position` / `base_orientation_rpy`. Each body is then its own
+entry, `<stage>/<name>`, that an environment can load and move. Bear in mind
+that cutting a body out of the scan leaves a gap in the surface it stood on.
 
 ## Generating new trajectories
 
