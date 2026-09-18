@@ -151,6 +151,12 @@ def parse_matrix(text: str) -> np.ndarray:
     return m
 
 
+def wrote(what: str, path) -> None:
+    """One output per line, absolute path last, so it is copy/pastable and
+    clickable in a terminal."""
+    print(f"  {what:<32s} {Path(path).resolve()}")
+
+
 def link_colors(n: int, seed: int = 0):
     rng = np.random.default_rng(seed)
     return rng.random((n + 1, 3))
@@ -164,14 +170,16 @@ def step_pcd(stage: str, asset: str, name: str, cfg: dict, args) -> Path:
     colors = link_colors(p.getNumJoints(body))
     pcd_path = out / f"{asset}_urdf_pcd.ply"
     write_ply(pcd_path, X, colors[(y + 1).astype(int)])
-    print(f"[{name}] URDF at its scan pose -> {pcd_path}  ({len(X)} points, {p.getNumJoints(body) + 1} links)")
+    print(f"[{name}] URDF sampled at its scan pose: {len(X)} points over {p.getNumJoints(body) + 1} links")
+    wrote("URDF point cloud (per-link colours)", pcd_path)
     splat_rgb = out / "splat_rgb.ply"
     if not splat_rgb.exists() or args.force:
         xyz, rgb = read_splat(splat_ply(cfg))
         write_ply(splat_rgb, xyz, rgb)
-        print(f"[{name}] splat as a plain RGB cloud -> {splat_rgb}  ({len(xyz)} gaussians)")
+        wrote(f"splat as an RGB cloud ({len(xyz)} gaussians)", splat_rgb)
     else:
-        print(f"[{name}] splat_rgb.ply already there (use --force to rewrite)")
+        wrote("splat RGB cloud (kept; --force rewrites)", splat_rgb)
+    wrote("stage yaml to edit", registry.source_file(name))
     if is_first_body(stage, asset):
         print("Next: open both in CloudCompare, crop the splat to this body, align it onto the URDF cloud (ICP without "
               "scale, adjust by hand, ICP with scale), paste Transformation History into the stage.yaml under "
@@ -209,11 +217,13 @@ def step_transform(stage: str, asset: str, name: str, cfg: dict, args) -> None:
             print(f"WARNING: the matrix scales by {scale:.3f}; a body's pose cannot carry scale — "
                   f"the URDF is what it is. Dropping the scale.")
         path = registry.write_back(name, {"base_position": new_pos, "base_orientation_rpy": new_rpy})
-        print(f"[{name}] base pose <- matrix: position {new_pos}, rpy {new_rpy}  -> {path}")
+        print(f"[{name}] base pose <- matrix: position {new_pos}, rpy {new_rpy}")
+        wrote("written to", path)
     else:
         rows = [[round(float(v), 6) for v in row] for row in M]
         path = registry.write_back(stage, {"transformation": {"matrix": rows}})
-        print(f"[{stage}] transformation.matrix (splat -> simulator) <- matrix  -> {path}")
+        print(f"[{stage}] transformation.matrix (splat -> simulator) <- matrix")
+        wrote("written to", path)
     print(f"Next: python scripts/segment_stage_asset.py {stage} --asset {asset} labels --show")
 
 
@@ -255,7 +265,9 @@ def step_labels(stage: str, asset: str, name: str, cfg: dict, args) -> None:
     path = registry.write_back(name, {"aabb": {"bounding_box": box}, "labels_path": labels_path.name})
     counts = {classes[int(v)]: int(c) for v, c in zip(*np.unique(labels, return_counts=True))}
     print(f"[{name}] box {box}\n[{name}] {len(inside)} of {len(xyz)} gaussians inside; per link: {counts}")
-    print(f"[{name}] labels -> {labels_path.name} (+ {key.name}); yaml -> {path}")
+    wrote("labels (one per gaussian in the box)", labels_path)
+    wrote("labels key (value -> link name)", key)
+    wrote("aabb + labels_path written to", path)
     cu, cs = X.mean(0), xyz_sim[inside].mean(0)
     print(f"[{name}] alignment check — URDF centroid {np.round(cu, 3).tolist()} vs splat-in-box centroid {np.round(cs, 3).tolist()} "
           f"(|d| = {np.linalg.norm(cu - cs):.3f} m; a few cm is fine, tens of cm means the transform or the box is off)")
