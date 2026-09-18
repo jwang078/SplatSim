@@ -44,7 +44,9 @@ pip install -e '.[hardware]'
 datasets through it, and it's where the training and DAgger code lives, so
 the two are meant to be worked on together. If you already have a checkout,
 the installer uses a sibling `../lerobot` automatically, or point it anywhere
-with `LEROBOT_DIR=/path/to/lerobot ./install.sh`.
+with `LEROBOT_DIR=/path/to/lerobot ./install.sh` — and symlinks whichever one
+it used to `external/lerobot`, so the layout is the same either way and paths
+can just say `external/lerobot`. (`external/` is gitignored, link included.)
 
 ### Things `install.sh` already handles
 

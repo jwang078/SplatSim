@@ -148,6 +148,8 @@ TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/$TORCH_CUDA}"
 # the installer never creates anything outside the directory you ran it in.
 # An existing sibling checkout at ../lerobot is used if present (reading it
 # is fine; we just won't create one there). LEROBOT_DIR overrides both.
+# Wherever it lives, it ends up reachable at external/lerobot — see the
+# symlink step in the LeRobot section below.
 if [[ -z "${LEROBOT_DIR:-}" ]]; then
     if [[ -d "external/lerobot" ]]; then
         LEROBOT_DIR="$PWD/external/lerobot"
@@ -270,6 +272,23 @@ GSPLAT
 # SKIP_LEROBOT=true skips the step entirely (the bare simulator still runs).
 LEROBOT_URL="${LEROBOT_URL:-https://github.com/jwang078/lerobot.git}"
 if [[ "$SKIP_LEROBOT" != "true" ]]; then
+    # One layout, wherever the checkout actually is: a sibling ../lerobot (or
+    # an explicit LEROBOT_DIR) gets a symlink at external/lerobot, so the repo
+    # looks identical whether LeRobot lives inside it or next to it — paths in
+    # docs, editors, configs and scripts can all just say external/lerobot.
+    # external/ is gitignored, so the link is never committed. The editable
+    # install below still points pip at the REAL path: a recorded path that
+    # doesn't depend on this link keeps imports working if it ever goes away.
+    if [[ "$LEROBOT_DIR" != "$PWD/external/lerobot" ]]; then
+        mkdir -p external
+        if [[ -e external/lerobot && ! -L external/lerobot ]]; then
+            echo "WARNING: external/lerobot is a real directory but LEROBOT_DIR is $LEROBOT_DIR." >&2
+            echo "         Leaving it alone; remove it if you meant to use the link." >&2
+        else
+            ln -sfn "$LEROBOT_DIR" external/lerobot
+            echo "NOTE: external/lerobot -> $LEROBOT_DIR"
+        fi
+    fi
     if [[ ! -d "$LEROBOT_DIR" ]]; then
         say "LeRobot: cloning $LEROBOT_URL -> $LEROBOT_DIR"
         git clone "$LEROBOT_URL" "$LEROBOT_DIR"
