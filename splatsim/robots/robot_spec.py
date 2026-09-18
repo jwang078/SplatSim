@@ -38,11 +38,12 @@ Full form (every key optional; `auto` or omitted = derive):
 calibrations that ship in the code (splatsim/robots/camera_calibrations.py)
 and need nothing else. A pinhole with `intrinsics` gets its FoV from fx/fy.
       gripper:
-        kind: auto | robotiq_2f85 | synergies | per_joint | none
+        kind: auto | synergies | per_joint | none
         joints: auto | [joint names]
         open:   [per gripper joint]             # synergies: joint targets at command 0
         closed: [per gripper joint]             #            ... and at command 1
         matrix: [[...]]                         # synergies with K > 1: K x N, q = open + matrix^T c
+        stroke_m: 0.085                         # max opening width, for width-based commands (optional)
         tip_link: auto | link name
         contact_links: auto | [link names]
 
@@ -65,10 +66,13 @@ in this order followed by every gripper's commands in this order:
           ee_link: right_tool0
       cameras: [...]                            # cameras are per link, not per arm
 
-`kind: auto` recognises the Robotiq 2F-85 by its joint names (the shipped
-UR5) and keeps its calibrated mimic behaviour; any other gripper becomes
-`per_joint` over its movable joints, which always works and can be tightened
-to `synergies` later. A URDF with no finger-ish joints is `none`.
+`kind: auto` takes the finger-ish joints of the URDF (name contains
+finger/knuckle/gripper/...): if the URDF couples them with `<mimic>` tags it
+is `synergies` with one command per non-mimic joint and open/closed from the
+joint limits (the shipped UR5's Robotiq 2F-85 comes out as one drive joint,
+0 = open .. 0.8 = closed — its yaml spells that out), otherwise `per_joint`.
+A URDF with no finger-ish joints is `none`. `stroke_m` (max opening width)
+is only needed by the width-based `move_gripper` API.
 
 The legacy config form (`articulation_config`, `wrist_camera_link_name`,
 `use_gripper`) is still read, so existing robot scans need no changes.
@@ -104,21 +108,6 @@ _CAMERA_LINK_RE = re.compile(r"camera", re.I)
 # The Robotiq 2F-85 as shipped on the UR5: drive joint + mimic children with
 # their gear ratios (see PybulletRobotServerBase.setup_gripper). Recognised by
 # name so `kind: auto` keeps the calibrated open-length behaviour.
-ROBOTIQ_2F85_DRIVE = "finger_joint"
-ROBOTIQ_2F85_MIMIC = {
-    "right_outer_knuckle_joint": 1,
-    "left_inner_knuckle_joint": 1,
-    "right_inner_knuckle_joint": 1,
-    "left_inner_finger_joint": -1,
-    "right_inner_finger_joint": -1,
-}
-ROBOTIQ_2F85_ALL_JOINTS = [
-    "finger_joint", "left_outer_finger_joint", "left_inner_finger_joint",
-    "left_inner_finger_pad_joint", "left_inner_knuckle_joint",
-    "right_outer_knuckle_joint", "right_outer_finger_joint",
-    "right_inner_finger_joint", "right_inner_finger_pad_joint",
-    "right_inner_knuckle_joint",
-]
 
 
 @dataclass
@@ -167,7 +156,7 @@ class CameraSpec:
 
 @dataclass
 class GripperSpec:
-    kind: str                       # robotiq_2f85 | synergies | per_joint | none
+    kind: str                       # synergies | per_joint | none
     joint_indices: List[int] = field(default_factory=list)   # movable gripper joints
     joint_names: List[str] = field(default_factory=list)
     link_indices: List[int] = field(default_factory=list)    # every link under the gripper (incl. fixed)
@@ -177,6 +166,7 @@ class GripperSpec:
     mimic: Dict[int, tuple] = field(default_factory=dict)    # child joint idx -> (parent idx, multiplier, offset)
     tip_link_index: Optional[int] = None
     contact_link_indices: List[int] = field(default_factory=list)
+    stroke_m: Optional[float] = None        # max opening width (m), for width-based commands
 
     @property
     def command_dim(self) -> int:
@@ -186,12 +176,11 @@ class GripperSpec:
             return len(self.joint_indices)
         if self.kind == "synergies" and self.matrix is not None:
             return int(self.matrix.shape[0])
-        return 1  # robotiq_2f85, single-synergy
+        return 1  # single synergy (open .. closed)
 
     def joint_targets(self, command: Sequence[float]) -> np.ndarray:
         """Joint targets (per joint_indices) for a command vector of
-        command_dim values in [0, 1] (0 = open). Not used for robotiq_2f85,
-        whose calibrated mimic path lives in the server."""
+        command_dim values in [0, 1] (0 = open)."""
         c = np.asarray(command, dtype=np.float64).reshape(-1)
         if self.kind == "per_joint":
             lo, hi = self.open, self.closed
@@ -368,8 +357,6 @@ class RobotSpec:
                 a_idx = [j for j in a_idx if j not in g_all]
                 claimed |= set(a_idx) | set(g_all)
                 arms.append(ArmSpec(name=aname, joint_indices=a_idx, ee_link_index=ee_i, gripper=g))
-            if any(g.kind == "robotiq_2f85" for g in (a.gripper for a in arms)) and sum(a.gripper.kind == "robotiq_2f85" for a in arms) > 1:
-                raise ValueError(f"{name}: only one Robotiq 2F-85 per robot is supported (its calibrated mimic path is a singleton)")
         else:
             g, g_joint_idx = _derive_gripper(dict(rb.get("gripper") or {}), joints, movable, link_names, wheel_idx,
                                              legacy=legacy, use_gripper_legacy=bool(cfg.get("use_gripper", True)),
@@ -544,26 +531,26 @@ def _derive_gripper(gcfg: Dict[str, Any], joints: List[JointInfo], movable: List
     def _auto(v): return v is None or (isinstance(v, str) and v.lower() == "auto")
     def _in(j): return candidate_links is None or j.index in candidate_links
     kind = str(gcfg.get("kind") or "auto").lower()
-    names = {j.name for j in joints if _in(j)}
-    is_robotiq = ROBOTIQ_2F85_DRIVE in names and all(n in names for n in ROBOTIQ_2F85_MIMIC)
+    if kind == "robotiq_2f85":
+        raise ValueError(f"{name}: gripper.kind robotiq_2f85 is gone — the Robotiq is an ordinary `synergies` "
+                         f"gripper now; see data/assets/ur5/asset.yaml (joints: [finger_joint], open/closed, stroke_m)")
+    auto_g = [j for j in movable if _in(j) and _GRIPPER_NAME_RE.search(j.name) and not _WHEEL_NAME_RE.search(j.name)]
     if kind == "auto":
-        if is_robotiq and (not legacy or use_gripper_legacy):
-            kind = "robotiq_2f85"
-        elif legacy and not use_gripper_legacy:
+        if legacy and not use_gripper_legacy:
+            kind = "none"
+        elif not auto_g:
             kind = "none"
         else:
-            auto_g = [j for j in movable if _in(j) and _GRIPPER_NAME_RE.search(j.name) and not _WHEEL_NAME_RE.search(j.name)]
-            kind = "per_joint" if auto_g else "none"
-    if kind == "robotiq_2f85" and not is_robotiq:
-        raise ValueError(f"{name}: gripper.kind robotiq_2f85 but the URDF has no Robotiq 2F-85 joints")
+            # coupled fingers (URDF <mimic>) -> one command per drive joint
+            mim = _mimic_from_urdf(urdf_path, joints)
+            kind = "synergies" if any(j.index in mim for j in auto_g) else "per_joint"
+    if kind not in ("none", "synergies", "per_joint"):
+        raise ValueError(f"{name}: gripper.kind must be auto | synergies | per_joint | none, got {kind!r}")
 
     if kind == "none":
         g_roots: List[int] = []
-    elif kind == "robotiq_2f85":
-        g_roots = [j.index for j in joints if j.name in ROBOTIQ_2F85_ALL_JOINTS and j.movable and _in(j)]
     elif _auto(gcfg.get("joints")):
-        g_roots = [j.index for j in movable
-                   if _in(j) and _GRIPPER_NAME_RE.search(j.name) and not _WHEEL_NAME_RE.search(j.name)]
+        g_roots = [j.index for j in auto_g]
     else:
         g_roots = [_find_joint(joints, n).index for n in gcfg["joints"]]
     g_roots = [i for i in g_roots if i not in wheel_idx]
@@ -577,7 +564,7 @@ def _derive_gripper(gcfg: Dict[str, Any], joints: List[JointInfo], movable: List
     g_mimic = _mimic_from_urdf(urdf_path, joints) if kind in ("synergies", "per_joint") else {}
     g_mimic = {c: pm for c, pm in g_mimic.items() if c in g_joint_idx}
     # mimic children are driven by their parent, not commanded
-    commanded = [i for i in g_joint_idx if i not in g_mimic] if kind != "robotiq_2f85" else g_joint_idx
+    commanded = [i for i in g_joint_idx if i not in g_mimic]
     gopen = gclosed = gmat = None
     if kind in ("synergies", "per_joint"):
         n = len(commanded)
@@ -603,9 +590,10 @@ def _derive_gripper(gcfg: Dict[str, Any], joints: List[JointInfo], movable: List
         contact = [_link_index(link_names, n) for n in gcfg["contact_links"]]
     else:
         contact = _leaf_links(joints, g_links) if g_links else []
+    stroke = float(gcfg["stroke_m"]) if gcfg.get("stroke_m") is not None else None
     return GripperSpec(kind=kind, joint_indices=commanded, joint_names=[joints[i].name for i in commanded],
                        link_indices=g_links, open=gopen, closed=gclosed, matrix=gmat, mimic=g_mimic,
-                       tip_link_index=tip_idx, contact_link_indices=contact), g_joint_idx
+                       tip_link_index=tip_idx, contact_link_indices=contact, stroke_m=stroke), g_joint_idx
 
 
 def _chain_to(joints: List[JointInfo], link_index: int) -> List[int]:

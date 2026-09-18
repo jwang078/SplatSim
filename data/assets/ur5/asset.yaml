@@ -11,8 +11,12 @@ robot:
   arm_joints: auto                # the six UR joints
   ee_link: wrist_camera_link      # goal frame = the wrist camera (imaging tasks)
   initial_joint_positions: [1.570796, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]
-  gripper:
-    kind: robotiq_2f85            # recognised by its joint names; calibrated open/close path
+  gripper:                        # Robotiq 2F-85: one drive joint, the other five follow it through
+    kind: synergies               #   the URDF's <mimic> tags (gear constraints in the sim)
+    joints: [finger_joint]
+    open: [0.0]                   # drive angle (rad) at command 0
+    closed: [0.8]                 #                  ... at command 1
+    stroke_m: 0.085               # max opening width, for width-based commands (move_gripper)
   cameras:
     - name: wrist
       link: wrist_camera_link

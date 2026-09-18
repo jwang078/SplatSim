@@ -237,8 +237,12 @@ its meshes.
      arm_joints: auto                # the six UR joints
      ee_link: wrist_camera_link      # goal frame = the wrist camera (imaging tasks)
      initial_joint_positions: [1.570796, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]
-     gripper:
-       kind: robotiq_2f85            # recognised by its joint names; calibrated open/close path
+     gripper:                        # Robotiq 2F-85: one drive joint, the other five follow it through
+       kind: synergies               #   the URDF's <mimic> tags (gear constraints in the sim)
+       joints: [finger_joint]
+       open: [0.0]                   # drive angle (rad) at command 0
+       closed: [0.8]                 #                  ... at command 1
+       stroke_m: 0.085               # max opening width, for width-based commands (move_gripper)
      cameras:
        - name: wrist
          link: wrist_camera_link
@@ -278,8 +282,8 @@ its meshes.
    yaml so it starts there in every scene (comments kept).
 
 The yaml can also say, all optional: which joints are the arm and which the
-gripper, how the gripper is commanded (one value, one per finger, or
-synergies), the cameras (pinhole with a field of view, or fisheye with
+gripper, how the gripper is commanded (one value per finger, or synergies
+for fingers the URDF couples with `<mimic>` — the Robotiq is one of those), the cameras (pinhole with a field of view, or fisheye with
 `intrinsics:` inline or as a `calibration.json` from
 `scripts/calibrate_camera_intrinsics.py`), the end-effector link, and the
 base — `fixed`, `planar`, or `wheeled` (velocity-controlled wheels; planning
@@ -433,14 +437,8 @@ that cutting a body out of the scan leaves a gap in the surface it stood on.
 
 ## Making a collision body from a scan (no URDF)
 
-A body cut out of the scan as its own splat (`ply_path` in its yaml) can
-already be placed anywhere and randomised — grape bunches scattered around
-the scene, say. This section is what makes it solid: it builds a collision
-mesh from those gaussians and wraps it in a generated URDF, so the robot can
-collide with it like any other asset. The section above starts from a
-URDF and cuts its splat out of the scan. Things that have no URDF — the
-grape vine, its trellis, a tree — go the other way: cut the body's gaussians
-out of the scan, turn them into a mesh, and wrap that in a generated URDF,
+For objects that have no URDF, we can cut the body's gaussians
+out of the splat, turn them into a mesh, and wrap that in a generated URDF,
 which is what lets the robot collide with it and lets you place it. The result is a *segmentation build*,
 `data/stages/<scan>/segmentations/<build>/`, which is a registry entry like
 any other (the vine env's `vine_and_trellis` is one). The examples run on the
@@ -448,12 +446,12 @@ shipped `vine_scene`.
 
 1. **Crop the body's gaussians** into a gaussian PLY (it must keep the 3DGS
    fields — SuperSplat's editor exports them; CloudCompare's PLY export does
-   not). Put it in the build folder:
+   not unless you use `3dgsconverter` to convert it back to the non-cloudcompare version with `3dgsconverter -i input_cc.ply -o output_3dgs.ply -f 3dgs`). Put it in the build folder:
    `data/stages/vine_scene/segmentations/<build>/<build>.ply`. For vegetation,
    `scripts/segment_vine_splat.py <ply> --outdir <build dir>` splits it into
    the hard trunk (`<build>_trunk_hard.ply`, what gets a mesh) and the soft
    twigs/leaves/grapes (`<build>_soft_cost.npz`, what the planner steers
-   around), with a picture of every stage under `viz/`.
+   around), with a picture of every stage under `viz/`, though the color thresholding might need to be tuned.
 
 2. **Mesh it and register it:**
    ```bash

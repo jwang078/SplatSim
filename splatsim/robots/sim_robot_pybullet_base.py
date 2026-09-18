@@ -518,10 +518,7 @@ class PybulletRobotServerBase:
         # Class-declared ARM pairs describe the shipped UR5; a robot with a
         # `robot:` block brings its own (derived or declared) pairs instead.
         arm_pairs = list(type(self).SELF_COLLISION_SKIP_PAIRS) if spec.legacy else []
-        gripper_pairs = (
-            self._resolve_link_name_pairs(self.GRIPPER_SELF_COLLISION_SKIP_PAIR_NAMES)
-            if spec.gripper.kind == "robotiq_2f85" else []
-        )
+        gripper_pairs: list = []   # gripper-internal pairs come from the spec (every link pair inside each gripper)
         spec_pairs = list(spec.self_collision_skip_pairs)
         # Dedup while preserving order; treat (a,b) == (b,a).
         seen = set()
@@ -4798,10 +4795,8 @@ class PybulletRobotServerBase:
         dummy_ee_euler = self.pybullet_client.getEulerFromQuaternion(dummy_ee_quat)
 
         # print the euler angles and the reconstructed quaternion
-        if self.use_gripper and self.robot_spec.gripper.kind != "robotiq_2f85":
-            self.current_gripper_state = self.get_current_gripper_state()   # already normalised 0..1
-        elif self.use_gripper:
-            self.current_gripper_state = self.get_current_gripper_state() / 0.8
+        if self.use_gripper:
+            self.current_gripper_state = self.get_current_gripper_state()   # normalised: 0 open .. 1 closed
             # Snap the gripper state to 0 or 1 if they're reasonably close.
             # The wider thresholds (0.2 / 0.8 instead of 0.05 / 0.95) account
             # for residual rest-position drift after physics settling — e.g.
@@ -5745,10 +5740,7 @@ class PybulletRobotServerBase:
             c, off = cmd[off: off + g.command_dim], off + g.command_dim
             if g.command_dim == 0:
                 continue
-            if g.kind == "robotiq_2f85":
-                self.move_gripper((1 - float(c[0])) * 0.085)
-            else:
-                self._command_generic_gripper(c, g)
+            self._command_generic_gripper(c, g)
 
     # ------------------------------------------------------------ generic grippers
     # Any gripper that is not the calibrated Robotiq 2F-85: driven through
@@ -5778,19 +5770,45 @@ class PybulletRobotServerBase:
         for link_a, link_b in getattr(self, "SELF_COLLISION_SKIP_PAIRS", ()):
             self.pybullet_client.setCollisionFilterPair(rid, rid, link_a, link_b, enableCollision=0)
 
-    def _command_generic_gripper(self, command, g=None) -> None:
+    def _command_generic_gripper(self, command, g=None, velocity=None) -> None:
+        """Drive one gripper to `command` (per channel, 0 = open .. 1 = closed).
+
+        Commanded joints get a position target with the URDF's effort and
+        velocity limits. Joints the URDF couples to them with <mimic> follow
+        through the gear constraints from _setup_generic_gripper; in
+        debug-fast mode they are snapped and held (a gear alone lets fingers
+        flap during an arm snap), and with GRIPPER_MIMIC_HOLD_FORCE > 0 they
+        are position-held at their gear-consistent angle in normal mode too
+        (real parallel grippers are structurally rigid). Targets for parent
+        and children are always set together, so the holds never fight the
+        gears at a stale target."""
         g = g or self.robot_spec.gripper
         targets = g.joint_targets(command)
         rid = self.splatsim_robot.sim_id
+        pc = self.pybullet_client
+        target_of = {}
         for j, q in zip(g.joint_indices, targets):
             info = self.robot_spec.joints[j]
             force = info.max_force if info.max_force > 0 else 20.0
+            vel = velocity if velocity is not None else (info.max_velocity if info.max_velocity > 0 else 1.0)
             if self.debug_fast_control:
-                self.pybullet_client.resetJointState(rid, j, float(q))
-            self.pybullet_client.setJointMotorControl2(
-                rid, j, p.POSITION_CONTROL, targetPosition=float(q), force=force,
-                maxVelocity=(info.max_velocity if info.max_velocity > 0 else 1.0),
-            )
+                force = max(force, self.DEBUG_FAST_CONTROL_GRIPPER_FORCE)
+                vel = self.DEBUG_FAST_CONTROL_MAX_VELOCITY
+                pc.resetJointState(rid, j, float(q))
+            pc.setJointMotorControl2(rid, j, p.POSITION_CONTROL, targetPosition=float(q), force=force, maxVelocity=vel)
+            target_of[j] = (float(q), vel)
+        for child, (parent, mult, offset) in g.mimic.items():
+            if parent not in target_of:
+                continue
+            qp, vel = target_of[parent]
+            qc = mult * qp + offset
+            if self.debug_fast_control:
+                pc.resetJointState(rid, child, qc)
+                pc.setJointMotorControl2(rid, child, p.POSITION_CONTROL, targetPosition=qc,
+                                         force=self.DEBUG_FAST_CONTROL_GRIPPER_FORCE, maxVelocity=vel)
+            elif self.GRIPPER_MIMIC_HOLD_FORCE > 0:
+                pc.setJointMotorControl2(rid, child, p.POSITION_CONTROL, targetPosition=qc,
+                                         force=self.GRIPPER_MIMIC_HOLD_FORCE, maxVelocity=vel)
 
     def plan_execute_record_trajectory(self, initial_joint_positions, joint_signs):
         # Returns whether it was a success
@@ -7250,189 +7268,34 @@ class PybulletRobotServerBase:
             self.joints.append(info)
 
     def setup_gripper(self):
+        """Gear constraints for every URDF <mimic> joint and no self-collision
+        inside each gripper (a parallel gripper's linkage overlaps by design
+        and would jam), plus the class-level SELF_COLLISION_SKIP_PAIRS.
+        Everything gripper-specific comes from the URDF + asset.yaml."""
         self.__parse_joint_info__()
-        self._setup_generic_gripper()            # every per_joint / synergies gripper
-        if not any(g.kind == "robotiq_2f85" for g in self.robot_spec.grippers):
-            return
-        self.gripper_range = [0, 0.085]
-
-        mimic_parent_name = "finger_joint"
-        mimic_children_names = {
-            "right_outer_knuckle_joint": 1,
-            # "finger_joint": 1, # TODO: is this left_outer_knuckle_joint?
-            "left_inner_knuckle_joint": 1,
-            "right_inner_knuckle_joint": 1,
-            "left_inner_finger_joint": -1,
-            "right_inner_finger_joint": -1,
-        }
-        # self.__setup_mimic_joints__(mimic_parent_name, mimic_children_names)
-
-        self.mimic_parent_id = [
-            joint.id for joint in self.joints if joint.name == mimic_parent_name
-        ][0]
-        self.mimic_child_multiplier = {
-            joint.id: mimic_children_names[joint.name]
-            for joint in self.joints
-            if joint.name in mimic_children_names
-        }
-
-        for joint_id, multiplier in self.mimic_child_multiplier.items():
-            c = self.pybullet_client.createConstraint(
-                self.splatsim_robot.sim_id,
-                self.mimic_parent_id,
-                self.splatsim_robot.sim_id,
-                joint_id,
-                jointType=self.pybullet_client.JOINT_GEAR,
-                jointAxis=[0, 1, 0],
-                parentFramePosition=[0, 0, 0],
-                childFramePosition=[0, 0, 0],
-            )
-            # maxForce stays 10 in EVERY mode, including debug_fast_control.
-            # Stiffening the gears for debug mode was tried and is actively
-            # harmful: the gear's erp term tracks an internal reference that
-            # does NOT follow resetJointState, so after a debug-mode teleport
-            # a stiff gear drives the fingers at a sustained ~15 rad/s
-            # against the position holds (measured). At maxForce=10 that
-            # residual fight is negligible, and debug mode doesn't need the
-            # gears anyway — move_gripper position-holds every mimic child.
-            self.pybullet_client.changeConstraint(
-                c, gearRatio=-multiplier, maxForce=10, erp=1
-            )  # Note: the mysterious `erp` is of EXTREME importance
-
-        # Disable PHYSICS self-collision among the gripper's own links. The
-        # Robotiq 2F-85 is a 4-bar linkage whose inner-finger and inner-knuckle
-        # collision meshes overlap by design; with URDF_USE_SELF_COLLISION on,
-        # those overlaps (e.g. left_inner_finger vs left_inner_knuckle) register
-        # as penetrating contacts that jam the mimic — the gripper gets pinned
-        # in a squeezed mid-range and can neither fully open nor fully close.
-        # Collision with EXTERNAL objects (grasping) is a separate filter and is
-        # unaffected. (SELF_COLLISION_SKIP_PAIRS only feeds the RRT planner's
-        # collision check, not the physics engine, so it doesn't help here.)
-        gripper_joint_names = {
-            "finger_joint", "left_outer_finger_joint", "left_inner_finger_joint",
-            "left_inner_finger_pad_joint", "left_inner_knuckle_joint",
-            "right_outer_knuckle_joint", "right_outer_finger_joint",
-            "right_inner_finger_joint", "right_inner_finger_pad_joint",
-            "right_inner_knuckle_joint",
-        }
-        gripper_link_ids = [j.id for j in self.joints if j.name in gripper_joint_names]
-        for a in range(len(gripper_link_ids)):
-            for b in range(a + 1, len(gripper_link_ids)):
-                self.pybullet_client.setCollisionFilterPair(
-                    self.splatsim_robot.sim_id, self.splatsim_robot.sim_id,
-                    gripper_link_ids[a], gripper_link_ids[b], enableCollision=0,
-                )
-
-        # Unify the PHYSICS-side skip contract with the RRT PLANNER's skip
-        # contract. Every pair in SELF_COLLISION_SKIP_PAIRS is a URDF-artifact
-        # overlap the planner already ignores; if physics still enforces them,
-        # planner-accepted configs get pinned by constraint forces at the mesh
-        # overlap (drift-abort). See analyze_forearm_wrist2_penetration.py:
-        # forearm↔wrist_2 has a ~120° wrist_1 zone where the UR5 stock
-        # collision hulls overlap by design, which was jamming joint 3 during
-        # RRT chunk execution. NOT extended to
-        # SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA — those pairs the
-        # planner still checks, so disabling them at the physics level would
-        # let RRT accept a plan whose execution silently produced mesh
-        # overlap.
-        for link_a, link_b in getattr(self, "SELF_COLLISION_SKIP_PAIRS", ()):
-            self.pybullet_client.setCollisionFilterPair(
-                self.splatsim_robot.sim_id, self.splatsim_robot.sim_id,
-                link_a, link_b, enableCollision=0,
-            )
+        self._setup_generic_gripper()
 
     def get_link_pose(self, body, link):
         result = self.pybullet_client.getLinkState(body, link)
         return result[4], result[5]
 
     def move_gripper(self, open_length, velocity=2):
+        """Width-based command for a single parallel gripper: `open_length`
+        metres of opening (0 = closed .. stroke_m = open). Needs `stroke_m`
+        in the gripper's yaml block; the normalised command is 1 - width/stroke."""
         if not self.use_gripper:
             return
-        # open_length = np.clip(open_length, *self.gripper_range)
-        # Don't throw an error when out of range
-        open_angle = 0.715 - math.asin(np.clip(
-            (open_length - 0.010) / 0.1143,
-            -1,
-            1
-        ))  # angle calculation
-        # Control the mimic gripper joint(s). Debug-fast mode raises the hold
-        # force so arm-snap inertia can't back-drive the finger drive joint
-        # (the gear constraints are stiffened to match in setup_gripper).
-        drive_force = self.joints[self.mimic_parent_id].maxForce
-        if self.debug_fast_control:
-            drive_force = max(drive_force, self.DEBUG_FAST_CONTROL_GRIPPER_FORCE)
-            # Debug mode: the whole gripper snaps like the arm does — the
-            # realistic per-call `velocity` cap (2 rad/s) is far too slow to
-            # reject arm-snap disturbances on the finger links.
-            velocity = self.DEBUG_FAST_CONTROL_MAX_VELOCITY
-        self.pybullet_client.setJointMotorControl2(
-            self.splatsim_robot.sim_id,
-            self.mimic_parent_id,
-            self.pybullet_client.POSITION_CONTROL,
-            targetPosition=open_angle,
-            force=drive_force,
-            maxVelocity=velocity,
-        )
-        if self.debug_fast_control:
-            # KINEMATIC snap + hold for every mimic CHILD, mirroring the
-            # arm's debug path in command_joint_state: teleport each finger
-            # joint to its gear-consistent angle and position-hold it there.
-            # The JOINT_GEAR coupling alone is a velocity-level constraint —
-            # even at DEBUG_FAST_CONTROL_GRIPPER_FORCE it lets the fingers
-            # flap 25-65 deg during a debug-speed arm snap (measured;
-            # transient, self-recovering, but visually a twitching finger).
-            # Normally children MUST stay motor-free (a position hold at a
-            # STALE target jams the mimic — see the teleport/setup notes);
-            # here it's safe because parent and child targets are set
-            # TOGETHER from the same open_angle on every call, so the
-            # motors and gears always agree.
-            self.pybullet_client.resetJointState(
-                self.splatsim_robot.sim_id, self.mimic_parent_id, open_angle
-            )
-            for child_id, mult in self.mimic_child_multiplier.items():
-                self.pybullet_client.resetJointState(
-                    self.splatsim_robot.sim_id, child_id, mult * open_angle
-                )
-                self.pybullet_client.setJointMotorControl2(
-                    self.splatsim_robot.sim_id,
-                    child_id,
-                    self.pybullet_client.POSITION_CONTROL,
-                    targetPosition=mult * open_angle,
-                    force=self.DEBUG_FAST_CONTROL_GRIPPER_FORCE,
-                    maxVelocity=velocity,
-                )
-        elif self.GRIPPER_MIMIC_HOLD_FORCE > 0:
-            # NORMAL-mode mimic rigidity (see the class attr): position-hold
-            # the mimic children at their gear-consistent angles so contact
-            # can't bend the follower fingers away from the drive joint.
-            # Targets refresh on every call — always in agreement with the
-            # parent target and the gears, so no stale-target jam.
-            for child_id, mult in self.mimic_child_multiplier.items():
-                self.pybullet_client.setJointMotorControl2(
-                    self.splatsim_robot.sim_id,
-                    child_id,
-                    self.pybullet_client.POSITION_CONTROL,
-                    targetPosition=mult * open_angle,
-                    force=self.GRIPPER_MIMIC_HOLD_FORCE,
-                    maxVelocity=velocity,
-                )
+        g = self.robot_spec.gripper
+        if g.stroke_m is None:
+            raise ValueError(f"robot {self.robot_name!r}: move_gripper(width) needs `stroke_m` under gripper: in its yaml "
+                             f"(the max opening width); or command it with a 0..1 value through command_joint_state")
+        c = float(np.clip(1.0 - float(open_length) / g.stroke_m, 0.0, 1.0))
+        self._command_generic_gripper(np.full(g.command_dim, c), g, velocity=velocity)
 
     def get_current_gripper_state(self):
-        g = self.robot_spec.gripper
-        if g.kind != "robotiq_2f85":
-            # Normalised command read back from the first commanded joint:
-            # 0 = open, 1 = closed (per_joint / synergies convention).
-            if not g.joint_indices:
-                return 0.0
-            j = g.joint_indices[0]
-            q = self.pybullet_client.getJointState(self.splatsim_robot.sim_id, j)[0]
-            lo, hi = float(g.open[0]), float(g.closed[0])
-            return float(np.clip((q - lo) / (hi - lo), 0.0, 1.0)) if hi != lo else 0.0
-        # Snap the gripper state to 0 or 1 if they're very close
-        gripper_state = self.pybullet_client.getJointState(
-            self.splatsim_robot.sim_id, self.mimic_parent_id
-        )[0]
-        return gripper_state
+        """Where the primary gripper is, normalised: 0 = open .. 1 = closed,
+        read back from its first commanded joint."""
+        return self._gripper_command_now(self.robot_spec.gripper, 0)
 
     def get_camera_image_from_end_effector(self):
 
@@ -7957,8 +7820,6 @@ class PybulletRobotServerBase:
         """Where a gripper actually is, as its command value in [0, 1]
         (0 = open), read from its joints — not the last command sent."""
         rid = self.splatsim_robot.sim_id
-        if g.kind == "robotiq_2f85":
-            return float(np.clip(self.get_current_gripper_state() / 0.8, 0.0, 1.0))
         if not g.joint_indices:
             return 0.0
         j = g.joint_indices[min(channel, len(g.joint_indices) - 1)] if g.kind == "per_joint" else g.joint_indices[0]
