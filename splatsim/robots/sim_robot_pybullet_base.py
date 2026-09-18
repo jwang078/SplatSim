@@ -5184,19 +5184,57 @@ class PybulletRobotServerBase:
                 return json.loads(val)
             return val
 
-        robot_cfg = _parse_ep_field(scenario.get("splatsim_robot_config"))
-        object_configs = _parse_ep_field(
-            scenario.get("splatsim_object_configs")) or []
-        if robot_cfg is not None:
-            initial_joints = robot_cfg["articulation_config"]["initial_joint_positions"]
-            self.teleport_joint_state(self.splatsim_robot, initial_joints)
-            # self.command_joint_state(self.splatsim_robot, np.concatenate([initial_joints[:self.num_dofs()], [0]]))
+        if "robot" in scenario or "objects" in scenario:
+            # Scenario FILE format (`scenario_dict`): only what a scenario is —
+            # the robot's start state and where the objects are. Everything
+            # else (paths, scan pose, transforms) belongs to the stage/asset.
+            robot = scenario.get("robot") or {}
+            objs = scenario.get("objects") or {}
+            robot_cfg = None
+            if robot.get("q_start") is not None:
+                q = [float(v) for v in robot["q_start"]]
+                names = list(robot.get("state_joints") or [])
+                mine = self.robot_spec.state_joint_names
+                if names and names != mine[: len(names)]:
+                    # Different robot or different state layout: match by name,
+                    # keep the current value for anything the file doesn't name.
+                    cur = list(self.get_joint_state())
+                    by_name = dict(zip(names, q))
+                    q = [by_name.get(n, cur[i] if i < len(cur) else 0.0) for i, n in enumerate(mine)]
+                    missing = [n for n in names if n not in mine]
+                    if missing:
+                        print(f"[scenario] joints {missing} are not state joints of {self.robot_name!r}; ignored")
+                self.teleport_joint_state(self.splatsim_robot, q)
+            object_configs = [
+                {"name": n, "initial_position": o["position"], "initial_quat": o["quat"],
+                 "initial_scale": o.get("scale", [1.0, 1.0, 1.0])}
+                for n, o in objs.items()
+            ]
+            if not robot and not objs:
+                raise ValueError("scenario has neither a robot start nor objects")
+        else:
+            # Episode-metadata format (LeRobot `meta/episodes` rows, ZMQ oracle
+            # info): full config dumps, of which only the robot's
+            # articulation_config.initial_joint_positions and the objects'
+            # initial pose/scale are read.
+            robot_cfg = _parse_ep_field(scenario.get("splatsim_robot_config"))
+            object_configs = _parse_ep_field(
+                scenario.get("splatsim_object_configs")) or []
+            if robot_cfg is not None:
+                initial_joints = list(robot_cfg["articulation_config"]["initial_joint_positions"])
+                state_idx = self.robot_spec.state_joint_indices
+                if len(initial_joints) > len(state_idx):
+                    # Recorded in the pre-`robot:` convention (one value per
+                    # URDF joint 1..N); pick this robot's state joints out of it.
+                    initial_joints = [initial_joints[j - 1] if j - 1 < len(initial_joints) else 0.0
+                                      for j in state_idx]
+                self.teleport_joint_state(self.splatsim_robot, initial_joints)
 
         # Build a name→object lookup for the live scene objects
         obj_by_name = {obj.config.name: obj for obj in self.splatsim_objects}
 
         # Restore each non-robot, non-background object
-        if robot_cfg is None and len(object_configs) == 0:
+        if robot_cfg is None and len(object_configs) == 0 and "robot" not in scenario:
             raise ValueError("scenario has neither a robot config nor object configs")
         for obj_cfg_dict in object_configs:
             name = obj_cfg_dict["name"]
@@ -5247,9 +5285,31 @@ class PybulletRobotServerBase:
 
 
     def scenario_dict(self) -> dict:
-        """Current scene as an oracle scenario (the format apply_scenario eats)."""
-        meta = self._get_splatsim_episode_metadata()
-        return {k: meta[k] for k in self.SCENARIO_FIELDS if k in meta}
+        """Current scene as a scenario file: the robot's start state (with the
+        names of the state joints, so it is readable and can be matched by
+        name on another robot) and each object's pose/scale. Stage/asset
+        facts are not repeated here — a scenario is the session layer on top
+        of them. `apply_scenario` reads this and the episode-metadata form."""
+        objects = {}
+        for obj in self.splatsim_objects:
+            if obj is self.splatsim_robot or obj is self.splatsim_background or obj.sim_id is None:
+                continue
+            pos, quat = self.pybullet_client.getBasePositionAndOrientation(obj.sim_id)
+            objects[obj.config.name] = {
+                "position": [float(v) for v in pos],
+                "quat": [float(v) for v in quat],
+                "scale": [float(v) for v in (obj.config.current_scale or [1.0, 1.0, 1.0])],
+            }
+        q = [float(v) for v in self.get_joint_state()]
+        return {
+            "format": "splatsim-scenario/2",
+            "robot": {
+                "entry": self.robot_name,
+                "state_joints": self.robot_spec.state_joint_names[: len(q)],
+                "q_start": q,
+            },
+            "objects": objects,
+        }
 
     def save_scenario_file(self, path) -> None:
         """Write the current scene to a JSON scenario file.

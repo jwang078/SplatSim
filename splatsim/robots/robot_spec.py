@@ -182,6 +182,12 @@ class RobotSpec:
     cameras: List[CameraSpec]
     ee_link_index: int
     state_joint_indices: List[int]              # what get_joint_state / teleport vectors index
+
+    @property
+    def state_joint_names(self) -> List[str]:
+        """URDF joint names in state-vector order (the legend for q vectors)."""
+        by_index = {j.index: j.name for j in self.joints}
+        return [by_index[i] for i in self.state_joint_indices]
     initial_joint_positions: np.ndarray         # per state_joint_indices
     joint_signs: np.ndarray                     # per state_joint_indices
     self_collision_skip_pairs: List[tuple]      # (link_a, link_b) indices

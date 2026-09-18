@@ -169,6 +169,10 @@ data/stages/<stage>/
 - The yaml files are tracked in git; the data next to them is not.
 - Folders extracted under the older names (`data/scenes/`, `data/robots/`,
   `scene.yaml`, `robot.yaml`) still load.
+- `data/scenarios/<env>__<robot>.json` is a saved arrangement: the robot's
+  start joint state (named) and each object's pose. It sits on top of the
+  stage and asset and repeats nothing from them; `launch_nodes.py` picks it
+  up automatically and `--save_scenario` writes one.
 
 To add a stage: make `data/stages/<stage>/` with `splat/` and `sfm/`, copy
 `data/stages/vine_scene/stage.yaml` beside them and fill in the transform
