@@ -29,8 +29,6 @@ robot:
       model: pinhole              # pinhole | fisheye_v1 | fisheye_v2 (shipped GoPro calibrations)
       fov_deg: 70                 # pinhole only; omit to match the scene camera
     - name: elbow
-      link: panda_link4
-      offset_xyz: [0.0, 0.0, 0.1]
-      offset_rpy: [1.5708, 0.0, 0.0]
+      link: elbow_camera_link     # a link off panda_link4 in the URDF, with RGB axis visuals
       model: pinhole
       fov_deg: 90
