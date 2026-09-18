@@ -1212,27 +1212,46 @@ class PybulletRobotServerBase:
         # they are on disk BEFORE anything tries to load one — a missing scan
         # should not take the whole server down several seconds into
         # construction. See `_preflight_splat_assets`.
-        self.missing_splat_assets = (
-            self._preflight_splat_assets() if self.RENDER_SPLATS else []
+        robot_missing, scene_missing = (
+            self._preflight_splat_assets() if self.RENDER_SPLATS else ([], [])
         )
-        self._splat_assets_unavailable = bool(self.missing_splat_assets)
+        self.missing_splat_assets = robot_missing + scene_missing
+        # Only a missing SCENE costs us splat rendering outright.
+        self._splat_assets_unavailable = bool(scene_missing)
         if self.missing_splat_assets:
-            print(
-                "[splat assets] not found — rendering from the PyBullet camera "
-                "instead. Physics, control, planning, metrics and oracle state "
-                "are unaffected; images just aren't photoreal."
-            )
+            print("[splat assets] not on disk:")
             for item in self.missing_splat_assets:
-                print(f"    missing: {item}")
+                print(f"    {item}")
             print(
                 "    Unpack the scene tarball(s) into data/scenes/ and relaunch "
-                "for splat rendering (see the README's Download the example scenes)."
+                "for the full splat render (see the README's Download the "
+                "example scenes)."
+            )
+        if scene_missing:
+            print(
+                "[splat assets] no scene to render — falling back to the PyBullet "
+                "camera. Physics, control, planning, metrics and oracle state are "
+                "unaffected; the images just aren't photoreal."
             )
             # Instance-level shadow of the ClassVar. Everything reads
             # self.RENDER_SPLATS, so this one assignment turns off the robot
             # splat, the background object, the base camera, the segmentation
             # load and the SPLAT entry in the GUI's render-mode dropdown.
             self.RENDER_SPLATS = False
+        elif robot_missing:
+            # The scene scans ARE here — only the robot was never scanned (or
+            # its scan isn't downloaded). Keep rendering the scene as
+            # gaussians and draw the robot in from PyBullet, depth-composited
+            # against the splat. That is a first-class mode of this class, not
+            # a consolation prize: the floating-gripper vine env is built on
+            # it. Far better than throwing away a scene we have.
+            print(
+                "[splat assets] scene renders as splats; the robot has no scan, so "
+                "it is composited in from PyBullet geometry "
+                "(RENDER_ROBOT_SPLAT=False + COMPOSITE_PYBULLET_ROBOT)."
+            )
+            self.RENDER_ROBOT_SPLAT = False
+            self.COMPOSITE_PYBULLET_ROBOT = True
 
         # load labels.npy — the per-link segmentation of the ROBOT's own splat,
         # so it is needed exactly when that splat is loaded (see
@@ -1277,7 +1296,7 @@ class PybulletRobotServerBase:
             else:
                 render_mode = RenderMode.NONE
         render_mode = RenderMode(render_mode)  # accept enum or str
-        if render_mode == RenderMode.SPLAT and self.missing_splat_assets:
+        if render_mode == RenderMode.SPLAT and self._splat_assets_unavailable:
             # Splats were asked for explicitly (--render_mode splat, or the
             # env's own default) but there are none to render. The PyBullet
             # camera covers the same camera keys, so downgrade rather than
@@ -3498,8 +3517,9 @@ class PybulletRobotServerBase:
                 missing.append(f"{splat_name}.{field} -> {resolved}")
         return missing
 
-    def _preflight_splat_assets(self) -> List[str]:
-        """Splat assets this env needs to render but that aren't on disk.
+    def _preflight_splat_assets(self) -> Tuple[List[str], List[str]]:
+        """Splat assets this env needs to render but that aren't on disk,
+        split into (robot's own, the scene's) — they degrade differently.
 
         The scans live outside the repo — one downloadable tarball per scene —
         so a complete checkout with a working CUDA stack can still have
@@ -3511,36 +3531,45 @@ class PybulletRobotServerBase:
         camera renders the same camera keys. So we look first, and the caller
         degrades to that camera instead of aborting.
 
-        Checked: the robot's own splat and its per-link labels (only when the
-        robot is rendered as gaussians), the background scan, the base
-        camera's scan (its COLMAP output too — `setup_camera_from_dataset`
-        reads `source_path`, not just the splat), and every scene object that
-        loads a splat.
+        Robot group: the robot's own splat and its per-link labels (checked
+        only when the robot is meant to render as gaussians). Missing, these
+        cost the photoreal ROBOT and nothing else — the scene still renders
+        and PyBullet draws the arm.
+
+        Scene group: the background scan, the base camera's scan (its COLMAP
+        output too — `setup_camera_from_dataset` reads `source_path`, not just
+        the splat), and every scene object that loads a splat. Missing any of
+        these, there is no photoreal scene left to put a robot in.
         """
-        missing: List[str] = []
+        robot: List[str] = []
         if self._render_robot_splat():
-            missing += self._missing_splat_files(
+            robot += self._missing_splat_files(
                 self.robot_name, ("model_path", "ply_path")
             )
             labels = (
                 SPLATSIM_ROOT / "data" / "labels_path" / f"{self.robot_name}_labels.npy"
             )
             if not labels.exists():
-                missing.append(f"{self.robot_name} per-link labels -> {labels}")
-        missing += self._missing_splat_files(
+                robot.append(f"{self.robot_name} per-link labels -> {labels}")
+        scene: List[str] = []
+        scene += self._missing_splat_files(
             self.background_splat_name, ("model_path", "ply_path")
         )
-        missing += self._missing_splat_files(
+        scene += self._missing_splat_files(
             self.base_camera_splat_name or self.background_splat_name,
             ("model_path", "source_path"),
         )
         for object_config in getattr(self.ENV_CONFIG, "objects", None) or []:
             if getattr(object_config, "load_splat", False):
-                missing += self._missing_splat_files(
+                scene += self._missing_splat_files(
                     getattr(object_config, "splat_name", None),
                     ("model_path", "ply_path"),
                 )
-        return list(dict.fromkeys(missing))  # de-duplicated, order kept
+        # De-duplicated, order kept; a path in both groups counts as the
+        # robot's, which is the milder degradation.
+        robot = list(dict.fromkeys(robot))
+        scene = [m for m in dict.fromkeys(scene) if m not in set(robot)]
+        return robot, scene
 
     def _composite_pybullet_robot(
         self,
