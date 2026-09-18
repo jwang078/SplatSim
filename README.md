@@ -238,7 +238,10 @@ You need a URDF. Nothing else — the simulator works out the rest from it.
 What the yaml can describe, all optional: which joints are the arm and which
 the gripper, how the gripper is commanded (one value for a parallel gripper,
 one per finger, or synergies for a coupled hand), any number of cameras and
-which link each sits on, the end-effector link, and the base — `fixed`,
+which link each sits on — a pinhole with a field of view, or a fisheye with
+its intrinsics, either written inline or as `intrinsics: calibration.json`
+next to the yaml (what `scripts/calibrate_camera_intrinsics.py` writes) —
+the end-effector link, and the base — `fixed`,
 `planar` (placed by the sliders, no physics), or `wheeled` (a free body on a
 ground plane; its wheel joints are velocity-controlled through
 `drive_wheels`). Planning covers the arm; driving a base around is teleop

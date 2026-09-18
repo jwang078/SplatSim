@@ -339,23 +339,9 @@ class SplatSimCamera:
 # and both the splat wrist and the pybullet wrist re-zoom together.
 FISHEYE_RECTIFY_ZOOM = 2.2
 
-# Wrist camera fisheye calibrations indexed by wrist_cam_ver. Version 0 is
-# pinhole (no entry here). New calibrations from
-# scripts/calibrate_camera_intrinsics.py should be appended with the next id.
-WRIST_CAM_FISHEYE_CALIBRATIONS: Dict[int, Dict[str, Any]] = {
-    1: {
-        "CAL_W": 2704, "CAL_H": 2028,
-        "CAL_FX": 775.5615, "CAL_FY": 778.0103,
-        "CAL_CX": 1343.6974, "CAL_CY": 1005.3416,
-        "D": [-0.0232652411, -0.0160767049, 0.0, 0.0],
-    },
-    2: {
-        "CAL_W": 1920, "CAL_H": 1080,
-        "CAL_FX": 777.86654216, "CAL_FY": 767.71982274,
-        "CAL_CX": 973.16480901, "CAL_CY": 524.25398954,
-        "D": [0.16369808, -0.15318689, 0.10608916, -0.02891525],
-    },
-}
+# Shipped wrist-camera calibrations live in splatsim.robots.camera_calibrations;
+# per-camera intrinsics come from the asset.yaml (CameraSpec.intrinsics).
+from splatsim.robots.camera_calibrations import WRIST_CAM_FISHEYE_CALIBRATIONS  # noqa: E402,F401
 
 
 class PybulletRobotServerBase:
@@ -2630,7 +2616,13 @@ class PybulletRobotServerBase:
         T_cw, R_cw = self._robot_camera_pose(cam, cached_link_states=cached_link_states)
         T_wc = -R_cw.T @ T_cw
 
-        fisheye_cal = WRIST_CAM_FISHEYE_CALIBRATIONS.get(cam.fisheye_version) if cam.fisheye_version else None
+        # Intrinsics come from the spec: a shipped fisheye_vN, a calibration
+        # file, or numbers written in the yaml — all normalised to one dict.
+        intr = cam.intrinsics
+        fisheye_cal = None
+        if intr is not None and cam.is_fisheye:
+            fisheye_cal = {"CAL_W": intr["width"], "CAL_H": intr["height"], "CAL_FX": intr["fx"], "CAL_FY": intr["fy"],
+                           "CAL_CX": intr["cx"], "CAL_CY": intr["cy"], "D": intr["D"]}
 
         if self.base_camera is None or getattr(self.base_camera, "camera", None) is None:
             # No splat base camera (RENDER_SPLATS=False envs): nothing to
@@ -2648,6 +2640,12 @@ class PybulletRobotServerBase:
             # Declared pinhole FoV (horizontal); vertical follows the aspect.
             fovx = float(np.radians(cam.fov_deg))
             fovy = 2 * np.arctan(np.tan(fovx / 2) * H / W)
+        elif intr is not None and not cam.is_fisheye:
+            # Calibrated pinhole: FoV from fx / fy at the calibration size.
+            W = int(round(H * intr["width"] / intr["height"]))
+            resolution = (W, H)
+            fovx = 2 * np.arctan(intr["width"] / (2 * intr["fx"]))
+            fovy = 2 * np.arctan(intr["height"] / (2 * intr["fy"]))
         else:
             fovx = self.base_camera.camera.FoVx
             fovy = 2 * np.atan(np.tan(self.base_camera.camera.FoVy / 2))

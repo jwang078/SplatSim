@@ -141,6 +141,7 @@ def _load_tree(root: Path) -> Dict[str, Dict[str, Any]]:
         cfg = _merge({k: v for k, v in parent_cfg.items() if k != "name"}, raw)
         name = cfg.get("name") or folder.name
         cfg["name"] = name
+        cfg["entry_dir"] = str(folder)     # where relative paths inside nested blocks (camera intrinsics) resolve
         if name in entries:
             logger.warning("registry: duplicate entry name %r (%s and %s); keeping the latter",
                            name, _SOURCE[name], f)

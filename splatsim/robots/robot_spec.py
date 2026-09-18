@@ -27,8 +27,16 @@ Full form (every key optional; `auto` or omitted = derive):
           link: wrist_camera_link
           offset_xyz: [0, 0, 0]
           offset_rpy: [0, 0, 0]
-          model: fisheye_v2 | fisheye_v1 | pinhole
-          fov_deg: 60                           # pinhole only
+          model: pinhole | fisheye | fisheye_v2 | fisheye_v1
+          fov_deg: 60                           # pinhole without intrinsics; omit = the scene camera's
+          intrinsics: calibration.json          # a file next to the yaml (what
+                                                #   scripts/calibrate_camera_intrinsics.py writes), or inline:
+          intrinsics: {width: 1920, height: 1080, fx: 777.9, fy: 767.7, cx: 973.2, cy: 524.3,
+                       D: [0.164, -0.153, 0.106, -0.029]}   # D: fisheye only (OpenCV k1..k4)
+
+`model: fisheye` needs `intrinsics`; `fisheye_v1` / `fisheye_v2` are the
+calibrations that ship in the code (splatsim/robots/camera_calibrations.py)
+and need nothing else. A pinhole with `intrinsics` gets its FoV from fx/fy.
       gripper:
         kind: auto | robotiq_2f85 | synergies | per_joint | none
         joints: auto | [joint names]
@@ -137,12 +145,19 @@ class CameraSpec:
     link_index: int
     offset_xyz: tuple = (0.0, 0.0, 0.0)
     offset_rpy: tuple = (0.0, 0.0, 0.0)
-    model: str = "pinhole"          # pinhole | fisheye_v1 | fisheye_v2
+    model: str = "pinhole"          # pinhole | fisheye | fisheye_v1 | fisheye_v2
     fov_deg: Optional[float] = None # pinhole horizontal FoV; None = same as the scene's base camera
+    # Normalised intrinsics: {width, height, fx, fy, cx, cy, D (fisheye), source}.
+    # None = a plain pinhole that follows the scene camera (or fov_deg).
+    intrinsics: Optional[Dict[str, Any]] = None
 
     @property
     def obs_key(self) -> str:
         return f"{self.name}_rgb"
+
+    @property
+    def is_fisheye(self) -> bool:
+        return self.model.startswith("fisheye")
 
     @property
     def fisheye_version(self) -> Optional[int]:
@@ -292,7 +307,9 @@ class RobotSpec:
                 f"    gripper: {g.kind}" + (f", command dim {g.command_dim}, joints {g.joint_names}" if g.kind != 'none' else ''),
             ]
         lines += [
-            f"  cameras ({len(self.cameras)}): " + (", ".join(f"{c.name}@{c.link} [{c.model}]" for c in self.cameras) or "none"),
+            f"  cameras ({len(self.cameras)}): " + (", ".join(
+                f"{c.name}@{c.link} [{c.model}" + (f", {c.intrinsics['width']}x{c.intrinsics['height']} from {c.intrinsics['source']}" if c.intrinsics else "") + "]"
+                for c in self.cameras) or "none"),
             f"  action vector: {self.num_dofs} arm + {self.gripper_command_dim} gripper = {self.action_dim}",
             f"  splat scan: {'yes' if self.has_splat else 'no (rendered from URDF meshes)'}",
         ]
@@ -375,18 +392,21 @@ class RobotSpec:
 
         # --- cameras -------------------------------------------------------
         cams: List[CameraSpec] = []
+        yaml_dir = Path(cfg.get("entry_dir") or Path(urdf_path or cfg.get("urdf_path") or ".").parent)
         if "cameras" in rb:
             for c in rb["cameras"] or []:
+                model = str(c.get("model", "pinhole")).lower()
                 cams.append(CameraSpec(
                     name=str(c["name"]), link=str(c["link"]), link_index=_link_index(link_names, c["link"]),
                     offset_xyz=tuple(c.get("offset_xyz", (0, 0, 0))), offset_rpy=tuple(c.get("offset_rpy", (0, 0, 0))),
-                    model=str(c.get("model", "pinhole")),
-                    fov_deg=(float(c["fov_deg"]) if c.get("fov_deg") is not None else None)))
+                    model=model, fov_deg=(float(c["fov_deg"]) if c.get("fov_deg") is not None else None),
+                    intrinsics=_camera_intrinsics(c, model, yaml_dir, f"{name}/{c['name']}")))
         elif cfg.get("wrist_camera_link_name"):
             ver = wrist_cam_ver if wrist_cam_ver else 0
+            model = f"fisheye_v{ver}" if ver else "pinhole"
             cams.append(CameraSpec(name="wrist", link=cfg["wrist_camera_link_name"],
                                    link_index=_link_index(link_names, cfg["wrist_camera_link_name"]),
-                                   model=(f"fisheye_v{ver}" if ver else "pinhole")))
+                                   model=model, intrinsics=_camera_intrinsics({}, model, yaml_dir, f"{name}/wrist")))
         seen = set()
         for c in cams:
             if c.name in seen:
@@ -463,6 +483,58 @@ class RobotSpec:
 
 
 # ---------------------------------------------------------------- helpers
+def _camera_intrinsics(c: Dict[str, Any], model: str, yaml_dir: Path, who: str) -> Optional[Dict[str, Any]]:
+    """Normalise a camera's intrinsics to {width, height, fx, fy, cx, cy, D, source}.
+
+    Sources, in order: `intrinsics:` as a path (relative to the yaml) to the
+    JSON from scripts/calibrate_camera_intrinsics.py or to a JSON/YAML with
+    the normalised keys (or a 3x3 `K`); `intrinsics:` written inline; or the
+    shipped table for `fisheye_vN`. Plain pinholes return None."""
+    import json
+    src = c.get("intrinsics")
+    data: Optional[Dict[str, Any]] = None
+    source = "inline"
+    if isinstance(src, str):
+        path = Path(src) if Path(src).is_absolute() else (yaml_dir / src)
+        if not path.exists():
+            raise FileNotFoundError(f"{who}: intrinsics file {path} not found")
+        text = path.read_text()
+        data = json.loads(text) if path.suffix.lower() == ".json" else __import__("yaml").safe_load(text)
+        source = str(path)
+    elif isinstance(src, dict):
+        data = dict(src)
+    m = re.fullmatch(r"fisheye_v(\d+)", model)
+    if data is None:
+        if m:
+            from splatsim.robots.camera_calibrations import shipped_intrinsics
+            return shipped_intrinsics(int(m.group(1)))
+        if model == "fisheye":
+            raise ValueError(f"{who}: model fisheye needs `intrinsics:` (a calibration file or fx/fy/cx/cy/width/height/D)")
+        return None
+    # scripts/calibrate_camera_intrinsics.py output -> normalised keys
+    if "fisheye_camera_matrix" in data or "fisheye_fx" in data:
+        K = data.get("fisheye_camera_matrix")
+        out = {"width": data["image_width"], "height": data["image_height"],
+               "fx": data.get("fisheye_fx", K and K[0][0]), "fy": data.get("fisheye_fy", K and K[1][1]),
+               "cx": data.get("fisheye_cx", K and K[0][2]), "cy": data.get("fisheye_cy", K and K[1][2]),
+               "D": list(data.get("fisheye_dist_coeffs", []))}
+    else:
+        K = data.get("K")
+        out = {"width": data.get("width", data.get("image_width")), "height": data.get("height", data.get("image_height")),
+               "fx": data.get("fx", K and K[0][0]), "fy": data.get("fy", K and K[1][1]),
+               "cx": data.get("cx", K and K[0][2]), "cy": data.get("cy", K and K[1][2]),
+               "D": list(data.get("D", data.get("dist_coeffs", [])))}
+    missing = [k for k in ("width", "height", "fx", "fy", "cx", "cy") if out.get(k) is None]
+    if missing:
+        raise ValueError(f"{who}: intrinsics missing {missing} (have keys {sorted(data)})")
+    if model.startswith("fisheye") and len(out["D"]) != 4:
+        raise ValueError(f"{who}: a fisheye needs 4 distortion coefficients (OpenCV fisheye k1..k4), got {len(out['D'])}")
+    out = {k: (float(v) if k not in ("D",) else [float(x) for x in v]) for k, v in out.items()}
+    out["width"], out["height"] = int(out["width"]), int(out["height"])
+    out["source"] = source
+    return out
+
+
 def _derive_gripper(gcfg: Dict[str, Any], joints: List[JointInfo], movable: List[JointInfo],
                     link_names: Dict[int, str], wheel_idx: List[int], *, legacy: bool, use_gripper_legacy: bool,
                     urdf_path, name: str, candidate_links: Optional[set] = None):
