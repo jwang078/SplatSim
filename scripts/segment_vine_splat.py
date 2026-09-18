@@ -1,15 +1,14 @@
 """Segment a vegetation splat into hard trunk / soft twigs / soft foliage,
 with a visualization artifact for EVERY stage so each step can be inspected.
 
-Outputs (under --outdir; the simulator loads only the first one):
-  <name>_soft_cost.npz      xyz + per-point weight + class for the cost field
-  byproducts/
-    <name>_trunk_hard.ply     gaussian PLY subset -> input to splat_to_collision.py
-    <name>_seg_labels.npy     full-length class array (aligned to input PLY)
-    <name>_seg_params.json    every threshold used (reproducibility)
-    <name>_class_preview.ply  class-colored point cloud (SuperSplat/CloudCompare)
-    <name>_weight_preview.ply weight-colormapped point cloud
-    viz/01_input_rgb.png          input cloud in its own colors
+Outputs (all under --outdir/byproducts/):
+  <name>_soft_cost.npz      xyz + per-point weight + class for the cost field (the planner loads this)
+  <name>_trunk_hard.ply     gaussian PLY subset -> input to splat_to_collision.py
+  <name>_seg_labels.npy     full-length class array (aligned to input PLY)
+  <name>_seg_params.json    every threshold used (reproducibility)
+  <name>_class_preview.ply  class-colored point cloud (SuperSplat/CloudCompare)
+  <name>_weight_preview.ply weight-colormapped point cloud
+  viz/01_input_rgb.png            input cloud in its own colors
   viz/02_opacity_prefilter.png    kept vs dropped points
   viz/03_color_classes.png        after HSV stage only
   viz/04_hue_histogram.png        hue distribution + threshold windows
@@ -178,10 +177,10 @@ def main():
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
-    # What the simulator loads stays at the top of the build folder
-    # (<name>_soft_cost.npz); everything else this script leaves behind —
-    # the trunk subset that feeds the mesher, per-point labels, thresholds,
-    # previews, plots — goes under byproducts/ so the folder stays legible.
+    # Everything this script produces goes under <outdir>/byproducts/ —
+    # the cost field the planner loads as much as the trunk subset that feeds
+    # the mesher, labels, thresholds, previews and plots. The build folder's
+    # top level is for what a person authors (grape_targets_manual.json).
     inter = outdir / "byproducts"
     vizdir = inter / "viz"
     vizdir.mkdir(parents=True, exist_ok=True)
@@ -276,7 +275,7 @@ def main():
     )
     soft = result.soft_mask
     np.savez_compressed(
-        outdir / f"{name}_soft_cost.npz",
+        inter / f"{name}_soft_cost.npz",
         xyz=cloud.xyz[soft],
         weight=result.weights[soft],
         class_id=result.labels[soft],

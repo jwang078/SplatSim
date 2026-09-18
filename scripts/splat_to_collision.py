@@ -13,7 +13,7 @@ Backends:
                   watertight blocky mesh. No external tools.
                   (Same idea as splat-transform's `--collision-mesh faces`.)
 
-Outputs (under --outdir, which should be the build's folder,
+Outputs (under --outdir/byproducts/, --outdir being the build's folder,
 data/stages/<scan>/segmentations/<build>/):
   <name>_collision.obj        collision mesh, in the scan's frame — or in SIM
                               frame if --transform is given (baking; the old
@@ -22,10 +22,10 @@ data/stages/<scan>/segmentations/<build>/):
   (the build is registered under `assets:` in the scan's stage.yaml as
   `<scan>/<build>`: urdf_path + collision_frame, splat or sim when baked. The
   scan's splat->sim matrix is applied at load, so prefer NOT baking.)
-  byproducts/viz/10_mesh_overlay.png   mesh cross-sections overlaid on trunk
-                              points — THE alignment check (mesh must hug red points)
-  byproducts/viz/11_mesh_render.png    shaded open3d render of the mesh (if EGL works)
-  byproducts/st_output.*    the mesher's own outputs
+  viz/10_mesh_overlay.png     mesh cross-sections overlaid on trunk points —
+                              THE alignment check (mesh must hug red points)
+  viz/11_mesh_render.png      shaded open3d render of the mesh (if EGL works)
+  st_output.*                 the mesher's own outputs
 
 Usage:
   python scripts/splat_to_collision.py \
@@ -287,7 +287,7 @@ def build_capsules(args, cloud, outdir, vizdir, name):
         trunk_pts = trunk_pts @ T[:3, :3].T + T[:3, 3]
         note = f" [transformed via {args.transform}]"
 
-    urdf_path = outdir / f"{name}_capsules.urdf"
+    urdf_path = (outdir / "byproducts") / f"{name}_capsules.urdf"
     urdf_path.write_text(capsule_urdf(skel.capsules, f"{name}_trunk_capsules"))
     wrote("URDF (capsules)", urdf_path)
 
@@ -358,8 +358,9 @@ def main():
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
-    # The mesh, URDF and stage.yaml sit at the top of the build folder; the
-    # mesher's own files and the check pictures go under byproducts/.
+    # Everything produced — mesh, URDF, the mesher's own files, the check
+    # pictures — goes under <outdir>/byproducts/; the registration (the
+    # stage's assets: block) points at the URDF there.
     inter = outdir / "byproducts"
     vizdir = inter / "viz"
     vizdir.mkdir(parents=True, exist_ok=True)
@@ -405,17 +406,17 @@ def main():
         trunk_pts = trunk_pts @ T[:3, :3].T + T[:3, 3]
         note = f" [transformed to sim frame via {args.transform}]"
 
-    obj_path = outdir / f"{name}_collision.obj"
+    obj_path = inter / f"{name}_collision.obj"
     write_obj(obj_path, verts, tris)
     wrote("collision mesh (OBJ)", obj_path)
 
-    urdf_path = outdir / f"{name}.urdf"
+    urdf_path = inter / f"{name}.urdf"
     urdf_path.write_text(
         URDF_TEMPLATE.format(name=f"{name}_trunk", obj_rel=obj_path.name)
     )
     wrote("URDF (fixed base, concave mesh)", urdf_path)
 
-    write_scene_yaml(outdir, name, urdf_path.name, baked=bool(args.transform))
+    write_scene_yaml(outdir, name, os.path.relpath(urdf_path, outdir), baked=bool(args.transform))
 
     plot_mesh_overlay(verts, tris, trunk_pts,
                       vizdir / "10_mesh_overlay.png", note)

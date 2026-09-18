@@ -204,9 +204,9 @@ data/stages/<stage>/
     <body>_labels.npy + .json        which URDF link each gaussian of that body belongs to, and the key
     segmentations/<build>/           a body built from the scan (see Making a collision body);
                                      registered under assets: in stage.yaml as <stage>/<build>
-        <build>.urdf, <build>_collision.obj, <build>_soft_cost.npz, grape_targets*.json
-                                     ... what the simulator loads
-        byproducts/                  what the scripts left behind (trunk subset, labels, previews, viz/)
+        grape_targets_manual.json    what you authored by hand
+        byproducts/                  everything the scripts produced: <build>.urdf + _collision.obj,
+                                     the cost fields, grape_targets.json, trunk subset, labels, viz/
 ```
 
 - The folder tree is the config: every yaml is one entry, named after its
@@ -501,7 +501,7 @@ shipped `vine_scene`.
    `data/stages/vine_scene/segmentations/<build>/<build>.ply`. For vegetation,
    `scripts/segment_vine_splat.py <ply> --outdir <build dir>` splits it into
    the hard trunk (`byproducts/<build>_trunk_hard.ply`, what gets a mesh) and the soft
-   twigs/leaves/grapes (`<build>_soft_cost.npz`, what the planner steers
+   twigs/leaves/grapes (`byproducts/<build>_soft_cost.npz`, what the planner steers
    around), with a picture of every stage under `byproducts/viz/`, though the color thresholding might need to be tuned.
 
 2. **Mesh it and register it:**
@@ -510,8 +510,8 @@ shipped `vine_scene`.
        data/stages/vine_scene/segmentations/vine_and_trellis/byproducts/vine_and_trellis_trunk_hard.ply \
        --outdir data/stages/vine_scene/segmentations/my_build
    ```
-   writes `<name>_collision.obj` and `<name>.urdf` (fixed base, concave) and
-   registers the build under `assets:` in the scan's `stage.yaml` — as
+   writes `byproducts/<name>_collision.obj` and `byproducts/<name>.urdf` (fixed
+   base, concave) and registers the build under `assets:` in the scan's `stage.yaml` — as
    `vine_scene/my_build`, named after its folder — with `collision_frame:
    splat`, meaning the mesh is in the scan's frame and the scan's
    `transformation` is applied at load: the same transform you found for the
@@ -522,8 +522,8 @@ shipped `vine_scene`.
 
 3. **Check it:** `byproducts/viz/10_mesh_overlay.png` must hug the trunk points, and
    ```bash
-   python scripts/visualize_collision.py --urdf data/stages/vine_scene/segmentations/my_build/my_build.urdf \
-       --soft-npz data/stages/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_soft_cost.npz --gui
+   python scripts/visualize_collision.py --urdf data/stages/vine_scene/segmentations/my_build/byproducts/my_build.urdf \
+       --soft-npz data/stages/vine_scene/segmentations/vine_and_trellis/byproducts/vine_and_trellis_soft_cost.npz --gui
    ```
    loads it in PyBullet with the soft points and a probe sphere. Grape
    targets for the task come from `scripts/regen_grape_targets.py` (or
@@ -531,9 +531,10 @@ shipped `vine_scene`.
 
 An environment then refers to the build as `<stage>/<build>`
 (`splat_name="vine_scene/vine_and_trellis"`); nothing else needs to know it
-was a splat first. Everything in a build folder is derived from the splat;
-the top level is what the simulator loads, `byproducts/` is what the scripts
-needed on the way.
+was a splat first. Everything the scripts produce — the URDF and mesh the
+simulator loads as much as the working files — sits in the build's
+`byproducts/`; the build folder's top level is for what you author by hand
+(`grape_targets_manual.json`).
 
 ## Generating new trajectories
 

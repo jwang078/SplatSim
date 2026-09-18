@@ -170,8 +170,8 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
     # gaussians are forced into the hard collision mesh via
     # `segment_vine_splat.py --force-hard-diff vine_only.ply`.
     VINE_SPLAT_NAME = "vine_scene/vine_and_trellis"
-    _SEG_DIR = registry.body_dir(VINE_SPLAT_NAME)
-    _BUILD = _SEG_DIR.name                      # file prefix of the build's artifacts
+    _SEG_DIR = registry.body_dir(VINE_SPLAT_NAME)   # .../segmentations/<build>/byproducts (beside the URDF)
+    _BUILD = _SEG_DIR.parent.name if _SEG_DIR.name == "byproducts" else _SEG_DIR.name   # artifact file prefix
     # Prefers grape_targets_manual.json when present (see
     # grape_targets.resolve_targets_json): hand annotation outranks detector
     # output, because colour segmentation cannot see green fruit and this

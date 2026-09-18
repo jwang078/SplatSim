@@ -14,7 +14,7 @@ sim-frame coordinates of the second.
 
 Usage:
     python scripts/regen_grape_targets.py                       # vine_and_trellis
-    python scripts/regen_grape_targets.py --scene-dir data/stages/<scan>/segmentations/<scene>
+    python scripts/regen_grape_targets.py --scene-dir data/stages/<scan>/segmentations/<build>/byproducts
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scene-dir", type=Path,
-                    default=Path("data/stages/<scan>/segmentations/vine_and_trellis"))
+                    default=Path("data/stages/vine_scene/segmentations/vine_and_trellis/byproducts"))
     ap.add_argument("--name", default=None,
                     help="asset basename (default: scene dir name)")
     ap.add_argument("--eps", type=float, default=0.025,
@@ -43,7 +43,8 @@ def main():
                     help="print the bunches without writing the JSON")
     args = ap.parse_args()
 
-    name = args.name or args.scene_dir.name
+    build = args.scene_dir.parent if args.scene_dir.name == "byproducts" else args.scene_dir
+    name = args.name or build.name          # artifacts are named after the build, not the subfolder
     soft = np.load(args.scene_dir / f"{name}_soft_cost.npz", allow_pickle=False)
     simf = np.load(args.scene_dir / f"{name}_cost_field_sim.npz", allow_pickle=False)
 
@@ -88,11 +89,11 @@ def main():
                 f"REFUSING to overwrite {out}: it contains hand-marked "
                 f"targets ({sum(1 for b in existing if b.get('manual'))} of "
                 f"{len(existing)}). Move them to "
-                f"{args.scene_dir / G.MANUAL_TARGETS_NAME} (which this script "
+                f"{G.manual_targets_json(args.scene_dir)} (which this script "
                 f"never writes and the env prefers), or delete the file if "
                 f"you really mean to discard the annotation.")
     out.write_text(json.dumps(bunches, indent=1))
-    manual = args.scene_dir / G.MANUAL_TARGETS_NAME
+    manual = G.manual_targets_json(args.scene_dir)
     print(f"\nwrote {out}")
     if manual.exists():
         print(f"NOTE {manual.name} exists and takes precedence — the env will "

@@ -28,9 +28,12 @@ def resolve_targets_json(scene_dir):
 
     Two files, with a deliberate split of ownership:
       grape_targets_manual.json  authored by scripts/mark_grape_targets.py.
-                                 Automation must never write this.
-      grape_targets.json         detector output; regenerated freely.
+                                 Automation must never write this. It sits at
+                                 the top of the build folder, beside byproducts/.
+      grape_targets.json         detector output; regenerated freely, lives
+                                 with the cost field it was clustered from.
 
+    `scene_dir` may be the build folder or its byproducts/; both are searched.
     The manual file wins when present, so hand annotation survives any
     re-run of the segmentation pipeline. Delete it to fall back to the
     detector once the real one lands.
@@ -40,8 +43,21 @@ def resolve_targets_json(scene_dir):
     merely seed it.
     """
     scene_dir = Path(scene_dir)
-    manual = scene_dir / MANUAL_TARGETS_NAME
-    return manual if manual.exists() else scene_dir / AUTO_TARGETS_NAME
+    dirs = [scene_dir, scene_dir.parent] if scene_dir.name == "byproducts" else [scene_dir, scene_dir / "byproducts"]
+    for d in dirs:
+        if (d / MANUAL_TARGETS_NAME).exists():
+            return d / MANUAL_TARGETS_NAME
+    for d in dirs:
+        if (d / AUTO_TARGETS_NAME).exists():
+            return d / AUTO_TARGETS_NAME
+    return dirs[-1] / AUTO_TARGETS_NAME
+
+
+def manual_targets_json(scene_dir):
+    """Where hand annotations for this build go: the build folder's top level."""
+    scene_dir = Path(scene_dir)
+    build = scene_dir.parent if scene_dir.name == "byproducts" else scene_dir
+    return build / MANUAL_TARGETS_NAME
 
 
 def is_manual(targets) -> bool:

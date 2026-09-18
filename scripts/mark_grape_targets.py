@@ -142,7 +142,7 @@ def main():
     # regen_grape_targets.py rewrites grape_targets.json freely, and the env
     # prefers the manual one anyway (grape_targets.resolve_targets_json).
     out_path = Path(args.out) if args.out else (
-        Path(env_cls.GRAPE_TARGETS_JSON).parent / G.MANUAL_TARGETS_NAME)
+        G.manual_targets_json(Path(env_cls.GRAPE_TARGETS_JSON).parent))
     pts_sim, class_id = load_soft_points(env_cls)
     print(f"{len(pts_sim):,} soft points loaded")
 

@@ -30,7 +30,7 @@ assets:
     #                               scripts/splat_to_collision.py (trellis gaussians forced
     #                               into the hard collision mesh). Env code names it
     #                               `vine_scene/vine_and_trellis`.
-    urdf_path: segmentations/vine_and_trellis/vine_and_trellis.urdf
+    urdf_path: segmentations/vine_and_trellis/byproducts/vine_and_trellis.urdf
     ply_path: splat/point_cloud/iteration_30000/vine_and_trellis.ply
     # collision_frame: sim — this build's collision OBJ, cost field and grape
     # targets were baked into SIM frame with --transform. New builds should
