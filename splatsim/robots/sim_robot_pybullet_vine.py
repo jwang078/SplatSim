@@ -63,7 +63,7 @@ def _vine_env_config(
     standoff_m: float,
     grape_targets_json: Path,
     soft_cost_npz: Path,
-    vine_splat_name: str = "vine_and_trellis",
+    vine_splat_name: str = "vine_scene/vine_and_trellis",
     assets_transform=None,
 ) -> EnvConfig:
     """Build the vine reach EnvConfig. Pure function so tests/subclasses can
@@ -161,15 +161,17 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
     PYBULLET_CAMERA_TARGET = (-0.4, 0.55, 0.5)
     PYBULLET_CAMERA_FOV = 65.0
 
-    # The vine is a segmentation BUILD registered under data/stages/ — its
-    # stage.yaml carries urdf/ply paths and the scan's splat->sim transform,
-    # and the folder holds the grape targets + cost field. Retarget to another
-    # vine (or another build of the same scan) by changing this one name; see
+    # The vine is a body built from the vine_scene scan, registered under that
+    # stage's `assets:` as `<stage>/<build>` — the entry carries urdf/ply paths
+    # and inherits the scan's splat->sim transform; the build folder (beside
+    # the URDF) holds the grape targets + cost field. Retarget to another vine
+    # (or another build of the same scan) by changing this one name; see
     # README "Data layout". This build is the trellis-inclusive one: trellis
     # gaussians are forced into the hard collision mesh via
     # `segment_vine_splat.py --force-hard-diff vine_only.ply`.
-    VINE_SPLAT_NAME = "vine_and_trellis"
-    _SEG_DIR = registry.stage_dir(VINE_SPLAT_NAME)
+    VINE_SPLAT_NAME = "vine_scene/vine_and_trellis"
+    _SEG_DIR = registry.body_dir(VINE_SPLAT_NAME)
+    _BUILD = _SEG_DIR.name                      # file prefix of the build's artifacts
     # Prefers grape_targets_manual.json when present (see
     # grape_targets.resolve_targets_json): hand annotation outranks detector
     # output, because colour segmentation cannot see green fruit and this
@@ -180,8 +182,8 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
     # soft-cost points, rasterised at load after the transform.
     ASSETS_FRAME, ASSETS_TRANSFORM = _build_frame(VINE_SPLAT_NAME)
     SOFT_COST_NPZ = (
-        _SEG_DIR / f"{VINE_SPLAT_NAME}_cost_field_sim.npz" if ASSETS_FRAME == "sim"
-        else _SEG_DIR / f"{VINE_SPLAT_NAME}_soft_cost.npz"
+        _SEG_DIR / f"{_BUILD}_cost_field_sim.npz" if ASSETS_FRAME == "sim"
+        else _SEG_DIR / f"{_BUILD}_soft_cost.npz"
     )
 
     @classmethod

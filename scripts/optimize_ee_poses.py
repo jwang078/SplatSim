@@ -101,9 +101,9 @@ def main():
     out_dir = Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------------------------------------------------- 1. load the scene
-    _t = V._SEG_DIR / "intermediate" / "splat_to_sim.json"
+    _t = V._SEG_DIR / "byproducts" / "splat_to_sim.json"
     if not _t.exists():
-        _t = V._SEG_DIR / "splat_to_sim.json"      # pre-intermediate/ builds
+        _t = V._SEG_DIR / "splat_to_sim.json"      # pre-byproducts/ builds
     T = np.asarray(json.loads(_t.read_text()),
                    dtype=np.float64)
     grapes = read_gaussian_ply(args.grapes_ply).xyz @ T[:3, :3].T + T[:3, 3]

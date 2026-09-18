@@ -202,15 +202,18 @@ data/stages/<stage>/
     splat_rgb.ply                    the splat as a plain RGB cloud, for CloudCompare
     <body>_urdf_pcd.ply              that body's URDF sampled at its scan_pose, for aligning
     <body>_labels.npy + .json        which URDF link each gaussian of that body belongs to, and the key
-    segmentations/<build>/
-        stage.yaml                   ply_path, urdf_path, collision_frame
-        <build>.urdf, <build>_collision.obj, cost field, grape targets, ...
+    segmentations/<build>/           a body built from the scan (see Making a collision body);
+                                     registered under assets: in stage.yaml as <stage>/<build>
+        <build>.urdf, <build>_collision.obj, <build>_soft_cost.npz, grape_targets*.json
+                                     ... what the simulator loads
+        byproducts/                  what the scripts left behind (trunk subset, labels, previews, viz/)
 ```
 
 - The folder tree is the config: every yaml is one entry, named after its
-  folder, referenced by that flat name in code (`splat_name="vine_and_trellis"`).
-  Paths inside it are relative to the file; a nested `stage.yaml` inherits
-  from the one above it.
+  folder and referenced by that name in code; a body listed under a stage's
+  `assets:` is `<stage>/<body>` (`splat_name="vine_scene/vine_and_trellis"`).
+  Paths inside it are relative to the file; a body under `assets:` inherits
+  the stage's own fields (transformation, splat) beneath its own.
 - `collision_frame: splat` means the build's collision mesh, cost field and
   grape targets are in the scan's frame and get the scan's `transformation`
   at load; `sim` means they were baked already. `scripts/splat_to_collision.py`
@@ -497,27 +500,27 @@ shipped `vine_scene`.
    not unless you use `3dgsconverter` to convert it back to the non-cloudcompare version with `3dgsconverter -i input_cc.ply -o output_3dgs.ply -f 3dgs`). Put it in the build folder:
    `data/stages/vine_scene/segmentations/<build>/<build>.ply`. For vegetation,
    `scripts/segment_vine_splat.py <ply> --outdir <build dir>` splits it into
-   the hard trunk (`<build>_trunk_hard.ply`, what gets a mesh) and the soft
+   the hard trunk (`byproducts/<build>_trunk_hard.ply`, what gets a mesh) and the soft
    twigs/leaves/grapes (`<build>_soft_cost.npz`, what the planner steers
-   around), with a picture of every stage under `viz/`, though the color thresholding might need to be tuned.
+   around), with a picture of every stage under `byproducts/viz/`, though the color thresholding might need to be tuned.
 
 2. **Mesh it and register it:**
    ```bash
    python scripts/splat_to_collision.py \
-       data/stages/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_trunk_hard.ply \
+       data/stages/vine_scene/segmentations/vine_and_trellis/byproducts/vine_and_trellis_trunk_hard.ply \
        --outdir data/stages/vine_scene/segmentations/my_build
    ```
-   writes `<name>_collision.obj`, `<name>.urdf` (fixed base, concave) and
-   the build's `stage.yaml` with `collision_frame: splat`, meaning the mesh is
-   in the scan's frame and the scan's `transformation` (inherited from the
-   stage.yaml above) is applied at load — the same transform you found for
-   the robot places the vine. The build is named after its folder
-   (`my_build` here). The default backend is PlayCanvas's mesher
+   writes `<name>_collision.obj` and `<name>.urdf` (fixed base, concave) and
+   registers the build under `assets:` in the scan's `stage.yaml` — as
+   `vine_scene/my_build`, named after its folder — with `collision_frame:
+   splat`, meaning the mesh is in the scan's frame and the scan's
+   `transformation` is applied at load: the same transform you found for the
+   robot places the vine. The default backend is PlayCanvas's mesher
    (`npm i -g @playcanvas/splat-transform`); `--backend voxel` is an
    in-repo blockier mesher that needs no extra tools. `--voxel-size` sets
    the resolution in the scan's units.
 
-3. **Check it:** `viz/10_mesh_overlay.png` must hug the trunk points, and
+3. **Check it:** `byproducts/viz/10_mesh_overlay.png` must hug the trunk points, and
    ```bash
    python scripts/visualize_collision.py --urdf data/stages/vine_scene/segmentations/my_build/my_build.urdf \
        --soft-npz data/stages/vine_scene/segmentations/vine_and_trellis/vine_and_trellis_soft_cost.npz --gui
@@ -526,9 +529,11 @@ shipped `vine_scene`.
    targets for the task come from `scripts/regen_grape_targets.py` (or
    `mark_grape_targets.py` by hand); see *Tuning the vine task*.
 
-An environment then refers to the build by its folder name
-(`splat_name="vine_and_trellis"`); nothing else needs to know it was
-a splat first.
+An environment then refers to the build as `<stage>/<build>`
+(`splat_name="vine_scene/vine_and_trellis"`); nothing else needs to know it
+was a splat first. Everything in a build folder is derived from the splat;
+the top level is what the simulator loads, `byproducts/` is what the scripts
+needed on the way.
 
 ## Generating new trajectories
 

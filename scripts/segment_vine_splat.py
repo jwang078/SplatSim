@@ -3,7 +3,7 @@ with a visualization artifact for EVERY stage so each step can be inspected.
 
 Outputs (under --outdir; the simulator loads only the first one):
   <name>_soft_cost.npz      xyz + per-point weight + class for the cost field
-  intermediate/
+  byproducts/
     <name>_trunk_hard.ply     gaussian PLY subset -> input to splat_to_collision.py
     <name>_seg_labels.npy     full-length class array (aligned to input PLY)
     <name>_seg_params.json    every threshold used (reproducibility)
@@ -181,8 +181,8 @@ def main():
     # What the simulator loads stays at the top of the build folder
     # (<name>_soft_cost.npz); everything else this script leaves behind —
     # the trunk subset that feeds the mesher, per-point labels, thresholds,
-    # previews, plots — goes under intermediate/ so the folder stays legible.
-    inter = outdir / "intermediate"
+    # previews, plots — goes under byproducts/ so the folder stays legible.
+    inter = outdir / "byproducts"
     vizdir = inter / "viz"
     vizdir.mkdir(parents=True, exist_ok=True)
     name = Path(args.input_ply).stem

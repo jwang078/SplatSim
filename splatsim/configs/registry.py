@@ -10,17 +10,18 @@ what was scanned):
     data/stages/<stage>/stage.yaml           a scan: splat + alignment transform,
                                              optionally `asset: <name>` for the
                                              body it is a scan of
-    data/stages/<stage>/segmentations/<build>/stage.yaml   (nested: inherits)
+    data/stages/<stage>/segmentations/<build>/           files of a body built from the
+                                                         scan; registered under the stage's assets:
 
 A stage that contains several segmented bodies lists them under `assets:`,
 one block per instance (the robot, a box, an apple ...), each with what is
 true of THAT body in THIS scan — `asset:` (or urdf_path), base_position,
 scan_pose, aabb, labels_path. The stage's own fields (splat, transformation)
-are shared. Every instance is a registry entry `<stage>/<instance>`; the
-bare stage name resolves to the instance called `robot` (else the only /
-first one) so envs keep saying `splat_name="<stage>"` for the robot, and the
-entry also carries `exclude_aabbs` (every instance's box) for when the
-stage is loaded as the background.
+are shared. Every instance is a registry entry `<stage>/<instance>`. The
+bare stage name is the instance called `robot` when there is one (envs name
+the robot by its scan), otherwise the scan itself (for background loads);
+either way it carries `exclude_aabbs`, every instance's box, so a background
+load crops all of them out.
 
 Each entry holds exactly what one `objects.yaml` entry used to hold
 (`ply_path`, `model_path`, `source_path`, `urdf_path`, `labels_path`,
@@ -38,8 +39,8 @@ Each entry holds exactly what one `objects.yaml` entry used to hold
     `robot:` block, ...) underneath the stage's own — the stage's opinions
     win, like a USD reference with overrides on the referencing prim.
 
-`name` defaults to the folder name. Names are flat — env code keeps saying
-`splat_name="vine_and_trellis"` regardless of nesting.
+`name` defaults to the folder name; a body under a stage's `assets:` is
+`<stage>/<body>` (`splat_name="vine_scene/vine_and_trellis"`).
 
 Still accepted, so nothing already downloaded breaks: the old roots
 `data/robots/` and `data/scenes/`, the old file names `robot.yaml` and
@@ -190,8 +191,14 @@ def _flatten_stage_assets(entries: Dict[str, Dict[str, Any]]) -> None:
             flat[e["name"]] = e
             _SOURCE[e["name"]] = _SOURCE[name]
             _DIR[e["name"]] = _DIR[name]
-        primary = f"{name}/robot" if f"{name}/robot" in flat else next(iter(flat))
-        alias = copy.deepcopy(flat[primary])
+        # The bare stage name: the `robot` instance when there is one (envs
+        # name the robot by its scan), otherwise the scan itself — splat,
+        # transform, its own aabb — which is what a background load wants.
+        # Either way it carries every instance's box to crop out.
+        if f"{name}/robot" in flat:
+            alias = copy.deepcopy(flat[f"{name}/robot"])
+        else:
+            alias = copy.deepcopy(shared)
         alias["name"] = name
         alias["exclude_aabbs"] = boxes
         entries[name] = alias
@@ -277,6 +284,17 @@ def entry_dir(name: str) -> Path:
 
 stage_dir = entry_dir
 scene_dir = entry_dir   # pre-rename spelling
+
+
+def body_dir(name: str) -> Path:
+    """Where a body's own files live: the folder of its URDF when it has one
+    (a build under segmentations/<build>/ keeps its cost field and targets
+    beside its URDF), else the entry's folder."""
+    from splatsim.utils.paths import resolve_splatsim_path
+    cfg = get(name) or {}
+    if cfg.get("urdf_path"):
+        return Path(resolve_splatsim_path(cfg["urdf_path"])).parent
+    return entry_dir(name)
 
 
 def labels_path(name: str) -> Path:

@@ -19,18 +19,17 @@ data/stages/<scan>/segmentations/<build>/):
                               frame if --transform is given (baking; the old
                               behaviour, kept for reproducing existing builds)
   <name>.urdf                 fixed-base URDF wrapping the mesh (concave)
-  stage.yaml                  registers the build: urdf_path + collision_frame
-                              (splat, or sim when baked). The scan's
-                              splat->sim matrix is applied at load from the
-                              parent stage.yaml, so prefer NOT baking.
-  intermediate/viz/10_mesh_overlay.png   mesh cross-sections overlaid on trunk
+  (the build is registered under `assets:` in the scan's stage.yaml as
+  `<scan>/<build>`: urdf_path + collision_frame, splat or sim when baked. The
+  scan's splat->sim matrix is applied at load, so prefer NOT baking.)
+  byproducts/viz/10_mesh_overlay.png   mesh cross-sections overlaid on trunk
                               points — THE alignment check (mesh must hug red points)
-  intermediate/viz/11_mesh_render.png    shaded open3d render of the mesh (if EGL works)
-  intermediate/st_output.*    the mesher's own outputs
+  byproducts/viz/11_mesh_render.png    shaded open3d render of the mesh (if EGL works)
+  byproducts/st_output.*    the mesher's own outputs
 
 Usage:
   python scripts/splat_to_collision.py \
-      data/stages/vine_scene/segmentations/vine_and_trellis/intermediate/vine_and_trellis_trunk_hard.ply \
+      data/stages/vine_scene/segmentations/vine_and_trellis/byproducts/vine_and_trellis_trunk_hard.ply \
       --outdir data/stages/vine_scene/segmentations/vine_and_trellis
       [--backend voxel|splat-transform] [--voxel-size 0.012] [--dilate 1]
       [--transform path/to/4x4.json]   # bake into sim frame (not recommended)
@@ -164,7 +163,7 @@ def run_splat_transform(input_ply: Path, outdir: Path, voxel: float):
             "splat-transform not on PATH (npm i -g @playcanvas/splat-transform); "
             "use --backend voxel instead"
         )
-    out_voxel = outdir / "intermediate" / "st_output.voxel.json"
+    out_voxel = outdir / "byproducts" / "st_output.voxel.json"
     cmd = [exe, str(input_ply), "--voxel-params", f"{voxel},0.1",
            "--collision-mesh", "smooth", str(out_voxel)]
     print("running:", " ".join(cmd))
@@ -173,8 +172,8 @@ def run_splat_transform(input_ply: Path, outdir: Path, voxel: float):
         print("GPU voxelization failed; retrying with -g cpu ...")
         subprocess.run(cmd + ["-g", "cpu"], check=True)
     # splat-transform writes its st_output.* beside the input or in outdir
-    # depending on version; gather them under intermediate/ either way.
-    inter = outdir / "intermediate"
+    # depending on version; gather them under byproducts/ either way.
+    inter = outdir / "byproducts"
     for f in list(outdir.glob("st_output.*")) + list(input_ply.parent.glob("st_output.*")):
         if f.parent != inter:
             shutil.move(str(f), str(inter / f.name))
@@ -360,8 +359,8 @@ def main():
 
     outdir = Path(args.outdir)
     # The mesh, URDF and stage.yaml sit at the top of the build folder; the
-    # mesher's own files and the check pictures go under intermediate/.
-    inter = outdir / "intermediate"
+    # mesher's own files and the check pictures go under byproducts/.
+    inter = outdir / "byproducts"
     vizdir = inter / "viz"
     vizdir.mkdir(parents=True, exist_ok=True)
     global _INPUT_PLY
@@ -432,41 +431,49 @@ _INPUT_PLY = ""
 
 
 def write_scene_yaml(outdir: Path, name: str, urdf_rel: str, baked: bool) -> None:
-    """Register the build with the scene registry (data/stages/<scan>/
-    segmentations/<build>/stage.yaml). One frame declaration covers every
-    artifact of the build — this URDF, the cost field and the grape targets:
+    """Register the build. Inside a stage (data/stages/<scan>/segmentations/
+    <build>/) it becomes a block under that stage's `assets:` — the entry
+    `<scan>/<build>` — and inherits the scan's transformation; outside a
+    stage it gets a stage.yaml of its own. One frame declaration covers every
+    artifact of the build (this URDF, the cost field, the grape targets):
 
       collision_frame: sim    --transform was given; everything is baked into
                               sim frame and loads at identity.
       collision_frame: splat  no --transform; everything is in the scan's
-                              frame and the scan's `transformation` (inherited
-                              from ../../stage.yaml) is applied at load.
-
-    Only sets the keys this script owns; an existing file keeps its other
-    fields (aabb, ply_path, ...)."""
-    import yaml
-    from splatsim.configs.registry import _edit_yaml_lines
-    path = outdir / "stage.yaml"
+                              frame and the scan's `transformation` is applied
+                              at load.
+    """
+    from splatsim.configs import registry
     frame = "sim" if baked else "splat"
-    if path.exists():
-        # keep the file's comments and other fields; only set what this build owns
-        text = _edit_yaml_lines(path.read_text(), {"urdf_path": urdf_rel, "collision_frame": frame})
-        doc = yaml.safe_load(text) or {}
-        for k, v in (("name", name), ("base_position", [0.0, 0.0, 0.0]), ("use_fixed_base", True)):
-            if k not in doc:
-                text = _edit_yaml_lines(text, {k: v})
-        path.write_text(text)
-    else:
-        path.write_text(
-            f"# Collision body built from {Path(_INPUT_PLY).name} by scripts/splat_to_collision.py.\n"
-            f"# Inherits the scan's transformation from the stage.yaml above; collision_frame\n"
-            f"# says which frame the mesh is in ({frame}).\n"
-            f"name: {name}\n"
-            f"ply_path: {os.path.relpath(_INPUT_PLY, outdir)}\n"
-            f"urdf_path: {urdf_rel}\n"
-            f"collision_frame: {frame}\n"
-            f"base_position: [0.0, 0.0, 0.0]\n"
-            f"use_fixed_base: true\n")
+    stage_dir = None
+    for anc in outdir.resolve().parents:
+        if (anc / "stage.yaml").exists():
+            stage_dir = anc
+            break
+    if stage_dir is not None:
+        stage = stage_dir.name
+        block = {
+            "urdf_path": os.path.relpath(outdir.resolve() / urdf_rel, stage_dir),
+            "ply_path": os.path.relpath(_INPUT_PLY, stage_dir),
+            "collision_frame": frame,
+            "base_position": [0.0, 0.0, 0.0],
+            "use_fixed_base": True,
+        }
+        path = registry.write_back(stage, {"assets": {name: block}})
+        print(f"[{stage}/{name}] registered under assets: in the stage's yaml (collision_frame: {frame})")
+        wrote("stage yaml", path)
+        return
+    path = outdir / "stage.yaml"
+    path.write_text(
+        f"# Collision body built from {Path(_INPUT_PLY).name} by scripts/splat_to_collision.py\n"
+        f"# (standalone: not inside a data/stages/<scan>/ folder). collision_frame says\n"
+        f"# which frame the mesh is in ({frame}).\n"
+        f"name: {name}\n"
+        f"ply_path: {os.path.relpath(_INPUT_PLY, outdir)}\n"
+        f"urdf_path: {urdf_rel}\n"
+        f"collision_frame: {frame}\n"
+        f"base_position: [0.0, 0.0, 0.0]\n"
+        f"use_fixed_base: true\n")
     wrote(f"stage yaml (collision_frame: {frame})", path)
 
 

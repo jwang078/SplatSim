@@ -231,7 +231,7 @@ class VineFloatingGripperPybulletRobotServer(FloatingGripperPybulletRobotServer)
     Same replay machinery as the base class, but the frame is photoreal: the
     `vine_scene` Gaussian scan renders as the background and the vine's
     collision mesh loads at the origin (its splat->sim transform is pre-baked
-    into the URDF — see objects.yaml `vine_and_trellis`), so a recorded UMI
+    into the URDF — see `vine_scene/vine_and_trellis` in data/stages/vine_scene/stage.yaml), so a recorded UMI
     trajectory can be watched against the actual grape clusters it was recorded
     on.
 
@@ -287,7 +287,7 @@ class VineFloatingGripperPybulletRobotServer(FloatingGripperPybulletRobotServer)
         objects=[
             SplatObjectConfig(
                 name="vine",
-                splat_name="vine_and_trellis",
+                splat_name="vine_scene/vine_and_trellis",
                 grasp_configs=[],
                 randomize_pose=False,
                 rotation_range_z=(0, 0),

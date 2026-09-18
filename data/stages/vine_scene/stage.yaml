@@ -1,9 +1,10 @@
 # Full grape-vine highbay scan. Used as the RENDERING BACKGROUND of the vine
-# env (vine, trellis, room). Segmentation builds of this scan live under
-# segmentations/<build>/ and inherit `transformation` / `aabb` from here.
-# `aabb` for a background is the region crop_splat REMOVES so the articulated
-# robot splat can composite there without z-fighting — never widen it into
-# the vine (x < -0.25). Paths are relative to this folder.
+# env (vine, trellis, room). The bodies built from this scan are listed under
+# `assets:` at the bottom; their files live in segmentations/<build>/ and they
+# share `transformation` from here. `aabb` for a background is the region
+# crop_splat REMOVES so the articulated robot splat can composite there without
+# z-fighting — never widen it into the vine (x < -0.25). Paths are relative to
+# this folder.
 name: vine_scene
 transformation:
   matrix:
@@ -23,3 +24,25 @@ model_path: splat
 source_path: sfm
 base_position: [0.0, 0.0, 0.0]
 use_fixed_base: true
+
+assets:
+  vine_and_trellis:               # the vine + trellis, built from this scan by
+    #                               scripts/splat_to_collision.py (trellis gaussians forced
+    #                               into the hard collision mesh). Env code names it
+    #                               `vine_scene/vine_and_trellis`.
+    urdf_path: segmentations/vine_and_trellis/vine_and_trellis.urdf
+    ply_path: splat/point_cloud/iteration_30000/vine_and_trellis.ply
+    # collision_frame: sim — this build's collision OBJ, cost field and grape
+    # targets were baked into SIM frame with --transform. New builds should
+    # omit --transform and get collision_frame: splat.
+    collision_frame: sim
+    base_position: [0.0, 0.0, 0.0]
+    use_fixed_base: true
+    aabb:                         # the body's own bounds (sim frame)
+      bounding_box:
+      - [-1.488, 0.15, -0.536]
+      - [0.77, 1.055, 1.62]
+      urdf_bbox_adjustment:
+      - [0.0, 0.0]
+      - [0.0, 0.0]
+      - [0.0, 0.0]
