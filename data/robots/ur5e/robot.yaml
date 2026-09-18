@@ -1,0 +1,11 @@
+# UR5e arm, no gripper, no cameras — the bare arm from the URDF that ships
+# with the repo. Meshes are inside this folder so it is self-contained.
+urdf_path: ur5e.urdf
+base_position: [0.0, 0.0, 0.0]
+base_orientation_rpy: [0.0, 0.0, 0.0]
+
+robot:
+  base: fixed
+  arm_joints: auto
+  ee_link: auto                   # -> ee_link (fixed frame after wrist_3)
+  initial_joint_positions: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]

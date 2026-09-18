@@ -171,7 +171,8 @@ You need a URDF. Nothing else — the simulator works out the rest from it.
    ```yaml
    urdf_path: my_robot.urdf
    ```
-   `data/robots/example_panda/` is a complete, working example — copy it.
+   `data/robots/panda/`, `ur5/` and `ur5e/` are complete, working robot folders
+   — copy one.
 2. Check what the simulator sees:
    ```bash
    python scripts/check_robot.py my_robot
@@ -189,7 +190,11 @@ You need a URDF. Nothing else — the simulator works out the rest from it.
    robot fits. Without a splat scan of its own the robot is drawn from its
    meshes, composited by depth into the scene. Drop `--viewer` when you want
    the environment's task to run against it.
-4. Move it where you want it: press **Robot Placement** in the control window.
+4. Tick **Play** in the control window to see the splat render update
+   continuously (at the rate next to it) instead of only when something asks
+   for an observation — handy for watching the splat and the PyBullet window
+   side by side while you move the robot.
+5. Move it where you want it: press **Robot Placement** in the control window.
    Sliders move the base (x, y, z, yaw) and every arm joint live in the scene;
    **Save placement** writes the pose into your `robot.yaml` so it starts
    there next time (the file's comments are kept).

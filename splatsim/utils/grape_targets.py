@@ -131,7 +131,12 @@ def tool_tip_vector(client, robot_id: int, ee_link: int,
     if not pads:
         pads = links
     if not pads:
-        raise ValueError("no finger/knuckle links found on this robot")
+        # No gripper (bare flange, a probe, a camera-only tool): the tool tip
+        # IS the EE link origin. Offset 0 and the EE +z as the nominal
+        # approach axis — callers that care about the axis pass their own.
+        logger.warning("tool_tip_vector: robot has no finger/knuckle links; "
+                       "using the EE link origin as the tool tip (offset 0)")
+        return np.array([0.0, 0.0, 1.0]), 0.0
     state = client.getLinkState(robot_id, ee_link, computeForwardKinematics=True)
     origin = np.asarray(state[4], dtype=np.float64)
     rot = np.asarray(client.getMatrixFromQuaternion(state[5]),

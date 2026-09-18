@@ -1,9 +1,9 @@
-# Example robot folder: a Franka Panda from pybullet_data, dropped in as-is.
+# Franka Panda (URDF + meshes from pybullet_data), a complete robot folder.
 # Copy this folder, replace the URDF, and edit the few lines below.
 #
 # Only `urdf_path` is required. Everything under `robot:` is optional —
 # omit a key (or write `auto`) and it is derived from the URDF. Run
-#   python scripts/check_robot.py example_panda
+#   python scripts/check_robot.py panda
 # to see what the simulator derived.
 urdf_path: panda.urdf
 

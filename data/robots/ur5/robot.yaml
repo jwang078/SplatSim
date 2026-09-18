@@ -1,0 +1,19 @@
+# UR5 with a Robotiq 2F-85 gripper and a GoPro wrist camera — the robot the
+# shipped scans were made with (the engine-scene scan in data/scenes/
+# robot_iphone_w_engine_curtain points its urdf_path at this file). Meshes
+# are inside this folder so it is self-contained.
+urdf_path: ur5.urdf
+base_position: [0.0, 0.0, 0.0]
+base_orientation_rpy: [0.0, 0.0, 0.0]
+
+robot:
+  base: fixed
+  arm_joints: auto                # the six UR joints
+  ee_link: wrist_camera_link      # goal frame = the wrist camera (imaging tasks)
+  initial_joint_positions: [1.570796, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]
+  gripper:
+    kind: robotiq_2f85            # recognised by its joint names; calibrated open/close path
+  cameras:
+    - name: wrist
+      link: wrist_camera_link
+      model: fisheye_v2           # the GoPro calibration used for the datasets

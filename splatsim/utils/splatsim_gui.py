@@ -1278,6 +1278,13 @@ class SplatSimGui(ThreadedTkinterGui):
     # Key for the render-mode dropdown (polled by the server each loop tick)
     RENDER_MODE_KEY = "render_mode"
     SPLAT_SHADOWS_KEY = "splat_shadows"
+    # Render cadence for the camera thumbnails. Off (default) = EVENT: frames
+    # are rendered when something asks for observations (a client step, a
+    # replay frame, a mode switch). On = PLAY: the server also renders at
+    # RENDER_HZ_KEY Hz whatever is happening, so the splat view and the
+    # PyBullet window can be watched together while moving the robot by hand.
+    RENDER_PLAY_KEY = "render_play"
+    RENDER_HZ_KEY = "render_hz"
 
     def __init__(
         self,
@@ -1381,11 +1388,23 @@ class SplatSimGui(ThreadedTkinterGui):
         # We keep the local variable name `main_frame` pointing at the
         # SAME inner Frame the rest of this function expects, so no
         # downstream layout code needs to change.
-        self._root.grid_rowconfigure(0, weight=1)
+        # Row 0: camera observations, pinned so they never scroll away.
+        # Row 1: everything else, inside a scrollable canvas.
+        self._root.grid_rowconfigure(1, weight=1)
         self._root.grid_columnconfigure(0, weight=1)
 
+        _pinned = ttk.Frame(self._root, padding=self._style.padding)
+        _pinned.grid(row=0, column=0, sticky="ew")
+        _pinned.grid_columnconfigure(0, weight=1)
+        ttk.Label(_pinned, text="Camera Observations", style="Header.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(5, 8)
+        )
+        self._camera_frame = ttk.LabelFrame(_pinned, text="", padding=5)
+        self._camera_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 5))
+        ttk.Separator(_pinned, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=(5, 0))
+
         _scroll_shell = ttk.Frame(self._root)
-        _scroll_shell.grid(row=0, column=0, sticky="nsew")
+        _scroll_shell.grid(row=1, column=0, sticky="nsew")
         _scroll_shell.grid_rowconfigure(0, weight=1)
         _scroll_shell.grid_columnconfigure(0, weight=1)
 
@@ -1428,18 +1447,8 @@ class SplatSimGui(ThreadedTkinterGui):
 
         builder = GuiBuilder(main_frame, self, self._style)
 
-        # Camera observations display area (at the top)
-        builder.add_header("Camera Observations")
-        self._camera_frame = ttk.LabelFrame(main_frame, text="", padding=5)
-        self._camera_frame.grid(
-            row=builder.current_row, column=0, columnspan=2, sticky="nsew", pady=5
-        )
-        builder._row += 1
-
-        # Start polling for image updates
+        # Start polling for image updates (the frame itself lives in the pinned row above)
         self._poll_camera_images()
-
-        builder.add_separator()
 
         # Current mode status display
         self._mode_var = tk.StringVar(value=f"Mode: {self._initial_mode}")
@@ -1484,6 +1493,11 @@ class SplatSimGui(ThreadedTkinterGui):
             BoolParam(self.SPLAT_SHADOWS_KEY, "Splat shadows (pybullet)"),
             initial_value=self._initial_splat_shadows,
         )
+        builder.add_bool_param(
+            BoolParam(self.RENDER_PLAY_KEY, "Play: render continuously (else on events)"),
+            initial_value=False,
+        )
+        builder.add_float_param(FloatParam(self.RENDER_HZ_KEY, "Play rate (Hz)", 1.0, 30.0, 5.0), 5.0)
 
         # Debug mode dropdown (if enum provided)
         if self._debug_mode_enum is not None:
@@ -1637,6 +1651,18 @@ class SplatSimGui(ThreadedTkinterGui):
         if value is None:
             return self._initial_render_mode
         return value
+
+    def get_render_play(self) -> bool:
+        """Play checkbox: render the camera thumbnails continuously."""
+        value = self.get_value(self.RENDER_PLAY_KEY)
+        return bool(value) if value is not None else False
+
+    def get_render_hz(self) -> float:
+        value = self.get_value(self.RENDER_HZ_KEY)
+        try:
+            return max(0.5, float(value)) if value is not None else 5.0
+        except (TypeError, ValueError):
+            return 5.0
 
     def get_splat_shadows(self) -> Optional[bool]:
         """Current "Splat shadows" checkbox state. Thread-safe. Falls back to

@@ -16,7 +16,7 @@ aabb:
   - [0.0, 0.0]
   - [0.0, 0.1]
   - [0.0, 0.0]
-urdf_path: ./splatsim/robot_definitions/urdf/sisbot.urdf
+urdf_path: ../../robots/ur5/ur5.urdf   # the UR5 robot folder (data/robots/ur5)
 base_position: [0.0, 0.0, -0.088]
 articulation_config:
   initial_joint_positions: [1.5707963267948966, -1.5707963267948966, 1.5707963267948966,

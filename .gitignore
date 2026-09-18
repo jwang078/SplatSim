@@ -47,6 +47,9 @@ data/scenes/**
 data/robots/**
 !data/robots/**/
 !data/robots/**/robot.yaml
-!data/robots/example_*/**
+# robots that ship with the repo (URDF + meshes)
+!data/robots/panda/**
+!data/robots/ur5/**
+!data/robots/ur5e/**
 data/scenarios/
 scripts/outputs/

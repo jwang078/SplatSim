@@ -3598,7 +3598,12 @@ class PybulletRobotServerBase:
         return out.astype(np.float32, copy=False)
 
     def _get_ee_link_index(self) -> int:
-        """Return the link index used as the end-effector for trajectory planning."""
+        """Link index used as the end-effector for planning and goals: the
+        robot's EE link from its spec (for the shipped scans that is the wrist
+        camera link; for a camera-less robot the tool/last arm link)."""
+        spec = getattr(self, "robot_spec", None)
+        if spec is not None:
+            return int(spec.ee_link_index)
         return int(self.wrist_camera.tracked_link_index)
 
     def get_current_ee_pose(self):
@@ -6713,6 +6718,9 @@ class PybulletRobotServerBase:
                 # Sync camera rendering with the GUI checkbox
                 self._check_camera_rendering_toggle()
 
+                # Play mode: periodic renders regardless of what else happens
+                self._maybe_periodic_render()
+
                 # Detect and handle mode transitions
                 current_mode = self.serve_mode
                 if _prev_serve_mode != current_mode:
@@ -6731,7 +6739,7 @@ class PybulletRobotServerBase:
                     if self._sync_physics_to_client:
                         self._consume_sync_step_request()
                     else:
-                        self.pybullet_client.stepSimulation()
+                        self._step_physics_realtime()
                     # Also consume any pending camera-render request. Always
                     # active (not gated on _sync_physics_to_client) because
                     # the EGL-context-thread-affinity issue is unconditional
@@ -6741,12 +6749,12 @@ class PybulletRobotServerBase:
                     time.sleep(1 / 240)
                 elif current_mode == self.SERVE_MODES.PLACEMENT:
                     self._placement_tick()
-                    self.pybullet_client.stepSimulation()
+                    self._step_physics_realtime()
                     self._consume_sync_render_request()
                     time.sleep(1 / 240)
                 elif current_mode == self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE:
                     # Idle mode - just step simulation while user configures settings
-                    self.pybullet_client.stepSimulation()
+                    self._step_physics_realtime()
                     self._consume_sync_render_request()
                     time.sleep(1 / 240)
                 elif current_mode == self.SERVE_MODES.GENERATE_DEMOS:
@@ -7763,6 +7771,61 @@ class PybulletRobotServerBase:
             msg = f"Placement NOT saved: {e}"
         print(f"[placement] {msg}")
         self._splatsim_gui.set_status(msg)
+
+    # Serve modes that render per event on their own (every replay / recorded
+    # frame already refreshes the thumbnails); Play adds nothing there.
+    _EVENT_RENDERED_MODES = ("generate_trajectories", "eval_benchmark")
+
+    PHYSICS_DT = 1 / 240          # matches setTimeStep in __init__
+    _REALTIME_MAX_CATCHUP_S = 0.25  # after a longer stall, drop the rest instead of bursting
+
+    def _step_physics_realtime(self) -> None:
+        """Step physics so simulated time tracks wall-clock time.
+
+        The idle serve loops used to call `stepSimulation()` exactly once per
+        loop pass, so anything that stalls a pass — a Play-mode splat render
+        (~100-300 ms), GUI polling, a slow tick — silently slowed the
+        simulation down (physics "lagged" and took ages to settle). This
+        accumulates wall time since the previous call and runs however many
+        1/240 s steps fit, so a 200 ms render is followed by a burst of ~48
+        cheap steps and the robot is where it would have been in real time.
+        Catch-up is capped so a multi-second stall (reset, planning) does not
+        turn into a long burst; the leftover is dropped.
+        """
+        now = time.time()
+        last = getattr(self, "_realtime_last_step_t", None)
+        if last is None:
+            self._realtime_last_step_t = now
+            self._realtime_accum_s = 0.0
+            self.pybullet_client.stepSimulation()
+            return
+        self._realtime_accum_s = min(
+            self._realtime_accum_s + (now - last), self._REALTIME_MAX_CATCHUP_S
+        )
+        self._realtime_last_step_t = now
+        while self._realtime_accum_s >= self.PHYSICS_DT:
+            self.pybullet_client.stepSimulation()
+            self._realtime_accum_s -= self.PHYSICS_DT
+
+    def _maybe_periodic_render(self) -> None:
+        """Play mode (GUI checkbox): render + display the camera thumbnails at
+        the GUI's rate, so the splat view stays live while the robot is moved
+        by hand (placement sliders, PyBullet mouse drags, teleop) — instead
+        of only refreshing when a client asks for observations."""
+        gui = self._splatsim_gui
+        if gui is None or not gui.get_render_play():
+            return
+        if self.serve_mode.value in self._EVENT_RENDERED_MODES:
+            return
+        now = time.time()
+        period = 1.0 / gui.get_render_hz()
+        if now - getattr(self, "_last_periodic_render", 0.0) < period:
+            return
+        self._last_periodic_render = now
+        try:
+            self.get_observations()   # renders every camera + display_observations
+        except Exception as e:
+            print(f"[render] periodic render failed: {e}")
 
     def _check_debug_mode(self):
         """Check if debug mode has changed in the GUI and update self.debug_mode."""
