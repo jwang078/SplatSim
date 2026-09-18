@@ -1,0 +1,42 @@
+# Two UR5s (Robotiq 2F-85 + wrist camera each) on a wheeled box — the
+# shipped example of a mobile multi-arm robot. Made with
+# scripts/make_multi_arm_urdf.py (the command is in that script's docstring);
+# meshes are shared with data/assets/ur5/.
+#
+# `base: wheeled` makes the body free: it stands on a ground plane and the
+# two `wheel_joints` are velocity-controlled. Drive it from the control
+# window's Robot Placement panel (Drive sliders, or the arrow keys in the
+# PyBullet window) or from code with server.drive_wheels([left, right]).
+urdf_path: dual_ur5.urdf
+base_position: [0.0, 0.0, 0.0]
+base_orientation_rpy: [0.0, 0.0, 0.0]
+
+robot:
+  base: wheeled
+  wheel_joints: [left_wheel_joint, right_wheel_joint]
+  arms:
+    - name: left
+      ee_link: left_wrist_camera_link
+      initial_joint_positions: [1.570796, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]
+      gripper:
+        kind: synergies
+        joints: [left_finger_joint]
+        open: [0.0]
+        closed: [0.8]
+        stroke_m: 0.085
+    - name: right
+      ee_link: right_wrist_camera_link
+      initial_joint_positions: [-1.570796, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]   # mirrored: folds away from the left arm
+      gripper:
+        kind: synergies
+        joints: [right_finger_joint]
+        open: [0.0]
+        closed: [0.8]
+        stroke_m: 0.085
+  cameras:
+    - name: left_wrist
+      link: left_wrist_camera_link
+      model: fisheye_v2
+    - name: right_wrist
+      link: right_wrist_camera_link
+      model: fisheye_v2

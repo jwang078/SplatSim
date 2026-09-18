@@ -786,12 +786,17 @@ class RobotPlacementPanel(ModePanel):
     BTN_LOAD = "placement_load"
     BTN_SAVE_YAML = "placement_save_yaml"    # -> the robot's own asset/stage yaml (its default pose)
     BTN_RESET = "placement_reset"
+    BTN_STOP_DRIVE = "placement_stop_drive"
     NS = "placement"
     SCENARIO_KEY = "placement.scenario_name"
 
     @classmethod
     def base_keys(cls):
         return [f"{cls.NS}.base_x", f"{cls.NS}.base_y", f"{cls.NS}.base_z", f"{cls.NS}.base_yaw"]
+
+    @classmethod
+    def drive_keys(cls):
+        return [f"{cls.NS}.drive_forward", f"{cls.NS}.drive_turn"]
 
     @classmethod
     def joint_key(cls, i: int) -> str:
@@ -813,6 +818,14 @@ class RobotPlacementPanel(ModePanel):
             (-3.0, -3.0, -2.0, -3.1416), (3.0, 3.0, 2.0, 3.1416), base,
         ):
             builder.add_float_param(FloatParam(key, label, lo, hi, float(v)), float(v))
+        if info.get("wheeled"):
+            # Differential drive (robot.base: wheeled). Arrow keys in the
+            # PyBullet window do the same while held.
+            builder.add_header("Drive (m/s, rad/s) — or arrow keys in the PyBullet window")
+            fk, tk_ = self.drive_keys()
+            builder.add_float_param(FloatParam(fk, "forward", -1.0, 1.0, 0.0), 0.0)
+            builder.add_float_param(FloatParam(tk_, "turn (+left)", -2.0, 2.0, 0.0), 0.0)
+            builder.add_button_row([ButtonConfig("Stop", self.BTN_STOP_DRIVE)])
         if joints:
             builder.add_header("Arm joints (rad)")
             for i, (label, lo, hi, q0) in enumerate(joints):

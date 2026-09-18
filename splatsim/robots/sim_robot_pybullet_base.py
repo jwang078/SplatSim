@@ -5909,10 +5909,21 @@ class PybulletRobotServerBase:
         each gripper, for every non-Robotiq gripper on the robot."""
         rid = self.splatsim_robot.sim_id
         self._generic_gripper_gears = []
+        # A free (wheeled) body cannot use JOINT_GEAR: pybullet's multibody
+        # gear constraint leaks a net torque into the base (measured ~0.24
+        # rad/s of spontaneous yaw on the dual_ur5, whatever the gear axis),
+        # which a fixed base silently absorbs. Mimic children are then
+        # position-held at their gear-consistent angle instead (motor torques
+        # are internal) — see _mimic_hold_force.
+        use_gears = self.robot_spec.base == "fixed"
+        if not use_gears and any(g.mimic for g in self.robot_spec.grippers):
+            print("[robot] free base: gripper <mimic> joints are position-held (no JOINT_GEAR constraints)")
         for g in self.robot_spec.grippers:
             if g.kind not in ("per_joint", "synergies"):
                 continue
             for child, (parent, mult, _offset) in g.mimic.items():
+                if not use_gears:
+                    continue
                 c = self.pybullet_client.createConstraint(
                     rid, parent, rid, child, jointType=self.pybullet_client.JOINT_GEAR,
                     jointAxis=[0, 1, 0], parentFramePosition=[0, 0, 0], childFramePosition=[0, 0, 0],
@@ -5925,6 +5936,20 @@ class PybulletRobotServerBase:
                     self.pybullet_client.setCollisionFilterPair(rid, rid, links[a], links[b], enableCollision=0)
         for link_a, link_b in getattr(self, "SELF_COLLISION_SKIP_PAIRS", ()):
             self.pybullet_client.setCollisionFilterPair(rid, rid, link_a, link_b, enableCollision=0)
+        if not use_gears:
+            # Give the children their holds now (open) — until the first
+            # gripper command they would otherwise dangle motor-free.
+            for g in self.robot_spec.grippers:
+                if g.command_dim:
+                    self._command_generic_gripper(np.zeros(g.command_dim), g)
+
+    def _mimic_hold_force(self) -> float:
+        """Position-hold force for gripper mimic children: the class knob, but
+        never 0 on a free base (there the holds replace the gear constraints)."""
+        f = float(self.GRIPPER_MIMIC_HOLD_FORCE)
+        if getattr(self, "robot_spec", None) is not None and self.robot_spec.base != "fixed":
+            return max(f, 20.0)
+        return f
 
     def _command_generic_gripper(self, command, g=None, velocity=None) -> None:
         """Drive one gripper to `command` (per channel, 0 = open .. 1 = closed).
@@ -5962,9 +5987,9 @@ class PybulletRobotServerBase:
                 pc.resetJointState(rid, child, qc)
                 pc.setJointMotorControl2(rid, child, p.POSITION_CONTROL, targetPosition=qc,
                                          force=self.DEBUG_FAST_CONTROL_GRIPPER_FORCE, maxVelocity=vel)
-            elif self.GRIPPER_MIMIC_HOLD_FORCE > 0:
+            elif self._mimic_hold_force() > 0:
                 pc.setJointMotorControl2(rid, child, p.POSITION_CONTROL, targetPosition=qc,
-                                         force=self.GRIPPER_MIMIC_HOLD_FORCE, maxVelocity=vel)
+                                         force=self._mimic_hold_force(), maxVelocity=vel)
 
     def plan_execute_record_trajectory(self, initial_joint_positions, joint_signs):
         # Returns whether it was a success
@@ -7402,6 +7427,9 @@ class PybulletRobotServerBase:
             controllable = jointType != p.JOINT_FIXED
             if controllable:
                 self.controllable_joints.append(jointID)
+            # Wheels keep their brake (velocity 0 at drive force) — see
+            # _setup_wheeled_base; freeing them would let the base coast.
+            if controllable and jointID not in self.robot_spec.wheel_joint_indices:
                 self.pybullet_client.setJointMotorControl2(
                     self.splatsim_robot.sim_id,
                     jointID,
@@ -7936,7 +7964,16 @@ class PybulletRobotServerBase:
         self._ground_plane_id = self.pybullet_client.loadURDF("plane.urdf", [0, 0, z], useFixedBase=True)
         for j in self.robot_spec.wheel_joint_indices:
             self.pybullet_client.setJointMotorControl2(rid, j, p.VELOCITY_CONTROL, targetVelocity=0.0, force=50.0)
-        print(f"[robot] wheeled base: ground plane at z={z:.3f}, {len(self.robot_spec.wheel_joint_indices)} wheel joint(s) under velocity control")
+        # Wheels need weight on them to get traction: most envs never set
+        # gravity (fixed-base arms don't care, and free objects are meant to
+        # stay where they were placed), so a wheeled robot turns it on.
+        g = self.pybullet_client.getPhysicsEngineParameters()
+        gz = float(g.get("gravityAccelerationZ", 0.0))
+        if abs(gz) < 1e-6:
+            self.pybullet_client.setGravity(0.0, 0.0, -9.81)
+            gz = -9.81
+        print(f"[robot] wheeled base: ground plane at z={z:.3f}, {len(self.robot_spec.wheel_joint_indices)} wheel joint(s) "
+              f"under velocity control, gravity {gz:g} m/s^2")
 
     def drive_wheels(self, velocities, force: float = 50.0) -> None:
         """Set wheel joint velocities (rad/s), one per `wheel_joints` entry in
@@ -7946,6 +7983,81 @@ class PybulletRobotServerBase:
         for j, w in zip(wheels, v):
             self.pybullet_client.setJointMotorControl2(
                 self.splatsim_robot.sim_id, j, p.VELOCITY_CONTROL, targetVelocity=float(w), force=force)
+
+    def _diff_drive_geometry(self) -> Optional[tuple]:
+        """(wheel radius, [signed lateral offset per wheel]) for a
+        differential drive, read off the URDF: each wheel's radius from its
+        link's cylinder/sphere, its offset the joint origin's coordinate
+        along the wheel axis (which also gives the spin sign), relative to the
+        base's centroid between the wheels. None for a fixed base or when
+        there are no wheel joints."""
+        spec = getattr(self, "robot_spec", None)
+        if spec is None or spec.base != "wheeled" or not spec.wheel_joint_indices:
+            return None
+        cached = getattr(self, "_diff_drive_cache", None)
+        if cached is not None:
+            return cached
+        rid = self.splatsim_robot.sim_id
+        # Wheel radius from the URDF's <cylinder>/<sphere> on the wheel link;
+        # the world AABB (half its z-extent) is the fallback for mesh wheels,
+        # and is only right while the robot stands level.
+        urdf_radius: Dict[str, float] = {}
+        try:
+            import xml.etree.ElementTree as ET
+            for link in ET.parse(spec.urdf_path).getroot().iter("link"):
+                for tag in ("collision", "visual"):
+                    el = link.find(f"{tag}/geometry/cylinder")
+                    el = el if el is not None else link.find(f"{tag}/geometry/sphere")
+                    if el is not None and el.get("radius"):
+                        urdf_radius.setdefault(link.get("name"), float(el.get("radius")))
+        except Exception:
+            pass
+        radii, offsets = [], []
+        for j in spec.wheel_joint_indices:
+            r = urdf_radius.get(spec.joints[j].child_link)
+            if r is None:
+                lo, hi = self.pybullet_client.getAABB(rid, j)
+                r = 0.5 * (hi[2] - lo[2])
+            radii.append(r)
+            info = self.pybullet_client.getJointInfo(rid, j)
+            axis, origin = np.asarray(info[13], dtype=float), np.asarray(info[14], dtype=float)
+            # Wheel axis must be lateral; projecting the origin on it gives the
+            # side (+ left / - right when the axis is +y), the axis sign says
+            # which spin direction moves the base forward.
+            offsets.append(float(np.dot(origin, axis)) * (1.0 if np.dot(axis, [0, 1, 0]) >= 0 else -1.0))
+        offsets = np.asarray(offsets) - np.mean(offsets)
+        self._diff_drive_cache = (float(np.mean(radii)), offsets)
+        return self._diff_drive_cache
+
+    def drive_base(self, forward: float, turn: float, force: float = 50.0) -> None:
+        """Differential drive: base speed `forward` (m/s) and yaw rate `turn`
+        (rad/s, + = left) -> per-wheel angular velocities via
+        `_diff_drive_geometry`. No-op on a fixed base."""
+        geom = self._diff_drive_geometry()
+        if geom is None:
+            return
+        r, offsets = geom
+        self.drive_wheels((forward - turn * offsets) / max(r, 1e-6), force=force)
+
+    def _drive_from_keys(self) -> Optional[tuple]:
+        """(forward, turn) from arrow keys held in the PyBullet window, or
+        None when none are held (headless has no window)."""
+        if self._headless:
+            return None
+        try:
+            keys = self.pybullet_client.getKeyboardEvents()
+        except Exception:
+            return None
+        down = lambda k: bool(keys.get(k, 0) & p.KEY_IS_DOWN)
+        fwd = (1.0 if down(p.B3G_UP_ARROW) else 0.0) - (1.0 if down(p.B3G_DOWN_ARROW) else 0.0)
+        turn = (1.0 if down(p.B3G_LEFT_ARROW) else 0.0) - (1.0 if down(p.B3G_RIGHT_ARROW) else 0.0)
+        if fwd == 0.0 and turn == 0.0:
+            return None
+        return fwd * self.DRIVE_KEY_SPEED, turn * self.DRIVE_KEY_TURN_RATE
+
+    # Arrow-key driving speeds (Robot Placement mode, wheeled bases).
+    DRIVE_KEY_SPEED: ClassVar[float] = 0.5        # m/s
+    DRIVE_KEY_TURN_RATE: ClassVar[float] = 1.0    # rad/s
 
     # ------------------------------------------------------------ placement
     def _robot_placement_info(self) -> Optional[dict]:
@@ -7969,7 +8081,8 @@ class PybulletRobotServerBase:
                 label = "gripper" if (len(spec.arms) == 1 and d == 1) else (arm.name if d == 1 else f"{arm.name} {c}")
                 grippers.append((label, self._gripper_command_now(g, c)))
         return {"base": [float(pos[0]), float(pos[1]), float(pos[2]), float(yaw)], "joints": joints,
-                "grippers": grippers, "scenario_name": getattr(self, "scenario_name", None) or "default",
+                "grippers": grippers, "wheeled": self._diff_drive_geometry() is not None,
+                "scenario_name": getattr(self, "scenario_name", None) or "default",
                 "scenarios": self.list_scenarios()}
 
     def _gripper_command_now(self, g, channel: int = 0) -> float:
@@ -8017,12 +8130,33 @@ class PybulletRobotServerBase:
         if any(v is None for v in vals) or any(q is None for q in qs) or any(g is None for g in gs):
             return  # panel not built yet
         state = (tuple(float(v) for v in vals), tuple(float(q) for q in qs), tuple(float(g) for g in gs))
+        # Wheeled base: the Drive sliders / arrow keys move the base through
+        # physics. While driving, the base-pose sliders are left alone; when
+        # it stops they are synced to where it ended up, so the next slider
+        # touch doesn't teleport it back.
+        driving = False
+        if self._diff_drive_geometry() is not None:
+            drive = self._drive_from_keys()
+            if drive is None:
+                dv = [gui.get_value(k) for k in P.drive_keys()]
+                drive = (float(dv[0] or 0.0), float(dv[1] or 0.0))
+            driving = drive != (0.0, 0.0)
+            if driving or getattr(self, "_placement_was_driving", False):
+                self.drive_base(*drive)
+            if not driving and getattr(self, "_placement_was_driving", False):
+                self._placement_sync_base_sliders()
+                vals = [gui.get_value(k) for k in P.base_keys()]
+                state = (tuple(float(v) for v in vals),) + state[1:]
+            self._placement_was_driving = driving
         last = getattr(self, "_placement_last", None)
+        if driving and last is not None:
+            state = (last[0],) + state[1:]   # base follows the wheels, not the sliders
         if state != last:
             self._placement_last = state
             x, y, z, yaw = state[0]
-            self.pybullet_client.resetBasePositionAndOrientation(
-                rid, [x, y, z], self.pybullet_client.getQuaternionFromEuler([0.0, 0.0, yaw]))
+            if not driving:
+                self.pybullet_client.resetBasePositionAndOrientation(
+                    rid, [x, y, z], self.pybullet_client.getQuaternionFromEuler([0.0, 0.0, yaw]))
             for q, j in zip(state[1], spec.arm_joint_indices):
                 self.pybullet_client.resetJointState(rid, j, q)
                 self.pybullet_client.setJointMotorControl2(
@@ -8032,6 +8166,9 @@ class PybulletRobotServerBase:
                 self._command_grippers(np.asarray(state[2]))
                 self.current_gripper_action = float(gs[0]) if len(gs) == 1 else np.asarray(gs)
             self._bump_state_version()
+        if gui.check_button(P.BTN_STOP_DRIVE):
+            for k in P.drive_keys():
+                gui.set_value(k, 0.0)
         if gui.check_button(P.BTN_SAVE):
             self._placement_save_scenario(gui.get_value(P.SCENARIO_KEY))
         if gui.check_button(P.BTN_LOAD):
@@ -8045,6 +8182,14 @@ class PybulletRobotServerBase:
             for i, (_n, _lo, _hi, q0) in enumerate(info["joints"]):
                 gui.set_value(P.joint_key(i), q0)
             gui.set_status("Placement reset to the robot's yaml pose")
+
+    def _placement_sync_base_sliders(self) -> None:
+        """Base-pose sliders <- live base pose (after driving)."""
+        from splatsim.utils.splatsim_gui import RobotPlacementPanel as P
+        pos, quat = self.pybullet_client.getBasePositionAndOrientation(self.splatsim_robot.sim_id)
+        yaw = self.pybullet_client.getEulerFromQuaternion(quat)[2]
+        for k, v in zip(P.base_keys(), (pos[0], pos[1], pos[2], yaw)):
+            self._splatsim_gui.set_value(k, float(v))
 
     def _placement_sync_sliders(self) -> None:
         """Push the live robot state into the placement sliders (after a

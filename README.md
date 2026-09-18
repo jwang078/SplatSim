@@ -329,6 +329,21 @@ every arm's joints in that order followed by every gripper's commands, and
 goals refer to the first arm (or `primary_arm`). `data/assets/dual_panda/`
 is a working two-arm example.
 
+A mobile robot is the same thing on wheels: `base: wheeled` plus the two
+driven `wheel_joints`, and the body is free to roll on a ground plane. In
+**Robot Placement** the panel grows Drive sliders (forward m/s, turn rad/s),
+and the arrow keys do the same while the PyBullet window has focus; from code
+it is `server.drive_base(forward, turn)` (differential drive, geometry read
+from the URDF) or `server.drive_wheels([...])` per wheel.
+`data/assets/dual_ur5/` is the shipped example — two UR5s with Robotiq
+grippers and wrist cameras on a wheeled box, built with
+`scripts/make_multi_arm_urdf.py`, which composes any arm URDFs onto a box
+base with optional wheels:
+
+```bash
+python scripts/launch_nodes.py --robot sim_pybullet_vine_interactive --robot_name dual_ur5 --viewer
+```
+
 To render your robot photoreal — as gaussians rather than meshes — it needs a
 scan and a calibration; that's the next section.
 

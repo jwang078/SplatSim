@@ -54,6 +54,7 @@ data/assets/**
 !data/assets/ur5/**
 !data/assets/ur5e/**
 !data/assets/dual_panda/**
+!data/assets/dual_ur5/**
 !data/assets/floating_gripper/**
 !data/assets/planar_3joint/**
 data/scenarios/
