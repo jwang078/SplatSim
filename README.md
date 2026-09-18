@@ -251,17 +251,13 @@ You need a URDF. Nothing else — the simulator works out the rest from it.
    **Save as robot default (yaml)** instead writes the pose into your
    `asset.yaml` so the robot starts there in every scene (comments kept).
 
-What the yaml can describe, all optional: which joints are the arm and which
-the gripper, how the gripper is commanded (one value for a parallel gripper,
-one per finger, or synergies for a coupled hand), any number of cameras and
-which link each sits on — a pinhole with a field of view, or a fisheye with
-its intrinsics, either written inline or as `intrinsics: calibration.json`
-next to the yaml (what `scripts/calibrate_camera_intrinsics.py` writes) —
-the end-effector link, and the base — `fixed`,
-`planar` (placed by the sliders, no physics), or `wheeled` (a free body on a
-ground plane; its wheel joints are velocity-controlled through
-`drive_wheels`). Planning covers the arm; driving a base around is teleop
-territory. Details and defaults are in `splatsim/robots/robot_spec.py`.
+The yaml can also say, all optional: which joints are the arm and which the
+gripper, how the gripper is commanded (one value, one per finger, or
+synergies), the cameras (pinhole with a field of view, or fisheye with
+`intrinsics:` inline or as a `calibration.json` from
+`scripts/calibrate_camera_intrinsics.py`), the end-effector link, and the
+base — `fixed`, `planar`, or `wheeled` (velocity-controlled wheels; planning
+covers the arm only). Defaults and details: `splatsim/robots/robot_spec.py`.
 
 A robot with several arms is still one URDF and one folder: list them under
 `arms:` instead of `arm_joints` / `ee_link` / `gripper`, each with its own
@@ -326,7 +322,9 @@ steps; the robot is just the one called `robot`. Look at
 
 #### 1. Describe the scan
 
-Make `data/stages/<stage>/` with a `stage.yaml`:
+The examples below use the shipped UR5 scan, `robot_iphone_w_engine_curtain`,
+so every command runs as written on the downloaded data; for your own scan,
+make `data/stages/<stage>/` with a `stage.yaml`:
 
 - `model_path` — the gaussian-splat training output (ex: `~/.../output/258f657d-c`), or symlink it as `splat/` next to the yaml.
 - `source_path` — the images + COLMAP output (ex: `~/data/<stage>/input`), or symlink it as `sfm/`.
@@ -345,7 +343,7 @@ Make `data/stages/<stage>/` with a `stage.yaml`:
 #### 2. Point cloud of the URDF, align it in CloudCompare
 
 ```bash
-python scripts/segment_stage_asset.py <stage> --asset robot pcd
+python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset robot pcd
 ```
 
 writes `<stage>/robot_urdf_pcd.ply` (the URDF sampled at `scan_pose`, one
@@ -372,7 +370,7 @@ sidebar). Paste it in — a file with the four rows, or the 16 numbers on the
 command line:
 
 ```bash
-python scripts/segment_stage_asset.py <stage> --asset robot transform matrix.txt
+python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset robot transform matrix.txt
 ```
 
 That becomes the stage's `transformation` (splat → simulator), which every
@@ -381,7 +379,7 @@ body in the scan shares.
 #### 3. Cut the body out and label it
 
 ```bash
-python scripts/segment_stage_asset.py <stage> --asset robot labels --show
+python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset robot labels --show
 ```
 
 fits the body's box from the URDF cloud, labels every gaussian inside it
@@ -401,10 +399,13 @@ and pass the matrix with `--as-pose` — it becomes that body's
 `base_position` / `base_orientation_rpy` — then `labels`:
 
 ```bash
-python scripts/segment_stage_asset.py <stage> --asset box pcd
-python scripts/segment_stage_asset.py <stage> --asset box transform matrix.txt --as-pose
-python scripts/segment_stage_asset.py <stage> --asset box labels --show
+python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box pcd
+python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box transform matrix.txt --as-pose
+python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box labels --show
 ```
+
+(`box` being a second block under `assets:` in that stage's yaml, e.g.
+`asset: thinkpad_box` with a `base_position`.)
 
 Every body is then its own entry, `<stage>/<name>`, that an environment can
 load and move (`splat_name="<stage>/box"`); the stage name alone is the
