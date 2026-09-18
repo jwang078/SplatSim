@@ -10,6 +10,9 @@ This repository contains the code for the paper "SplatSim".
 ## Installation
 
 You'll need conda and an NVIDIA GPU. We've tested on Python 3.12 / CUDA 12.8.
+Older cards work too: `install.sh` reads your GPU's compute capability and
+picks a PyTorch build that has kernels for it (CUDA 12.8 for Turing and
+newer, CUDA 12.6 for anything older, down to a GTX 10-series).
 
 ```bash
 git clone --recursive git@github.com:jwang078/SplatSim.git ~/code/SplatSim
@@ -56,6 +59,14 @@ doesn't surprise you.
   wrist camera can see up close). `install.sh` applies them right before
   compiling, so if `git status` shows those two files modified inside the
   submodule, that's expected.
+- **`gsplat`** compiles its CUDA kernels on the first render rather than at
+  install time, so `install.sh` clears that path in advance: it links the
+  CUDA headers where the host compiler will find them, and on pre-Volta GPUs
+  runs `scripts/patch_gsplat_pre_volta.py` (gsplat's backward kernels use a
+  Volta-only cooperative-groups call, and one file that won't compile takes
+  the whole renderer with it). Then it builds the extension once, so the
+  first sim launch doesn't spend minutes on nvcc. Re-run that script by hand
+  after any `pip install gsplat`, which restores the stock sources.
 
 ### If something goes wrong
 
@@ -66,9 +77,17 @@ doesn't surprise you.
   out directly with `git -C submodules/<name> checkout -f HEAD`.
 - **`nvcc: command not found`** when running things later — the conda env
   isn't active. A quick `conda activate splatsim` fixes it.
-- **Please don't upgrade torch.** It's pinned to 2.11.0+cu128 on purpose: the
-  CUDA extensions are compiled against it, and video dataloading gets several
-  times slower on other builds. The same goes for the CUDA 12.8 toolchain.
+- **`CUDA error: no kernel image is available for execution on the device`**
+  — torch is a CUDA build (`cuda available: True`) but has no kernels for
+  your GPU. Compare `torch.cuda.get_device_capability()` with
+  `torch.cuda.get_arch_list()`; if your `sm_XX` isn't in the list, re-run
+  `./install.sh` (it now picks the wheel index from the GPU) or force one
+  with `TORCH_INDEX=https://download.pytorch.org/whl/cu126 ./install.sh`.
+- **Please don't upgrade torch.** It's pinned to 2.11.0 on purpose: the CUDA
+  extensions are compiled against it, and video dataloading gets several
+  times slower on other builds. The same goes for the CUDA 12.x toolchain.
+  Which `+cuXXX` build of 2.11.0 you get is chosen by `install.sh` from your
+  GPU — that part is not a pin.
 - **Noisy `git status` after installing** — the submodule builds leave a few
   artifacts behind. Harmless, but if you'd like them hidden:
   ```bash

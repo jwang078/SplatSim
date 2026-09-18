@@ -64,7 +64,10 @@ dependencies = [
     "opencv-python==4.12.0.88",
     "pillow==12.0.0",
     "PyYAML==6.0.3",
-    "dill==0.4.0",
+    # Range, not a pin: LeRobot's [dataset] extra pulls multiprocess,
+    # which needs dill>=0.4.1, and an exact pin here makes pip end the
+    # install with a red "dependency conflicts" line for no reason.
+    "dill>=0.4,<0.5",
 
     # Networking / CLI / misc
     "pyzmq==27.1.0",

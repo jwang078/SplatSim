@@ -8,7 +8,8 @@
 # order that works — which is the whole point of this script and cannot be
 # expressed in pyproject.toml:
 #   1. git submodules            — not a pip concept
-#   2. torch from the CUDA 12.8 index — the +cu128 builds are not on PyPI
+#   2. torch from the CUDA wheel index that covers THIS GPU (see the
+#      TORCH_INDEX block below) — those builds are not on PyPI
 #   3. the rest of the pip deps  — pyproject.toml
 #   4. source-built CUDA extensions — their setup.py IMPORTS torch, so torch
 #      must already be present; hence --no-build-isolation
@@ -17,11 +18,30 @@
 #   ENV_NAME=splatsim        conda env to create/use
 #   ENV_ACTION=use|recreate  what to do if ENV_NAME already exists (else: ask)
 #   ENV_ONLY=true            stop after the conda env is ready
-#   LEROBOT_DIR, SKIP_LEROBOT, TORCH_INDEX — see below
+#   TORCH_CUDA_ARCH_LIST     GPU archs to compile the CUDA extensions for
+#                            (default: the installed GPU's, via nvidia-smi)
+#   TORCH_INDEX              pip index for the torch wheels (default: picked
+#                            from the GPU's compute capability, see below)
+#   LEROBOT_DIR, SKIP_LEROBOT — see below
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+
+# ── GPU check — before anything else ───────────────────────────────────────
+# Everything below ends in CUDA extensions compiled for THIS machine's GPU,
+# so there is no point creating an env or installing anything if the driver
+# cannot see one (no GPU, or a kernel update that needs a reboot first).
+# nvidia-smi prints its "couldn't communicate with the driver" message on
+# stdout, so keep only lines that look like a compute capability (e.g. 6.1).
+# (`|| true` because grep exits 1 on no match, which set -e would turn into
+# a silent exit before the error message below.)
+GPU_ARCHS="$( { nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+              | grep -Ex '[0-9]+\.[0-9]+' | sort -u | tr '\n' ' ' | sed 's/ *$//'; } || true)"
+[[ -n "$GPU_ARCHS" ]] || {
+    echo "ERROR: nvidia-smi found no GPU (driver not loaded?). Nothing was installed." >&2
+    echo "       Fix the driver first (a reboot after a kernel update is the usual cause) and re-run." >&2
+    exit 1; }
 
 # ── 0. conda env — decided BEFORE any other work ───────────────────────────
 ENV_NAME="${ENV_NAME:-splatsim}"
@@ -96,7 +116,34 @@ if [[ "${ENV_ONLY:-false}" == "true" ]]; then
 fi
 
 # ── knobs for the pip layer ────────────────────────────────────────────────
-TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
+# PyTorch's CUDA wheels do not all cover the same GPU generations, and a
+# wheel with no kernels for your card still reports `cuda available: True`:
+# it only fails at the first kernel launch, with "no kernel image is
+# available for execution on the device". So the index is chosen from the
+# compute capability nvidia-smi reported above, not hard-coded:
+#
+#   cu126   sm_50 .. sm_90     Maxwell/Pascal/Volta .. Hopper
+#   cu128   sm_75 .. sm_120    Turing and newer, incl. Blackwell (RTX 50xx)
+#
+# i.e. CUDA 12.8 dropped everything before Turing, and CUDA 12.6 predates
+# Blackwell. The oldest card in the machine decides, since torch is one
+# install for all of them.
+TORCH_VERSION="${TORCH_VERSION:-2.11.0}"        # must satisfy pyproject.toml
+TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.26.0}"
+cap_int() { local c="${1%%.*}" m="${1##*.}"; echo $(( 10#$c * 10 + 10#$m )); }
+MIN_CAP=9999; MAX_CAP=0
+for a in $GPU_ARCHS; do
+    n="$(cap_int "$a")"
+    if (( n < MIN_CAP )); then MIN_CAP=$n; fi
+    if (( n > MAX_CAP )); then MAX_CAP=$n; fi
+done
+if (( MIN_CAP >= 75 )); then TORCH_CUDA=cu128; else TORCH_CUDA=cu126; fi
+if (( MIN_CAP < 75 && MAX_CAP > 90 )); then
+    echo "WARNING: this machine mixes a pre-Turing GPU (sm_$MIN_CAP) with a post-Hopper one (sm_$MAX_CAP)." >&2
+    echo "         No single torch wheel covers both; building for sm_$MIN_CAP ($TORCH_CUDA)." >&2
+    echo "         Set TORCH_INDEX / CUDA_VISIBLE_DEVICES if you want the newer card instead." >&2
+fi
+TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/$TORCH_CUDA}"
 # Where LeRobot lives. Default is INSIDE this repo (external/, gitignored) so
 # the installer never creates anything outside the directory you ran it in.
 # An existing sibling checkout at ../lerobot is used if present (reading it
@@ -117,11 +164,13 @@ export SKIP_LEROBOT   # read by the verify step below
 say "1/4  git submodules"
 git submodule update --init --recursive
 
-say "2/4  torch stack (CUDA 12.8 index)"
+say "2/4  torch stack ($TORCH_INDEX — GPU arch(s): $GPU_ARCHS)"
 # Installed BEFORE the pyproject resolve so the range constraints there are
 # already satisfied and pip never falls back to a CPU wheel from PyPI.
 pip install --index-url "$TORCH_INDEX" \
-    "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128"
+    "torch==$TORCH_VERSION+$TORCH_CUDA" \
+    "torchvision==$TORCHVISION_VERSION+$TORCH_CUDA" \
+    "torchaudio==$TORCH_VERSION+$TORCH_CUDA"
 
 # Two dependencies cannot come from the `pip install -e .` resolve below and
 # have to be placed FIRST, the same way torch is:
@@ -142,6 +191,12 @@ say "3b/4  SplatSim + pip dependencies"
 pip install -e .                      # add '.[hardware]' for a physical xArm
 
 say "4/4  source-built submodules (--no-build-isolation: they import torch at build time)"
+
+# torch's build helper needs to know which GPU archs to compile for. Left
+# unset it asks the driver itself, but pinning it is explicit and lets
+# TORCH_CUDA_ARCH_LIST override (e.g. to build for a different machine).
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$GPU_ARCHS}"
+echo "NOTE: compiling CUDA extensions for GPU arch(s): $TORCH_CUDA_ARCH_LIST"
 
 # diff-gaussian-rasterization is pinned to upstream graphdeco-inria, which
 # SplatSim needs two changes to. Applied here rather than committed because
@@ -166,6 +221,46 @@ pip install -e submodules/pybullet-playground-wrapper
 pip install -e submodules/gello_software
 pip install -r submodules/gello_software/requirements.txt
 pip install -e submodules/gello_software/third_party/DynamixelSDK/python
+
+# gsplat does NOT build its CUDA extension at install time — it JIT-compiles
+# from its bundled sources on the first render, inside whatever process is
+# running the sim. Two things have to be true for that compile to work, and
+# both are easier to fix here than to debug at 3am behind a pybullet window.
+say "gsplat's runtime JIT compile (prerequisites, then a warm-up build)"
+
+# 1. Headers. The CUDA packages from the `nvidia` channel put their headers in
+#    $CONDA_PREFIX/targets/x86_64-linux/include. nvcc adds that directory
+#    itself, but gsplat's plain C++ sources are compiled by the host gcc,
+#    which does not — so Rasterization.cpp fails on `#include <cuda_runtime.h>`
+#    even though nvcc is right there. Link them where everything looks
+#    ($CONDA_PREFIX/include is what torch passes as -isystem).
+CUDA_TARGET_INC="$CONDA_PREFIX/targets/x86_64-linux/include"
+if [[ -d "$CUDA_TARGET_INC" ]]; then
+    linked=0
+    for hdr in "$CUDA_TARGET_INC"/*; do
+        dest="$CONDA_PREFIX/include/$(basename "$hdr")"
+        [[ -e "$dest" ]] || { ln -sfn "$hdr" "$dest"; linked=$((linked+1)); }
+    done
+    echo "NOTE: linked $linked CUDA header(s) into \$CONDA_PREFIX/include"
+fi
+
+# 2. Pre-Volta GPUs. gsplat's projection kernels use cg::labeled_partition,
+#    which needs sm_70+; without this the extension does not compile at all on
+#    a GTX 10-series card. See the script for why it is safe here.
+if (( MIN_CAP < 70 )); then
+    python scripts/patch_gsplat_pre_volta.py
+fi
+
+# Compile it now rather than on the user's first render — it takes minutes,
+# and a failure belongs in this script's output, not in a sim session.
+python - <<'GSPLAT'
+import torch
+from gsplat import spherical_harmonics
+sh = torch.zeros(4, 1, 3, device="cuda")
+dirs = torch.zeros(4, 3, device="cuda")
+spherical_harmonics(0, dirs, sh)
+print("  gsplat CUDA extension built and loaded")
+GSPLAT
 
 # LeRobot: our fork (github.com/jwang078/lerobot) is co-developed with this
 # repo — it holds the training / DAgger side, and SplatSim's dataset
@@ -200,6 +295,23 @@ for m in mods:
         ok=False; print(f"  {m}: FAIL -> {type(e).__name__}: {e}")
 import torch
 print(f"  torch {torch.__version__} | cuda available: {torch.cuda.is_available()}")
+# `cuda available` is not enough: it is True even when the wheel carries no
+# kernels for this GPU. Launch one and see.
+if torch.cuda.is_available():
+    try:
+        torch.zeros(8, device="cuda").add_(1).sum().item()
+        print(f"  cuda kernel on {torch.cuda.get_device_name(0)}: OK")
+    except Exception as e:
+        ok = False
+        cap = "sm_%d%d" % torch.cuda.get_device_capability(0)
+        print(f"  cuda kernel: FAIL -> {type(e).__name__}: {e}")
+        print(f"    this GPU is {cap}; this torch build has kernels for "
+              f"{' '.join(torch.cuda.get_arch_list())}")
+        print("    -> wrong wheel index; re-run with TORCH_INDEX set to a CUDA "
+              "version whose wheels cover " + cap)
+else:
+    ok = False
+    print("  cuda available: FAIL -> torch cannot see the GPU (CPU-only wheel?)")
 raise SystemExit(0 if ok else 1)
 PY
 say "done — activate with: conda activate $ENV_NAME"
