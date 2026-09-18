@@ -2489,6 +2489,7 @@ class PybulletRobotServerBase:
                 self._sync_step_request_ticks = int(self._physics_substeps_per_command)
                 self._sync_step_done_event.clear()
                 self._sync_step_pending_event.set()
+            self._last_client_step_t = time.time()   # a client is pacing the sim (see serve loop)
             # Wait for the main serve loop to run the requested steps.
             # Timeout is generous — the main loop wakes every 1/240 s and
             # each step is cheap; N=8 completes in well under a second even
@@ -6841,6 +6842,10 @@ class PybulletRobotServerBase:
     # scenario): no randomisation and no goal solving until the user presses
     # Reset Env or starts generating. The episode-driven modes reset first.
     START_WITHOUT_RESET_MODES = ("interactive", "placement", "generate_trajectories_idle", "eval_benchmark_idle")
+    # sync_physics_to_client: after this long without a client command the
+    # interactive loop steps physics itself (free-run) so the PyBullet window
+    # stays live; the next client command gates it again.
+    CLIENT_IDLE_FREE_RUN_S = 1.0
 
     def serve(self) -> None:
         if self.serve_mode.value in self.START_WITHOUT_RESET_MODES:
@@ -6934,6 +6939,20 @@ class PybulletRobotServerBase:
                     # cede the GIL to the ZMQ thread when idle.
                     if self._sync_physics_to_client:
                         self._consume_sync_step_request()
+                        # Client-gated stepping only makes sense while a client
+                        # is actually sending commands. With nobody connected
+                        # (the usual state right after launch, or while you
+                        # poke the robot in the PyBullet window) a gated sim
+                        # is simply frozen: mouse drags do nothing, objects
+                        # never settle. So free-run in wall-clock time until
+                        # a client command arrives, then gate again.
+                        idle = time.time() - getattr(self, "_last_client_step_t", 0.0) > self.CLIENT_IDLE_FREE_RUN_S
+                        if idle:
+                            self._step_physics_realtime()
+                        if idle != getattr(self, "_sync_idle_last", None):
+                            self._sync_idle_last = idle
+                            print("[sync_physics] no client commands — physics free-running in wall-clock time"
+                                  if idle else "[sync_physics] client commands arriving — physics gated on them")
                     else:
                         self._step_physics_realtime()
                     # Also consume any pending camera-render request. Always
