@@ -257,16 +257,48 @@ def step_labels(stage: str, asset: str, name: str, cfg: dict, args) -> None:
 
 
 def _show(X, y, S, labels, n_links):
+    """Three windows at once: the URDF cloud, the labelled splat, and both
+    overlaid — same colour = same link. Closing them all continues."""
     import open3d as o3d
+    import open3d.visualization.gui as gui
+    import open3d.visualization.rendering as rendering
     colors = link_colors(n_links)
     a = o3d.geometry.PointCloud(); a.points = o3d.utility.Vector3dVector(X); a.colors = o3d.utility.Vector3dVector(colors[(y + 1).astype(int)])
     b = o3d.geometry.PointCloud(); b.points = o3d.utility.Vector3dVector(S); b.colors = o3d.utility.Vector3dVector(colors[(labels + 1).astype(int)])
     frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-    print("Windows: URDF links (left), splat gaussians coloured by the link they were given (right). "
-          "Same colours should sit on the same parts. Close to continue.")
-    o3d.visualization.draw_geometries([a, frame], window_name="URDF at scan pose", width=800, height=600, left=50, top=50)
-    o3d.visualization.draw_geometries([b, frame], window_name="splat labelled by link", width=800, height=600, left=900, top=50)
-    o3d.visualization.draw_geometries([a, b, frame], window_name="overlay", width=800, height=600, left=50, top=700)
+    hint = "3D view — left-drag to rotate, scroll to zoom, right-drag to pan"
+
+    def window(app, title, geoms, x, y):
+        w = app.create_window(title, 800, 600, x, y)
+        scene = gui.SceneWidget()
+        scene.scene = rendering.Open3DScene(w.renderer)
+        mat = rendering.MaterialRecord(); mat.point_size = 3.0
+        for i, g in enumerate(geoms):
+            scene.scene.add_geometry(f"geometry_{i}", g, mat)
+        bounds = geoms[0].get_axis_aligned_bounding_box()
+        for g in geoms[1:]:
+            bounds += g.get_axis_aligned_bounding_box()
+        scene.setup_camera(60, bounds, bounds.get_center())
+        label = gui.Label(hint)
+        em = w.theme.font_size
+
+        def on_layout(ctx):
+            r = w.content_rect
+            scene.frame = r
+            pref = label.calc_preferred_size(ctx, gui.Widget.Constraints())
+            label.frame = gui.Rect(r.x + em, r.y + em, pref.width, pref.height)
+        w.set_on_layout(on_layout)
+        w.add_child(scene)
+        w.add_child(label)
+
+    print("Windows: URDF links (left), splat gaussians coloured by the link they were given (right), both overlaid (below). "
+          "Same colours should sit on the same parts. Close all three to continue.")
+    app = gui.Application.instance
+    app.initialize()
+    window(app, "URDF at scan pose", [a, frame], 50, 50)
+    window(app, "splat labelled by link", [b, frame], 900, 50)
+    window(app, "overlay: URDF + labelled splat", [a, b, frame], 50, 700)
+    app.run()
 
 
 # -------------------------------------------------------------------- main
