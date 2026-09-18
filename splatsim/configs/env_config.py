@@ -75,6 +75,10 @@ class ObjectConfig(ABC):
     # are 0. Expanded into articulation_config at load; the older form is a
     # bare `articulation_config.initial_joint_positions` list in URDF order.
     scan_pose: Optional[Dict[str, float]] = Default(None)
+    # Set by the registry on a stage that lists several `assets:`: every
+    # instance's aabb, so loading the stage as the background crops out all
+    # of them (not just this entry's own box).
+    exclude_aabbs: Optional[List[Any]] = Default(None)
     use_fixed_base: Optional[bool] = Default(False)
     scaling_range_x: Tuple[float, float] = Default((1.0, 1.0))
     scaling_range_y: Tuple[float, float] = Default((1.0, 1.0))

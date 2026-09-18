@@ -147,12 +147,13 @@ A stage folder looks like this:
 
 ```
 data/stages/<stage>/
-    stage.yaml                       transformation, aabb, asset, scan_pose, model_path, source_path, ...
+    stage.yaml                       model_path, source_path, transformation, and one block per body under assets:
+                                     (asset, base_position, scan_pose, aabb, labels_path)
     splat/                           gaussian-splatting output
     sfm/                             COLMAP / hloc output
-    splat_labels.npy                 which URDF link each Gaussian belongs to (see Scanning your robot)
-    splat_labels.json                its key: label value -> name, and where the labels came from
-    urdf_pcd.ply                     the URDF sampled at scan_pose, for aligning the splat (see Scanning your robot)
+    splat_rgb.ply                    the splat as a plain RGB cloud, for CloudCompare
+    <body>_urdf_pcd.ply              that body's URDF sampled at its scan_pose, for aligning
+    <body>_labels.npy + .json        which URDF link each gaussian of that body belongs to, and the key
     segmentations/<build>/
         stage.yaml                   ply_path, urdf_path, collision_frame
         <build>.urdf, <build>_collision.obj, cost field, grape targets, ...
@@ -302,41 +303,47 @@ python submodules/gaussian-splatting-wrapper/gaussian_splatting/train.py -s ~/da
 
 ### Align the simulator and the splat
 
-#### Configs
+A scan is a *stage* (`data/stages/<stage>/stage.yaml`), and every body you
+want the simulator to move — the robot, a box, an engine — is one entry
+under its `assets:`. Each is cut out of the same splat with the same three
+steps; the robot is just the one called `robot`. Look at
+`data/stages/robot_iphone_w_engine_curtain/stage.yaml` while reading this.
 
-Make `data/stages/your_robot_name/` and put a `stage.yaml` in it — copy
-`data/stages/robot_iphone_w_engine_curtain/stage.yaml` and change:
+#### 1. Describe the scan
 
-- `asset` to the body you scanned (a folder under `data/assets/`, see *Adding
-  your robot*); the UR5 scans say `asset: ur5`.
+Make `data/stages/<stage>/` with a `stage.yaml`:
 
-- `model_path` to the folder output of the gaussian splat training (ex: `~/.../.../output/258f657d-c`), or symlink it as `splat/` next to the yaml.
+- `model_path` — the gaussian-splat training output (ex: `~/.../output/258f657d-c`), or symlink it as `splat/` next to the yaml.
+- `source_path` — the images + COLMAP output (ex: `~/data/<stage>/input`), or symlink it as `sfm/`.
+- `assets:` — one block per body. For the robot:
+  ```yaml
+  assets:
+    robot:
+      asset: ur5                    # its folder under data/assets/ (see Adding your robot)
+      base_position: [0.0, 0.0, 0.0]
+      scan_pose:                    # joint angles (rad, by joint name) it had during the scan
+        shoulder_pan_joint: 1.5708  #   joints you leave out are 0
+        ...
+  ```
+  A box or an apple is the same block without `scan_pose`.
 
-- `source_path` to the folder with the image data and colmap outputs (ex: `~/data/your_robot_name/input`), or symlink it as `sfm/`.
+#### 2. Point cloud of the URDF, align it in CloudCompare
 
-- `scan_pose` to the joint angles (radians, by joint name) the robot had when the splat data was collected. Joints you leave out are 0.
-
-#### Convert URDF to point cloud
-
-Run
 ```bash
-python scripts/articulated_robot_pipeline.py --robot_name your_robot_name
+python scripts/segment_stage_asset.py <stage> --asset robot pcd
 ```
 
-Verify that the first point cloud visualization has the same joint poses as your robot had in the splat. If not, adjust `scan_pose`. Ignore the second visualization for now.
-
-The point cloud is written next to the scan as `data/stages/your_robot_name/urdf_pcd.ply` (and the per-Gaussian link labels as `splat_labels.npy` in the same folder, recorded in the `stage.yaml` as `labels_path`, with `splat_labels.json` saying what each label value is).
-
-#### Align robot coordinate frames in sim and in splat
-
-Download CloudCompare, which visualizes point clouds. 
-
-Open both the URDF point cloud `data/stages/your_robot_name/urdf_pcd.ply` and the gaussian splat `output/.../point_cloud/point_cloud/iteration_30000/point_cloud.ply`. The goal is to apply transformations (rotation/translation/scale) *to your splat* such that the robot arm matches between the sim and splat, then you can copy that transformation to a config file. Don't apply transformations to the simulated robot arm.
+writes `<stage>/robot_urdf_pcd.ply` (the URDF sampled at `scan_pose`, one
+colour per link) and `<stage>/splat_rgb.ply` (the splat as a plain RGB
+cloud). Check the first one has the joint pose the robot really had; if
+not, fix `scan_pose` and rerun. Then open both in CloudCompare, crop the
+splat down to the robot, and align — *moving the splat onto the URDF cloud*,
+never the other way round:
 
 <details>
 <summary> Tips and tricks with CloudCompare </summary>
 
-- To see rgb colors on your trained splat, download `3dgsconverter` and run `3dgsconverter -i point_cloud.ply -o output_cloudcompare.ply -f cc --rgb`. After importing `output_cloudcompare.ply` to CloudCompare, select it in the top left sidebar, then in the bottom left sidebar, set `Properties > Colors` to `RGB`
+- `splat_rgb.ply` already has RGB; select it in the top-left sidebar and set `Properties > Colors` to `RGB` if it shows grey.
 
 - Use the Segment tool (scissor in top bar) to crop out the table and other objects, leaving only the robot. Also crop out any wires (which wouldn't be present in the simulated robot). Note: select the point cloud you want to segment on the left toolbar before you click Segment, or else it will try to segment the wrong point cloud, thus making no changes. The points you segmented out re-appear after you save the segmentation because they are now in another group (in the left toolbar). You can deselect it to stop visualizing it. First select create the selection polygon with left clicks, right click to finish your polygon, click either Segment In or Segment Out, then if you want to keep on iterating on this, find a new angle then press the unpause button to start segmenting again. When you're done, press the green checkmark.
 
@@ -345,17 +352,49 @@ Open both the URDF point cloud `data/stages/your_robot_name/urdf_pcd.ply` and th
 - You can double-check alignment by setting the floor as visible and seeing if the floor planes are aligned, or by looking at all orthographic views (left toolbar)
 </details>
 
-The splat-to-simulator transformation is in `Transformation History` (scroll to the bottom of Properties in the left sidebar). Copy-paste it into your `stage.yaml` under `transformation: matrix:`, while fitting the yaml format
-
-#### Double check calibration
-
-Run this script below again. The last visualization that compares the two point clouds should have colors and coordinate frames lined up.
+The result is in `Transformation History` (bottom of Properties in the left
+sidebar). Paste it in — a file with the four rows, or the 16 numbers on the
+command line:
 
 ```bash
-python scripts/articulated_robot_pipeline.py --robot_name your_robot_name
+python scripts/segment_stage_asset.py <stage> --asset robot transform matrix.txt
 ```
 
-Note: `urdf_bbox_adjustment` can handle cases where your physical robot has an additional attachment compared to the URDF. You can check its effects in the same final visualization
+That becomes the stage's `transformation` (splat → simulator), which every
+body in the scan shares.
+
+#### 3. Cut the body out and label it
+
+```bash
+python scripts/segment_stage_asset.py <stage> --asset robot labels --show
+```
+
+fits the body's box from the URDF cloud, labels every gaussian inside it
+with the nearest URDF link, and writes `aabb`, `labels_path`
+(`robot_labels.npy` + a `.json` key saying which value is which link) into
+the yaml. The windows show the URDF and the labelled splat in the same
+colours; they should sit on the same parts, and the printed centroid
+distance should be a few centimetres. If the box clips something the URDF
+doesn't have (a wrist camera, cables), widen it with `urdf_bbox_adjustment`
+under that body and rerun.
+
+#### More bodies in the same scan
+
+The scan is now placed, so a second body (a box, say) is aligned the other
+way: run `pcd` for it, move the *URDF cloud* onto the splat in CloudCompare,
+and pass the matrix with `--as-pose` — it becomes that body's
+`base_position` / `base_orientation_rpy` — then `labels`:
+
+```bash
+python scripts/segment_stage_asset.py <stage> --asset box pcd
+python scripts/segment_stage_asset.py <stage> --asset box transform matrix.txt --as-pose
+python scripts/segment_stage_asset.py <stage> --asset box labels --show
+```
+
+Every body is then its own entry, `<stage>/<name>`, that an environment can
+load and move (`splat_name="<stage>/box"`); the stage name alone is the
+robot, and loading the stage as a background leaves a hole where each body
+was scanned.
 
 #### Your custom robot can now follow the same recorded joint state trajectories!
 

@@ -12,6 +12,16 @@ what was scanned):
                                              body it is a scan of
     data/stages/<stage>/segmentations/<build>/stage.yaml   (nested: inherits)
 
+A stage that contains several segmented bodies lists them under `assets:`,
+one block per instance (the robot, a box, an apple ...), each with what is
+true of THAT body in THIS scan — `asset:` (or urdf_path), base_position,
+scan_pose, aabb, labels_path. The stage's own fields (splat, transformation)
+are shared. Every instance is a registry entry `<stage>/<instance>`; the
+bare stage name resolves to the instance called `robot` (else the only /
+first one) so envs keep saying `splat_name="<stage>"` for the robot, and the
+entry also carries `exclude_aabbs` (every instance's box) for when the
+stage is loaded as the background.
+
 Each entry holds exactly what one `objects.yaml` entry used to hold
 (`ply_path`, `model_path`, `source_path`, `urdf_path`, `labels_path`,
 `transformation`, `aabb`, ...) with three differences:
@@ -130,6 +140,8 @@ def _load_tree(root: Path) -> Dict[str, Dict[str, Any]]:
         folder = f.parent
         raw = yaml.safe_load(f.read_text()) or {}
         raw = _rebase_paths(raw, folder)
+        if isinstance(raw.get("assets"), dict):
+            raw["assets"] = {k: _rebase_paths(dict(v or {}), folder) for k, v in raw["assets"].items()}
         # Nearest ancestor entry (already resolved because of the sort).
         parent_cfg: Dict[str, Any] = {}
         for anc in folder.parents:
@@ -152,6 +164,39 @@ def _load_tree(root: Path) -> Dict[str, Dict[str, Any]]:
     return entries
 
 
+def _flatten_stage_assets(entries: Dict[str, Dict[str, Any]]) -> None:
+    """`assets: {instance: {...}}` in a stage -> one entry per instance."""
+    for name in list(entries):
+        cfg = entries[name]
+        inst = cfg.get("assets")
+        if not isinstance(inst, dict) or not inst:
+            continue
+        shared = {k: v for k, v in cfg.items() if k != "assets"}
+        boxes = []
+        flat: Dict[str, Dict[str, Any]] = {}
+        for iname, icfg in inst.items():
+            icfg = dict(icfg or {})
+            if "aabb" in icfg:
+                boxes.append(copy.deepcopy(icfg["aabb"]))
+            e = _merge({k: v for k, v in shared.items() if k != "name"}, icfg)
+            e["name"] = f"{name}/{iname}"
+            e["stage"] = name
+            e["instance"] = iname
+            flat[e["name"]] = e
+            _SOURCE[e["name"]] = _SOURCE[name]
+            _DIR[e["name"]] = _DIR[name]
+        primary = f"{name}/robot" if f"{name}/robot" in flat else next(iter(flat))
+        alias = copy.deepcopy(flat[primary])
+        alias["name"] = name
+        alias["exclude_aabbs"] = boxes
+        entries[name] = alias
+        entries.update(flat)
+
+
+_ASSET_BODY_FIELDS = ("urdf_path", "robot", "use_fixed_base", "is_articulated", "articulation_config",
+                      "base_position", "base_orientation_rpy", "num_dofs", "use_gripper", "wrist_camera_link_name")
+
+
 def _resolve_asset_refs(entries: Dict[str, Dict[str, Any]]) -> None:
     """`asset: <name>` -> that entry's fields underneath this one's."""
     def resolve(name: str, chain: tuple) -> Dict[str, Any]:
@@ -165,7 +210,11 @@ def _resolve_asset_refs(entries: Dict[str, Dict[str, Any]]) -> None:
             raise KeyError(f"registry: {name!r} ({_SOURCE.get(name)}) references asset {ref!r}, "
                            f"which is not under {ASSETS_ROOT} (known: {sorted(entries)})")
         base = resolve(ref, chain + (name,))
-        merged = _merge({k: v for k, v in base.items() if k not in ("name", "asset", "_asset_resolved")}, cfg)
+        # Only what describes the BODY comes across. A referenced entry may
+        # itself be a scan (a box scanned once keeps its URDF in its stage);
+        # its splat, transform, box, labels and scan pose belong to that scan.
+        body = {k: v for k, v in base.items() if k in _ASSET_BODY_FIELDS}
+        merged = _merge(body, cfg)
         merged["_asset_resolved"] = True
         entries[name] = merged
         return merged
@@ -192,6 +241,7 @@ def load_all() -> Dict[str, Dict[str, Any]]:
     tree: Dict[str, Dict[str, Any]] = {}
     for root in (ASSETS_ROOT, STAGES_ROOT) + LEGACY_ROOTS:
         tree.update(_load_tree(root))
+    _flatten_stage_assets(tree)
     _resolve_asset_refs(tree)
     for name, cfg in tree.items():
         if name in entries and _SOURCE.get(name) == LEGACY_OBJECTS_YAML:
@@ -308,8 +358,12 @@ def write_back(name: str, updates: Dict[str, Any]) -> Path:
     the given keys. For a per-folder yaml the edit is done line by line so
     the file's comments survive (an asset.yaml is also the user's template);
     objects.yaml entries and anything the line editor can't place fall back
-    to a full re-dump."""
+    to a full re-dump. A `<stage>/<instance>` entry is edited under its
+    `assets: <instance>:` block."""
     path = source_file(name)
+    cfg = get(name) or {}
+    if cfg.get("instance") and "/" in name:
+        updates = {"assets": {cfg["instance"]: updates}}
     if path != LEGACY_OBJECTS_YAML:
         text = path.read_text()
         edited = _edit_yaml_lines(text, updates)
@@ -319,90 +373,100 @@ def write_back(name: str, updates: Dict[str, Any]) -> Path:
             return path
     doc = yaml.safe_load(path.read_text()) or {}
     target = doc if path != LEGACY_OBJECTS_YAML else doc.setdefault(name, {})
-    for k, v in updates.items():
-        if isinstance(v, dict) and isinstance(target.get(k), dict):
-            target[k].update(v)
-        else:
-            target[k] = v
+    _deep_update(target, updates)
     path.write_text(yaml.safe_dump(doc, sort_keys=False, default_flow_style=None))
     invalidate()
     return path
 
 
+def _deep_update(target: Dict[str, Any], updates: Dict[str, Any]) -> None:
+    for k, v in updates.items():
+        if isinstance(v, dict) and isinstance(target.get(k), dict):
+            _deep_update(target[k], v)
+        else:
+            target[k] = v
+
+
 def _flow(v: Any) -> str:
     """One-line YAML for a scalar or a (nested) list of scalars."""
-    return yaml.safe_dump(v, default_flow_style=True, width=10**6).strip()
+    out = yaml.safe_dump(v, default_flow_style=True, width=10**6).strip()
+    return out.split("\n")[0] if out.endswith("\n...") or "\n..." in out else out
 
 
 def _edit_yaml_lines(text: str, updates: Dict[str, Any]) -> Optional[str]:
-    """Replace/insert `key: <flow value>` lines in place, keeping every other
-    line (comments included). Handles top-level keys and one level of
-    nesting (`{"robot": {"initial_joint_positions": [...]}}`). Returns None
-    when a value is not representable on one line (nested mappings beyond
-    one level, multi-line data) so the caller can fall back."""
+    """Replace/insert `key: <flow value>` lines in place, at any nesting
+    depth, keeping every other line (comments included). A mapping value is
+    written key by key inside the existing block (created if missing); a
+    scalar or list value is one flow-style line that replaces the key's
+    current line and whatever block hung under it. Returns None only for
+    values it cannot express (nothing, currently) so callers can fall back."""
     import re as _re
     lines = text.splitlines(keepends=True)
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
 
-    def key_line(indent: str, key: str, value: Any) -> str:
-        return f"{indent}{key}: {_flow(value)}\n"
+    def indent_of(ln: str) -> int:
+        return len(ln) - len(ln.lstrip(" "))
 
-    def find_top(key: str):
-        for i, ln in enumerate(lines):
-            if _re.match(rf"^{_re.escape(key)}\s*:", ln):
+    def is_blank_or_comment(ln: str) -> bool:
+        return ln.strip() == "" or ln.lstrip().startswith("#")
+
+    def find_key(start: int, end: int, indent: int, key: str):
+        """Index of `key:` at exactly `indent` within lines[start:end]."""
+        pat = _re.compile(rf"^ {{{indent}}}{_re.escape(key)}\s*:")
+        for i in range(start, end):
+            if pat.match(lines[i]):
                 return i
         return None
 
-    def block_end(start: int) -> int:
-        """Index one past the last line belonging to the top-level block at `start`."""
+    def block_end(start: int, indent: int) -> int:
+        """One past the last line of the block whose key is at lines[start]
+        (child lines are indented deeper; comments/blanks inside count)."""
         i = start + 1
-        while i < len(lines) and (lines[i].startswith(" ") or lines[i].strip() == "" or lines[i].lstrip().startswith("#")):
-            # a top-level comment followed by a top-level key ends the block
-            if lines[i].lstrip().startswith("#") and not lines[i].startswith(" "):
-                j = i
-                while j < len(lines) and lines[j].lstrip().startswith("#") and not lines[j].startswith(" "):
-                    j += 1
-                if j >= len(lines) or not lines[j].startswith(" "):
-                    break
+        while i < len(lines) and (is_blank_or_comment(lines[i]) or indent_of(lines[i]) > indent
+                                  or (indent_of(lines[i]) == indent and lines[i].lstrip().startswith("- "))):
             i += 1
-        # trailing blank lines belong to the file's layout, not the block
-        while i > start + 1 and lines[i - 1].strip() == "":
+        while i > start + 1 and is_blank_or_comment(lines[i - 1]) and indent_of(lines[i - 1]) <= indent:
             i -= 1
         return i
 
-    for key, value in updates.items():
-        if isinstance(value, dict):
-            top = find_top(key)
-            if top is None:
-                lines.append(f"{key}:\n"); top = len(lines) - 1
-            end = block_end(top)
-            for sub, subval in value.items():
-                if isinstance(subval, dict):
-                    return None
-                placed = False
-                for i in range(top + 1, end):
-                    if _re.match(rf"^\s+{_re.escape(sub)}\s*:", lines[i]):
-                        indent = _re.match(r"^(\s+)", lines[i]).group(1)
-                        lines[i] = key_line(indent, sub, subval); placed = True
-                        break
-                if not placed:
-                    indent = "  "
-                    for i in range(top + 1, end):
-                        m = _re.match(r"^(\s+)\S", lines[i])
-                        if m and not lines[i].lstrip().startswith("#"):
-                            indent = m.group(1); break
-                    lines.insert(top + 1, key_line(indent, sub, subval)); end += 1
-        else:
-            top = find_top(key)
-            if top is not None:
-                # a block-style value spanning following indented lines is replaced whole
-                end = block_end(top)
-                lines[top:end] = [key_line("", key, value)]
+    def child_indent(start: int, end: int, indent: int) -> int:
+        for i in range(start + 1, end):
+            if not is_blank_or_comment(lines[i]):
+                return indent_of(lines[i])
+        return indent + 2
+
+    def apply(updates_: Dict[str, Any], start: int, end: int, indent: int) -> int:
+        """Apply within lines[start:end] at `indent`; returns the new end."""
+        for key, value in updates_.items():
+            at = find_key(start, end, indent, key)
+            if isinstance(value, dict):
+                if at is None:
+                    lines.insert(end, " " * indent + f"{key}:\n"); at = end; end += 1
+                    bend = at + 1
+                else:
+                    bend = block_end(at, indent)
+                    # `key: {inline}` or `key: value` -> make it a block
+                    if lines[at].split(":", 1)[1].strip() not in ("", ) and not lines[at].split(":", 1)[1].strip().startswith("#"):
+                        lines[at] = " " * indent + f"{key}:\n"; bend = at + 1
+                ci = child_indent(at, bend, indent)
+                new_bend = apply(value, at + 1, bend, ci)
+                end += new_bend - bend
             else:
-                anchor = find_top("urdf_path")
-                at = (anchor + 1) if anchor is not None else 0
-                lines.insert(at, key_line("", key, value))
+                line = " " * indent + f"{key}: {_flow(value)}"
+                if at is None:
+                    lines.insert(end, line + "\n"); end += 1
+                else:
+                    # keep a trailing `# comment` on the line being replaced
+                    m = _re.search(r"\s+(#.*)$", lines[at].rstrip("\n"))
+                    if m and not _re.match(r"^\s*[^#]*:\s*#", lines[at]) or (m and lines[at].split(":", 1)[1].strip().startswith("#")):
+                        line += "   " + m.group(1)
+                    bend = block_end(at, indent)
+                    lines[at:bend] = [line + "\n"]
+                    end -= (bend - at - 1)
+        return end
+
+    apply(updates, 0, len(lines), 0)
     return "".join(lines)
 
 

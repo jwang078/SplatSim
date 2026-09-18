@@ -150,9 +150,26 @@ def crop_splat(splatsim_obj: SplatSimObject, keep_within_aabb=True):
 
     xyz_obj = copy.deepcopy(pc._xyz)
 
+    def _inside(box):
+        return ((xyz_obj[:, 0] > box[0][0]) & (xyz_obj[:, 0] < box[1][0]) & (xyz_obj[:, 1] > box[0][1]) & (xyz_obj[:, 1] < box[1][1])
+                & (xyz_obj[:, 2] > box[0][2]) & (xyz_obj[:, 2] < box[1][2]))
+
     #segment according to axis aligned bounding box
-    segmented_indices = ((xyz_obj[:, 0] > aabb[0][0]) & (xyz_obj[:, 0] < aabb[1][0]) & (xyz_obj[:, 1] > aabb[0][1] ) & (xyz_obj[:, 1] < aabb[1][1]) & (xyz_obj[:, 2] > aabb[0][2] ) & (xyz_obj[:, 2] < aabb[1][2]))
+    segmented_indices = _inside(aabb)
     if not keep_within_aabb:
+        # Background use: drop this body's box AND every other segmented
+        # body's box in the same scan (a multi-asset stage), so movable
+        # objects are not also painted where they were scanned.
+        extra = getattr(splatsim_obj.config, "exclude_aabbs", None) or []
+        for other in extra:
+            ob = other.get("bounding_box") if isinstance(other, dict) else getattr(other, "bounding_box", None)
+            adj = other.get("urdf_bbox_adjustment") if isinstance(other, dict) else getattr(other, "urdf_bbox_adjustment", None)
+            if ob is None:
+                continue
+            box = np.array(ob, dtype=np.float64)
+            if adj is not None:
+                box += np.array(adj, dtype=np.float64).T
+            segmented_indices = segmented_indices | _inside(box)
         segmented_indices = ~segmented_indices
 
     # Combine splats of robot and of objects
