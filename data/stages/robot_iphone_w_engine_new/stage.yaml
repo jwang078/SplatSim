@@ -1,0 +1,25 @@
+# UR5 + Robotiq scan. `asset: ur5` brings the body; `scan_pose` is the
+# configuration it was scanned in (labels + splat are relative to it).
+asset: ur5
+scan_pose: {shoulder_pan_joint: 1.570796, shoulder_lift_joint: -1.570796, elbow_joint: 1.570796, wrist_1_joint: -1.570796,
+  wrist_2_joint: -1.570796, wrist_3_joint: 0.0, finger_joint: 0.0, left_inner_finger_joint: 0.0, left_inner_knuckle_joint: 0.0,
+  right_outer_knuckle_joint: 0.0, right_inner_finger_joint: 0.0, right_inner_knuckle_joint: 0.0}
+transformation:
+  matrix:
+  - [-0.297564, 0.021757, -0.055539, -0.288505]
+  - [0.05964, 0.113288, -0.275157, 0.631604]
+  - [0.001006, -0.280704, -0.115354, 0.580824]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.2044, -0.11, 0.0082]
+  - [0.0734, 0.7145, 0.5867]
+  urdf_bbox_adjustment:
+  - [0.0, 0.0]
+  - [0.0, 0.1]
+  - [0.0, 0.0]
+base_position: [0.0, 0.0, -0.088]
+source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle/sfm_disk_disk+lightglue/undistorted
+model_path: /home/jennyw2/code/gaussian-splatting/output/small_engine_on_table_new_all_views_images_500_40match_800height_stdangle
+use_fixed_base: true
+labels_path: splat_labels.npy

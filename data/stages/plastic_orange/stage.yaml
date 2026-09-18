@@ -1,0 +1,14 @@
+# plastic_orange: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [0.48213, -0.001385, -0.017298, 0.104238]
+  - [0.001288, 0.482433, -0.002725, 0.031612]
+  - [0.017306, 0.002677, 0.482124, -0.119978]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.042241001009941104, -0.05334599825739861, -0.003751000014133754]
+  - [0.029288999244570735, 0.02029799993336201, 0.06777800011634827]
+ply_path: /home/jennyw2/data/output/plastic_orange/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: false

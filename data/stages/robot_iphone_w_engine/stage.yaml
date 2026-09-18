@@ -1,0 +1,26 @@
+# UR5 + Robotiq scan. `asset: ur5` brings the body; `scan_pose` is the
+# configuration it was scanned in (labels + splat are relative to it).
+# NOTE: not present on this machine as of 2026-09-18: model_path, source_path.
+asset: ur5
+scan_pose: {shoulder_pan_joint: 0.0, shoulder_lift_joint: -1.570796, elbow_joint: 1.570796, wrist_1_joint: -1.570796, wrist_2_joint: -1.570796,
+  wrist_3_joint: 0.0, finger_joint: 0.0, left_inner_finger_joint: 0.0, left_inner_knuckle_joint: 0.0, right_outer_knuckle_joint: 0.0,
+  right_inner_finger_joint: 0.0, right_inner_knuckle_joint: 0.0}
+transformation:
+  matrix:
+  - [-0.031934, 0.086246, -0.316679, 0.747205]
+  - [0.327034, -0.018588, -0.03804, -0.169514]
+  - [-0.027799, -0.317742, -0.083732, 0.447195]
+  - [0, 0, 0, 1]
+aabb:
+  bounding_box:
+  - [-0.0734, -0.11, -0.0033]
+  - [0.5812, 0.2044, 0.5748]
+  urdf_bbox_adjustment:
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+base_position: [0.0, 0.0, -0.078]
+source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_2_images_500_highres_20match_540height/sfm_disk_disk+lightglue/undistorted
+model_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height
+use_fixed_base: true
+labels_path: splat_labels.npy

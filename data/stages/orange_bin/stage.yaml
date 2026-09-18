@@ -1,0 +1,14 @@
+# orange_bin: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [-0.12062, 0.033697, -0.104786, -0.221648]
+  - [0.110068, 0.037936, -0.114501, 0.034491]
+  - [0.000716, -0.15521, -0.050736, 0.25867]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.15628000485897064, -0.19878200578689575, -0.10199599850177765]
+  - [0.15677600491046906, 0.19878200578689575, 0.10260500150918961]
+ply_path: /home/jennyw2/data/output/orange_bin/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: false

@@ -19,16 +19,20 @@ aabb:
 asset: ur5                        # the body this is a scan of (data/assets/ur5)
 labels_path: splat_labels.npy     # per-Gaussian link labels of splat/, from articulated_robot_pipeline.py
 base_position: [0.0, 0.0, -0.088]
-articulation_config:
-  initial_joint_positions: [1.5707963267948966, -1.5707963267948966, 1.5707963267948966,
-    -1.5707963267948966, -1.5707963267948966, 0.0, 0.0, 0.0, 0.3524144382886717, 0.0,
-    -0.3524129579021227, 0.0, 0.3524147995863395, 0.3524001421883213, 0.0, -0.35240854143885103,
-    0.0, 0.35241114733591894, 0.0, 0.0, 0.0, 0.0]
-  joint_signs: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1]
 source_path: sfm
 model_path: splat
-use_gripper: true
-is_articulated: true
 use_fixed_base: true
-wrist_camera_link_name: wrist_camera_link
+# The configuration the robot was scanned in (labels + splat are relative to it).
+scan_pose:
+  shoulder_pan_joint: 1.570796
+  shoulder_lift_joint: -1.570796
+  elbow_joint: 1.570796
+  wrist_1_joint: -1.570796
+  wrist_2_joint: -1.570796
+  wrist_3_joint: 0.0
+  finger_joint: 0.352414
+  left_inner_finger_joint: -0.352413
+  left_inner_knuckle_joint: 0.352415
+  right_outer_knuckle_joint: 0.3524
+  right_inner_finger_joint: -0.352409
+  right_inner_knuckle_joint: 0.352411

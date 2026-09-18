@@ -1,0 +1,14 @@
+# redblock: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [-0.462869, -0.192065, -0.007291, -0.068703]
+  - [-0.191989, 0.462917, -0.006113, 0.004405]
+  - [0.009077, -0.002853, -0.501098, 0.146021]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.13175, -0.128575, -0.11905]
+  - [0.13175, 0.128575, 0.11905]
+ply_path: /home/jennyw2/data/output/redblock/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: false

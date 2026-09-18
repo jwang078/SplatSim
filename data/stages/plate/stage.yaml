@@ -1,0 +1,14 @@
+# plate: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [0.428037, -0.002224, 0.00156, 0.025199]
+  - [0.002146, 0.427532, 0.02087, 0.069187]
+  - [-0.001667, -0.020862, 0.427534, -0.056894]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.14549199628829956, -0.13433099675178528, -0.006904999932274225]
+  - [0.12161000210046768, 0.13436300444602967, 0.027752000346779826]
+ply_path: /home/jennyw2/data/output/plate/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: true

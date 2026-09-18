@@ -1,0 +1,14 @@
+# pepper_plant: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [-0.10078, 0.009917, -0.035741, -0.157408]
+  - [0.03685, 0.014978, -0.09975, 0.283084]
+  - [-0.004227, -0.105876, -0.017459, 0.230395]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.10084044325351715, -0.07163486766815186, -0.04365334051847458]
+  - [0.1079582064151764, 0.11075531828403473, 0.18289256978034973]
+ply_path: /home/jennyw2/data/output/pepper_plant/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: false

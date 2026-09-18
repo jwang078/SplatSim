@@ -1,0 +1,14 @@
+# plastic_apple: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [0.464929, 0.031817, 0.058262, 0.057396]
+  - [-0.031791, 0.468562, -0.002185, 0.009826]
+  - [-0.058276, -0.001781, 0.466011, -0.137607]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.040464000284671786, -0.04481899875402451, -0.003991999986581507]
+  - [0.042181999862194064, 0.03782700139284134, 0.07506100225448609]
+ply_path: /home/jennyw2/data/output/plastic_apple/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: false

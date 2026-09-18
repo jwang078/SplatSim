@@ -1,0 +1,25 @@
+# UR5 + Robotiq scan. `asset: ur5` brings the body; `scan_pose` is the
+# configuration it was scanned in (labels + splat are relative to it).
+# NOTE: not present on this machine as of 2026-09-18: model_path.
+asset: ur5
+scan_pose: {shoulder_pan_joint: 0.0, shoulder_lift_joint: -1.570796, elbow_joint: 1.570796, wrist_1_joint: -1.570796, wrist_2_joint: -1.570796,
+  wrist_3_joint: 0.0, finger_joint: 0.0, left_inner_finger_joint: 0.0, left_inner_knuckle_joint: 0.0, right_outer_knuckle_joint: 0.0,
+  right_inner_finger_joint: 0.0, right_inner_knuckle_joint: 0.0}
+transformation:
+  matrix:
+  - [-0.04356, 0.08924, -0.233418, 0.367886]
+  - [0.248989, 0.035668, -0.032829, -0.119694]
+  - [0.021272, -0.234754, -0.09372, 0.319593]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.0734, -0.11, -0.0033]
+  - [0.5296, 0.2044, 0.5747]
+  urdf_bbox_adjustment:
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+base_position: [0.0, 0.0, -0.078]
+source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/2025-10-24_new_bedford_engine_visit_GX010016_notwideangle_better_images_500_20match_540height/sfm_disk_disk+lightglue/undistorted
+model_path: /home/jennyw2/code/gaussian-splatting/output/2025-10-24_new_bedford_engine_visit_GX010016_notwideangle_better_images_500_20match_540height
+use_fixed_base: true

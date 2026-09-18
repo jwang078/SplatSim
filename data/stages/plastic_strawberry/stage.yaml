@@ -1,0 +1,14 @@
+# plastic_strawberry: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [0.496632, 0.102881, -0.03002, 0.065829]
+  - [-0.106615, 0.488752, -0.088789, 0.039882]
+  - [0.010899, 0.093091, 0.499344, -0.155743]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.026838000372052195, -0.010228999864310029, -0.0035789999850094345]
+  - [0.024836999803781512, 0.04144700008630753, 0.048820999890565875]
+ply_path: /home/jennyw2/data/output/plastic_strawberry/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: false

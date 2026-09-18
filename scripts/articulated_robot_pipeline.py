@@ -103,8 +103,11 @@ def main(args):
     pcd_splat = o3d.geometry.PointCloud()
     pcd_splat.points = o3d.utility.Vector3dVector(robot_xyz)
 
-    robot_path = object_configs[args.robot_name]["urdf_path"]
-    initial_joint_positions = object_configs[args.robot_name]['articulation_config']['initial_joint_positions']
+    cfg = object_configs[args.robot_name]
+    robot_path = cfg["urdf_path"]
+    if not os.path.isabs(robot_path):
+        from splatsim.utils.paths import resolve_splatsim_path
+        robot_path = resolve_splatsim_path(robot_path)
 
     #connect to pybullet
     physicsClient = p.connect(p.GUI)
@@ -115,8 +118,16 @@ def main(args):
     base_position = object_configs[args.robot_name]["base_position"]
     robot_id = p.loadURDF(robot_path, useFixedBase=True, basePosition=base_position)
 
-    #get the joint states from args
-    joint_states = initial_joint_positions
+    # The scan pose: `scan_pose` by joint name (current), or the older
+    # `articulation_config.initial_joint_positions` list in URDF order.
+    if cfg.get("scan_pose"):
+        by_name = {p.getJointInfo(robot_id, j)[1].decode(): j for j in range(p.getNumJoints(robot_id))}
+        joint_states = [0.0] * (p.getNumJoints(robot_id) - 1)
+        for k, v in cfg["scan_pose"].items():
+            if by_name[k] >= 1:
+                joint_states[by_name[k] - 1] = float(v)
+    else:
+        joint_states = (cfg.get("articulation_config") or {}).get("initial_joint_positions") or []
 
     # Set the joint states. The yaml convention (matching
     # sim_robot_pybullet_base.py teleport_joint_state) is that entry i of

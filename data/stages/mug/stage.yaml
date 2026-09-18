@@ -1,0 +1,15 @@
+# mug: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [0.399489, 0.125515, 0.08209, 0.059245]
+  - [-0.12238, 0.407827, -0.028004, 0.006866]
+  - [-0.086694, 0.002674, 0.417805, -0.122231]
+  - [0, 0, 0, 1]
+aabb:
+  bounding_box:
+  - [-0.06174099954962731, -0.048921999961137774, -0.04394899818301201]
+  - [0.06177900123596192, 0.05085599932074547, 0.043957998484373095]
+ply_path: /home/jennyw2/data/output/mug/point_cloud/iteration_7000/point_cloud.ply
+is_articulated: true
+use_fixed_base: true

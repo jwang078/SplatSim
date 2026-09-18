@@ -69,6 +69,12 @@ class ObjectConfig(ABC):
     model_path: Optional[str] = Default(None)
     is_articulated: Optional[bool] = Default(False)
     articulation_config: Optional[ArticulationConfig] = Default(None)
+    # The configuration the body was SCANNED in, keyed by URDF joint name
+    # (`shoulder_pan_joint: 1.5708`). Labels and the splat are relative to
+    # it, so it belongs to the scan (stage), not the body. Joints not listed
+    # are 0. Expanded into articulation_config at load; the older form is a
+    # bare `articulation_config.initial_joint_positions` list in URDF order.
+    scan_pose: Optional[Dict[str, float]] = Default(None)
     use_fixed_base: Optional[bool] = Default(False)
     scaling_range_x: Tuple[float, float] = Default((1.0, 1.0))
     scaling_range_y: Tuple[float, float] = Default((1.0, 1.0))

@@ -1,0 +1,11 @@
+# Planar 3-joint arm (the planar envs). Legacy fields kept as they were in
+# objects.yaml: no `robot:` block, so the state convention is URDF joints 1..N.
+urdf_path: planar_3joint.urdf
+base_position: [0.0, 0.0, 0.0]
+use_gripper: true
+is_articulated: true
+use_fixed_base: true
+wrist_camera_link_name: wrist_camera_link
+articulation_config:
+  initial_joint_positions: [0.5, -0.9, -0.8, 0.0]
+  joint_signs: [1, 1, 1, 1]

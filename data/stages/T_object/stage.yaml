@@ -1,0 +1,14 @@
+# T_object: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [-0.132477, 0.034095, -0.121401, 0.035303]
+  - [0.123114, -0.003108, -0.135219, 0.329979]
+  - [-0.02727, -0.179663, -0.0207, 0.264398]
+  - [0, 0, 0, 1]
+aabb:
+  bounding_box:
+  - [-0.10481339830160141, -0.17983333158493042, -0.0066666600499302175]
+  - [0.10481339830160141, 0.029833329349756244, 0.04666666078567505]
+ply_path: /home/jennyw2/data/output/T_object/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: false

@@ -1,0 +1,27 @@
+# UR5 + Robotiq scan. `asset: ur5` brings the body; `scan_pose` is the
+# configuration it was scanned in (labels + splat are relative to it).
+# NOTE: not present on this machine as of 2026-09-18: model_path, source_path.
+asset: ur5
+scan_pose: {shoulder_pan_joint: 0.0, shoulder_lift_joint: -1.570796, elbow_joint: 1.570796, wrist_1_joint: -1.570796, wrist_2_joint: -1.570796,
+  wrist_3_joint: 0.0, finger_joint: 0.8, left_inner_finger_joint: -0.800007, left_inner_knuckle_joint: 0.799995, right_outer_knuckle_joint: 0.799996,
+  right_inner_finger_joint: -0.799988, right_inner_knuckle_joint: 0.799993}
+transformation:
+  matrix:
+  - [0.091979, 0.040193, -0.202176, 0.771204]
+  - [0.205922, -0.007912, 0.09211, -0.335536]
+  - [0.009315, -0.221975, -0.039892, 0.520633]
+  - [0, 0, 0, 1]
+aabb:
+  bounding_box:
+  - [-0.0734, -0.11, -0.0033]
+  - [0.5297, 0.2044, 0.5747]
+  urdf_bbox_adjustment:
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+base_position: [0.0, 0.0, -0.078]
+note: the -0.1 is from the URDF definition and -0.022 is the base plate that the robot is mounted on
+source_path: /home/jennyw2/data/test_data/robot_iphone
+model_path: /home/jennyw2/data/output/robot_iphone
+use_fixed_base: true
+labels_path: splat_labels.npy

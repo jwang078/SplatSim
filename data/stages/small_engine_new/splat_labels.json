@@ -1,0 +1,9 @@
+{
+  "labels_file": "splat_labels.npy",
+  "meaning": "one value per Gaussian of the splat (same order as its point_cloud.ply); `classes` says what each value is",
+  "source": "scripts/articulated_robot_pipeline.py: KNN against the URDF sampled at the scan pose",
+  "classes": {
+    "-1": "base_link",
+    "0": "diesel_cap"
+  }
+}

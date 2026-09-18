@@ -147,11 +147,12 @@ A stage folder looks like this:
 
 ```
 data/stages/<stage>/
-    stage.yaml                       transformation, aabb, asset, model_path, source_path, ...
+    stage.yaml                       transformation, aabb, asset, scan_pose, model_path, source_path, ...
     splat/                           gaussian-splatting output
     sfm/                             COLMAP / hloc output
     splat_labels.npy                 which URDF link each Gaussian belongs to (see Scanning your robot)
     splat_labels.json                its key: label value -> name, and where the labels came from
+    urdf_pcd.ply                     the URDF sampled at scan_pose, for aligning the splat (see Scanning your robot)
     segmentations/<build>/
         stage.yaml                   ply_path, urdf_path, collision_frame
         <build>.urdf, <build>_collision.obj, cost field, grape targets, ...
@@ -173,8 +174,14 @@ To add a stage: make `data/stages/<stage>/` with `splat/` and `sfm/`, copy
 `data/stages/vine_scene/stage.yaml` beside them and fill in the transform
 (see *Scanning your robot for photoreal rendering*), run the segmentation scripts with
 `--outdir data/stages/<stage>/segmentations/<build>`, and tar the folder for
-whoever needs it. `configs/object_configs/objects.yaml` is the older
-single-file form; it still loads, but a folder entry with the same name wins.
+whoever needs it.
+
+Two fields in a stage are about *this* scan and nothing else: `scan_pose`,
+the joint configuration (by joint name) the body was scanned in — the splat
+and its labels are relative to it, so it never changes — and `labels_path`.
+The pose a robot *starts* episodes in is the asset's
+`robot.initial_joint_positions`; a stage that wants a different start writes
+its own `robot:` block, which overrides the asset's.
 
 ## Adding your robot
 
@@ -272,15 +279,17 @@ python submodules/gaussian-splatting-wrapper/gaussian_splatting/train.py -s ~/da
 
 #### Configs
 
-Add `your_robot_name` to `configs/object_configs/objects.yaml`. First, copy-paste the attributes from `robot_iphone`.
+Make `data/stages/your_robot_name/` and put a `stage.yaml` in it — copy
+`data/stages/robot_iphone_w_engine_curtain/stage.yaml` and change:
 
-- Set `model_path` to the folder output of the gaussian splat training (ex: `~/.../.../output/258f657d-c`)
+- `asset` to the body you scanned (a folder under `data/assets/`, see *Adding
+  your robot*); the UR5 scans say `asset: ur5`.
 
-- Set `source_path` to the folder with the image data and colmap outputs (ex: `~/data/your_robot_name/input`)
+- `model_path` to the folder output of the gaussian splat training (ex: `~/.../.../output/258f657d-c`), or symlink it as `splat/` next to the yaml.
 
-- Set `joint_states` (radians) to the joint angles that the robot had when the gaussian splat data was collected. There might be an extra 0 preceding the base joint (ex: [0, 0, 1.57, ...])
+- `source_path` to the folder with the image data and colmap outputs (ex: `~/data/your_robot_name/input`), or symlink it as `sfm/`.
 
-- If you have a different URDF, change `urdf_path`. Note that `robot_iphone` is a UR5 robot.
+- `scan_pose` to the joint angles (radians, by joint name) the robot had when the splat data was collected. Joints you leave out are 0.
 
 #### Convert URDF to point cloud
 
@@ -289,7 +298,7 @@ Run
 python scripts/articulated_robot_pipeline.py --robot_name your_robot_name
 ```
 
-Verify that the first point cloud visualization has the same joint poses as your robot had in the splat. If not, adjust `joint_states`. Ignore the second visualization for now.
+Verify that the first point cloud visualization has the same joint poses as your robot had in the splat. If not, adjust `scan_pose`. Ignore the second visualization for now.
 
 The point cloud is written next to the scan as `data/stages/your_robot_name/urdf_pcd.ply` (and the per-Gaussian link labels as `splat_labels.npy` in the same folder, recorded in the `stage.yaml` as `labels_path`, with `splat_labels.json` saying what each label value is).
 
@@ -311,7 +320,7 @@ Open both the URDF point cloud `data/stages/your_robot_name/urdf_pcd.ply` and th
 - You can double-check alignment by setting the floor as visible and seeing if the floor planes are aligned, or by looking at all orthographic views (left toolbar)
 </details>
 
-The splat-to-simulator transformation is in `Transformation History` (scroll to the bottom of Properties in the left sidebar). Copy-paste it to `configs/object_configs/objects.yaml` under your_robot_name > transformation > matrix, while fitting the yaml format
+The splat-to-simulator transformation is in `Transformation History` (scroll to the bottom of Properties in the left sidebar). Copy-paste it into your `stage.yaml` under `transformation: matrix:`, while fitting the yaml format
 
 #### Double check calibration
 

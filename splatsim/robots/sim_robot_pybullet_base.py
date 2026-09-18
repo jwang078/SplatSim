@@ -2113,6 +2113,21 @@ class PybulletRobotServerBase:
 
             if splatsim_obj.config.name == "robot":
                 self.splatsim_robot = splatsim_obj
+                if splatsim_obj.config.scan_pose:
+                    # Scan pose by joint name -> one value per URDF joint 1..N
+                    # (the form everything below already understands).
+                    n_all = self.pybullet_client.getNumJoints(splatsim_obj.sim_id)
+                    by_name = {self.pybullet_client.getJointInfo(splatsim_obj.sim_id, j)[1].decode(): j
+                               for j in range(n_all)}
+                    unknown = [k for k in splatsim_obj.config.scan_pose if k not in by_name]
+                    if unknown:
+                        raise ValueError(f"{splatsim_obj.config.name}: scan_pose names joints the URDF does not have: {unknown}")
+                    full = [0.0] * (n_all - 1)
+                    for k, v in splatsim_obj.config.scan_pose.items():
+                        if by_name[k] >= 1:
+                            full[by_name[k] - 1] = float(v)
+                    articulation_config.initial_joint_positions = full
+                    articulation_config.joint_signs = None
                 # Everything robot-specific (arm joints, gripper, cameras, EE
                 # link, action size) comes from the URDF + the robot's yaml —
                 # see splatsim.robots.robot_spec. Built here, the moment the

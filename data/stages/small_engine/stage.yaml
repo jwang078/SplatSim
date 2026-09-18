@@ -1,0 +1,25 @@
+# small_engine: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: model_path, ply_path, source_path.
+transformation:
+  matrix:
+  - [0.03328, -0.077565, 0.307622, -0.428054]
+  - [-0.317168, -0.015161, 0.03049, 0.71483]
+  - [0.007206, -0.309045, -0.078703, 0.371978]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.179, -0.0767, 0.0014]
+  - [0.1631, 0.2996, 0.3388]
+  urdf_bbox_adjustment:
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+  - [0.0, 0.0]
+ply_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height/point_cloud/iteration_30000/point_cloud.ply
+urdf_path: /home/jennyw2/data/small_engine_on_table_2/small_engine_with_prismatic_cap2/urdf/small_engine_with_prismatic_cap2.urdf
+source_path: /home/jennyw2/code/Hierarchical-Localization/outputs/small_engine_on_table_2_images_500_highres_20match_540height/sfm_disk_disk+lightglue/undistorted
+model_path: /home/jennyw2/code/gaussian-splatting-repo/gaussian_splatting/output/small_engine_on_table_2_images_500_highres_20match_540height/small_engine_on_table_2_images_500_highres_20match_540height
+articulation_config:
+  initial_joint_positions: []
+base_position: [0.0, 0.0, 0.345]
+use_fixed_base: true
+labels_path: splat_labels.npy

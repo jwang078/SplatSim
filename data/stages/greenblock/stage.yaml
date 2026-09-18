@@ -1,0 +1,14 @@
+# greenblock: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [0.462382, 0.194866, 0.032317, 0.068623]
+  - [-0.194668, 0.463495, -0.009541, 0.0009]
+  - [-0.033488, -0.003738, 0.501676, -0.14401]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.13175, -0.128575, -0.11905]
+  - [0.13175, 0.128575, 0.11905]
+ply_path: /home/jennyw2/data/output/greenblock/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: false

@@ -1,0 +1,14 @@
+# plastic_banana: migrated verbatim from configs/object_configs/objects.yaml (2026-09-18).
+# NOTE: not present on this machine as of 2026-09-18: ply_path.
+transformation:
+  matrix:
+  - [0.40671, 0.176775, 0.108957, 0.067257]
+  - [-0.168149, 0.420952, -0.055308, 0.006486]
+  - [-0.121848, 0.009139, 0.440004, -0.127512]
+  - [0.0, 0.0, 0.0, 1.0]
+aabb:
+  bounding_box:
+  - [-0.10480799663066864, -0.05512200060486794, -0.021652999773621562]
+  - [0.09845499831438065, 0.026052999749779704, 0.021651999533176425]
+ply_path: /home/jennyw2/data/output/plastic_banana/point_cloud/iteration_7000/point_cloud.ply
+use_fixed_base: false
