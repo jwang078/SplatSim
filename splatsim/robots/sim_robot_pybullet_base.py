@@ -5304,7 +5304,6 @@ class PybulletRobotServerBase:
         return {
             "format": "splatsim-scenario/2",
             "robot": {
-                "robot_name": self.robot_name,   # the --robot_name it was launched with (a stage or an asset)
                 "state_joints": self.robot_spec.state_joint_names[: len(q)],
                 "q_start": q,
             },
