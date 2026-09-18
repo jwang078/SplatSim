@@ -176,10 +176,11 @@ data/stages/<stage>/
   scan and must not be drawn twice.)
 - Folders extracted under the older names (`data/scenes/`, `data/robots/`,
   `scene.yaml`, `robot.yaml`) still load.
-- `data/scenarios/<env>__<robot>.json` is a saved arrangement: the robot's
-  start joint state (named) and each object's pose. It sits on top of the
-  stage and asset and repeats nothing from them; `launch_nodes.py` picks it
-  up automatically and `--save_scenario` writes one.
+- `data/scenarios/<env>__<robot>__<name>.json` is a saved arrangement: the
+  robot's base pose and start joint state (by joint name) and each object's
+  pose. It sits on top of the stage and asset and repeats nothing from them.
+  `launch_nodes.py` loads `default` unless you pass `--scenario <name>`;
+  save more from the Robot Placement panel.
 
 To add a stage: make `data/stages/<stage>/` with `splat/` and `sfm/`, copy
 `data/stages/vine_scene/stage.yaml` beside them and fill in the transform
@@ -222,14 +223,17 @@ You need a URDF. Nothing else — the simulator works out the rest from it.
    robot fits. Without a splat scan of its own the robot is drawn from its
    meshes, composited by depth into the scene. Drop `--viewer` when you want
    the environment's task to run against it.
-4. Tick **Play** in the control window to see the splat render update
+4. **Play** (on by default; off while generating trajectories) in the control window makes the splat render update
    continuously (at the rate next to it) instead of only when something asks
    for an observation — handy for watching the splat and the PyBullet window
    side by side while you move the robot.
 5. Move it where you want it: press **Robot Placement** in the control window.
-   Sliders move the base (x, y, z, yaw) and every arm joint live in the scene;
-   **Save placement** writes the pose into your `asset.yaml` so it starts
-   there next time (the file's comments are kept).
+   Sliders move the base (x, y, z, yaw), every arm joint and every gripper
+   live in the scene. Type a name and press **Save scenario** to keep the
+   arrangement as `data/scenarios/<env>__<robot>__<name>.json` (**Load
+   scenario** brings one back; `--scenario <name>` launches into it).
+   **Save as robot default (yaml)** instead writes the pose into your
+   `asset.yaml` so the robot starts there in every scene (comments kept).
 
 What the yaml can describe, all optional: which joints are the arm and which
 the gripper, how the gripper is commanded (one value for a parallel gripper,

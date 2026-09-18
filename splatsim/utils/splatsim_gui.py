@@ -779,9 +779,12 @@ class RobotPlacementPanel(ModePanel):
     button_key = "placement_mode"
     default_mode = "placement"
 
-    BTN_SAVE = "placement_save"
+    BTN_SAVE = "placement_save"              # -> data/scenarios/<env>__<robot>__<name>.json
+    BTN_LOAD = "placement_load"
+    BTN_SAVE_YAML = "placement_save_yaml"    # -> the robot's own asset/stage yaml (its default pose)
     BTN_RESET = "placement_reset"
     NS = "placement"
+    SCENARIO_KEY = "placement.scenario_name"
 
     @classmethod
     def base_keys(cls):
@@ -790,6 +793,10 @@ class RobotPlacementPanel(ModePanel):
     @classmethod
     def joint_key(cls, i: int) -> str:
         return f"{cls.NS}.joint_{i}"
+
+    @classmethod
+    def gripper_key(cls, i: int) -> str:
+        return f"{cls.NS}.gripper_{i}"
 
     def build(self, parent: tk.Widget, gui: 'ThreadedTkinterGui',
               style: GuiStyle, config: SplatSimModeConfig) -> None:
@@ -809,9 +816,26 @@ class RobotPlacementPanel(ModePanel):
                 lo_f = float(lo) if np.isfinite(lo) and lo < hi else -3.1416
                 hi_f = float(hi) if np.isfinite(hi) and lo < hi else 3.1416
                 builder.add_float_param(FloatParam(self.joint_key(i), label, lo_f, hi_f, float(q0)), float(q0))
+        grippers = list(info.get("grippers", []))
+        if grippers:
+            builder.add_header("Grippers (0 = open, 1 = closed)")
+            for i, (label, c0) in enumerate(grippers):
+                builder.add_float_param(FloatParam(self.gripper_key(i), label, 0.0, 1.0, float(c0)), float(c0))
+        builder.add_separator()
+        builder.add_header("Scenario")
+        builder.add_str_param(StrParam(self.SCENARIO_KEY, "Name", str(info.get("scenario_name") or "default"), width=18))
+        existing = list(info.get("scenarios", []))
+        if existing:
+            ttk.Label(parent, text="Saved: " + ", ".join(existing), style="TLabel", wraplength=360).grid(
+                row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            builder._row += 1
         builder.add_button_row([
-            ButtonConfig("Save placement", self.BTN_SAVE),
-            ButtonConfig("Reset to saved", self.BTN_RESET),
+            ButtonConfig("Save scenario", self.BTN_SAVE),
+            ButtonConfig("Load scenario", self.BTN_LOAD),
+        ])
+        builder.add_button_row([
+            ButtonConfig("Save as robot default (yaml)", self.BTN_SAVE_YAML),
+            ButtonConfig("Reset to yaml", self.BTN_RESET),
         ])
 
 
@@ -1494,8 +1518,8 @@ class SplatSimGui(ThreadedTkinterGui):
             initial_value=self._initial_splat_shadows,
         )
         builder.add_bool_param(
-            BoolParam(self.RENDER_PLAY_KEY, "Play: render continuously (else on events)"),
-            initial_value=False,
+            BoolParam(self.RENDER_PLAY_KEY, "Play: render continuously (else on events)", default=True),
+            initial_value=True,
         )
         builder.add_float_param(FloatParam(self.RENDER_HZ_KEY, "Play rate (Hz)", 1.0, 30.0, 5.0), 5.0)
 
@@ -1651,6 +1675,10 @@ class SplatSimGui(ThreadedTkinterGui):
         if value is None:
             return self._initial_render_mode
         return value
+
+    def set_render_play(self, on: bool) -> None:
+        """Flip the Play checkbox from the server (mode changes)."""
+        self.set_value(self.RENDER_PLAY_KEY, bool(on))
 
     def get_render_play(self) -> bool:
         """Play checkbox: render the camera thumbnails continuously."""

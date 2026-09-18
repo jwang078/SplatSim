@@ -31,7 +31,7 @@
       <geometry>
         <mesh filename="../panda/meshes/collision/link0.obj" />
       </geometry>
-      <material name="panda_white">
+      <material name="left_panda_white">
         <color rgba="1. 1. 1. 1." />
       </material>
     </visual>
@@ -39,7 +39,7 @@
       <geometry>
         <mesh filename="../panda/meshes/collision/link0.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <link name="left_panda_link1">
@@ -52,13 +52,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link1.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link1.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <joint name="left_panda_joint1" type="revolute">
@@ -79,13 +79,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link2.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link2.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <joint name="left_panda_joint2" type="revolute">
@@ -106,7 +106,7 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link3.obj" />
       </geometry>
-      <material name="panda_red">
+      <material name="left_panda_red">
         <color rgba="1. 1. 1. 1." />
       </material>
     </visual>
@@ -134,13 +134,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link4.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link4.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <joint name="left_panda_joint4" type="revolute">
@@ -161,13 +161,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link5.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link5.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <joint name="left_panda_joint5" type="revolute">
@@ -188,13 +188,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link6.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link6.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <joint name="left_panda_joint6" type="revolute">
@@ -215,13 +215,13 @@
       <geometry>
         <mesh filename="../panda/meshes/collision/link7.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link7.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <joint name="left_panda_joint7" type="revolute">
@@ -260,13 +260,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/hand.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/hand.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <link name="left_panda_leftfinger">
@@ -286,13 +286,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/finger.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/finger.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <link name="left_panda_rightfinger">
@@ -313,14 +313,14 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/finger.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </visual>
     <collision>
       <origin rpy="0 0 3.14159265359" xyz="0 0 0" />
       <geometry>
         <mesh filename="../panda/meshes/collision/finger.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="left_panda_white" />
     </collision>
   </link>
   <joint name="left_panda_finger_joint1" type="prismatic">
@@ -350,6 +350,76 @@
     <child link="left_panda_grasptarget" />
     <origin rpy="0 0 0" xyz="0 0 0.105" />
   </joint>
+  <link name="left_wrist_camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <box size="0.02 0.03 0.02" />
+      </geometry>
+      <material name="left_cam_dark_grey">
+        <color rgba="0.2 0.2 0.2 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <box size="0.02 0.03 0.02" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="left_wrist_camera_joint" type="fixed">
+    <parent link="left_panda_hand" />
+    <child link="left_wrist_camera_link" />
+    <origin xyz="0.06 0 0.02" rpy="0 -0.2618 0" />
+  </joint>
+  <link name="left_wrist_camera_vis_x_link">
+    <visual>
+      <origin xyz="0.05 0 0" rpy="0 1.5708 0" />
+      <geometry>
+        <cylinder radius="0.004" length="0.1" />
+      </geometry>
+      <material name="left_cam_red">
+        <color rgba="1 0 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="left_wrist_camera_vis_x_joint" type="fixed">
+    <parent link="left_wrist_camera_link" />
+    <child link="left_wrist_camera_vis_x_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+  <link name="left_wrist_camera_vis_y_link">
+    <visual>
+      <origin xyz="0 0.05 0" rpy="-1.5708 0 0" />
+      <geometry>
+        <cylinder radius="0.004" length="0.1" />
+      </geometry>
+      <material name="left_cam_green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="left_wrist_camera_vis_y_joint" type="fixed">
+    <parent link="left_wrist_camera_link" />
+    <child link="left_wrist_camera_vis_y_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+  <link name="left_wrist_camera_vis_z_link">
+    <visual>
+      <origin xyz="0 0 0.05" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.004" length="0.1" />
+      </geometry>
+      <material name="left_cam_blue">
+        <color rgba="0 0 1 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="left_wrist_camera_vis_z_joint" type="fixed">
+    <parent link="left_wrist_camera_link" />
+    <child link="left_wrist_camera_vis_z_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
   <joint name="left_mount" type="fixed">
     <parent link="base" />
     <child link="left_panda_link0" />
@@ -365,7 +435,7 @@
       <geometry>
         <mesh filename="../panda/meshes/collision/link0.obj" />
       </geometry>
-      <material name="panda_white">
+      <material name="right_panda_white">
         <color rgba="1. 1. 1. 1." />
       </material>
     </visual>
@@ -373,7 +443,7 @@
       <geometry>
         <mesh filename="../panda/meshes/collision/link0.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <link name="right_panda_link1">
@@ -386,13 +456,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link1.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link1.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <joint name="right_panda_joint1" type="revolute">
@@ -413,13 +483,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link2.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link2.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <joint name="right_panda_joint2" type="revolute">
@@ -440,7 +510,7 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link3.obj" />
       </geometry>
-      <material name="panda_red">
+      <material name="right_panda_red">
         <color rgba="1. 1. 1. 1." />
       </material>
     </visual>
@@ -468,13 +538,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link4.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link4.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <joint name="right_panda_joint4" type="revolute">
@@ -495,13 +565,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link5.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link5.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <joint name="right_panda_joint5" type="revolute">
@@ -522,13 +592,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/link6.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link6.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <joint name="right_panda_joint6" type="revolute">
@@ -549,13 +619,13 @@
       <geometry>
         <mesh filename="../panda/meshes/collision/link7.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/link7.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <joint name="right_panda_joint7" type="revolute">
@@ -594,13 +664,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/hand.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/hand.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <link name="right_panda_leftfinger">
@@ -620,13 +690,13 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/finger.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </visual>
     <collision>
       <geometry>
         <mesh filename="../panda/meshes/collision/finger.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <link name="right_panda_rightfinger">
@@ -647,14 +717,14 @@
       <geometry>
         <mesh filename="../panda/meshes/visual/finger.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </visual>
     <collision>
       <origin rpy="0 0 3.14159265359" xyz="0 0 0" />
       <geometry>
         <mesh filename="../panda/meshes/collision/finger.obj" />
       </geometry>
-      <material name="panda_white" />
+      <material name="right_panda_white" />
     </collision>
   </link>
   <joint name="right_panda_finger_joint1" type="prismatic">
@@ -683,6 +753,76 @@
     <parent link="right_panda_hand" />
     <child link="right_panda_grasptarget" />
     <origin rpy="0 0 0" xyz="0 0 0.105" />
+  </joint>
+  <link name="right_wrist_camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <box size="0.02 0.03 0.02" />
+      </geometry>
+      <material name="right_cam_dark_grey">
+        <color rgba="0.2 0.2 0.2 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <box size="0.02 0.03 0.02" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_wrist_camera_joint" type="fixed">
+    <parent link="right_panda_hand" />
+    <child link="right_wrist_camera_link" />
+    <origin xyz="0.06 0 0.02" rpy="0 -0.2618 0" />
+  </joint>
+  <link name="right_wrist_camera_vis_x_link">
+    <visual>
+      <origin xyz="0.05 0 0" rpy="0 1.5708 0" />
+      <geometry>
+        <cylinder radius="0.004" length="0.1" />
+      </geometry>
+      <material name="right_cam_red">
+        <color rgba="1 0 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="right_wrist_camera_vis_x_joint" type="fixed">
+    <parent link="right_wrist_camera_link" />
+    <child link="right_wrist_camera_vis_x_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+  <link name="right_wrist_camera_vis_y_link">
+    <visual>
+      <origin xyz="0 0.05 0" rpy="-1.5708 0 0" />
+      <geometry>
+        <cylinder radius="0.004" length="0.1" />
+      </geometry>
+      <material name="right_cam_green">
+        <color rgba="0 1 0 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="right_wrist_camera_vis_y_joint" type="fixed">
+    <parent link="right_wrist_camera_link" />
+    <child link="right_wrist_camera_vis_y_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+  <link name="right_wrist_camera_vis_z_link">
+    <visual>
+      <origin xyz="0 0 0.05" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.004" length="0.1" />
+      </geometry>
+      <material name="right_cam_blue">
+        <color rgba="0 0 1 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="right_wrist_camera_vis_z_joint" type="fixed">
+    <parent link="right_wrist_camera_link" />
+    <child link="right_wrist_camera_vis_z_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
   </joint>
   <joint name="right_mount" type="fixed">
     <parent link="base" />

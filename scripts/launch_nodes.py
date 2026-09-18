@@ -38,6 +38,10 @@ class Args:
     # is loaded and PINNED; if not, the scene is randomized ONCE, validated,
     # and written there for next time.
     scenario_file: Optional[str] = None
+    # Which named scenario of this env + robot to load:
+    # data/scenarios/<robot>__<robot_name>__<scenario>.json. Save more from the
+    # control window's Robot Placement panel.
+    scenario: str = "default"
     # Opt out of the cache entirely (always randomize afresh).
     no_scenario_cache: bool = False
     # Write the current scene to this path at launch and continue.
@@ -285,9 +289,13 @@ def launch_robot_server(args: Args):
         )
 
     from splatsim.configs import registry
+    from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
     if args.viewer:
-        from splatsim.robots.sim_robot_pybullet_base import PybulletRobotServerBase
         PybulletRobotServerBase.VIEWER_MODE_DEFAULT = True
+    # Scenario files are keyed on env variant + robot; the server needs the
+    # key before its control GUI is built (the Robot Placement panel lists
+    # the saved scenarios).
+    PybulletRobotServerBase.SCENARIO_STEM_DEFAULT = args.robot + (f"__{args.robot_name}" if args.robot_name else "")
     object_config = registry.load_all()
     if args.robot_name not in object_config:
         raise KeyError(
@@ -822,8 +830,13 @@ def launch_robot_server(args: Args):
         _interactive = (_mode is not None
                         and getattr(_mode, "name", "") == "INTERACTIVE")
         if _interactive and args.eval_benchmark_repo_id is None:
-            _stem = args.robot + (f"__{args.robot_name}" if args.robot_name else "")
-            _scenario_path = SPLATSIM_ROOT / "data" / "scenarios" / f"{_stem}.json"
+            _stem = PybulletRobotServerBase.SCENARIO_STEM_DEFAULT
+            server.scenario_name = args.scenario
+            _scenario_path = server.scenario_path(args.scenario)
+            _legacy = SPLATSIM_ROOT / "data" / "scenarios" / f"{_stem}.json"
+            if not _scenario_path.exists() and _legacy.exists():
+                _legacy.rename(_scenario_path)          # pre-naming cache -> "default"
+                print(f"[scenario] renamed {_legacy.name} -> {_scenario_path.name}")
         elif not _interactive:
             print(f"[scenario] cache off: serve_mode={getattr(_mode, 'name', _mode)} "
                   f"needs fresh randomization (use --scenario_file to force)")

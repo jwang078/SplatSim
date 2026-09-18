@@ -5259,6 +5259,10 @@ class PybulletRobotServerBase:
             robot = scenario.get("robot") or {}
             objs = scenario.get("objects") or {}
             robot_cfg = None
+            if robot.get("base_position") is not None:
+                self.pybullet_client.resetBasePositionAndOrientation(
+                    self.splatsim_robot.sim_id, robot["base_position"],
+                    robot.get("base_quat") or [0.0, 0.0, 0.0, 1.0])
             if robot.get("q_start") is not None:
                 q = [float(v) for v in robot["q_start"]]
                 names = list(robot.get("state_joints") or [])
@@ -5369,9 +5373,12 @@ class PybulletRobotServerBase:
                 "scale": [float(v) for v in (obj.config.current_scale or [1.0, 1.0, 1.0])],
             }
         q = [float(v) for v in self.get_joint_state()]
+        pos, quat = self.pybullet_client.getBasePositionAndOrientation(self.splatsim_robot.sim_id)
         return {
             "format": "splatsim-scenario/2",
             "robot": {
+                "base_position": [float(v) for v in pos],
+                "base_quat": [float(v) for v in quat],
                 "state_joints": self.robot_spec.state_joint_names[: len(q)],
                 "q_start": q,
             },
@@ -5828,6 +5835,14 @@ class PybulletRobotServerBase:
 
     def _enter_mode(self, mode: 'PybulletRobotServerBase.SERVE_MODES'):
         """Called when entering a new serve mode. Override in subclasses for custom behavior."""
+        # Play (continuous rendering) is what you want while looking at or
+        # placing the robot, and dead weight while trajectories are being
+        # generated (every recorded frame is rendered anyway). Eval-benchmark
+        # playback is unaffected either way: `_maybe_periodic_render` never
+        # fires in the event-rendered modes, so replay keeps its full rate.
+        if self._splatsim_gui is not None and hasattr(self._splatsim_gui, "set_render_play"):
+            self._splatsim_gui.set_render_play(
+                mode not in (self.SERVE_MODES.GENERATE_TRAJECTORIES, self.SERVE_MODES.GENERATE_TRAJECTORIES_IDLE))
         if mode == self.SERVE_MODES.GENERATE_TRAJECTORIES:
             # Invalidate any cached planner so the next plan() call rebuilds
             # RRTToGoalPlanner with the CURRENT config values. Without this,
@@ -7884,7 +7899,50 @@ class PybulletRobotServerBase:
             info = spec.joints[j]
             q0 = float(q_now[k]) if k < len(q_now) else 0.0
             joints.append((info.name, info.lower, info.upper, q0))
-        return {"base": [float(pos[0]), float(pos[1]), float(pos[2]), float(yaw)], "joints": joints}
+        grippers = []
+        for arm in spec.arms:
+            g = arm.gripper
+            d = g.command_dim
+            for c in range(d):
+                label = "gripper" if (len(spec.arms) == 1 and d == 1) else (arm.name if d == 1 else f"{arm.name} {c}")
+                grippers.append((label, self._gripper_command_now(g, c)))
+        return {"base": [float(pos[0]), float(pos[1]), float(pos[2]), float(yaw)], "joints": joints,
+                "grippers": grippers, "scenario_name": getattr(self, "scenario_name", None) or "default",
+                "scenarios": self.list_scenarios()}
+
+    def _gripper_command_now(self, g, channel: int = 0) -> float:
+        """Where a gripper actually is, as its command value in [0, 1]
+        (0 = open), read from its joints — not the last command sent."""
+        rid = self.splatsim_robot.sim_id
+        if g.kind == "robotiq_2f85":
+            return float(np.clip(self.get_current_gripper_state() / 0.8, 0.0, 1.0))
+        if not g.joint_indices:
+            return 0.0
+        j = g.joint_indices[min(channel, len(g.joint_indices) - 1)] if g.kind == "per_joint" else g.joint_indices[0]
+        q = self.pybullet_client.getJointState(rid, j)[0]
+        idx = g.joint_indices.index(j)
+        lo, hi = float(g.open[idx]), float(g.closed[idx])
+        return float(np.clip((q - lo) / (hi - lo), 0.0, 1.0)) if hi != lo else 0.0
+
+    # ---- named scenarios: data/scenarios/<env>__<robot>__<name>.json ----------
+    # `scenario_stem` ("<env>__<robot_name>") is set by launch_nodes; without
+    # it the robot name alone keys the files.
+    SCENARIO_STEM_DEFAULT: ClassVar[Optional[str]] = None   # launch_nodes sets "<env>__<robot_name>" before constructing
+    scenario_stem: Optional[str] = None
+    scenario_name: Optional[str] = None
+
+    def _scenario_stem(self) -> str:
+        return self.scenario_stem or type(self).SCENARIO_STEM_DEFAULT or self.robot_name
+
+    def scenario_path(self, name: str) -> Path:
+        stem = self._scenario_stem()
+        safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in str(name).strip()) or "default"
+        return SPLATSIM_ROOT / "data" / "scenarios" / f"{stem}__{safe}.json"
+
+    def list_scenarios(self) -> List[str]:
+        stem = self._scenario_stem()
+        d = SPLATSIM_ROOT / "data" / "scenarios"
+        return sorted(f.stem[len(stem) + 2:] for f in d.glob(f"{stem}__*.json")) if d.is_dir() else []
 
     def _placement_tick(self) -> None:
         """One serve-loop tick of Robot Placement mode: apply the panel's
@@ -7895,10 +7953,12 @@ class PybulletRobotServerBase:
         rid = self.splatsim_robot.sim_id
         vals = [gui.get_value(k) for k in P.base_keys()]
         qs = [gui.get_value(P.joint_key(i)) for i in range(spec.num_dofs)]
-        if any(v is None for v in vals) or any(q is None for q in qs):
+        gs = [gui.get_value(P.gripper_key(i)) for i in range(spec.gripper_command_dim)]
+        if any(v is None for v in vals) or any(q is None for q in qs) or any(g is None for g in gs):
             return  # panel not built yet
-        state = (tuple(float(v) for v in vals), tuple(float(q) for q in qs))
-        if state != getattr(self, "_placement_last", None):
+        state = (tuple(float(v) for v in vals), tuple(float(q) for q in qs), tuple(float(g) for g in gs))
+        last = getattr(self, "_placement_last", None)
+        if state != last:
             self._placement_last = state
             x, y, z, yaw = state[0]
             self.pybullet_client.resetBasePositionAndOrientation(
@@ -7908,16 +7968,63 @@ class PybulletRobotServerBase:
                 self.pybullet_client.setJointMotorControl2(
                     rid, j, p.POSITION_CONTROL, targetPosition=q,
                     force=self._control_force(), maxVelocity=self._control_max_velocity())
+            if gs and (last is None or state[2] != last[2]):
+                self._command_grippers(np.asarray(state[2]))
+                self.current_gripper_action = float(gs[0]) if len(gs) == 1 else np.asarray(gs)
             self._bump_state_version()
         if gui.check_button(P.BTN_SAVE):
-            self._placement_save(state)
+            self._placement_save_scenario(gui.get_value(P.SCENARIO_KEY))
+        if gui.check_button(P.BTN_LOAD):
+            self._placement_load_scenario(gui.get_value(P.SCENARIO_KEY))
+        if gui.check_button(P.BTN_SAVE_YAML):
+            self._placement_save(state[:2])
         if gui.check_button(P.BTN_RESET):
             info = self._robot_placement_info_saved()
             for k, v in zip(P.base_keys(), info["base"]):
                 gui.set_value(k, v)
             for i, (_n, _lo, _hi, q0) in enumerate(info["joints"]):
                 gui.set_value(P.joint_key(i), q0)
-            gui.set_status("Placement reset to the saved pose")
+            gui.set_status("Placement reset to the robot's yaml pose")
+
+    def _placement_sync_sliders(self) -> None:
+        """Push the live robot state into the placement sliders (after a
+        scenario load), so the next tick doesn't drag it back."""
+        from splatsim.utils.splatsim_gui import RobotPlacementPanel as P
+        gui = self._splatsim_gui
+        info = self._robot_placement_info()
+        for k, v in zip(P.base_keys(), info["base"]):
+            gui.set_value(k, v)
+        for i, (_n, _lo, _hi, q0) in enumerate(info["joints"]):
+            gui.set_value(P.joint_key(i), q0)
+        for i, (_n, c0) in enumerate(info["grippers"]):
+            gui.set_value(P.gripper_key(i), c0)
+        self._placement_last = None
+
+    def _placement_save_scenario(self, name) -> None:
+        path = self.scenario_path(name or "default")
+        try:
+            self.save_scenario_file(path)
+            self.scenario_name = path.stem.split("__")[-1]
+            msg = f"Scenario saved -> {path.name}"
+        except Exception as e:  # noqa: BLE001
+            msg = f"Scenario NOT saved: {e}"
+        print(f"[placement] {msg}")
+        self._splatsim_gui.set_status(msg)
+
+    def _placement_load_scenario(self, name) -> None:
+        path = self.scenario_path(name or "default")
+        if not path.exists():
+            msg = f"No scenario {path.name} (have: {', '.join(self.list_scenarios()) or 'none'})"
+        else:
+            try:
+                self.load_scenario_file(path, pin=True)
+                self.scenario_name = path.stem.split("__")[-1]
+                self._placement_sync_sliders()
+                msg = f"Scenario loaded <- {path.name} (pinned for resets)"
+            except Exception as e:  # noqa: BLE001
+                msg = f"Scenario NOT loaded: {e}"
+        print(f"[placement] {msg}")
+        self._splatsim_gui.set_status(msg)
 
     def _robot_placement_info_saved(self) -> dict:
         """The pose as saved in the robot's yaml (not the live one)."""

@@ -334,5 +334,42 @@
     <child link="panda_grasptarget"/>
     <origin rpy="0 0 0" xyz="0 0 0.105"/>
   </joint>
-  
+
+  <!-- Wrist camera: a small box on the side of the hand (+x, clear of the
+       fingers, which open along y and extend along +z), looking along the
+       fingers and tilted 15 deg toward their centreline. The camera looks
+       down its own +Z; image-up is -Y. -->
+  <link name="wrist_camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.02 0.03 0.02"/></geometry>
+      <material name="cam_dark_grey"><color rgba="0.2 0.2 0.2 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.02 0.03 0.02"/></geometry>
+    </collision>
+  </link>
+  <joint name="wrist_camera_joint" type="fixed">
+    <parent link="panda_hand"/>
+    <child link="wrist_camera_link"/>
+    <origin xyz="0.06 0 0.02" rpy="0 -0.2618 0"/>
+  </joint>
+  <!-- camera axes, so the frame is visible in PyBullet: X red, Y green, Z blue -->
+  <link name="wrist_camera_vis_x_link">
+    <visual><origin xyz="0.05 0 0" rpy="0 1.5708 0"/><geometry><cylinder radius="0.004" length="0.1"/></geometry>
+      <material name="cam_red"><color rgba="1 0 0 1"/></material></visual>
+  </link>
+  <joint name="wrist_camera_vis_x_joint" type="fixed"><parent link="wrist_camera_link"/><child link="wrist_camera_vis_x_link"/><origin xyz="0 0 0" rpy="0 0 0"/></joint>
+  <link name="wrist_camera_vis_y_link">
+    <visual><origin xyz="0 0.05 0" rpy="-1.5708 0 0"/><geometry><cylinder radius="0.004" length="0.1"/></geometry>
+      <material name="cam_green"><color rgba="0 1 0 1"/></material></visual>
+  </link>
+  <joint name="wrist_camera_vis_y_joint" type="fixed"><parent link="wrist_camera_link"/><child link="wrist_camera_vis_y_link"/><origin xyz="0 0 0" rpy="0 0 0"/></joint>
+  <link name="wrist_camera_vis_z_link">
+    <visual><origin xyz="0 0 0.05" rpy="0 0 0"/><geometry><cylinder radius="0.004" length="0.1"/></geometry>
+      <material name="cam_blue"><color rgba="0 0 1 1"/></material></visual>
+  </link>
+  <joint name="wrist_camera_vis_z_joint" type="fixed"><parent link="wrist_camera_link"/><child link="wrist_camera_vis_z_link"/><origin xyz="0 0 0" rpy="0 0 0"/></joint>
+
 </robot>

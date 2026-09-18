@@ -32,12 +32,10 @@ robot:
         closed: [0.0]
   cameras:
     - name: left_wrist
-      link: left_panda_hand
-      offset_xyz: [0.0, 0.0, 0.03]
+      link: left_wrist_camera_link
       model: pinhole
       fov_deg: 70
     - name: right_wrist
-      link: right_panda_hand
-      offset_xyz: [0.0, 0.0, 0.03]
+      link: right_wrist_camera_link
       model: pinhole
       fov_deg: 70
