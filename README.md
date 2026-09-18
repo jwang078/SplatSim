@@ -120,7 +120,12 @@ You should see the PyBullet window, the control GUI, and a splat render with
 the arm in front of the vine. The scene starts exactly as configured — every
 object at its placed pose, the robot at its scan / home pose (or the saved
 `default` scenario, if there is one); nothing is randomised or planned until
-you press **Reset Env** or start generating trajectories. `--wrist_cam_ver=2` picks a fisheye calibration
+you press **Reset Env** or start generating trajectories. The control window
+opens in **External Control**: the server waits for a controller — a policy,
+GELLO, a script — on its port and, with the default
+`--sync_physics_to_client`, steps physics only on that controller's
+commands, so the scene stands still until one connects. To move the robot
+or objects by hand, switch to **Robot Placement**. `--wrist_cam_ver=2` picks a fisheye calibration
 that ships in the code; `--robot_name` isn't needed, the variant knows its
 robot.
 

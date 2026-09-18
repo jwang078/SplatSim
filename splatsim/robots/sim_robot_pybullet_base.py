@@ -1218,6 +1218,7 @@ class PybulletRobotServerBase:
         else:
             self.robot_labels = None
 
+        self._serve_host, self._serve_port = host, port
         self._zmq_server = ZMQRobotServer(robot=self, host=host, port=port)
         self._zmq_server_thread = ZMQServerThread(self._zmq_server)
         print(f"Listening on {host}:{port}")
@@ -6842,10 +6843,33 @@ class PybulletRobotServerBase:
     # scenario): no randomisation and no goal solving until the user presses
     # Reset Env or starts generating. The episode-driven modes reset first.
     START_WITHOUT_RESET_MODES = ("interactive", "placement", "generate_trajectories_idle", "eval_benchmark_idle")
-    # sync_physics_to_client: after this long without a client command the
-    # interactive loop steps physics itself (free-run) so the PyBullet window
-    # stays live; the next client command gates it again.
-    CLIENT_IDLE_FREE_RUN_S = 1.0
+
+    def _external_control_status(self) -> None:
+        """Status line for the external-control (`interactive`) mode: what the
+        server is waiting for, and whether physics is paced by it."""
+        gui = self._splatsim_gui
+        if gui is None:
+            return
+        now = time.time()
+        if now - getattr(self, "_ext_status_t", 0.0) < 1.0:
+            return
+        self._ext_status_t = now
+        last = getattr(self, "_last_client_step_t", None)
+        where = f"{self._serve_host}:{self._serve_port}"
+        if last is not None and now - last < 5.0:
+            msg = f"External control: controller connected on {where} (last command {now - last:.1f} s ago)"
+        else:
+            msg = f"External control: waiting for a controller on {where}"
+        connected = last is not None and now - last < 5.0
+        if self._sync_physics_to_client:
+            msg += " — physics steps only on its commands"
+            if not connected:
+                msg += " (the scene stands still until one connects; use Robot Placement to move things by hand)"
+        else:
+            msg += " — physics free-running"
+        if msg != getattr(self, "_ext_status_last", None):
+            self._ext_status_last = msg
+            gui.set_status(msg)
 
     def serve(self) -> None:
         if self.serve_mode.value in self.START_WITHOUT_RESET_MODES:
@@ -6938,23 +6962,16 @@ class PybulletRobotServerBase:
                     # deadlock. Still sleep to keep the GUI responsive and
                     # cede the GIL to the ZMQ thread when idle.
                     if self._sync_physics_to_client:
+                        # Physics steps ONLY on the controller's commands —
+                        # never on its own, however long the controller
+                        # pauses (a policy planning its next chunk must not
+                        # see the sim run ahead). With no controller
+                        # connected the scene therefore stands still; use
+                        # Robot Placement to move things by hand.
                         self._consume_sync_step_request()
-                        # Client-gated stepping only makes sense while a client
-                        # is actually sending commands. With nobody connected
-                        # (the usual state right after launch, or while you
-                        # poke the robot in the PyBullet window) a gated sim
-                        # is simply frozen: mouse drags do nothing, objects
-                        # never settle. So free-run in wall-clock time until
-                        # a client command arrives, then gate again.
-                        idle = time.time() - getattr(self, "_last_client_step_t", 0.0) > self.CLIENT_IDLE_FREE_RUN_S
-                        if idle:
-                            self._step_physics_realtime()
-                        if idle != getattr(self, "_sync_idle_last", None):
-                            self._sync_idle_last = idle
-                            print("[sync_physics] no client commands — physics free-running in wall-clock time"
-                                  if idle else "[sync_physics] client commands arriving — physics gated on them")
                     else:
                         self._step_physics_realtime()
+                    self._external_control_status()
                     # Also consume any pending camera-render request. Always
                     # active (not gated on _sync_physics_to_client) because
                     # the EGL-context-thread-affinity issue is unconditional

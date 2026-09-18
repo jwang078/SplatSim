@@ -756,9 +756,12 @@ class ModePanel:
 
 
 class InteractiveModePanel(ModePanel):
-    """Interactive mode — no configurable settings yet."""
+    """External control: an outside controller (a policy, GELLO, a script)
+    drives the robot over ZMQ; the server's status line says what it is
+    waiting for. The mode's identifier stays `interactive` (CLI flags,
+    LeRobot and the gym env all use it); only the label changed."""
 
-    name = "Interactive Mode"
+    name = "External Control"
     mode_values = {"interactive"}
     button_key = "interactive_mode"
     default_mode = "interactive"
