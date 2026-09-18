@@ -214,9 +214,10 @@ its own `robot:` block, which overrides the asset's.
 ## Adding an asset you have a URDF for (a robot, a box, an engine)
 
 Anything with a URDF is an asset: a folder under `data/assets/` that the
-simulator can load into any scene, collide with and move (a body with no
-URDF is just part of the background splat — see *Making a collision body
-from a scan* for those). The steps below are written for a robot,
+simulator can load into any scene, collide with and move. A body with no
+URDF has no links — nothing to collide with, label or move — and is just
+part of the background splat; see *Making a collision body from a scan* to
+give it one. The steps below are written for a robot,
 which is the interesting case (joints, gripper, cameras); a box is the same
 with just step 1.
 
@@ -412,8 +413,9 @@ that cutting a body out of the scan leaves a gap in the surface it stood on.
 
 ## Making a collision body from a scan (no URDF)
 
-Without a URDF a thing is only paint in the background splat: the simulator
-can neither collide with it nor move it. The section above starts from a
+Without a URDF a thing has no links, so it is only paint in the background
+splat: nothing for the simulator to collide with, nothing to attach its
+gaussians to, and nothing to move. The section above starts from a
 URDF and cuts its splat out of the scan. Things that have no URDF — the
 grape vine, its trellis, a tree — go the other way: cut the body's gaussians
 out of the scan, turn them into a mesh, and wrap that in a generated URDF,
