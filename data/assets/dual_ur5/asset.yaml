@@ -17,7 +17,7 @@ robot:
   arms:
     - name: left
       ee_link: left_wrist_camera_link
-      initial_joint_positions: [1.570796, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]
+      initial_joint_positions: [0.0, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]   # pan 0 = folded arm points forward (+x)
       gripper:
         kind: synergies
         joints: [left_finger_joint]
@@ -26,7 +26,7 @@ robot:
         stroke_m: 0.085
     - name: right
       ee_link: right_wrist_camera_link
-      initial_joint_positions: [-1.570796, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]   # mirrored: folds away from the left arm
+      initial_joint_positions: [0.0, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]
       gripper:
         kind: synergies
         joints: [right_finger_joint]

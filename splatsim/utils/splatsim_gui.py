@@ -691,12 +691,14 @@ class GuiBuilder:
         self._row += 1
         return self._row - 1
 
-    def add_button_row(self, buttons: List[ButtonConfig], colspan: int = 2) -> int:
+    def add_button_row(self, buttons: List[ButtonConfig], colspan: int = 2,
+                       per_row: Optional[int] = None) -> int:
         """Add a row of buttons.
 
         Args:
             buttons: List of button configurations
             colspan: Column span for the button frame
+            per_row: wrap into rows of this many (None = all on one row)
 
         Returns:
             Row index
@@ -704,14 +706,15 @@ class GuiBuilder:
         btn_frame = ttk.Frame(self._parent)
         btn_frame.grid(row=self._row, column=0, columnspan=colspan, pady=8)
 
-        for btn_config in buttons:
+        n = per_row or len(buttons)
+        for i, btn_config in enumerate(buttons):
             self._gui._register_button(btn_config.callback_key)
             btn = ttk.Button(
                 btn_frame, text=btn_config.text,
                 command=lambda k=btn_config.callback_key: self._gui._on_button_pressed(k),
                 style=btn_config.style
             )
-            btn.pack(side="left", padx=5)
+            btn.grid(row=i // n, column=i % n, padx=5, pady=3, sticky="ew")
 
         self._row += 1
         return self._row - 1
@@ -786,8 +789,11 @@ class RobotPlacementPanel(ModePanel):
     BTN_LOAD = "placement_load"
     BTN_SAVE_YAML = "placement_save_yaml"    # -> the robot's own asset/stage yaml (its default pose)
     BTN_RESET = "placement_reset"
-    BTN_STOP_DRIVE = "placement_stop_drive"
     NS = "placement"
+    # Hold-to-drive speeds for the Drive pad (and the arrow keys): brisk
+    # enough to cross a room, slow enough to park.
+    DRIVE_SPEED = 0.4       # m/s
+    DRIVE_TURN = 0.8        # rad/s
     SCENARIO_KEY = "placement.scenario_name"
 
     @classmethod
@@ -819,13 +825,26 @@ class RobotPlacementPanel(ModePanel):
         ):
             builder.add_float_param(FloatParam(key, label, lo, hi, float(v)), float(v))
         if info.get("wheeled"):
-            # Differential drive (robot.base: wheeled). Arrow keys in the
-            # PyBullet window do the same while held.
-            builder.add_header("Drive (m/s, rad/s) — or arrow keys in the PyBullet window")
+            # Differential drive (robot.base: wheeled): a plus-shaped pad of
+            # hold-to-drive buttons. Pressing sets the (forward, turn) values
+            # the server polls in _placement_tick; releasing zeroes them. The
+            # arrow keys in the PyBullet window do the same while held.
+            builder.add_header("Drive (hold) — or arrow keys in the PyBullet window")
             fk, tk_ = self.drive_keys()
-            builder.add_float_param(FloatParam(fk, "forward", -1.0, 1.0, 0.0), 0.0)
-            builder.add_float_param(FloatParam(tk_, "turn (+left)", -2.0, 2.0, 0.0), 0.0)
-            builder.add_button_row([ButtonConfig("Stop", self.BTN_STOP_DRIVE)])
+            for key in (fk, tk_):
+                gui._register_value_var(key, tk.DoubleVar(value=0.0))
+            pad = ttk.Frame(parent)
+            pad.grid(row=builder.current_row, column=0, columnspan=2, pady=(2, 8))
+            builder._row += 1
+            def _btn(text, r, c, fwd, turn):
+                b = ttk.Button(pad, text=text, width=8)
+                b.grid(row=r, column=c, padx=3, pady=3)
+                b.bind("<ButtonPress-1>", lambda _e: (gui.set_value(fk, fwd), gui.set_value(tk_, turn)))
+                b.bind("<ButtonRelease-1>", lambda _e: (gui.set_value(fk, 0.0), gui.set_value(tk_, 0.0)))
+            _btn("forward", 0, 1, self.DRIVE_SPEED, 0.0)
+            _btn("left", 1, 0, 0.0, self.DRIVE_TURN)
+            _btn("right", 1, 2, 0.0, -self.DRIVE_TURN)
+            _btn("back", 2, 1, -self.DRIVE_SPEED, 0.0)
         if joints:
             builder.add_header("Arm joints (rad)")
             for i, (label, lo, hi, q0) in enumerate(joints):
@@ -1325,6 +1344,8 @@ class SplatSimGui(ThreadedTkinterGui):
     # PyBullet window can be watched together while moving the robot by hand.
     RENDER_PLAY_KEY = "render_play"
     RENDER_HZ_KEY = "render_hz"
+    # Wrap width for free-text lines (status, mode): about two thumbnails.
+    TEXT_WRAP_PX = 500
 
     def __init__(
         self,
@@ -1441,6 +1462,7 @@ class SplatSimGui(ThreadedTkinterGui):
         )
         self._camera_frame = ttk.LabelFrame(_pinned, text="", padding=5)
         self._camera_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 5))
+        self._root.bind("<Configure>", lambda e: self._reflow_camera_grid() if e.widget is self._root else None, add="+")
         ttk.Separator(_pinned, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=(5, 0))
 
         _scroll_shell = ttk.Frame(self._root)
@@ -1450,9 +1472,11 @@ class SplatSimGui(ThreadedTkinterGui):
 
         _canvas = tk.Canvas(_scroll_shell, borderwidth=0, highlightthickness=0)
         _vscroll = ttk.Scrollbar(_scroll_shell, orient="vertical", command=_canvas.yview)
-        _canvas.configure(yscrollcommand=_vscroll.set)
+        _hscroll = ttk.Scrollbar(_scroll_shell, orient="horizontal", command=_canvas.xview)
+        _canvas.configure(yscrollcommand=_vscroll.set, xscrollcommand=_hscroll.set)
         _canvas.grid(row=0, column=0, sticky="nsew")
         _vscroll.grid(row=0, column=1, sticky="ns")
+        _hscroll.grid(row=1, column=0, sticky="ew")
 
         main_frame = ttk.Frame(_canvas, padding=self._style.padding)
         _main_window_id = _canvas.create_window((0, 0), window=main_frame, anchor="nw")
@@ -1468,10 +1492,18 @@ class SplatSimGui(ThreadedTkinterGui):
 
         # Stretch the inner frame to the canvas's width so widgets
         # using sticky="ew" fill horizontally instead of clinging to the
-        # left edge. Vertical scrolling only; horizontal isn't needed.
+        # left edge — but never below the frame's own requested width: a
+        # canvas doesn't ask the window for the size of the frames it
+        # hosts, so a window narrower than the widest row (a slider + its
+        # entry) would otherwise clip that row on the right; instead the
+        # horizontal scrollbar reaches it. The window can be resized freely.
         def _on_canvas_configure(event):
-            _canvas.itemconfigure(_main_window_id, width=event.width)
+            _canvas.itemconfigure(_main_window_id, width=max(event.width, main_frame.winfo_reqwidth()))
         _canvas.bind("<Configure>", _on_canvas_configure)
+        self._main_frame = main_frame
+        self._main_canvas = _canvas
+        self._main_scrollbar = _vscroll
+        self._pinned_frame = _pinned
 
         # Mousewheel — Windows/Mac vs X11 use different event types.
         # bind_all so the wheel scrolls the panel even when the cursor
@@ -1493,21 +1525,25 @@ class SplatSimGui(ThreadedTkinterGui):
         # Current mode status display
         self._mode_var = tk.StringVar(value=f"Mode: {self._initial_mode}")
         self._register_value_var("_mode_var", self._mode_var)
-        mode_label = ttk.Label(main_frame, textvariable=self._mode_var, style="Header.TLabel")
+        mode_label = ttk.Label(main_frame, textvariable=self._mode_var, style="Header.TLabel", wraplength=self.TEXT_WRAP_PX, justify="left")
         mode_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 2))
         builder._row += 1
 
         # Trajectory progress status line
         self._status_var = tk.StringVar(value="")
         self._register_value_var("_status_var", self._status_var)
-        status_label = ttk.Label(main_frame, textvariable=self._status_var)
+        # Long status lines wrap at a fixed width rather than dictating the
+        # window's (a wrap tied to the window width feeds back: wider
+        # window -> longer line -> wider natural width -> wider window).
+        status_label = ttk.Label(main_frame, textvariable=self._status_var, wraplength=self.TEXT_WRAP_PX, justify="left")
         status_label.grid(row=builder.current_row, column=0, columnspan=2, sticky="w", pady=(0, 8))
         builder._row += 1
 
-        # Mode selection buttons (one per panel)
+        # Mode selection buttons (one per panel), two per row so the window
+        # can stay narrow.
         builder.add_button_row([
             ButtonConfig(p.name, p.button_key, "Mode.TButton") for p in self._panels
-        ])
+        ], per_row=2)
 
         # Environment reset button — always visible regardless of mode
         builder.add_button_row([
@@ -1579,20 +1615,7 @@ class SplatSimGui(ThreadedTkinterGui):
         # winfo_reqheight asynchronously during the first idle pass).
         def _clamp_height():
             try:
-                self._root.update_idletasks()
-                req_h = self._root.winfo_reqheight()
-                req_w = self._root.winfo_reqwidth()
-                screen_h = self._root.winfo_screenheight()
-                screen_w = self._root.winfo_screenwidth()
-                # Default-size multipliers chosen so the initial window is
-                # roomy: 2× the natural requested width and 3× the natural
-                # requested height. Both are then capped against the screen
-                # (90% to leave taskbar/menubar room) — the scrollbar
-                # handles the case where the requested height exceeds that
-                # cap. Width has no horizontal scrolling, so we just cap to
-                # the screen as a safety net.
-                use_w = min(int(req_w * 2), screen_w)
-                use_h = min(int(req_h * 3), int(screen_h * 0.90))
+                use_w, use_h = self._natural_window_size()
                 self._root.geometry(f"{use_w}x{use_h}")
             except tk.TclError:
                 pass
@@ -1670,6 +1693,12 @@ class SplatSimGui(ThreadedTkinterGui):
                     panel.frame.grid()
                 else:
                     panel.frame.grid_remove()
+            except tk.TclError:
+                pass
+        # A wider panel (Robot Placement's sliders, say) must not be clipped.
+        if self._root is not None and getattr(self, "_main_frame", None) is not None:
+            try:
+                self._root.after_idle(self._fit_window)
             except tk.TclError:
                 pass
 
@@ -1770,6 +1799,37 @@ class SplatSimGui(ThreadedTkinterGui):
         """
         self.update_camera_images({})
 
+    def _natural_window_size(self) -> tuple:
+        """(width, height) the window needs to show everything without
+        clipping: the wider of the pinned camera row (which the root sizes
+        itself for) and the scrollable content (which it doesn't — see
+        _on_canvas_configure) plus the scrollbar; the camera row plus the
+        content's height. Both capped to the screen (90% of its height,
+        for the taskbar); the scrollbar takes over past that."""
+        self._root.update_idletasks()
+        pad = 2 * int(self._style.padding) + 4
+        content_w = self._main_frame.winfo_reqwidth() + self._main_scrollbar.winfo_reqwidth() + pad
+        # The camera area flows (see _reflow_camera_grid), so it never needs
+        # more than two thumbnails of width; the third wraps.
+        cam_w = 2 * self._THUMB_CELL_W + 2 * pad
+        w = min(max(cam_w, content_w), self._root.winfo_screenwidth())
+        content_h = self._pinned_frame.winfo_reqheight() + self._main_frame.winfo_reqheight() + pad
+        h = min(content_h, int(self._root.winfo_screenheight() * 0.90))
+        return w, h
+
+    def _fit_window(self) -> None:
+        """Grow the window to its natural size if something (a camera
+        thumbnail arriving, a panel appearing) made the content bigger than
+        the window is now. Never shrinks a window the user resized, and
+        never grows one past the content's natural size."""
+        try:
+            w, h = self._natural_window_size()
+            cur_w, cur_h = self._root.winfo_width(), self._root.winfo_height()
+            if w > cur_w or h > cur_h:
+                self._root.geometry(f"{max(w, cur_w)}x{max(h, cur_h)}")
+        except (tk.TclError, AttributeError):
+            pass
+
     def _poll_camera_images(self) -> None:
         """Poll for pending image updates from other threads."""
         if not self._root or self._shutdown_requested:
@@ -1794,11 +1854,15 @@ class SplatSimGui(ThreadedTkinterGui):
         if self._camera_frame is None:
             return
 
-        # Determine grid layout: arrange in rows of up to 2 columns
+        # Thumbnails are 224 px and FLOW: as many per row as the camera
+        # area is wide (base_rgb, left_wrist_rgb, right_wrist_rgb on one
+        # row when there is room, wrapping otherwise). Re-flowed on resize
+        # by _reflow_camera_grid. Before the first layout pass the frame
+        # has no width yet; two per row until then.
         camera_names = sorted(frames.keys())
         num_cameras = len(camera_names)
-        cols = min(num_cameras, 2)
         max_thumb_width = 224
+        cols = self._camera_cols(num_cameras)
 
         # Remove labels for cameras that are no longer present
         stale = set(self._camera_labels.keys()) - set(camera_names)
@@ -1835,5 +1899,41 @@ class SplatSimGui(ThreadedTkinterGui):
                 img_lbl = tk.Label(self._camera_frame, bg="black")
                 img_lbl.grid(row=row + 1, column=col, padx=5, pady=(0, 5))
                 self._camera_labels[name] = img_lbl
+                # Thumbnails arrive after the window was sized; grow it if
+                # the camera area no longer fits (up to the natural size).
+                self._root.after_idle(self._fit_window)
 
             self._camera_labels[name].configure(image=photo)
+        self._camera_cols_used = cols
+
+    # Thumbnail cell width: 224 px image + grid padding.
+    _THUMB_CELL_W = 224 + 10
+
+    def _camera_cols(self, num_cameras: int) -> int:
+        """How many thumbnails fit per row in the camera area's current width."""
+        if num_cameras <= 0:
+            return 1
+        # Measured against the WINDOW, not the camera frame: a gridded
+        # frame never reports less than its requested width, so it would
+        # never ask to wrap when the window is made narrower than it.
+        try:
+            avail = self._root.winfo_width() - 2 * int(self._style.padding) - 10
+        except tk.TclError:
+            avail = 0
+        if avail <= 1:                      # not laid out yet
+            return min(num_cameras, 2)
+        return max(1, min(num_cameras, avail // self._THUMB_CELL_W))
+
+    def _reflow_camera_grid(self, _event=None) -> None:
+        """Re-grid the thumbnails when the camera area's width changes."""
+        names = sorted(self._camera_labels.keys())
+        if not names:
+            return
+        cols = self._camera_cols(len(names))
+        if cols == getattr(self, "_camera_cols_used", None):
+            return
+        self._camera_cols_used = cols
+        for idx, name in enumerate(names):
+            row, col = (idx // cols) * 2, idx % cols
+            self._camera_name_labels[name].grid_configure(row=row, column=col)
+            self._camera_labels[name].grid_configure(row=row + 1, column=col)
