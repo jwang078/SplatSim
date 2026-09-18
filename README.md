@@ -216,34 +216,39 @@ its own `robot:` block, which overrides the asset's.
 Anything with a URDF is an asset: a folder under `data/assets/` that the
 simulator can load into any scene, collide with and move. If all you have
 is the body's splat, *Making a collision body from a scan* builds the
-collision mesh and URDF from its gaussians instead. The steps below are written for a robot,
-which is the interesting case (joints, gripper, cameras); a box is the same
-with just step 1.
+collision mesh and URDF from its gaussians instead. The steps below are written for a robot (joints, gripper, cameras); something simpler like a box is the same with just step 1.
+
+The commands below use the shipped UR5: its body is `data/assets/ur5/`, and
+`robot_iphone_w_engine_curtain` is the scan of it under `data/stages/`, whose
+`stage.yaml` says `asset: ur5`. Either name works wherever a robot is asked
+for; the scan name renders the robot photoreal, the asset name draws it from
+its meshes.
 
 1. Make a folder under `data/assets/` and put the URDF (and its meshes)
    inside. Add an `asset.yaml` next to it that says where the URDF is:
    ```yaml
    urdf_path: my_robot.urdf
    ```
-   `data/assets/panda/`, `ur5/` and `ur5e/` are complete, working robot folders
-   — copy one.
+   `data/assets/ur5/`, `ur5e/` and `panda/` are complete, working robot
+   folders — copy one.
 2. Check what the simulator sees:
    ```bash
-   python scripts/check_robot.py my_robot
+   python scripts/check_robot.py robot_iphone_w_engine_curtain
    ```
    It prints the arm joints, gripper, cameras and end-effector link it
    derived, and warns about anything it had to guess. If a guess is wrong,
    add the matching key under `robot:` in `asset.yaml` — every key is
-   optional and documented in the example.
+   optional and documented in `data/assets/panda/asset.yaml`.
 3. Put it in a scene:
    ```bash
-   python scripts/launch_nodes.py --robot sim_pybullet_vine_interactive --robot_name my_robot --viewer
+   python scripts/launch_nodes.py --robot sim_pybullet_vine_interactive \
+       --robot_name robot_iphone_w_engine_curtain --viewer --control_gui
    ```
    `--viewer` works with any environment: it loads the scene and the robot and
    nothing else — no task, no planning, no datasets — so you can look at how the
-   robot fits. Without a splat scan of its own the robot is drawn from its
-   meshes, composited by depth into the scene. Drop `--viewer` when you want
-   the environment's task to run against it.
+   robot fits. A robot without a scan of its own (`--robot_name ur5e`, say) is
+   drawn from its meshes, composited by depth into the scene. Drop `--viewer`
+   when you want the environment's task to run against it.
 4. **Play** (on by default; off while generating trajectories) in the control window makes the splat render update
    continuously (at the rate next to it) instead of only when something asks
    for an observation — handy for watching the splat and the PyBullet window
@@ -253,8 +258,8 @@ with just step 1.
    live in the scene. Type a name and press **Save scenario** to keep the
    arrangement as `data/scenarios/<env>__<robot>__<name>.json` (**Load
    scenario** brings one back; `--scenario <name>` launches into it).
-   **Save as robot default (yaml)** instead writes the pose into your
-   `asset.yaml` so the robot starts there in every scene (comments kept).
+   **Save as robot default (yaml)** instead writes the pose into the robot's
+   yaml so it starts there in every scene (comments kept).
 
 The yaml can also say, all optional: which joints are the arm and which the
 gripper, how the gripper is commanded (one value, one per finger, or
