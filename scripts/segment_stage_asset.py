@@ -11,12 +11,14 @@ alignment tends to find odd solutions, so it stays manual):
              Open both in CloudCompare, crop the splat down to the body, align
              (ICP without scale, fix by hand, ICP with scale) and copy the final
              Transformation History matrix.
-  2. transform  paste that matrix in:
-                 python scripts/segment_stage_asset.py <stage> --asset robot transform matrix.txt
-             The first body of a scan defines the scan's transformation
-             (splat -> simulator). For every later body the scan is already
-             placed, so align the URDF cloud onto the splat instead and pass
-             --as-pose: the matrix becomes that body's base pose.
+  2. paste that matrix into the stage.yaml under `transformation: matrix:`
+             (four rows, formatted like data/stages/robot_iphone_w_engine_curtain/
+             stage.yaml). It is the scan's splat -> simulator transform, shared
+             by every body in the scan. For a later body the scan is already
+             placed: align the URDF cloud onto the splat instead and write
+             its pose as the body's base_position / base_orientation_rpy —
+             or let `transform --as-pose` convert the matrix for you:
+                 python scripts/segment_stage_asset.py <stage> --asset box transform "<16 numbers>" --as-pose
   3. labels  with everything aligned, fit the body's box, label every gaussian
              inside it with the nearest URDF link and save both to the yaml:
                  python scripts/segment_stage_asset.py <stage> --asset robot labels [--show]
@@ -170,10 +172,14 @@ def step_pcd(stage: str, asset: str, name: str, cfg: dict, args) -> Path:
         print(f"[{name}] splat as a plain RGB cloud -> {splat_rgb}  ({len(xyz)} gaussians)")
     else:
         print(f"[{name}] splat_rgb.ply already there (use --force to rewrite)")
-    print("Next: open both in CloudCompare, crop the splat to this body, align (ICP without scale, "
-          "adjust by hand, ICP with scale), then\n"
-          f"      python scripts/segment_stage_asset.py {stage} --asset {asset} transform <matrix>"
-          + ("" if is_first_body(stage, asset) else "  --as-pose"))
+    if is_first_body(stage, asset):
+        print("Next: open both in CloudCompare, crop the splat to this body, align it onto the URDF cloud (ICP without "
+              "scale, adjust by hand, ICP with scale), paste Transformation History into the stage.yaml under "
+              f"`transformation: matrix:`, then\n      python scripts/segment_stage_asset.py {stage} --asset {asset} labels --show")
+    else:
+        print("Next: open both in CloudCompare and move the URDF cloud onto this body in the splat; write where it ended "
+              f"up as the body's base_position / base_orientation_rpy (or: segment_stage_asset.py {stage} --asset {asset} "
+              f"transform \"<16 numbers>\" --as-pose), then\n      python scripts/segment_stage_asset.py {stage} --asset {asset} labels --show")
     p.disconnect()
     return pcd_path
 

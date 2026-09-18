@@ -366,15 +366,18 @@ never the other way round:
 </details>
 
 The result is in `Transformation History` (bottom of Properties in the left
-sidebar). Paste it in — a file with the four rows, or the 16 numbers on the
-command line:
+sidebar). Paste its four rows into your `stage.yaml` under `transformation:
+matrix:`, formatted like the shipped
+`data/stages/robot_iphone_w_engine_curtain/stage.yaml`:
 
-```bash
-python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset robot transform matrix.txt
+```yaml
+transformation:                   # splat frame -> simulator frame, shared by every body in the scan
+  matrix:
+  - [-0.231955, -0.002806, -0.002667, -0.299566]
+  - [0.001594, 0.076423, -0.219032, 0.764096]
+  - [0.003528, -0.219019, -0.076393, 0.550882]
+  - [0.0, 0.0, 0.0, 1.0]
 ```
-
-That becomes the stage's `transformation` (splat → simulator), which every
-body in the scan shares.
 
 #### 3. Cut the body out and label it
 
@@ -395,12 +398,13 @@ under that body and rerun.
 
 The scan is now placed, so a second body (a box, say) is aligned the other
 way: run `pcd` for it, move the *URDF cloud* onto the splat in CloudCompare,
-and pass the matrix with `--as-pose` — it becomes that body's
-`base_position` / `base_orientation_rpy` — then `labels`:
+and write where it ended up as that body's `base_position` /
+`base_orientation_rpy` in the yaml (or hand the matrix to `transform
+--as-pose`, which converts it for you) — then `labels`:
 
 ```bash
 python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box pcd
-python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box transform matrix.txt --as-pose
+python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box transform "<16 numbers>" --as-pose   # optional
 python scripts/segment_stage_asset.py robot_iphone_w_engine_curtain --asset box labels --show
 ```
 
