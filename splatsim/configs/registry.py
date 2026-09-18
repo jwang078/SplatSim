@@ -135,6 +135,11 @@ def _load_tree(root: Path) -> Dict[str, Dict[str, Any]]:
     if not root.is_dir():
         return entries
     files = sorted((f for pat in ENTRY_FILES for f in root.rglob(pat)), key=lambda p: (len(p.parts), str(p)))
+    # A tarball made before the rename may drop a `scene.yaml` / `robot.yaml`
+    # next to the `stage.yaml` / `asset.yaml` that git tracks: the tracked
+    # file is the current one, so the old name is ignored, not merged.
+    files = [f for f in files
+             if not (f.name in LEGACY_ENTRY_FILES and any((f.parent / n).exists() for n in (ASSET_FILE, STAGE_FILE)))]
     resolved_by_dir: Dict[Path, Dict[str, Any]] = {}
     for f in files:
         folder = f.parent
