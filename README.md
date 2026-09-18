@@ -117,9 +117,19 @@ python scripts/launch_nodes.py --robot sim_pybullet_vine_interactive \
 ```
 
 You should see the PyBullet window, the control GUI, and a splat render with
-the arm in front of the vine. `--wrist_cam_ver=2` picks a fisheye calibration
+the arm in front of the vine. The scene starts exactly as configured — every
+object at its placed pose, the robot at its scan / home pose (or the saved
+`default` scenario, if there is one); nothing is randomised or planned until
+you press **Reset Env** or start generating trajectories. `--wrist_cam_ver=2` picks a fisheye calibration
 that ships in the code; `--robot_name` isn't needed, the variant knows its
 robot.
+
+You can also view the small engine environment:
+
+```bash
+python scripts/launch_nodes.py     --robot sim_ur_pybullet_small_engine_new_interactive     --rob
+ot_port 6001 --robot_name robot_iphone_w_engine_curtain --wrist_cam_ver=2
+```
 
 The apple-on-plate demo from the paper (the `test_data` / `output` /
 `bc_data/gello` downloads) is not maintained here — use the

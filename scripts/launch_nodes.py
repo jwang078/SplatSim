@@ -849,18 +849,12 @@ def launch_robot_server(args: Args):
                 print(f"[scenario] FAILED to load {_scenario_path}: {exc}\n"
                       f"[scenario] continuing with normal randomization")
         else:
-            # Prime it from a VALIDATED scene: reset() runs the randomize /
-            # solvability search once, so what gets cached is an arrangement
-            # that passed the check — not the construction-time defaults.
-            # Pinning afterwards stops serve()'s own reset re-running it.
-            print(f"[scenario] {_scenario_path} not found — randomizing once, "
-                  f"then caching the result")
-            try:
-                server.reset()
-                server.save_scenario_file(_scenario_path)
-                server._pinned_scenario = server.scenario_dict()
-            except Exception as exc:                    # noqa: BLE001
-                print(f"[scenario] could not prime cache: {exc}")
+            # No saved arrangement: start from the configured poses (objects
+            # as placed, the robot at its scan / home pose). Nothing costly
+            # runs until Reset Env or trajectory generation; save a scenario
+            # from the Robot Placement panel to come back to an arrangement.
+            print(f"[scenario] no {_scenario_path.name} — starting from the configured poses "
+                  f"(Reset Env randomises; Robot Placement > Save scenario keeps an arrangement)")
 
     if getattr(args, "save_scenario", None):
         try:

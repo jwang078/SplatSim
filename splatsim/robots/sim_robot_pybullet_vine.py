@@ -315,20 +315,12 @@ class VineGrapeReachPybulletRobotServer(SmallEnginePybulletRobotServer):
         # get_env_config and _resolve_goal_ee_target.
         if getattr(self, "viewer_mode", False):
             return   # viewer: no goal solving, no soft-cost overlay setup
-        try:
-            pos, quat, q_seed = self._grape_goal()
-            cfg = self.trajectory_generator.config
-            cfg.ee_pos_goal = [float(v) for v in pos]
-            cfg.ee_quat_goal = [float(v) for v in quat]
-            cfg.q_goal_bias = [float(v) for v in q_seed]
-        except Exception:
-            logger.exception(
-                "vine env: could not refine trajectory-gen goal — GUI batch "
-                "generation will use the STATIC task pose (bunch centre, "
-                "horizontal approach, no fingertip offset). Episodes will "
-                "still aim at the bunch but from the wrong distance; fix the "
-                "goal search before recording."
-            )
+        # The grasp-aligned goal (a task-space search + IK, tens of seconds)
+        # is NOT solved here: startup shows the scene as scanned / configured,
+        # and the goal is solved on the first reset that needs it
+        # (trajectory generation, Reset Env), then cached per bunch —
+        # see _pick_target_bunch and _get_default_trajectory_gen_config,
+        # which falls back to the static task pose until then.
         # GUI-only overlay of the SOFT vegetation (leaves/twigs/grapes the
         # pipeline kept OUT of the hard collision mesh), viridis by cost
         # weight. Debug points, drawn once: no bodies, no broadphase entry,

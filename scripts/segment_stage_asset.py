@@ -224,9 +224,11 @@ def step_labels(stage: str, asset: str, name: str, cfg: dict, args) -> None:
     X, y = sample_urdf(body)
     # the body's box in the simulator frame: the URDF's extent plus the yaml's adjustments
     adj = np.asarray((cfg.get("aabb") or {}).get("urdf_bbox_adjustment") or [[0, 0], [0, 0], [0, 0]], dtype=np.float64)
-    lo = X.min(0) + adj[:, 0]
-    hi = X.max(0) + adj[:, 1]
-    box = [[round(float(v), 4) for v in lo], [round(float(v), 4) for v in hi]]
+    # The box is written to the yaml rounded to 4 decimals, and the simulator
+    # cuts the gaussians with THAT box, so the labels must be fitted with the
+    # rounded box too — every gaussian the loader keeps needs a label.
+    box = [[round(float(v), 4) for v in X.min(0) + adj[:, 0]], [round(float(v), 4) for v in X.max(0) + adj[:, 1]]]
+    lo, hi = np.asarray(box[0]), np.asarray(box[1])
     # the splat into the simulator frame
     xyz, rgb = read_splat(splat_ply(cfg))
     T = np.asarray(cfg["transformation"]["matrix"], dtype=np.float64)

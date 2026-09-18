@@ -6836,8 +6836,17 @@ class PybulletRobotServerBase:
         else:
             return self.reset(seed=seed, options=options)
 
+    # Modes that start from the scene exactly as constructed (every object at
+    # its configured pose, the robot at its scan / home pose, or the loaded
+    # scenario): no randomisation and no goal solving until the user presses
+    # Reset Env or starts generating. The episode-driven modes reset first.
+    START_WITHOUT_RESET_MODES = ("interactive", "placement", "generate_trajectories_idle", "eval_benchmark_idle")
+
     def serve(self) -> None:
-        self.reset()
+        if self.serve_mode.value in self.START_WITHOUT_RESET_MODES:
+            print(f"[serve] starting in {self.serve_mode.value} from the configured poses (Reset Env randomises)")
+        else:
+            self.reset()
 
         self._lerobot_saver = None
         _prev_serve_mode = self.serve_mode

@@ -1,0 +1,20 @@
+# Floating Robotiq gripper: a 6-DoF "virtual arm" (3 prismatic + 3 revolute
+# joints) that places the gripper anywhere, for replaying end-effector
+# trajectories (UMI-style) without an arm. The envs that use it:
+#   python scripts/launch_nodes.py --robot sim_pybullet_floating_gripper [--control_gui]
+#   python scripts/launch_nodes.py --robot sim_pybullet_floating_gripper_vine [--control_gui]
+urdf_path: floating_gripper.urdf
+base_position: [0.0, 0.0, 0.0]
+base_orientation_rpy: [0.0, 0.0, 0.0]
+
+robot:
+  base: fixed
+  arm_joints: [joint_1, joint_2, joint_3, joint_4, joint_5, joint_6]   # x, y, z, rx, ry, rz of the tool
+  ee_link: tcp_link
+  initial_joint_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  gripper:
+    kind: robotiq_2f85
+  cameras:
+    - name: wrist
+      link: wrist_camera_link
+      model: fisheye_v2
