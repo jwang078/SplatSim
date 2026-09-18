@@ -1,3 +1,4 @@
+import copy
 import logging
 import pickle
 import threading
@@ -1489,6 +1490,7 @@ class PybulletRobotServerBase:
                     name="background",
                     splat_name=self.background_splat_name,
                     keep_within_aabb=False,
+                    exclude_aabbs=self._background_cutouts(),
                     load_urdf=False,
                     is_articulated=False,
                     randomize_pose=False,
@@ -3649,6 +3651,26 @@ class PybulletRobotServerBase:
         if self.RENDER_ROBOT_SPLAT is None:
             return bool(self.RENDER_SPLATS)
         return bool(self.RENDER_ROBOT_SPLAT and self.RENDER_SPLATS)
+
+    def _background_cutouts(self) -> list:
+        """Boxes to cut out of the background scan: the bodies segmented from
+        it that this env renders AS THEIR OWN gaussians (an env object with
+        load_splat=True whose splat_name is `<background>/<instance>`), so
+        they are not painted twice. A body the env loads with
+        load_splat=False — the vine, drawn by the background itself — must
+        NOT be cut, or its gaussians vanish. The robot's own box is handled
+        by the background entry's aabb (the scan's `robot` instance) and by
+        the robot rendering as gaussians in its place."""
+        stage = self.background_splat_name
+        boxes = []
+        for oc in getattr(self.ENV_CONFIG, "objects", None) or []:
+            sn = getattr(oc, "splat_name", None)
+            if not sn or not getattr(oc, "load_splat", False) or not sn.startswith(f"{stage}/"):
+                continue
+            entry = registry.get(sn) or {}
+            if entry.get("aabb"):
+                boxes.append(copy.deepcopy(entry["aabb"]))
+        return boxes
 
     def _composite_bodies(self) -> Dict[int, str]:
         """{pybullet body id: object name} of every body to draw from PyBullet
@@ -8053,11 +8075,8 @@ class PybulletRobotServerBase:
         turn = (1.0 if down(p.B3G_LEFT_ARROW) else 0.0) - (1.0 if down(p.B3G_RIGHT_ARROW) else 0.0)
         if fwd == 0.0 and turn == 0.0:
             return None
-        return fwd * self.DRIVE_KEY_SPEED, turn * self.DRIVE_KEY_TURN_RATE
-
-    # Arrow-key driving speeds (Robot Placement mode, wheeled bases).
-    DRIVE_KEY_SPEED: ClassVar[float] = 0.5        # m/s
-    DRIVE_KEY_TURN_RATE: ClassVar[float] = 1.0    # rad/s
+        from splatsim.utils.splatsim_gui import RobotPlacementPanel as P
+        return fwd * P.DRIVE_SPEED, turn * P.DRIVE_TURN
 
     # ------------------------------------------------------------ placement
     def _robot_placement_info(self) -> Optional[dict]:
@@ -8166,9 +8185,6 @@ class PybulletRobotServerBase:
                 self._command_grippers(np.asarray(state[2]))
                 self.current_gripper_action = float(gs[0]) if len(gs) == 1 else np.asarray(gs)
             self._bump_state_version()
-        if gui.check_button(P.BTN_STOP_DRIVE):
-            for k in P.drive_keys():
-                gui.set_value(k, 0.0)
         if gui.check_button(P.BTN_SAVE):
             self._placement_save_scenario(gui.get_value(P.SCENARIO_KEY))
         if gui.check_button(P.BTN_LOAD):
