@@ -1636,6 +1636,33 @@ class PybulletRobotServerBase:
                   f"URDF meshes (composited by depth into the splat render). Scan it for photoreal rendering.")
         return spec
 
+    def _reset_to_labelling_pose(self, splatsim_obj: SplatSimObject) -> None:
+        """Snap every URDF joint to the pose the splat's link labels were
+        assigned in, so `initial_link_poses` (the per-link render reference)
+        matches the geometry those labels describe.
+
+        With a `scan_pose` that is the yaml's value for every named joint,
+        mimic children included (what segment_stage_asset.load_body sets).
+        Without one, the labels came from the legacy full joint list, which
+        `_build_robot_spec` has already reduced to the state vector; the best
+        reconstruction of the gripper children is their <mimic> relation to
+        the (already teleported) parent."""
+        rid = splatsim_obj.sim_id
+        pc = self.pybullet_client
+        scan = splatsim_obj.config.scan_pose
+        if scan:
+            by_name = {pc.getJointInfo(rid, j)[1].decode(): j for j in range(pc.getNumJoints(rid))}
+            for k, v in scan.items():
+                pc.resetJointState(rid, by_name[k], float(v))
+            return
+        spec = getattr(self, "robot_spec", None)
+        if spec is None:
+            return
+        for g in spec.grippers:
+            for child, (parent, mult, offset) in g.mimic.items():
+                qp = pc.getJointState(rid, parent)[0]
+                pc.resetJointState(rid, child, mult * qp + offset)
+
     def num_dofs(self) -> int:
         spec = getattr(self, "robot_spec", None)
         return spec.num_dofs if spec is not None else 6
@@ -2214,9 +2241,16 @@ class PybulletRobotServerBase:
 
             # Use the config to find these values.
             self.teleport_joint_state(splatsim_obj, splatsim_obj.config.articulation_config.initial_joint_positions)
-            # Capture the transform-reference link poses at EXACTLY
-            # initial_joint_positions (resetJointState just set every joint,
-            # including the gripper mimic joints). get_curr_link_states uses
+            # teleport_joint_state only resets the STATE-VECTOR joints (arm +
+            # commanded gripper joint for a declared robot). The splat's link
+            # labels were made with EVERY joint at scan_pose — including the
+            # gripper's <mimic> children (segment_stage_asset.load_body) — so
+            # put those there too before the reference is captured, else the
+            # mimic-driven finger links get a reference ~finger_joint rad off
+            # and render over-rotated.
+            self._reset_to_labelling_pose(splatsim_obj)
+            # Capture the transform-reference link poses at EXACTLY the
+            # labelling pose. get_curr_link_states uses
             # computeForwardKinematics=True, so this is valid without stepping.
             #
             # CRITICAL: the robot must stay at this pose until AFTER
