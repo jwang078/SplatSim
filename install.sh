@@ -255,7 +255,18 @@ fi
 
 # Compile it now rather than on the user's first render — it takes minutes,
 # and a failure belongs in this script's output, not in a sim session.
-python - <<'GSPLAT'
+#
+# With TORCH_CUDA_ARCH_LIST UNSET, deliberately. It is exported above for the
+# ahead-of-time extensions, but gsplat compiles at RUNTIME, inside a sim
+# process that has no such variable — and torch then derives its own flags
+# from the device, adding a PTX `code=compute_XX` gencode that an explicit
+# arch list leaves out. Different flags mean a different build.ninja, so
+# ninja discards everything built here and recompiles ~30 CUDA files during
+# the first render: ten minutes that look exactly like a hang, because the
+# serve loop is stuck in it — no GUI status, no camera thumbnails, buttons
+# that do nothing. Matching the runtime flags is the whole point of warming
+# the cache, so build it the way the sim will ask for it.
+env -u TORCH_CUDA_ARCH_LIST python - <<'GSPLAT'
 import torch
 from gsplat import spherical_harmonics
 sh = torch.zeros(4, 1, 3, device="cuda")

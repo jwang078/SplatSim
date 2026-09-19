@@ -15,8 +15,8 @@ picks a PyTorch build that has kernels for it (CUDA 12.8 for Turing and
 newer, CUDA 12.6 for anything older, down to a GTX 10-series).
 
 ```bash
-git clone --recursive git@github.com:jwang078/SplatSim.git ~/code/SplatSim
-cd ~/code/SplatSim
+git clone --recursive git@github.com:jwang078/SplatSim.git
+cd SplatSim
 ./install.sh
 conda activate splatsim
 ```
@@ -36,7 +36,8 @@ If you'd like to drive a physical xArm, add the hardware extras afterwards:
 pip install -e '.[hardware]'
 ```
 
-### LeRobot
+<details>
+<summary>LeRobot — installed alongside SplatSim, and how to point it at your own checkout</summary>
 
 `install.sh` also clones and installs
 [our fork of LeRobot](https://github.com/jwang078/lerobot) into
@@ -47,8 +48,11 @@ the installer uses a sibling `../lerobot` automatically, or point it anywhere
 with `LEROBOT_DIR=/path/to/lerobot ./install.sh` — and symlinks whichever one
 it used to `external/lerobot`, so the layout is the same either way and paths
 can just say `external/lerobot`. (`external/` is gitignored, link included.)
+</details>
 
-### Things `install.sh` already handles
+<a id="things-installsh-already-handles"></a>
+<details>
+<summary>Things <code>install.sh</code> already handles — the dependencies it patches so they build</summary>
 
 You don't need to do anything about these — they're listed so the output
 doesn't surprise you.
@@ -69,6 +73,7 @@ doesn't surprise you.
   the whole renderer with it). Then it builds the extension once, so the
   first sim launch doesn't spend minutes on nvcc. Re-run that script by hand
   after any `pip install gsplat`, which restores the stock sources.
+</details>
 
 ### If something goes wrong
 
@@ -120,15 +125,15 @@ scene that it uses as its robot.
 
 One tarball per scene, named after the folder it unpacks to:
 
-- [vine_scene.tar.gz](https://drive.google.com/file/d/1fzErjuOOu85abCVYgvtSJQXf6HzEpZmO/view?usp=drive_link) — the grape vine, scanned in the highbay, ~1 GB
-- [robot_iphone_w_engine_curtain.tar.gz](https://drive.google.com/file/d/15OvhOXCvdgjNVPUZB1W28DLXjG9HLpJX/view?usp=drive_link) — the UR5 with its wrist camera, scanned in the engine scene, ~370 MB
+- [vine_scene.tar.gz](https://drive.google.com/file/d/1y9-8epz9nQ868EmqGSHOH_tyuGUB_X_8/view?usp=drive_link) — the grape vine prop, scanned in the highbay, ~1 GB
+- [robot_iphone_w_engine_curtain.tar.gz](https://drive.google.com/file/d/14CONUnIpUrL6v5KV99zVB8cOJanOUSZt/view?usp=drive_link) — the UR5 with its wrist camera, scanned in the engine scene, ~370 MB
 
 Unpack both into the repo's `data/stages/` folder. Each carries its own
 `stage.yaml`, so there's nothing to edit:
 
 ```bash
-tar xzf vine_scene.tar.gz -C /path/to/SplatSim/data/stages
-tar xzf robot_iphone_w_engine_curtain.tar.gz -C /path/to/SplatSim/data/stages
+tar xzf /path/to/vine_scene.tar.gz -C data/stages
+tar xzf /path/to/robot_iphone_w_engine_curtain.tar.gz -C data/stages
 ```
 
 That gives you:

@@ -1313,6 +1313,11 @@ class PybulletRobotServerBase:
             )
             render_mode = RenderMode.PYBULLET
         self._apply_render_mode(render_mode)
+        # gsplat compiles its CUDA extension on first use. Do that HERE, with
+        # a message, rather than silently inside the first render — see
+        # `_ready_gsplat_extension`.
+        if self.RENDER_SPLATS and self.use_gsplat:
+            self._ready_gsplat_extension()
         # Launch-time preference, kept separate from the runtime gates above:
         # paths that re-enable rendering after a temporary disable (e.g.
         # _render_and_save_episode in trajectory-gen mode) and the LeRobot
@@ -3716,6 +3721,97 @@ class PybulletRobotServerBase:
             if bodies:
                 print(f"[render] compositing from PyBullet (no splat): {sorted(bodies.values())}")
         return bodies
+
+    def _ready_gsplat_extension(self) -> None:
+        """Load gsplat's CUDA extension now, saying so if it has to compile.
+
+        gsplat JIT-compiles `gsplat_cuda` (~30 CUDA files, minutes) the
+        first time a kernel is called. Left to happen on its own, that first
+        call is the first render — inside the serve loop, after "Ready to
+        serve.", after the GUI is up. The window paints, the buttons do
+        nothing, no thumbnails appear, and nothing says why: gsplat only
+        announces a build when there is NO cached .so at all. When one exists
+        but was built for different flags (a shell exporting
+        TORCH_CUDA_ARCH_LIST, a torch upgrade, an installer bug we have had),
+        torch's loader rebuilds every file without a word. It reads as a hang.
+
+        install.sh warms this cache, so normally the load here takes a few
+        seconds. When it will not, predict it from what ninja will compare
+        — is there a .so, and do its gencode flags match what torch wants
+        for this GPU right now — and say so up front, with the reason and
+        the time it takes. Then load in a worker so this thread can keep
+        printing a heartbeat: "still compiling" every 30 s is the difference
+        between a user who waits and one who kills the process at minute 4.
+        """
+        import re
+
+        build_dir: Optional[Path] = None
+        reason: Optional[str] = None
+        try:
+            from torch.utils.cpp_extension import (
+                _get_build_directory,
+                _get_cuda_arch_flags,
+            )
+
+            build_dir = Path(_get_build_directory("gsplat_cuda", verbose=False))
+            so = build_dir / "gsplat_cuda.so"
+            ninja = build_dir / "build.ninja"
+            if not so.exists():
+                reason = "no cached build for this python/torch/CUDA"
+            elif ninja.exists():
+                wanted = sorted(set(_get_cuda_arch_flags()))
+                cached = sorted(set(re.findall(r"-gencode=\S+", ninja.read_text())))
+                if wanted != cached:
+                    reason = (
+                        "the cached build is for different GPU arch flags\n"
+                        f"         cached: {' '.join(cached)}\n"
+                        f"         wanted: {' '.join(wanted)}\n"
+                        "         (TORCH_CUDA_ARCH_LIST exported in this shell? It changes them.)"
+                    )
+        except Exception:
+            pass  # private torch helpers moved — fall through to the timed load
+
+        if reason:
+            print(
+                f"[gsplat] compiling its CUDA extension — {reason}\n"
+                "         One-time: roughly 2–10 minutes (ninja + nvcc over ~30 files;\n"
+                "         faster with more CPU cores). The sim starts when it finishes.\n"
+                "         install.sh normally does this ahead of time; re-run it if this\n"
+                "         keeps happening."
+                + (f"\n         build dir: {build_dir}" if build_dir else "")
+            )
+
+        # Load in a worker so the main thread can report progress. The load
+        # is ninja in a subprocess plus a dlopen — nothing that needs to be
+        # on the main thread or a CUDA context.
+        outcome: Dict[str, Any] = {}
+
+        def _load() -> None:
+            try:
+                import gsplat.cuda._backend  # noqa: F401  (module-level JIT load)
+            except BaseException as e:  # re-raised on the main thread below
+                outcome["error"] = e
+
+        t0 = time.time()
+        worker = threading.Thread(target=_load, name="gsplat-jit", daemon=True)
+        worker.start()
+        while True:
+            worker.join(timeout=30.0)
+            if not worker.is_alive():
+                break
+            elapsed = time.time() - t0
+            print(f"[gsplat] still compiling… {int(elapsed // 60)}m{int(elapsed % 60):02d}s elapsed")
+        elapsed = time.time() - t0
+        if "error" in outcome:
+            raise RuntimeError(
+                "gsplat's CUDA extension failed to build/load; the sim cannot "
+                "render splats. See the compiler output above, and the gsplat "
+                "notes in install.sh."
+            ) from outcome["error"]
+        if reason or elapsed > 20.0:
+            print(f"[gsplat] CUDA extension ready (compiled in {int(elapsed // 60)}m{int(elapsed % 60):02d}s)")
+        else:
+            print(f"[gsplat] CUDA extension ready (cached, {elapsed:.1f}s)")
 
     def _missing_splat_files(
         self, splat_name: Optional[str], fields: Sequence[str]
@@ -8322,11 +8418,21 @@ class PybulletRobotServerBase:
         period = 1.0 / gui.get_render_hz()
         if now - getattr(self, "_last_periodic_render", 0.0) < period:
             return
-        self._last_periodic_render = now
         try:
             self.get_observations()   # renders every camera + display_observations
         except Exception as e:
             print(f"[render] periodic render failed: {e}")
+        finally:
+            # Stamp when the render FINISHED, not when it started. The rate is
+            # then "wait `period` after each frame" rather than "start a frame
+            # every `period`", which matters the moment a frame costs longer
+            # than the period — two million gaussians on a GTX 1080 Ti is
+            # ~210 ms, past the 5 Hz default. Timing from the start, the next
+            # iteration's check is already satisfied, so renders run
+            # back-to-back and the loop never returns to the GUI: buttons and
+            # mode switches stop responding. This way the loop always gets a
+            # full period to itself, and a slow GPU just renders less often.
+            self._last_periodic_render = time.time()
 
     def _check_debug_mode(self):
         """Check if debug mode has changed in the GUI and update self.debug_mode."""
