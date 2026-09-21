@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_env_splatsim"
+version = "0.1.0"
+description = "SplatSim as a LeRobot environment plugin: `--env.type=splatsim` for lerobot-train / lerobot-eval"
+requires-python = ">=3.12"
+dependencies = ["splatsim", "lerobot", "gymnasium", "numpy", "torch"]
+
+[tool.setuptools.packages.find]
+include = ["lerobot_env_splatsim*"]

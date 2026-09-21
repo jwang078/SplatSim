@@ -308,6 +308,13 @@ if [[ "$SKIP_LEROBOT" != "true" ]]; then
     # [dataset] is what the recording / eval-replay paths import
     # (LeRobotDataset needs `datasets` + torchcodec).
     pip install -e "$LEROBOT_DIR[dataset]"
+    # The LeRobot environment plugin (lerobot_env_splatsim/): lerobot-train / lerobot-eval
+    # auto-import any installed `lerobot_env_*` distribution, which is what makes
+    # `--env.type=splatsim` resolve. --no-deps: everything it needs is already installed
+    # above, and letting pip resolve here would re-pin huggingface-hub/draccus against the
+    # fork's versions (seen 2026-09-21).
+    say "LeRobot environment plugin (lerobot_env_splatsim)"
+    pip install --no-deps -e "$PWD/lerobot_env_splatsim"
 fi
 
 say "verifying"
