@@ -20,7 +20,7 @@ Full form (every key optional; `auto` or omitted = derive):
       arm_joints: auto | [joint names]         # planner / IK joints, in order
       wheel_joints: []                          # base: wheeled; velocity-controlled
       ee_link: auto | link name                 # goal / tool frame (auto = last arm link)
-      self_collision_skip_pairs: auto | [[link_a, link_b], ...]
+      self_collision_skip_pairs: auto | [[link_a, link_b], ...]   # by link name; ADDED to the derived (adjacent + gripper-internal) pairs
       initial_joint_positions: auto | [per arm joint]
       cameras:                                  # any number, [] = none
         - name: wrist                           # observation key "<name>_rgb"
@@ -446,9 +446,7 @@ class RobotSpec:
 
         # --- self-collision skip pairs --------------------------------------
         skip: List[tuple] = []
-        if not _auto(rb.get("self_collision_skip_pairs")):
-            skip = [(_link_index(link_names, a), _link_index(link_names, b)) for a, b in rb["self_collision_skip_pairs"]]
-        elif not legacy:
+        if not legacy:
             # adjacent links always; every gripper-internal pair (linkages overlap by design)
             for j in joints:
                 skip.append((j.parent_link_index, j.index))
@@ -458,6 +456,10 @@ class RobotSpec:
                     for b in gl:
                         if a < b:
                             skip.append((a, b))
+        # Declared pairs ADD to the derived ones (they name the URDF's own mesh
+        # artifacts, e.g. the UR5's forearm <-> wrist_2 floor); `auto` = derived only.
+        if not _auto(rb.get("self_collision_skip_pairs")):
+            skip += [(_link_index(link_names, a), _link_index(link_names, b)) for a, b in rb["self_collision_skip_pairs"]]
         # legacy: the server's class-level lists apply (see PybulletRobotServerBase)
 
         return cls(

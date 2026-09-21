@@ -11,6 +11,14 @@ robot:
   arm_joints: auto                # the six UR joints
   ee_link: wrist_camera_link      # goal frame = the wrist camera (imaging tasks)
   initial_joint_positions: [1.570796, -1.570796, 1.570796, -1.570796, -1.570796, 0.0]
+  # Link pairs whose collision meshes overlap by construction in this URDF (audited 2026-07;
+  # base_link<->upper_arm at the shoulder, forearm<->wrist_2 at the elbow-wrist junction
+  # ~12 mm, wrist_1<->wrist_3 ~12 mm). Planning and eval-terminate both ignore them;
+  # without this the arm is "in collision" at rest and every eval episode ends at step 1.
+  self_collision_skip_pairs:
+    - [base_link, upper_arm_link]
+    - [forearm_link, wrist_2_link]
+    - [wrist_1_link, wrist_3_link]
   gripper:                        # Robotiq 2F-85: one drive joint, the other five follow it through
     kind: synergies               #   the URDF's <mimic> tags (gear constraints in the sim)
     joints: [finger_joint]
