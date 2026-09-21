@@ -181,6 +181,22 @@ for that.
 
 # Optional
 
+## Using SplatSim from LeRobot
+
+`lerobot_env_splatsim/` is a small LeRobot *environment plugin*. `install.sh` installs it next to
+LeRobot, and because its distribution name starts with `lerobot_env_`, `lerobot-train` and
+`lerobot-eval` import it automatically. That is what makes `--env.type=splatsim` (and
+`--robot.type=splatsim_lerobot`) resolve, with no changes inside LeRobot:
+
+```bash
+lerobot-eval --env.type=splatsim --env.task=planar_3joint --env.robot_name=planar_3joint \
+             --env.external_port=6023 --policy.path=<checkpoint> --eval.n_episodes=10
+```
+
+The env config (`lerobot_env_splatsim/lerobot_env_splatsim/config.py`) either connects to a node you
+launched with `scripts/launch_nodes.py` (`--env.external_port`) or starts one in-process. Install it by
+hand with `pip install --no-deps -e lerobot_env_splatsim`.
+
 ## Data layout
 
 Everything the simulator loads lives under `data/`, one folder per thing,
