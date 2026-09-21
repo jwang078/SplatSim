@@ -519,7 +519,15 @@ class PybulletRobotServerBase:
         # Class-declared ARM pairs describe the shipped UR5; a robot with a
         # `robot:` block brings its own (derived or declared) pairs instead.
         arm_pairs = list(type(self).SELF_COLLISION_SKIP_PAIRS) if spec.legacy else []
-        gripper_pairs: list = []   # gripper-internal pairs come from the spec (every link pair inside each gripper)
+        # Gripper-internal pairs (a linkage overlaps itself by design: the Robotiq
+        # knuckles rest 2 mm apart). A `robot:` asset gets them from the spec;
+        # a legacy asset (no `robot:` block, e.g. planar_3joint) does not, so
+        # derive them here the same way: every link pair inside each gripper.
+        gripper_pairs: list = []
+        if spec.legacy:
+            for g in spec.grippers:
+                gl = list(g.link_indices)
+                gripper_pairs += [(a, b) for a in gl for b in gl if a < b]
         spec_pairs = list(spec.self_collision_skip_pairs)
         # Dedup while preserving order; treat (a,b) == (b,a).
         seen = set()
