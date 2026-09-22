@@ -116,6 +116,19 @@ def _robot_defaults(cfg: Dict[str, Any]) -> None:
     wheeled = str((cfg["robot"] or {}).get("base", "fixed")).lower() == "wheeled"
     cfg.setdefault("use_fixed_base", not wheeled)
     cfg.setdefault("base_position", [0.0, 0.0, 0.0])
+    # The legacy `wrist_camera_link_name` field is still what the planners read
+    # for the tool frame (the shared-autonomy wrapper, the joystick / keyboard
+    # agents, trajectory_generation). A `robot:` block says the same thing as
+    # `cameras: [{name: wrist, link: ...}]` or `ee_link:`; fill the legacy
+    # field from those so a robot declared only the new way keeps working.
+    if not cfg.get("wrist_camera_link_name"):
+        rb = cfg["robot"] or {}
+        cams = [c for c in (rb.get("cameras") or []) if isinstance(c, dict) and c.get("link")]
+        wrist = next((c for c in cams if str(c.get("name", "")).lower() == "wrist"), cams[0] if cams else None)
+        ee = rb.get("ee_link")
+        link = wrist["link"] if wrist else (ee if isinstance(ee, str) and ee.lower() != "auto" else None)
+        if link:
+            cfg["wrist_camera_link_name"] = link
 
 
 def _merge(parent: Dict[str, Any], child: Dict[str, Any]) -> Dict[str, Any]:
