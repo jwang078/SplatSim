@@ -6,8 +6,15 @@ the grape vine and its trellis; the URDF-first path is
 scripts/segment_stage_asset.py.
 
 Backends:
-  splat-transform (default) PlayCanvas CLI (npm i -g @playcanvas/splat-transform);
-                  runs `--collision-mesh smooth` and imports the .collision.glb.
+  splat-transform (default) PlayCanvas CLI; runs `--collision-mesh smooth` and
+                  imports the .collision.glb. Not part of SplatSim's install
+                  (it is a Node tool, not a Python package). To get it:
+                      # Node 20+ if you don't have one (nvm keeps it out of the system):
+                      curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+                      nvm install 20
+                      npm i -g @playcanvas/splat-transform
+                      splat-transform --help          # must be on PATH when this script runs
+                  Voxelization uses the GPU when available and falls back to CPU.
   voxel           in-repo voxel-face mesher: occupancy grid from the gaussian
                   centers, emit faces between occupied/empty voxel neighbors ->
                   watertight blocky mesh. No external tools.
@@ -160,8 +167,9 @@ def run_splat_transform(input_ply: Path, outdir: Path, voxel: float):
     exe = shutil.which("splat-transform")
     if exe is None:
         raise RuntimeError(
-            "splat-transform not on PATH (npm i -g @playcanvas/splat-transform); "
-            "use --backend voxel instead"
+            "splat-transform not on PATH. It is a Node CLI, not installed by SplatSim: "
+            "`nvm install 20 && npm i -g @playcanvas/splat-transform` (see the header of "
+            "this script), or use --backend voxel, which needs no extra tools"
         )
     out_voxel = outdir / "byproducts" / "st_output.voxel.json"
     cmd = [exe, str(input_ply), "--voxel-params", f"{voxel},0.1",
