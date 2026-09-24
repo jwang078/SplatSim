@@ -163,7 +163,7 @@ def write_obj(path: Path, verts: np.ndarray, tris: np.ndarray) -> None:
 
 
 # ------------------------------------------------------ splat-transform path
-def run_splat_transform(input_ply: Path, outdir: Path, voxel: float):
+def run_splat_transform(input_ply: Path, outdir: Path, voxel: float, opacity: float = 0.1):
     exe = shutil.which("splat-transform")
     if exe is None:
         raise RuntimeError(
@@ -172,7 +172,7 @@ def run_splat_transform(input_ply: Path, outdir: Path, voxel: float):
             "this script), or use --backend voxel, which needs no extra tools"
         )
     out_voxel = outdir / "byproducts" / "st_output.voxel.json"
-    cmd = [exe, str(input_ply), "--voxel-params", f"{voxel},0.1",
+    cmd = [exe, str(input_ply), "--voxel-params", f"{voxel},{opacity}",
            "--collision-mesh", "smooth", str(out_voxel)]
     print("running:", " ".join(cmd))
     result = subprocess.run(cmd)
@@ -353,6 +353,10 @@ def main():
     ap.add_argument("--min-spur-len", type=float, default=0.08,
                     help="capsules: prune leaf chains shorter than this (m)")
     ap.add_argument("--voxel-size", type=float, default=0.012)
+    ap.add_argument("--opacity-threshold", type=float, default=0.1,
+                    help="splat-transform backend: a gaussian must have at least this opacity to fill "
+                    "a voxel (default 0.1). Raise it (0.3-0.5) so faint, wide gaussians such as "
+                    "leaves stop inflating into blobs; lower it to close gaps in thin branches.")
     ap.add_argument("--dilate", type=int, default=0,
                     help="grow occupancy by N voxels (safety margin, voxel backend)")
     ap.add_argument("--close", type=int, default=0,
@@ -390,8 +394,8 @@ def main():
         verts, tris = voxel_face_mesh(cloud.xyz, args.voxel_size, args.dilate,
                                       args.close)
     else:
-        verts, tris = run_splat_transform(Path(args.trunk_ply), outdir,
-                                          args.voxel_size)
+        verts, tris = run_splat_transform(Path(args.trunk_ply), outdir, args.voxel_size,
+                                          opacity=args.opacity_threshold)
     print(f"mesh: {len(verts)} verts, {len(tris)} tris ({args.backend})")
 
     if len(tris) > args.max_tris:
